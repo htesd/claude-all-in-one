@@ -1,0 +1,26 @@
+# 进程拓扑(多进程核心)。单机双 IPv4 灰度示例。
+# 启动:
+#   kiro-gw --mode router
+#   kiro-gw --mode worker --instance 0
+#   kiro-gw --mode worker --instance 1
+router:
+  listen: "0.0.0.0:8990"
+
+workers:
+  - instance: 0
+    listen: "127.0.0.1:9000"
+    egress:
+      mode: local_ip
+      address: "203.0.113.10"   # 主 IP
+    account_group: "G0"
+
+  - instance: 1
+    listen: "127.0.0.1:9001"
+    egress:
+      mode: local_ip
+      address: "203.0.113.11"     # 第二 IP(灰度)
+    account_group: "G1"
+    # 或走外部固定 IP 代理池:
+    # egress:
+    #   mode: proxy
+    #   url: "socks5://user:pass@host:1080"
