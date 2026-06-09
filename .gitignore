@@ -1,0 +1,9 @@
+/target
+# 真实凭据/配置不入库(只保留 *.example.yaml)
+/config/instances.yaml
+/config/accounts.yaml
+/config/system.yaml
+/data
+*.db
+*.db-wal
+*.db-shm

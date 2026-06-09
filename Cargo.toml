@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gw-core",
+    "crates/gw-kiro",
+    "crates/gw-store",
+    "crates/gw-app",
+    "crates/gw-claude-subprocess",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+# 内部 crate
+gw-core = { path = "crates/gw-core" }
+gw-kiro = { path = "crates/gw-kiro" }
+gw-store = { path = "crates/gw-store" }
+gw-claude-subprocess = { path = "crates/gw-claude-subprocess" }
+
+# 异步运行时与 HTTP（版本对齐旧 kiro.rs，便于资产搬运）
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream", "json", "socks",
+    "rustls-tls-webpki-roots", "rustls-tls-native-roots",
+    "http2", "system-proxy", "charset",
+] }
+hyper = "1"
+futures = "0.3"
+bytes = "1"
+
+# 序列化与配置
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# 错误与异步 trait
+anyhow = "1.0"
+thiserror = "2"
+async-trait = "0.1"
+
+# 持久化
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 工具
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.10", features = ["v4", "fast-rng"] }
+sha2 = "0.10"
+base64 = "0.22"
+crc = "3"
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

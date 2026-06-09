@@ -1,0 +1,16 @@
+# 账号(按组分配到 worker)。组名对应 instances.yaml 的 account_group。
+# ⚠️ 真实 refresh_token 是密钥,勿提交。复制为 accounts.yaml 后填写。
+groups:
+  G0:
+    provider: kiro
+    accounts:
+      - account_id: kiro-01
+        refresh_token: "REPLACE_ME"
+      - account_id: kiro-02
+        refresh_token: "REPLACE_ME"
+
+  G1:
+    provider: kiro
+    accounts:
+      - account_id: kiro-03
+        refresh_token: "REPLACE_ME"

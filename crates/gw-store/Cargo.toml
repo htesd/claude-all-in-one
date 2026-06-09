@@ -1,0 +1,17 @@
+[package]
+name = "gw-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gw-core.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
