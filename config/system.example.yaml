@@ -4,5 +4,5 @@ cache:
   cap_ratio: 0.9
   floor_ratio: 0.1
 
-empty_response:
-  buffered_fallback: true   # v58
+# 空响应无配置:v60 起不做反代侧重试/兜底,固定为记一条 empty_response error +
+# 阈值冷却 + 客户端自重试。

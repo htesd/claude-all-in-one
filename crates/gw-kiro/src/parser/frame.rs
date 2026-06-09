@@ -49,6 +49,17 @@ impl Frame {
         self.headers.event_type()
     }
 
+    /// 获取异常类型(:exception-type)。
+    /// 异常帧常无 :event-type,只有 :message-type=exception + :exception-type。
+    pub fn exception_type(&self) -> Option<&str> {
+        self.headers.exception_type()
+    }
+
+    /// 获取错误代码(:error-code)
+    pub fn error_code(&self) -> Option<&str> {
+        self.headers.error_code()
+    }
+
     /// 将 payload 解析为 JSON
     pub fn payload_as_json<T: serde::de::DeserializeOwned>(&self) -> ParseResult<T> {
         serde_json::from_slice(&self.payload).map_err(ParseError::PayloadDeserialize)
