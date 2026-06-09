@@ -13,6 +13,7 @@
 //! (见 [`crate::usage`]);output 逐帧累加(thinking+正文)。thinking 签名透传见
 //! [`crate::signature`],inline `<thinking>` 解析见 [`crate::inline_thinking`]。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -200,6 +201,19 @@ struct BlockTracker {
     /// 累积 output token 估算(thinking + 正文,逐帧累加)。🔵 对齐 kiro.rs estimate_tokens
     /// 在 process_assistant_response / process_reasoning_content 处累加原始内容串。
     output_tokens: i64,
+    /// 是否出现过 tool_use(stop_reason 优先级判定用)。
+    has_tool_use: bool,
+    /// 当前开着的 tool_use 块 (块索引, toolUseId)。块不可交错——任一时刻至多一个块开着,
+    /// 开新块前必关当前块。同一 toolUseId 的增量多帧匹配此项,只 start 一次。
+    open_tool: Option<(usize, String)>,
+    /// 已 stop 的 toolUseId 集合:用于忽略 stop 后迟到/重复帧(防向已关闭块再发 delta/stop)。
+    stopped_tools: HashSet<String>,
+    /// 是否开过 thinking 块(native 或 inline;thinking-only 兜底与空响应判定用)。
+    thinking_opened: bool,
+    /// 是否开过 text 块(text_index 会被 tool_use 关闭重置,故单独记"曾开过")。
+    text_opened: bool,
+    /// finish() 判定为 thinking-only:整流只有 thinking 块 → 收尾强制 stop_reason=max_tokens。
+    thinking_only_max_tokens: bool,
 }
 
 impl BlockTracker {
@@ -216,6 +230,12 @@ impl BlockTracker {
             thinking_enabled,
             inline: crate::inline_thinking::InlineThinkingParser::new(),
             output_tokens: 0,
+            has_tool_use: false,
+            open_tool: None,
+            stopped_tools: HashSet::new(),
+            thinking_opened: false,
+            text_opened: false,
+            thinking_only_max_tokens: false,
         }
     }
 
@@ -234,9 +254,11 @@ impl BlockTracker {
         if text.is_empty() {
             return Vec::new();
         }
-        // 2) 顺序保护:text 块已开且无活跃 reasoning → reasoning 迟到,丢弃(避免非法块顺序)。
-        if self.text_index.is_some() && !self.reasoning_active {
-            tracing::warn!("reasoningContentEvent 迟于正文到达,已丢弃以避免非法块顺序");
+        // 2) 顺序保护:已产出过正文/工具块且无活跃 reasoning → reasoning 迟到,丢弃。
+        //    用单调的 text_opened/has_tool_use(而非 text_index——它会在 text→tool 边界被
+        //    close_active_block 置 None,导致迟到 reasoning 误判为合法而在 text/tool 后重开 thinking)。
+        if (self.text_opened || self.has_tool_use) && !self.reasoning_active {
+            tracing::warn!("reasoningContentEvent 迟于正文/工具到达,已丢弃以避免非法块顺序");
             return Vec::new();
         }
         self.native_reasoning_seen = true;
@@ -251,20 +273,47 @@ impl BlockTracker {
         events
     }
 
+    /// 关闭当前开着的内容块(reasoning / text / tool 中至多一个)。块不可交错的不变量:
+    /// 开任何新块前都先调它。三个 close_*_if_open 各自在未开时是 no-op,故至多一个产出事件。
+    fn close_active_block(&mut self) -> Vec<SseEvent> {
+        let mut events = self.close_reasoning_if_open();
+        events.extend(self.close_text_if_open());
+        events.extend(self.close_open_tool());
+        events
+    }
+
+    /// 关闭开着的 tool_use 块(若有):发 content_block_stop + 记入 stopped_tools。
+    fn close_open_tool(&mut self) -> Vec<SseEvent> {
+        match self.open_tool.take() {
+            Some((idx, id)) => {
+                self.stopped_tools.insert(id);
+                vec![SseEvent::new(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":idx}),
+                )]
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// 开 thinking 块(若未开),返回 content_block_start(若发生)。共用于 native/inline 路径。
+    /// 开块前关掉任何开着的 text/tool 块(thinking 必须独立,不与其它块交错)。
     fn open_thinking_block_if_needed(&mut self) -> Vec<SseEvent> {
         if self.reasoning_active {
             return Vec::new();
         }
+        let mut events = self.close_active_block();
         let idx = self.next_index;
         self.next_index += 1;
         self.thinking_index = Some(idx);
         self.reasoning_active = true;
-        vec![SseEvent::new(
+        self.thinking_opened = true;
+        events.push(SseEvent::new(
             "content_block_start",
             json!({"type":"content_block_start","index":idx,
                    "content_block":{"type":"thinking","thinking":""}}),
-        )]
+        ));
+        events
     }
 
     /// 发一个 thinking_delta(块须已开)。
@@ -306,13 +355,15 @@ impl BlockTracker {
         events
     }
 
-    /// 开 text 块(若未开)+ 发 text_delta。
+    /// 开 text 块(若未开)+ 发 text_delta。开块前关掉任何开着的 reasoning/tool 块。
     fn push_text(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if self.text_index.is_none() {
+            events.extend(self.close_active_block());
             let idx = self.next_index;
             self.next_index += 1;
             self.text_index = Some(idx);
+            self.text_opened = true;
             events.push(SseEvent::new(
                 "content_block_start",
                 json!({"type":"content_block_start","index":idx,
@@ -326,6 +377,98 @@ impl BlockTracker {
                    "delta":{"type":"text_delta","text":text}}),
         ));
         events
+    }
+
+    /// 关闭开着的 text 块(若有)。tool_use 开块前与收尾共用:块不可交错,
+    /// 开新块前必须先 stop 当前块;text_index 置 None,后续正文会另开新 text 块。
+    fn close_text_if_open(&mut self) -> Vec<SseEvent> {
+        match self.text_index.take() {
+            Some(idx) => vec![SseEvent::new(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":idx}),
+            )],
+            None => Vec::new(),
+        }
+    }
+
+    /// 处理 toolUseEvent:开/续 tool_use 块,input 增量透传为 input_json_delta。
+    /// 🔵 对齐 kiro.rs stream.rs process_tool_use。kiro-gw 不做 tool 名重映射
+    /// (请求侧原样转发客户端 tool 定义,上游回原名),无需 tool_name_map。
+    ///
+    /// **顺序流式假设**:Kiro 按 `stop` 字段分隔顺序流式工具(一个工具 stop=true 后才下一个),
+    /// 与参考实现 kiro.rs 一致。Anthropic SSE 不允许块交错,故若上游异常交错(t1→t2→t1),
+    /// 开 t2 时会强关 t1 并 tombstone(stopped_tools),迟到的 t1 续帧被忽略——保证 SSE 合法,
+    /// 代价是该极端情形下 t1 的 JSON 被截断。真正支持交错需缓冲各工具 input 到 stop 再顺序吐出,
+    /// 属未发生场景的复杂度,按 [[subtract-before-you-add]] 暂不实现。
+    fn on_tool_use(&mut self, name: &str, tool_use_id: &str, input: &str, stop: bool) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        // 已 stop 的 tool id:忽略迟到/重复帧,避免向已关闭块再发 delta/stop(非法 SSE)。
+        if self.stopped_tools.contains(tool_use_id) {
+            tracing::warn!("toolUseEvent 命中已结束的 tool id {tool_use_id},忽略迟到帧");
+            return events;
+        }
+        // 是否为当前开着工具的增量续帧(同 id)。续帧只带 input 增量,复用块,不重开。
+        let is_continuation =
+            matches!(&self.open_tool, Some((_, open_id)) if open_id == tool_use_id);
+        if !is_continuation {
+            // 新工具调用。首帧必须带 name(agentic 客户端按工具名路由);缺 name = 上游畸形帧,
+            // 丢弃而非产出空名块(空名块客户端无法路由,却会以 stop_reason=tool_use 假成功收尾)。
+            if name.is_empty() {
+                tracing::warn!("新 toolUseEvent(id {tool_use_id})缺 name,丢弃畸形帧");
+                return events;
+            }
+            // 正文/思考必须在 tool_use 之前:先冲洗 inline thinking 缓冲(否则缓冲内容会被
+            // 推到 finish() 在 tool_use 之后才吐出,块顺序倒置)。🔵 对齐 kiro.rs process_tool_use。
+            if self.thinking_enabled && !self.native_reasoning_seen {
+                let segs = self.inline.flush();
+                events.extend(self.apply_inline(segs));
+            }
+            // 关闭当前开着的块(reasoning/text/其它 tool),保证块不交错。
+            events.extend(self.close_active_block());
+        }
+        self.has_tool_use = true;
+        let idx = match &self.open_tool {
+            Some((i, _)) => *i, // 续帧:复用开着的块索引
+            None => {
+                let i = self.next_index;
+                self.next_index += 1;
+                self.open_tool = Some((i, tool_use_id.to_string()));
+                events.push(SseEvent::new(
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":i,
+                           "content_block":{"type":"tool_use","id":tool_use_id,"name":name,"input":{}}}),
+                ));
+                i
+            }
+        };
+        if !input.is_empty() {
+            // tool input 计入 output(对齐 kiro.rs:(len+3)/4 估算)。
+            self.output_tokens += (input.len() as i64 + 3) / 4;
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":idx,
+                       "delta":{"type":"input_json_delta","partial_json":input}}),
+            ));
+        }
+        if stop {
+            events.push(SseEvent::new(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":idx}),
+            ));
+            self.open_tool = None;
+            self.stopped_tools.insert(tool_use_id.to_string());
+        }
+        events
+    }
+
+    /// 本次响应是否产出过实质内容(正文 token / 工具调用 / 原生 reasoning / inline thinking)。
+    /// 🔵 对齐 kiro.rs produced_any_content;再 OR 上 thinking_opened 覆盖 inline 路径。
+    /// 用于检测"上游 200 但零事件"的空响应。
+    fn produced_any_content(&self) -> bool {
+        self.output_tokens > 0
+            || self.has_tool_use
+            || self.native_reasoning_seen
+            || self.thinking_opened
     }
 
     /// 处理 assistantResponseEvent 正文。
@@ -371,6 +514,9 @@ impl BlockTracker {
     }
 
     /// 收尾:冲洗 inline 残留,再关掉任何开着的块(reasoning 优先闭合,再关 text)。
+    /// thinking-only 兜底在此判定:整流只产出 thinking 块 → 模型把 token 预算耗在
+    /// 思考上,置 thinking_only_max_tokens 并补发一个空格 text 块(完整 start/delta/stop),
+    /// 保证 content 数组含 text 块(🔵 kiro.rs stream.rs:1466-1475)。
     fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
         if self.thinking_enabled && !self.native_reasoning_seen {
@@ -378,12 +524,13 @@ impl BlockTracker {
             events.extend(self.apply_inline(tail));
         }
         events.extend(self.close_reasoning_if_open());
-        if let Some(idx) = self.text_index.take() {
-            events.push(SseEvent::new(
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":idx}),
-            ));
+        // 关闭未收到 stop=true 的开着的 tool_use 块(否则 message_delta 前留半开块,违反时序)。
+        events.extend(self.close_open_tool());
+        if self.thinking_enabled && self.thinking_opened && !self.text_opened && !self.has_tool_use {
+            self.thinking_only_max_tokens = true;
+            events.extend(self.push_text(" "));
         }
+        events.extend(self.close_text_if_open());
         events
     }
 }
@@ -425,7 +572,9 @@ fn async_stream_like(
 
         let mut tracker = BlockTracker::new(model.clone(), thinking_enabled);
         let mut decoder = EventStreamDecoder::new();
-        let mut stop_reason = "end_turn".to_string();
+        // 显式 stop_reason(model_context_window_exceeded / max_tokens)。None = 收尾按
+        // tool_use > end_turn 优先级推导(🔵 kiro.rs stream.rs get_stop_reason)。
+        let mut stop_reason: Option<String> = None;
 
         // report_total:计费基准 token。优先 tokenUsageEvent 真值(uncached+cacheRead),
         // 退而 contextUsageEvent(pct×窗口),再退模拟器 sim_total。
@@ -456,6 +605,39 @@ fn async_stream_like(
             loop {
                 match decoder.decode() {
                     Ok(Some(frame)) => {
+                        // 异常/错误帧按 :message-type 识别——异常帧常无 :event-type,
+                        // 只有 :message-type=exception + :exception-type,按 event_type
+                        // 匹配会漏进 `_ => {}` 被静默吞掉(🔵 kiro.rs events/base.rs 同路由)。
+                        match frame.message_type().unwrap_or("event") {
+                            "exception" => {
+                                let ex = frame.exception_type().unwrap_or("unknown");
+                                if ex == "ContentLengthExceededException" {
+                                    // 正常 max_tokens 截断:模型已产出内容到上限,非失败,
+                                    // 继续收尾(🔵 kiro.rs stream.rs:856-874)。
+                                    stop_reason = Some("max_tokens".to_string());
+                                } else {
+                                    let _ = tx
+                                        .send(Err(UpstreamError::new(
+                                            UpstreamErrorKind::ServerError,
+                                            format!("上游异常 {ex}: {}", frame.payload_as_str()),
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                continue;
+                            }
+                            "error" => {
+                                let code = frame.error_code().unwrap_or("unknown");
+                                let _ = tx
+                                    .send(Err(UpstreamError::new(
+                                        UpstreamErrorKind::ServerError,
+                                        format!("上游错误 {code}: {}", frame.payload_as_str()),
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            _ => {}
+                        }
                         let evt = frame.event_type().map(|s| s.to_string());
                         match evt.as_deref() {
                             Some("assistantResponseEvent") => {
@@ -476,6 +658,28 @@ fn async_stream_like(
                                     for ev in tracker.on_reasoning(text, sig) {
                                         if tx.send(Ok(StreamItem::Sse(ev))).await.is_err() {
                                             return;
+                                        }
+                                    }
+                                }
+                            }
+                            Some("toolUseEvent") => {
+                                // 上游 payload(camelCase):{name, toolUseId,
+                                // input(String,默认"",可增量部分 JSON), stop(bool,默认 false)}。
+                                if let Ok(v) = frame.payload_as_json::<serde_json::Value>() {
+                                    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                                    let id =
+                                        v.get("toolUseId").and_then(|x| x.as_str()).unwrap_or("");
+                                    let input =
+                                        v.get("input").and_then(|x| x.as_str()).unwrap_or("");
+                                    let stop =
+                                        v.get("stop").and_then(|x| x.as_bool()).unwrap_or(false);
+                                    if id.is_empty() {
+                                        tracing::warn!("toolUseEvent 缺 toolUseId,已丢弃");
+                                    } else {
+                                        for ev in tracker.on_tool_use(name, id, input, stop) {
+                                            if tx.send(Ok(StreamItem::Sse(ev))).await.is_err() {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -514,24 +718,34 @@ fn async_stream_like(
                                         report_total = Some(est);
                                     }
                                     if pct >= 100.0 {
-                                        stop_reason = "model_context_window_exceeded".into();
+                                        stop_reason =
+                                            Some("model_context_window_exceeded".to_string());
                                     }
                                 }
                             }
                             Some("meteringEvent") => {
                                 // v53 已不靠 metering 反推缓存;此处仅吞掉(留兼容)。
                             }
-                            // 上游异常 frame(Exception/Error)→ 报错并终止。
+                            // event-type 异常名兜底(:message-type=event 但 event-type 是异常名
+                            // 的奇异帧;常规异常帧已在上方按 :message-type 路由)。
+                            // ContentLengthExceeded 同样按 max_tokens 正常收尾,其余报错终止,
                             // 不再补发 message_delta/message_stop/Usage:避免「error 后又正常
                             // 收尾计费」的自相矛盾序列(🔵 对齐 kiro.rs stream.rs:1394 注释)。
                             Some(other) if other.contains("xception") || other.contains("rror") => {
-                                let _ = tx
-                                    .send(Err(UpstreamError::new(
-                                        UpstreamErrorKind::ServerError,
-                                        format!("上游异常事件 {other}: {}", frame.payload_as_str()),
-                                    )))
-                                    .await;
-                                return;
+                                if other.contains("ContentLengthExceeded") {
+                                    stop_reason = Some("max_tokens".to_string());
+                                } else {
+                                    let _ = tx
+                                        .send(Err(UpstreamError::new(
+                                            UpstreamErrorKind::ServerError,
+                                            format!(
+                                                "上游异常事件 {other}: {}",
+                                                frame.payload_as_str()
+                                            ),
+                                        )))
+                                        .await;
+                                    return;
+                                }
                             }
                             _ => {}
                         }
@@ -545,10 +759,41 @@ fn async_stream_like(
             }
         }
 
-        // --- 收尾:关掉任何开着的块(thinking/text) ---
-        for ev in tracker.finish() {
+        // --- 收尾:关掉任何开着的块(thinking/text)+ thinking-only 兜底 ---
+        let finish_events = tracker.finish();
+
+        // ⑤ 空响应检测(v60 契约):到达此处 = 流无失败;零实质产出且无显式 stop_reason
+        // (max_tokens/context 超限的零产出是合法退化,不算空)→ 终态 Err(EmptyResponse),
+        // 跳过 message_delta/message_stop/Usage(message_start 已急发无妨,不构成非法序列)。
+        // worker 的 Err 路径会 report_failure → scheduler v58 阈值冷却,并向客户端转发
+        // 终态 SSE error,Anthropic 客户端自行重试。不做任何换 ID 重发(v60 已删,有害)。
+        if !tracker.produced_any_content() && stop_reason.is_none() {
+            tracing::warn!("检测到空响应:上游 200 但零内容产出");
+            let _ = tx
+                .send(Err(UpstreamError::new(
+                    UpstreamErrorKind::EmptyResponse,
+                    "上游空响应(零内容产出)",
+                )))
+                .await;
+            return;
+        }
+        for ev in finish_events {
             let _ = tx.send(Ok(StreamItem::Sse(ev))).await;
         }
+        // thinking-only:finish() 判定整流只有 thinking 块 → max_tokens(模型把预算耗在思考上)。
+        // 仅在无显式 stop_reason 时填:context 超限(model_context_window_exceeded)等显式终态
+        // 优先,不被 thinking-only 兜底覆盖(显式 stop_reason 优先契约)。
+        if tracker.thinking_only_max_tokens && stop_reason.is_none() {
+            stop_reason = Some("max_tokens".to_string());
+        }
+        // stop_reason 优先级:显式 > tool_use > end_turn(🔵 kiro.rs get_stop_reason)。
+        let stop_reason = stop_reason.unwrap_or_else(|| {
+            if tracker.has_tool_use {
+                "tool_use".to_string()
+            } else {
+                "end_turn".to_string()
+            }
+        });
 
         // --- 计费收尾(v53 统一走模拟器,见 usage.rs)---
         let output_tokens = tracker.output_tokens.min(i32::MAX as i64) as i32;
@@ -739,5 +984,481 @@ mod tests {
         let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
         t.on_text("");
         assert_eq!(t.output_tokens, 0, "空正文不应增加 output");
+    }
+
+    // ---- ①B tool_use 响应路径 ----
+
+    #[test]
+    fn tool_use_after_reasoning_closes_thinking_first() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut all = Vec::new();
+        all.extend(t.on_reasoning("思考", None));
+        all.extend(t.on_tool_use("get_weather", "tooluse_1", r#"{"city":"sf"}"#, true));
+        let seq = tags(&all);
+        assert_eq!(
+            seq,
+            vec![
+                "content_block_start:thinking",
+                "content_block_delta:thinking_delta",
+                "content_block_delta:signature_delta",
+                "content_block_stop",
+                "content_block_start:tool_use",
+                "content_block_delta:input_json_delta",
+                "content_block_stop",
+            ],
+            "reasoning 后直接 tool_use 应先闭 thinking 块"
+        );
+        assert!(t.has_tool_use);
+    }
+
+    #[test]
+    fn tool_use_block_carries_id_name_and_empty_input() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let evs = t.on_tool_use("get_weather", "tooluse_1", "", false);
+        let start = evs.iter().find(|e| e.event == "content_block_start").unwrap();
+        assert_eq!(start.data["content_block"]["type"], "tool_use");
+        assert_eq!(start.data["content_block"]["id"], "tooluse_1");
+        assert_eq!(start.data["content_block"]["name"], "get_weather");
+        assert_eq!(start.data["content_block"]["input"], serde_json::json!({}));
+        assert_eq!(evs.len(), 1, "空 input 且未 stop 时只应有 start");
+    }
+
+    #[test]
+    fn tool_use_closes_open_text_block_first() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut all = Vec::new();
+        all.extend(t.on_text("先有正文"));
+        all.extend(t.on_tool_use("f", "t1", "{}", true));
+        let seq = tags(&all);
+        assert_eq!(
+            seq,
+            vec![
+                "content_block_start:text",
+                "content_block_delta:text_delta",
+                "content_block_stop",
+                "content_block_start:tool_use",
+                "content_block_delta:input_json_delta",
+                "content_block_stop",
+            ],
+            "开新 tool_use 块前必须先关开着的 text 块"
+        );
+        let tool_start = all
+            .iter()
+            .find(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(tool_start.data["index"], 1);
+    }
+
+    #[test]
+    fn tool_use_incremental_frames_share_one_block() {
+        // 同一 toolUseId 增量多帧:仅一次 start,多次 input_json_delta,stop=true 才 stop。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut all = Vec::new();
+        all.extend(t.on_tool_use("f", "t1", r#"{"a":"#, false));
+        all.extend(t.on_tool_use("f", "t1", "1}", true));
+        let starts = all.iter().filter(|e| e.event == "content_block_start").count();
+        let deltas = all
+            .iter()
+            .filter(|e| tag(e) == "content_block_delta:input_json_delta")
+            .count();
+        let stops = all.iter().filter(|e| e.event == "content_block_stop").count();
+        assert_eq!((starts, deltas, stops), (1, 2, 1));
+        let parts: Vec<&str> = all
+            .iter()
+            .filter(|e| tag(e) == "content_block_delta:input_json_delta")
+            .map(|e| e.data["delta"]["partial_json"].as_str().unwrap())
+            .collect();
+        assert_eq!(parts.join(""), r#"{"a":1}"#, "partial_json 应原样增量透传");
+    }
+
+    #[test]
+    fn tool_use_input_counts_into_output_tokens() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.on_tool_use("f", "t1", "12345678", true); // (8+3)/4 = 2
+        assert_eq!(t.output_tokens, 2);
+    }
+
+    #[test]
+    fn unstopped_tool_block_is_closed_at_finish() {
+        // tool_use 没收到 stop=true 就流结束 → finish() 必须补 content_block_stop,
+        // 否则 message_delta 前留半开块,违反 SSE 时序。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut all = Vec::new();
+        all.extend(t.on_tool_use("f", "t1", "{}", false)); // stop=false
+        all.extend(t.finish());
+        let stops = all.iter().filter(|e| e.event == "content_block_stop").count();
+        let starts = all
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .count();
+        assert_eq!(starts, 1, "应只有一个 tool_use start");
+        assert_eq!(stops, 1, "finish 必须关闭未 stop 的 tool_use 块");
+        assert_eq!(all.last().unwrap().event, "content_block_stop");
+    }
+
+    #[test]
+    fn two_concurrent_tools_do_not_interleave() {
+        // t1(stop=false) 后 t2(stop=false):开 t2 前必须先关 t1,块不可交错。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut all = Vec::new();
+        all.extend(t.on_tool_use("f1", "t1", "{}", false));
+        all.extend(t.on_tool_use("f2", "t2", "{}", false));
+        let seq = tags(&all);
+        // 期望:t1 start, t1 delta, t1 stop(因 t2 到来被迫关闭), t2 start, t2 delta
+        assert_eq!(
+            seq,
+            vec![
+                "content_block_start:tool_use",
+                "content_block_delta:input_json_delta",
+                "content_block_stop",
+                "content_block_start:tool_use",
+                "content_block_delta:input_json_delta",
+            ],
+            "并发工具帧不得交错:开 t2 前必须 stop t1"
+        );
+        // t1 与 t2 用不同块索引
+        let starts: Vec<i64> = all
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| e.data["index"].as_i64().unwrap())
+            .collect();
+        assert_eq!(starts, vec![0, 1]);
+    }
+
+    #[test]
+    fn stopped_tool_id_ignores_later_frames() {
+        // 同一 toolUseId 在 stop 后再来帧 → 忽略,不向已关闭块再发 delta/stop。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut first = t.on_tool_use("f", "t1", "{}", true);
+        let stops_first = first.iter().filter(|e| e.event == "content_block_stop").count();
+        assert_eq!(stops_first, 1);
+        first.clear();
+        let late = t.on_tool_use("f", "t1", "more", true);
+        assert!(
+            late.is_empty(),
+            "已 stop 的 tool id 再来帧应被忽略,得到: {:?}",
+            tags(&late)
+        );
+    }
+
+    #[test]
+    fn new_tool_missing_name_is_dropped() {
+        // 新 tool id 首帧缺 name(agentic 客户端按名路由)→ 丢弃畸形帧,不产出空名块。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let evs = t.on_tool_use("", "t1", "{}", true);
+        assert!(evs.is_empty(), "缺 name 的新 tool 帧应被丢弃");
+        assert!(!t.has_tool_use, "丢弃的 tool 不应置 has_tool_use");
+        assert!(!t.produced_any_content());
+    }
+
+    #[test]
+    fn late_reasoning_after_text_then_tool_is_dropped() {
+        // 回归:tool 关闭 text 后 text_index 置 None;迟到 native reasoning 不得借此重开
+        // thinking 块(违反 thinking 在前)。drop-guard 必须用单调的 text_opened/has_tool_use。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.on_text("正文");
+        t.on_tool_use("f", "t1", "{}", true); // 关闭 text(text_index→None)+ 输出并 stop tool
+        let late = t.on_reasoning("迟到思考", None);
+        assert!(
+            late.is_empty(),
+            "text/tool 之后迟到的 reasoning 应丢弃,不得重开 thinking 块: {:?}",
+            tags(&late)
+        );
+    }
+
+    #[test]
+    fn interleaved_tool_frames_stay_valid_sse_but_truncate() {
+        // Kiro 实际按 stop 分隔顺序流式工具。若上游异常交错 t1→t2→t1,我方保证 SSE 合法
+        // (开 t2 前强关 t1),代价=被强关的 t1 续帧丢弃(JSON 截断)。锁定此取舍。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut all = Vec::new();
+        all.extend(t.on_tool_use("f1", "t1", "{\"a\":", false));
+        all.extend(t.on_tool_use("f2", "t2", "{}", false)); // 强关 t1
+        let late = t.on_tool_use("f1", "t1", "1}", true); // t1 已被强关 → 忽略
+        assert!(late.is_empty(), "被强关的 t1 续帧应忽略,保持 SSE 合法");
+        let seq = tags(&all);
+        assert_eq!(
+            seq,
+            vec![
+                "content_block_start:tool_use",        // t1
+                "content_block_delta:input_json_delta",
+                "content_block_stop",                  // t1 因 t2 到来被强关
+                "content_block_start:tool_use",        // t2
+                "content_block_delta:input_json_delta",
+            ],
+            "交错工具帧不得产生交错块"
+        );
+    }
+
+    #[test]
+    fn inline_thinking_end_tag_before_tool_no_tag_leak() {
+        // M-1:</thinking> 无 \n\n 收尾即遇 tool_use,flush 必须识别结束标签,
+        // 不能把 </thinking> 当 thinking 内容泄漏。
+        let mut t = BlockTracker::new("claude-sonnet-4-5".to_string(), true);
+        let mut all = Vec::new();
+        all.extend(t.on_text("<thinking>\nabc</thinking>"));
+        all.extend(t.on_tool_use("f", "t1", "{}", true));
+        let thinking: String = all
+            .iter()
+            .filter(|e| tag(e) == "content_block_delta:thinking_delta")
+            .map(|e| e.data["delta"]["thinking"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(thinking, "abc", "thinking 内容不应含泄漏的 </thinking> 标签");
+        let seq = tags(&all);
+        let th = seq.iter().position(|s| s == "content_block_start:thinking");
+        let tl = seq.iter().position(|s| s == "content_block_start:tool_use");
+        assert!(th.is_some() && tl.is_some() && th < tl, "thinking 块应在 tool 块前: {seq:?}");
+    }
+
+    #[test]
+    fn inline_pending_text_flushed_before_tool_use() {
+        // 非 Opus + thinking:inline 解析器缓冲的正文必须在 tool_use 块之前吐出,
+        // 不能等到 finish() 才补在 tool_use 之后(块顺序倒置)。
+        let mut t = BlockTracker::new("claude-sonnet-4-5".to_string(), true);
+        let mut all = Vec::new();
+        all.extend(t.on_text("答案")); // 短于 <thinking> 窗口 → 全缓冲,无事件
+        assert!(all.is_empty(), "短正文应被 inline 解析器缓冲");
+        all.extend(t.on_tool_use("f", "t1", "{}", true));
+        let seq = tags(&all);
+        let text_start = seq.iter().position(|s| s == "content_block_start:text");
+        let tool_start = seq.iter().position(|s| s == "content_block_start:tool_use");
+        assert!(
+            text_start.is_some() && tool_start.is_some() && text_start < tool_start,
+            "缓冲正文应在 tool_use 块前: {seq:?}"
+        );
+    }
+
+    // ---- ⑤D 空响应判定 ----
+
+    #[test]
+    fn produced_any_content_false_for_untouched_tracker() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let _ = t.finish();
+        assert!(!t.produced_any_content());
+    }
+
+    #[test]
+    fn produced_any_content_true_after_tool_use_only() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.on_tool_use("f", "t1", "", false);
+        assert!(t.produced_any_content());
+    }
+
+    // ---- E thinking-only → max_tokens 兜底 ----
+
+    #[test]
+    fn thinking_only_stream_appends_space_text_and_forces_max_tokens() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), true);
+        let mut all = Vec::new();
+        all.extend(t.on_reasoning("只想不说", None));
+        all.extend(t.finish());
+        assert!(t.thinking_only_max_tokens, "纯 thinking 流应强制 max_tokens");
+        let seq = tags(&all);
+        assert_eq!(
+            seq,
+            vec![
+                "content_block_start:thinking",
+                "content_block_delta:thinking_delta",
+                "content_block_delta:signature_delta",
+                "content_block_stop",
+                "content_block_start:text",
+                "content_block_delta:text_delta",
+                "content_block_stop",
+            ],
+            "thinking-only 应补一个完整的空格 text 块"
+        );
+        let text_delta = all
+            .iter()
+            .find(|e| tag(e) == "content_block_delta:text_delta")
+            .unwrap();
+        assert_eq!(text_delta.data["delta"]["text"], " ");
+    }
+
+    #[test]
+    fn text_present_does_not_force_max_tokens() {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), true);
+        t.on_reasoning("思考", None);
+        t.on_text("回答");
+        let _ = t.finish();
+        assert!(!t.thinking_only_max_tokens);
+    }
+
+    // ---- 流级测试:eventstream 字节流 → SSE 全链 ----
+
+    /// 构造一个 CRC 正确的 AWS eventstream 帧(string 类型 header)。
+    fn es_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        use crate::parser::crc::crc32;
+        let mut headers_raw = Vec::new();
+        for (name, val) in headers {
+            headers_raw.push(name.len() as u8);
+            headers_raw.extend_from_slice(name.as_bytes());
+            headers_raw.push(7u8); // String
+            headers_raw.extend_from_slice(&(val.len() as u16).to_be_bytes());
+            headers_raw.extend_from_slice(val.as_bytes());
+        }
+        let header_len = headers_raw.len() as u32;
+        let total_len = (12 + headers_raw.len() + payload.len() + 4) as u32;
+        let mut prelude8 = Vec::new();
+        prelude8.extend_from_slice(&total_len.to_be_bytes());
+        prelude8.extend_from_slice(&header_len.to_be_bytes());
+        let prelude_crc = crc32(&prelude8);
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&prelude8);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers_raw);
+        msg.extend_from_slice(payload);
+        let msg_crc = crc32(&msg);
+        msg.extend_from_slice(&msg_crc.to_be_bytes());
+        msg
+    }
+
+    /// 把若干帧字节作为上游流跑完整 async_stream_like,收集所有产物。
+    async fn run_stream(
+        frames: Vec<Vec<u8>>,
+        thinking: bool,
+    ) -> Vec<Result<StreamItem, UpstreamError>> {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            frames.into_iter().map(|f| Ok(bytes::Bytes::from(f))).collect();
+        let byte_stream = futures::stream::iter(chunks);
+        let s = async_stream_like(
+            byte_stream,
+            "claude-opus-4-8".to_string(),
+            thinking,
+            (0, 100),
+            crate::CacheBilling::default(),
+        );
+        futures::StreamExt::collect::<Vec<_>>(s).await
+    }
+
+    fn sse_events(items: &[Result<StreamItem, UpstreamError>]) -> Vec<SseEvent> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(StreamItem::Sse(e)) => Some(e.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn empty_upstream_yields_empty_response_error_without_normal_finale() {
+        let items = run_stream(vec![], false).await;
+        let evs = sse_events(&items);
+        assert!(evs.iter().any(|e| e.event == "message_start"));
+        assert!(
+            !evs.iter().any(|e| e.event == "message_delta"),
+            "空响应不应发 message_delta"
+        );
+        assert!(
+            !evs.iter().any(|e| e.event == "message_stop"),
+            "空响应不应发 message_stop"
+        );
+        assert!(
+            !items.iter().any(|i| matches!(i, Ok(StreamItem::Usage(_)))),
+            "空响应不应发 Usage"
+        );
+        let err = items.iter().find_map(|i| i.as_ref().err()).expect("应有终态 Err");
+        assert_eq!(err.kind, UpstreamErrorKind::EmptyResponse);
+    }
+
+    #[tokio::test]
+    async fn content_length_exceeded_finishes_as_max_tokens_not_error() {
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            br#"{"content":"partial output"}"#,
+        );
+        // 异常帧:无 :event-type,只有 :message-type=exception + :exception-type。
+        let f2 = es_frame(
+            &[(":message-type", "exception"), (":exception-type", "ContentLengthExceededException")],
+            br#"{"message":"Input is too long"}"#,
+        );
+        let items = run_stream(vec![f1, f2], false).await;
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "ContentLengthExceeded 是正常 max_tokens 截断,不应作为流错误 abort"
+        );
+        let evs = sse_events(&items);
+        let delta = evs.iter().find(|e| e.event == "message_delta").expect("应正常收尾");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+        assert!(evs.iter().any(|e| e.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn other_exception_still_aborts_as_error() {
+        let f = es_frame(
+            &[(":message-type", "exception"), (":exception-type", "InternalServerException")],
+            br#"{"message":"boom"}"#,
+        );
+        let items = run_stream(vec![f], false).await;
+        let err = items
+            .iter()
+            .find_map(|i| i.as_ref().err())
+            .expect("非 ContentLength 异常应 abort");
+        assert_eq!(err.kind, UpstreamErrorKind::ServerError);
+        let evs = sse_events(&items);
+        assert!(!evs.iter().any(|e| e.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn thinking_only_with_context_exceeded_keeps_context_stop_reason() {
+        // 纯 thinking 且 contextUsage 100%:显式 model_context_window_exceeded 优先,
+        // thinking-only 兜底不得把它覆盖成 max_tokens(显式 stop_reason 优先契约)。
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "reasoningContentEvent")],
+            "{\"text\":\"只在思考\"}".as_bytes(),
+        );
+        let f2 = es_frame(
+            &[(":message-type", "event"), (":event-type", "contextUsageEvent")],
+            br#"{"contextUsagePercentage":100.0}"#,
+        );
+        let items = run_stream(vec![f1, f2], true).await;
+        let evs = sse_events(&items);
+        let delta = evs.iter().find(|e| e.event == "message_delta").expect("应正常收尾");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "model_context_window_exceeded",
+            "context 超限的显式 stop_reason 不应被 thinking-only 兜底覆盖"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_block_then_other_exception_emits_no_normal_finale() {
+        // #6 契约锁定:thinking 块开着时遇非 ContentLength 异常 → 终态 Err,
+        // 不补 message_delta/message_stop/Usage(clean-error,不把失败流伪装成完整消息)。
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "reasoningContentEvent")],
+            "{\"text\":\"思考中\"}".as_bytes(),
+        );
+        let f2 = es_frame(
+            &[(":message-type", "exception"), (":exception-type", "InternalServerException")],
+            br#"{"message":"boom"}"#,
+        );
+        let items = run_stream(vec![f1, f2], true).await;
+        let evs = sse_events(&items);
+        assert!(!evs.iter().any(|e| e.event == "message_delta"), "异常后不应补 message_delta");
+        assert!(!evs.iter().any(|e| e.event == "message_stop"), "异常后不应补 message_stop");
+        assert!(
+            !items.iter().any(|i| matches!(i, Ok(StreamItem::Usage(_)))),
+            "异常后不应补 Usage"
+        );
+        let err = items.iter().find_map(|i| i.as_ref().err()).expect("应有终态 Err");
+        assert_eq!(err.kind, UpstreamErrorKind::ServerError);
+    }
+
+    #[tokio::test]
+    async fn tool_use_event_end_to_end_sets_stop_reason_tool_use() {
+        let f = es_frame(
+            &[(":message-type", "event"), (":event-type", "toolUseEvent")],
+            br#"{"name":"get_weather","toolUseId":"t1","input":"{\"city\":\"sf\"}","stop":true}"#,
+        );
+        let items = run_stream(vec![f], false).await;
+        let evs = sse_events(&items);
+        assert!(
+            evs.iter().any(|e| e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "tool_use"),
+            "toolUseEvent 应转成 tool_use 块"
+        );
+        let delta = evs.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+        assert!(items.iter().any(|i| matches!(i, Ok(StreamItem::Usage(_)))));
     }
 }

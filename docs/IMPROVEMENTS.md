@@ -108,14 +108,14 @@
 | inline `<thinking>` 流式解析(跨chunk半标签/跳过引用伪标签) | 🔵旧 `stream.rs:68-171,1018-1154`;🟢static_flow `stream/inline_thinking.rs` | 🔵搬运+🟢借鉴 | P1 |
 | thinking block 收尾时序(thinking_delta→signature_delta→stop) | 🟢static_flow `stream/context.rs:693-697` | 🟢借鉴 | P1 |
 | tool_use 增量 JSON 聚合(input_json_delta,stop时反序列化) | 🟢static_flow `stream/context.rs:729` | 🟢借鉴 | P1 |
-| empty-response buffered fallback(首包empty→非流式重发→转SSE) | 🔵旧 `handlers.rs:598-966` | 🔵搬运 | P1 |
-| 空流首帧探测+延迟首事件(缓冲到首完整frame再出字节) | 🟢static_flow `kiro_dispatch.rs:1080-1127` | 🟢借鉴 | P1 |
-| 空流透明重试(退避200ms*attempt,同号) | 🟢static_flow `kiro_dispatch.rs:1127` | 🟢借鉴 | P1 |
-| buffered 非流式统一解析器(text/reasoning/tool_use/metering→IR) | 🔵旧 `handlers.rs:994-1171` | 🔵搬运 | P1 |
-| buffered结果→Anthropic SSE 重放 | 🔵旧 `handlers.rs:1180-1288` | 🔵搬运 | P2 |
+| ~~empty-response buffered fallback(首包empty→非流式重发→转SSE)~~ | 🔵旧 `handlers.rs:598-966` | ⚠️**勿搬**:v60(2026-06-07)已整套删除——实战救不回 empty 且 error 放大3×触发封号。现行为=终态 Err(EmptyResponse)+阈值冷却+客户端自重试(已实现于 gw-kiro chat.rs 收尾) | 已废弃 |
+| ~~空流首帧探测+延迟首事件(缓冲到首完整frame再出字节)~~ | 🟢static_flow `kiro_dispatch.rs:1080-1127` | ⚠️勿搬:同属 v60 删除的 empty 干预机制 | 已废弃 |
+| ~~空流透明重试(退避200ms*attempt,同号)~~ | 🟢static_flow `kiro_dispatch.rs:1127` | ⚠️勿搬:v60 起反代不做任何 empty 重试 | 已废弃 |
+| ~~buffered 非流式统一解析器(text/reasoning/tool_use/metering→IR)~~ | 🔵旧 `handlers.rs:994-1171` | ⚠️勿搬:v58/v59 buffered 机器的一部分,v60 已删 | 已废弃 |
+| ~~buffered结果→Anthropic SSE 重放~~ | 🔵旧 `handlers.rs:1180-1288` | ⚠️勿搬:同上 | 已废弃 |
 | 流终态失败分类(UpstreamError/Exception/EmptyResponse/StreamIo) | 🔵旧 `stream.rs:612-647` | 🔵搬运 | P2 |
 | input token 阈值判定(小请求信本地估算,大请求信contextUsage) | 🟢static_flow `stream/usage.rs:18-52` | 🟢借鉴 | P1 |
-| 空响应兜底(只thinking无内容→补空格text+max_tokens) | 🟢static_flow `stream/context.rs:870`;🔵旧 `stream.rs` | 🔵搬运+🟢借鉴 | P1 |
+| 空响应兜底(只thinking无内容→补空格text+max_tokens) | 🟢static_flow `stream/context.rs:870`;🔵旧 `stream.rs:1466-1475` | ✅已实现(gw-kiro chat.rs BlockTracker::finish) | 完成 |
 | tool call 截断检测→软失败(空输入/未闭合/括号不平衡/缺必填) | 🟢xkiro `anthropic/truncation.rs:61-138` | 🟢借鉴 | P1 |
 | bracket 风格工具调用回退解析([Called X with args:{}]) | 🟢xkiro `anthropic/bracket_tool_parser.rs:75` | 🟢借鉴 | P2 |
 | structured output tool→文本(不暴露tool_use,聚合JSON转text) | 🟢static_flow `stream/context.rs:730-749` | 🟢借鉴 | P2 |

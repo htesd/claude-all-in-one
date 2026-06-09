@@ -107,12 +107,14 @@ impl AccountsConfig {
 // ───────────────────────── system.yaml ─────────────────────────
 
 /// 运行开关(热调参数,沿用旧项目语义)。
+///
+/// 注:空响应不设配置——v60 起不做任何反代侧重试/兜底(实战证明换 ID 重发救不回
+/// 且 error 放大触发封号),行为固定为:provider 终态 Err(EmptyResponse) →
+/// worker report_failure 阈值冷却 → 终态 SSE error → 客户端自重试。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
     pub cache: CacheConfig,
-    #[serde(default)]
-    pub empty_response: EmptyResponseConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,20 +130,6 @@ impl Default for CacheConfig {
             read_multiplier: 1.0,
             cap_ratio: 0.9,
             floor_ratio: 0.1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmptyResponseConfig {
-    /// v58 buffered fallback 开关。
-    pub buffered_fallback: bool,
-}
-
-impl Default for EmptyResponseConfig {
-    fn default() -> Self {
-        Self {
-            buffered_fallback: true,
         }
     }
 }
@@ -198,6 +186,13 @@ groups:
     fn system_config_defaults() {
         let cfg = SystemConfig::default();
         assert_eq!(cfg.cache.read_multiplier, 1.0);
-        assert!(cfg.empty_response.buffered_fallback);
+    }
+
+    #[test]
+    fn system_config_ignores_legacy_empty_response_section() {
+        // 旧 system.yaml 可能残留 v58 的 empty_response 段,解析必须兼容(忽略)。
+        let yaml = "cache:\n  read_multiplier: 1.0\n  cap_ratio: 0.9\n  floor_ratio: 0.1\nempty_response:\n  buffered_fallback: true\n";
+        let cfg: SystemConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.cache.cap_ratio, 0.9);
     }
 }

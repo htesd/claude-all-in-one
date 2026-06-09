@@ -267,8 +267,9 @@ cache:
   read_multiplier: 1.0
   cap_ratio: 0.9
   floor_ratio: 0.1
-empty_response:
-  buffered_fallback: true        # v58
+# 空响应无配置:v60(2026-06-07)起不做反代侧重试/兜底(换 ID 重发已证无效且
+# error 放大触发封号)。固定行为:provider 终态 Err(EmptyResponse) → worker
+# report_failure 阈值冷却 → 终态 SSE error → 客户端自重试。
 ```
 
 `egress` 是新架构最关键的新增配置:每个 worker 显式声明出口。`local_ip` 模式用 reqwest `local_address` 绑定本机 IP(单机双 IPv4);`proxy` 模式走外部代理(未来一 IP 一组号 / 固定 IP 代理池)。
