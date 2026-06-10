@@ -23,17 +23,17 @@ pub struct RangeQuery {
 }
 
 impl RangeQuery {
-    /// 起始 Unix 秒(None = 不限)。
+    /// 起始 Unix 秒(None = 不限)。days 钳到 [0, 3650](10 年),饱和算术防溢出(审查 #3)。
     fn since_unix(&self) -> Option<i64> {
         if self.all.unwrap_or(false) {
             return None;
         }
-        let days = self.days.unwrap_or(30).max(0);
+        let days = self.days.unwrap_or(30).clamp(0, 3650);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        Some(now - days * 86_400)
+        Some(now.saturating_sub(days.saturating_mul(86_400)))
     }
 }
 

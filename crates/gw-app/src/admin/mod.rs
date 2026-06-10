@@ -32,11 +32,13 @@ pub fn admin_api_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// 500 错误响应(查询/存储失败)。
+/// 500 错误响应(查询/存储失败)。详细错误只进服务端日志,对外回笼统信息
+/// (避免向 admin 调用方泄漏 DB/schema/路径等细节,审查 #4)。
 pub(crate) fn internal_error(e: impl std::fmt::Display) -> axum::response::Response {
+    tracing::error!("admin 处理失败: {e}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"type":"error","error":{"message": e.to_string()}})),
+        Json(serde_json::json!({"type":"error","error":{"message":"内部错误"}})),
     )
         .into_response()
 }

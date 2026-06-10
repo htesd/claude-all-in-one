@@ -224,9 +224,37 @@ pub async fn run(
         .route("/health", get(health))
         .with_state(state);
 
+    // worker 不做对外鉴权、且信任 router 注入的 X-Gw-Client-Key;必须只绑 loopback,
+    // 否则客户端可直连 worker 绕过 router 鉴权并伪造用量归属(审查 #2)。
+    if !is_loopback_listen(&wcfg.listen) {
+        tracing::warn!(
+            listen = %wcfg.listen,
+            "⚠️ worker 绑定到非 loopback 地址:这会让客户端绕过 router 鉴权并伪造 client_key 归属。\
+             请改绑 127.0.0.1,或为 router→worker 内网跳加共享密钥。"
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(&wcfg.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// listen 地址是否绑 loopback(127.0.0.1 / ::1 / localhost)。
+fn is_loopback_listen(listen: &str) -> bool {
+    if let Ok(addr) = listen.parse::<std::net::SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+    match listen.rsplit_once(':') {
+        Some((host, _)) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false)
+        }
+        None => false,
+    }
 }
 
 async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
@@ -898,6 +926,16 @@ mod tests {
             disabled: false,
             extra: map,
         }
+    }
+
+    #[test]
+    fn loopback_listen_detection() {
+        assert!(is_loopback_listen("127.0.0.1:9000"));
+        assert!(is_loopback_listen("localhost:9000"));
+        assert!(is_loopback_listen("[::1]:9000"));
+        assert!(!is_loopback_listen("0.0.0.0:9000"));
+        assert!(!is_loopback_listen("203.0.113.10:9000"));
+        assert!(!is_loopback_listen("nonsense"));
     }
 
     #[test]
