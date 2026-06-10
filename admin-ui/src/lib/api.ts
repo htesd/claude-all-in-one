@@ -66,6 +66,11 @@ export function isUnauthorizedError(error: unknown): boolean {
   return axios.isAxiosError(error) && error.response?.status === 401
 }
 
+/** 取 HTTP 状态码（非 axios 错误返回 undefined），用于 409/400 的友好文案映射。 */
+export function getErrorStatus(error: unknown): number | undefined {
+  return axios.isAxiosError(error) ? error.response?.status : undefined
+}
+
 interface PingResponse {
   ok?: boolean
   role?: string

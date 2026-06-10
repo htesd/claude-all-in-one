@@ -3,7 +3,9 @@ import { AlertTriangle, Plus } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
+import { useGroups } from '@/features/groups/hooks'
 import { CreateKeyDialog } from '@/features/keys/components/CreateKeyDialog'
+import { KeyManageDialog } from '@/features/keys/components/KeyManageDialog'
 import { KeysTable } from '@/features/keys/components/KeysTable'
 import { useDeleteKey, useKeys, useUpdateKey } from '@/features/keys/hooks'
 import type { ApiKeyRow } from '@/features/keys/types'
@@ -14,16 +16,26 @@ import { useI18n } from '@/lib/i18n'
 export default function ApiKeysPage() {
   const { t } = useI18n()
   const [dialogOpen, setDialogOpen] = useState(false)
+  /** 「限额与分组」对话框当前管理的 key；null = 关闭。 */
+  const [manageKey, setManageKey] = useState<string | null>(null)
 
   const keysQuery = useKeys()
   // 用量联表：复用 /usage/by-key?all=true，前端按 client_key_id === key join
   const usageQuery = useUsageByKey({ mode: 'all' })
+  // 分组列上色 + 对话框里的分组 select
+  const groupsQuery = useGroups()
 
   const usageByKey = useMemo(() => {
     const map = new Map<string, KeyUsage>()
     for (const row of usageQuery.data ?? []) map.set(row.client_key_id, row)
     return map
   }, [usageQuery.data])
+
+  const groupColors = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const group of groupsQuery.data ?? []) map.set(group.name, group.color)
+    return map
+  }, [groupsQuery.data])
 
   const updateMutation = useUpdateKey()
   const deleteMutation = useDeleteKey()
@@ -41,6 +53,10 @@ export default function ApiKeysPage() {
   // label 传空串 = 清空备注（后端 PATCH 语义）
   const handleSaveLabel = (key: string, label: string) =>
     updateMutation.mutate({ key, patch: { label } })
+
+  // 管理对话框跟随列表数据（refetch 后行被删则自动关闭）
+  const manageRow =
+    manageKey !== null ? (keysQuery.data?.find((row) => row.key === manageKey) ?? null) : null
 
   const actionError = updateMutation.isError
     ? updateMutation.error
@@ -79,13 +95,21 @@ export default function ApiKeysPage() {
         loading={keysQuery.isPending}
         usageByKey={usageByKey}
         usageLoading={usageQuery.isPending}
+        groupColors={groupColors}
         busyKey={busyKey}
         onToggleDisabled={handleToggleDisabled}
         onDelete={handleDelete}
         onSaveLabel={handleSaveLabel}
+        onManage={(row) => setManageKey(row.key)}
       />
 
       <CreateKeyDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
+      <KeyManageDialog
+        open={manageRow !== null}
+        row={manageRow}
+        groups={groupsQuery.data ?? []}
+        onClose={() => setManageKey(null)}
+      />
     </div>
   )
 }

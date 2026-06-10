@@ -13,4 +13,16 @@ export const queryKeys = {
     root: ['keys'] as const,
     list: () => ['keys', 'list'] as const,
   },
+  groups: {
+    /** 分组域根 key；账号/Key 的分组归属变化也会 invalidate（计数列）。 */
+    root: ['groups'] as const,
+    list: () => ['groups', 'list'] as const,
+  },
+  accounts: {
+    /** 账号域根 key；invalidate 时连带 runtime 一起刷新。 */
+    root: ['accounts'] as const,
+    list: () => ['accounts', 'list'] as const,
+    /** worker 运行态，15s 轮询。 */
+    runtime: () => ['accounts', 'runtime'] as const,
+  },
 } as const

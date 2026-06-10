@@ -1,5 +1,3 @@
-import axios from 'axios'
-
 import { api } from '@/lib/api'
 
 import type { ApiKeyRow, CreateKeyPayload, UpdateKeyPayload } from './types'
@@ -25,7 +23,5 @@ export async function deleteKey(key: string): Promise<void> {
   await api.delete(`/keys/${encodeURIComponent(key)}`)
 }
 
-/** 取 HTTP 状态码（非 axios 错误返回 undefined），用于 409/400 的友好文案映射。 */
-export function getErrorStatus(error: unknown): number | undefined {
-  return axios.isAxiosError(error) ? error.response?.status : undefined
-}
+// 历史导出位置：实现已上移到 lib/api（groups/accounts 也要用），这里保持 re-export 兼容
+export { getErrorStatus } from '@/lib/api'

@@ -1,59 +1,50 @@
-import { KeyRound } from 'lucide-react'
+import { Users } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table'
-import type { KeyUsage } from '@/features/usage/types'
 import { useI18n } from '@/lib/i18n'
 
-import type { ApiKeyRow } from '../types'
-import { KeyRow } from './KeyRow'
+import type { AccountRow, AccountRuntimeEntry } from '../types'
+import { AccountTableRow, type RuntimeQueryState } from './AccountTableRow'
 
-interface KeysTableProps {
-  data: ApiKeyRow[] | undefined
+interface AccountsTableProps {
+  data: AccountRow[] | undefined
   loading: boolean
-  /** client_key_id -> 全时段用量，前端 join。 */
-  usageByKey: Map<string, KeyUsage>
-  usageLoading: boolean
+  /** account_id -> 运行态（mergeRuntimeByAccount 的结果）。 */
+  runtimeByAccount: Map<string, AccountRuntimeEntry>
+  runtimeState: RuntimeQueryState
   /** 分组名 -> 颜色（来自 /groups），分组列上色用。 */
   groupColors: Map<string, string>
-  /** 当前有 mutation 进行中的 key（仅该行操作置灰）。 */
-  busyKey: string | null
-  onToggleDisabled: (row: ApiKeyRow) => void
-  onDelete: (key: string) => void
-  onSaveLabel: (key: string, label: string) => void
-  /** 打开「限额与分组」对话框。 */
-  onManage: (row: ApiKeyRow) => void
+  /** 当前有 mutation 进行中的 account_id（仅该行操作置灰）。 */
+  busyId: string | null
+  onToggleDisabled: (row: AccountRow) => void
+  onEdit: (row: AccountRow) => void
+  onDelete: (id: string) => void
 }
 
-/**
- * Key 列表玻璃卡表格。不复用 UsageTableCard 是因为这里需要
- * 自定义空态引导文案 + 带交互的行（行内编辑 / 删除确认）。
- */
-export function KeysTable({
+/** 账号列表玻璃卡表格：配置行 + worker 运行态的 merge 视图。 */
+export function AccountsTable({
   data,
   loading,
-  usageByKey,
-  usageLoading,
+  runtimeByAccount,
+  runtimeState,
   groupColors,
-  busyKey,
+  busyId,
   onToggleDisabled,
+  onEdit,
   onDelete,
-  onSaveLabel,
-  onManage,
-}: KeysTableProps) {
+}: AccountsTableProps) {
   const { t } = useI18n()
 
   const columns = [
-    { label: t('table.key') },
-    { label: t('table.label') },
+    { label: t('table.accountId') },
     { label: t('table.group') },
+    { label: t('table.provider') },
     { label: t('table.status') },
-    { label: t('table.quota') },
-    { label: t('table.createdAt') },
-    { label: t('table.requests'), right: true },
-    { label: t('table.tokens'), right: true },
+    { label: t('table.concurrency'), right: true },
+    { label: t('table.failures'), right: true },
     { label: t('table.actions'), right: true },
   ]
 
@@ -63,8 +54,8 @@ export function KeysTable({
     <Card className="overflow-hidden">
       <div className="flex items-center justify-between border-b border-black/5 px-5 py-4 dark:border-white/5">
         <div className="flex items-center gap-2">
-          <KeyRound className="h-4 w-4 text-primary" />
-          <h2 className="text-sm font-semibold">{t('keys.listTitle')}</h2>
+          <Users className="h-4 w-4 text-primary" />
+          <h2 className="text-sm font-semibold">{t('accounts.listTitle')}</h2>
         </div>
         {!loading && <Badge variant="muted">{rows.length}</Badge>}
       </div>
@@ -92,22 +83,21 @@ export function KeysTable({
           ) : rows.length === 0 ? (
             <tr>
               <TD colSpan={columns.length} className="py-10 text-center text-muted-foreground">
-                {t('keys.empty')}
+                {t('accounts.empty')}
               </TD>
             </tr>
           ) : (
             rows.map((row) => (
-              <KeyRow
-                key={row.key}
+              <AccountTableRow
+                key={row.account_id}
                 row={row}
-                usage={usageByKey.get(row.key)}
-                usageLoading={usageLoading}
+                runtime={runtimeByAccount.get(row.account_id)}
+                runtimeState={runtimeState}
                 groupColor={groupColors.get(row.group_name)}
-                busy={busyKey === row.key}
+                busy={busyId === row.account_id}
                 onToggleDisabled={onToggleDisabled}
+                onEdit={onEdit}
                 onDelete={onDelete}
-                onSaveLabel={onSaveLabel}
-                onManage={onManage}
               />
             ))
           )}

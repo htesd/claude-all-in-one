@@ -5,10 +5,12 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TD, TR } from '@/components/ui/table'
+import { GroupChip } from '@/features/groups/components/GroupChip'
 import type { KeyUsage } from '@/features/usage/types'
 import { useI18n } from '@/lib/i18n'
 import { cn, formatCompact, formatInt, maskKey } from '@/lib/utils'
 
+import { quotaBarClass } from '../quota'
 import type { ApiKeyRow } from '../types'
 import { CopyKeyButton } from './CopyKeyButton'
 
@@ -21,21 +23,27 @@ interface KeyRowProps {
   /** 前端按 client_key_id === key join 出的用量行；该 key 没有流量时为 undefined。 */
   usage: KeyUsage | undefined
   usageLoading: boolean
+  /** 分组颜色（来自 /groups），未命中用默认色。 */
+  groupColor: string | undefined
   /** 本行是否有进行中的 mutation（按钮置灰防连点）。 */
   busy: boolean
   onToggleDisabled: (row: ApiKeyRow) => void
   onDelete: (key: string) => void
   onSaveLabel: (key: string, label: string) => void
+  /** 打开「限额与分组」对话框。 */
+  onManage: (row: ApiKeyRow) => void
 }
 
 export function KeyRow({
   row,
   usage,
   usageLoading,
+  groupColor,
   busy,
   onToggleDisabled,
   onDelete,
   onSaveLabel,
+  onManage,
 }: KeyRowProps) {
   const { t, lang } = useI18n()
   const [editingLabel, setEditingLabel] = useState(false)
@@ -45,6 +53,9 @@ export function KeyRow({
   const locale = lang === 'zh' ? 'zh-CN' : 'en-US'
   const createdAt = new Date(row.created_at * 1000)
   const tokensTotal = usage ? usage.input_tokens + usage.output_tokens : 0
+
+  const quota = row.quota_tokens
+  const quotaRatio = quota !== null && quota > 0 ? row.used_tokens / quota : 0
 
   const startEditLabel = () => {
     setLabelDraft(row.label ?? '')
@@ -123,11 +134,38 @@ export function KeyRow({
         )}
       </TD>
 
+      {/* 分组：色 chip（未分组显示 —） */}
+      <TD>
+        <GroupChip name={row.group_name} color={groupColor} />
+      </TD>
+
       {/* 状态 */}
       <TD>
         <Badge variant={row.disabled ? 'destructive' : 'success'}>
           {row.disabled ? t('keys.status.disabled') : t('keys.status.enabled')}
         </Badge>
+      </TD>
+
+      {/* 限额：迷你进度条 + 紧凑文字；无限额显示「不限」 */}
+      <TD>
+        {quota === null ? (
+          <span className="text-xs text-muted-foreground">{t('keys.quota.unlimited')}</span>
+        ) : (
+          <div className="flex w-24 flex-col gap-1">
+            <span
+              className="text-xs tabular-nums"
+              title={`${formatInt(row.used_tokens)} / ${formatInt(quota)}`}
+            >
+              {formatCompact(row.used_tokens)}/{formatCompact(quota)}
+            </span>
+            <div className="h-1 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
+              <div
+                className={cn('h-full rounded-full', quotaBarClass(quotaRatio))}
+                style={{ width: `${Math.min(quotaRatio * 100, 100)}%` }}
+              />
+            </div>
+          </div>
+        )}
       </TD>
 
       {/* 创建时间：本地化日期，悬停显示完整时间 */}
@@ -161,7 +199,7 @@ export function KeyRow({
         )}
       </TD>
 
-      {/* 操作：启停 + 删除（删除走二次确认态，提示用量记录保留） */}
+      {/* 操作：限额与分组 + 启停 + 删除（删除走二次确认态，提示用量记录保留） */}
       <TD className="text-right">
         {confirmingDelete ? (
           <span className="inline-flex items-center gap-2">
@@ -180,6 +218,9 @@ export function KeyRow({
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5">
+            <Button variant="outline" size="sm" disabled={busy} onClick={() => onManage(row)}>
+              {t('keys.action.quota')}
+            </Button>
             <Button
               variant="outline"
               size="sm"

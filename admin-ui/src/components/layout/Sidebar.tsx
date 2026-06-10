@@ -32,12 +32,9 @@ interface NavItem {
 const navItems: NavItem[] = [
   { to: '/', labelKey: 'nav.dashboard', icon: LayoutDashboard },
   { to: '/usage', labelKey: 'nav.usage', icon: BarChart3 },
+  { to: '/accounts', labelKey: 'nav.accounts', icon: Users },
   { to: '/keys', labelKey: 'nav.apiKeys', icon: KeyRound },
-]
-
-const comingSoonItems: { labelKey: I18nKey; icon: LucideIcon }[] = [
-  { labelKey: 'nav.accounts', icon: Users },
-  { labelKey: 'nav.groups', icon: FolderKanban },
+  { to: '/groups', labelKey: 'nav.groups', icon: FolderKanban },
 ]
 
 function readInitialCollapsed(): boolean {
@@ -182,34 +179,6 @@ export function Sidebar() {
             </button>
           )
         })}
-
-        {/* Coming soon placeholders */}
-        <div className="pt-2">
-          {comingSoonItems.map((item) => {
-            const Icon = item.icon
-            const label = t(item.labelKey)
-            return (
-              <div
-                key={item.labelKey}
-                title={`${label} · ${t('nav.comingSoon')}`}
-                className={cn(
-                  'flex w-full cursor-not-allowed items-center rounded-xl text-sm font-medium text-muted-foreground/50',
-                  collapsed ? 'justify-center p-2.5' : 'gap-3 px-3 py-2.5',
-                )}
-              >
-                <Icon className="h-5 w-5 shrink-0" />
-                {!collapsed && (
-                  <span className="flex min-w-0 flex-1 items-center justify-between gap-2">
-                    <span className="truncate whitespace-nowrap">{label}</span>
-                    <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px]">
-                      {t('nav.comingSoon')}
-                    </span>
-                  </span>
-                )}
-              </div>
-            )
-          })}
-        </div>
       </nav>
 
       {/* Footer: theme / language / logout */}
