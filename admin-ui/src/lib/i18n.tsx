@@ -54,7 +54,10 @@ const zh = {
   'table.cacheWrite': '缓存写',
   'table.unattributed': '未归属',
   'table.empty': '暂无数据',
-  'chart.topModels': '模型请求 Top 8',
+  'filter.from': '起',
+  'filter.to': '止',
+  'filter.clear': '清除',
+  'filter.allKeys': '全部 Key',
   'common.loadFailed': '加载失败',
 } as const
 
@@ -106,7 +109,10 @@ const en: Record<I18nKey, string> = {
   'table.cacheWrite': 'Cache write',
   'table.unattributed': 'Unattributed',
   'table.empty': 'No data yet',
-  'chart.topModels': 'Top 8 models by requests',
+  'filter.from': 'From',
+  'filter.to': 'To',
+  'filter.clear': 'Clear',
+  'filter.allKeys': 'All keys',
   'common.loadFailed': 'Failed to load',
 }
 

@@ -13,7 +13,7 @@ import { ByKeyTable } from '@/features/usage/components/ByKeyTable'
 import { ByModelTable } from '@/features/usage/components/ByModelTable'
 import { RangeSegment } from '@/features/usage/components/RangeSegment'
 import { useUsageByKey, useUsageByModel, useUsageSummary } from '@/features/usage/hooks'
-import type { TimeRange } from '@/features/usage/types'
+import { rangeToFilter, type TimeRange } from '@/features/usage/types'
 import { useI18n } from '@/lib/i18n'
 import { formatCompact, formatInt, formatPercent } from '@/lib/utils'
 
@@ -21,9 +21,10 @@ export default function DashboardPage() {
   const { t } = useI18n()
   const [range, setRange] = useState<TimeRange>(30)
 
-  const summaryQuery = useUsageSummary(range)
-  const byModelQuery = useUsageByModel(range)
-  const byKeyQuery = useUsageByKey(range)
+  const filter = rangeToFilter(range)
+  const summaryQuery = useUsageSummary(filter)
+  const byModelQuery = useUsageByModel(filter)
+  const byKeyQuery = useUsageByKey(filter)
 
   const summary = summaryQuery.data
   const loading = summaryQuery.isPending
