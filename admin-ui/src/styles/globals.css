@@ -1,0 +1,485 @@
+@import "tailwindcss";
+
+/* Class-based dark mode (toggle `.dark` on <html>) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* ==================== 浅色模式 - 清新冰白蓝 ==================== */
+  --color-background: #EEF2F8;
+  --color-foreground: #0f172a;
+  --color-card: rgba(255, 255, 255, 0.72);
+  --color-card-foreground: #0f172a;
+  --color-popover: rgba(255, 255, 255, 0.95);
+  --color-popover-foreground: #0f172a;
+  --color-primary: #5B8CFF;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: rgba(241, 245, 249, 0.6);
+  --color-secondary-foreground: #1e293b;
+  --color-muted: rgba(241, 245, 249, 0.7);
+  --color-muted-foreground: #64748b;
+  --color-accent: rgba(241, 245, 249, 0.7);
+  --color-accent-foreground: #1e293b;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+  --color-border: rgba(255, 255, 255, 0.4);
+  --color-input: rgba(255, 255, 255, 0.6);
+  --color-ring: #5B8CFF;
+  --color-success: #22C55E;
+  --color-warning: #f59e0b;
+  --color-accent-violet: #8B5CF6;
+
+  /* Sidebar 激活药丸渐变（主色 → 紫辅） */
+  --gradient-from: #5B8CFF;
+  --gradient-to:   #8B5CF6;
+
+  /* 圆角系统 */
+  --radius-sm: 0.5rem;     /* 8px */
+  --radius-md: 0.75rem;    /* 12px */
+  --radius-lg: 1rem;       /* 16px */
+  --radius-xl: 1.25rem;    /* 20px */
+  --radius-2xl: 1.5rem;    /* 24px - 主流 Card 圆角 */
+  --radius-3xl: 2rem;      /* 32px - 容器级 */
+
+  /* ==================== 玻璃态 (Glassmorphism) 令牌 ==================== */
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-bg-strong: rgba(255, 255, 255, 0.90);
+  --glass-bg-subtle: rgba(255, 255, 255, 0.35);
+  --glass-border: rgba(255, 255, 255, 0.4);
+  --glass-border-strong: rgba(255, 255, 255, 0.6);
+  /* 玻璃阳光：微外描边 + 轻远阴影 + 近接触影 */
+  --glass-shadow: 0 0 0 1px rgba(15, 23, 42, 0.04), 0 4px 16px rgba(31, 38, 135, 0.06), 0 1px 3px rgba(31, 38, 135, 0.04);
+  --glass-shadow-hover: 0 0 0 1px rgba(15, 23, 42, 0.06), 0 12px 32px rgba(31, 38, 135, 0.12), 0 3px 8px rgba(31, 38, 135, 0.06);
+  --glass-shadow-glow: 0 0 0 1px rgba(91, 140, 255, 0.18), 0 8px 32px rgba(91, 140, 255, 0.18);
+  --glass-shadow-violet: 0 0 0 1px rgba(139, 92, 246, 0.18), 0 8px 32px rgba(139, 92, 246, 0.18);
+}
+
+/* ==================== 深色模式 - 深空蓝 ==================== */
+.dark {
+  --color-background: #0B1220;
+  --color-foreground: #f1f5f9;
+  --color-card: rgba(22, 30, 48, 0.6);
+  --color-card-foreground: #f1f5f9;
+  --color-popover: rgba(20, 25, 40, 0.95);
+  --color-popover-foreground: #f1f5f9;
+  --color-primary: #7BA3FF;
+  --color-primary-foreground: #0a0e1a;
+  --color-secondary: rgba(40, 45, 60, 0.5);
+  --color-secondary-foreground: #f1f5f9;
+  --color-muted: rgba(40, 45, 60, 0.5);
+  --color-muted-foreground: #94a3b8;
+  --color-accent: rgba(40, 45, 60, 0.5);
+  --color-accent-foreground: #f1f5f9;
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-input: rgba(40, 45, 60, 0.5);
+  --color-ring: #7BA3FF;
+
+  /* 深色模式默认渐变 */
+  --gradient-from: #7BA3FF;
+  --gradient-to:   #A78BFA;
+
+  /* 玻璃态 - 深色 */
+  --glass-bg: rgba(20, 25, 40, 0.65);
+  --glass-bg-strong: rgba(20, 25, 40, 0.90);
+  --glass-bg-subtle: rgba(20, 25, 40, 0.45);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-strong: rgba(255, 255, 255, 0.15);
+  --glass-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 8px 32px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.2);
+  --glass-shadow-hover: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 16px 48px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.3);
+  --glass-shadow-glow: 0 0 0 1px rgba(123, 163, 255, 0.25), 0 8px 32px rgba(123, 163, 255, 0.18);
+  --glass-shadow-violet: 0 0 0 1px rgba(167, 139, 250, 0.25), 0 8px 32px rgba(167, 139, 250, 0.18);
+}
+
+/* ==================== 额外颜色主题（主色 + active-pill 渐变） ==================== */
+
+/* 紫色 - 紫 → 深紫 */
+.theme-purple {
+  --color-primary: #a855f7;
+  --color-ring: #a855f7;
+  --gradient-from: #a855f7;
+  --gradient-to:   #7c3aed;
+}
+.theme-purple.dark {
+  --color-primary: #c084fc;
+  --color-ring: #c084fc;
+  --gradient-from: #c084fc;
+  --gradient-to:   #a78bfa;
+}
+
+/* 翠绿 - 翠 → 青 */
+.theme-emerald {
+  --color-primary: #10b981;
+  --color-ring: #10b981;
+  --gradient-from: #10b981;
+  --gradient-to:   #14b8a6;
+}
+.theme-emerald.dark {
+  --color-primary: #34d399;
+  --color-ring: #34d399;
+  --gradient-from: #34d399;
+  --gradient-to:   #2dd4bf;
+}
+
+/* 靛蓝 - 靛 → 紫 */
+.theme-indigo {
+  --color-primary: #6366f1;
+  --color-ring: #6366f1;
+  --gradient-from: #6366f1;
+  --gradient-to:   #8b5cf6;
+}
+.theme-indigo.dark {
+  --color-primary: #818cf8;
+  --color-ring: #818cf8;
+  --gradient-from: #818cf8;
+  --gradient-to:   #a78bfa;
+}
+
+/* 玫瑰 - 玫瑰 → 粉 */
+.theme-rose {
+  --color-primary: #f43f5e;
+  --color-ring: #f43f5e;
+  --gradient-from: #f43f5e;
+  --gradient-to:   #ec4899;
+}
+.theme-rose.dark {
+  --color-primary: #fb7185;
+  --color-ring: #fb7185;
+  --gradient-from: #fb7185;
+  --gradient-to:   #f472b6;
+}
+
+/* 青色 - 青 → 蓝 */
+.theme-cyan {
+  --color-primary: #06b6d4;
+  --color-ring: #06b6d4;
+  --gradient-from: #06b6d4;
+  --gradient-to:   #0ea5e9;
+}
+.theme-cyan.dark {
+  --color-primary: #22d3ee;
+  --color-ring: #22d3ee;
+  --gradient-from: #22d3ee;
+  --gradient-to:   #38bdf8;
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+/* ==================== 表单控件全局兜底（深色边框，玻璃背景上可见） ==================== */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+textarea,
+select {
+  border-color: rgba(15, 23, 42, 0.15);
+}
+.dark input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+.dark textarea,
+.dark select {
+  border-color: rgba(255, 255, 255, 0.15);
+}
+input:focus, textarea:focus, select:focus {
+  border-color: var(--color-primary);
+}
+
+body {
+  /* 浅色：实色渐变，跟随主题色染色 */
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gradient-from) 10%, #EEF2F8) 0%,
+    #EEF2F8 50%,
+    color-mix(in srgb, var(--gradient-to) 8%, #F2F5FA) 100%
+  );
+  color: var(--color-foreground);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  min-height: 100vh;
+}
+.dark body {
+  /* 深色：实色深空蓝渐变 + 主题色染色 */
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--gradient-from) 14%, #0F1729) 0%,
+    #0B1220 50%,
+    color-mix(in srgb, var(--gradient-to) 10%, #060A14) 100%
+  );
+}
+
+/* 选中文本颜色适配主题 */
+::selection {
+  background-color: var(--color-primary);
+  color: var(--color-primary-foreground);
+}
+
+/* ==================== 自定义滚动条 ==================== */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: rgba(15, 23, 42, 0.25);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  transition: background-color 0.2s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-primary);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.20);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-primary);
+}
+
+/* Firefox 兼容 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(15, 23, 42, 0.25) transparent;
+}
+.dark * {
+  scrollbar-color: rgba(255, 255, 255, 0.20) transparent;
+}
+
+/* ==================== Glassmorphism 工具类 ==================== */
+
+/* 标准玻璃卡片 */
+.glass-card {
+  background-color: var(--glass-bg);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* 强玻璃 — 对话框/弹窗用 */
+.glass-card-strong {
+  background-color: var(--glass-bg-strong);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid var(--glass-border-strong);
+  box-shadow:
+    0 0 0 1px rgba(15, 23, 42, 0.06),
+    0 24px 64px -12px rgba(15, 23, 42, 0.25),
+    0 8px 24px -8px rgba(15, 23, 42, 0.15);
+}
+.dark .glass-card-strong {
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 24px 64px -12px rgba(0, 0, 0, 0.6),
+    0 8px 24px -8px rgba(0, 0, 0, 0.4);
+}
+
+/* Dialog 遮罩 */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background-color: rgba(0, 0, 0, 0.5);
+}
+
+/* 轻玻璃 — 二级容器/工具栏 */
+.glass-card-subtle {
+  background-color: var(--glass-bg-subtle);
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  border: 1px solid var(--glass-border);
+}
+
+/* 悬浮侧边栏 */
+.glass-sidebar {
+  background-color: var(--glass-bg);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* 顶部透明工具栏 */
+.glass-toolbar {
+  background-color: var(--glass-bg-subtle);
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  border-bottom: 1px solid var(--glass-border);
+}
+
+/* ==================== 交互动画 ==================== */
+
+/* hover 浮起 + 阴影增强 */
+.hover-lift {
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform;
+}
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--glass-shadow-hover);
+}
+
+/* 主色辉光环 */
+.glow-ring-primary {
+  box-shadow: var(--glass-shadow-glow);
+}
+/* 紫色辉光环 */
+.glow-ring-violet {
+  box-shadow: var(--glass-shadow-violet);
+}
+
+/* ==================== 渐变描边 / 渐变背景按钮（跟随主题渐变） ==================== */
+.gradient-border {
+  position: relative;
+  background: linear-gradient(var(--color-card), var(--color-card)) padding-box,
+              linear-gradient(135deg, var(--gradient-from), var(--gradient-to)) border-box;
+  border: 1.5px solid transparent;
+}
+
+.gradient-bg-primary {
+  background: linear-gradient(135deg, var(--gradient-from) 0%, var(--gradient-to) 100%);
+  color: white;
+  transition: filter 0.2s ease, box-shadow 0.25s ease;
+}
+.gradient-bg-primary:hover {
+  filter: brightness(1.08);
+  box-shadow: var(--glass-shadow-glow);
+}
+
+/* ==================== Ambient light 背景（主壳呼吸感） ==================== */
+
+@keyframes ambient-float-a {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%      { transform: translate(40px, -30px) scale(1.1); }
+  66%      { transform: translate(-30px, 40px) scale(0.95); }
+}
+
+@keyframes ambient-float-b {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%      { transform: translate(-50px, 30px) scale(1.05); }
+  66%      { transform: translate(30px, -40px) scale(0.9); }
+}
+
+.ambient-bg {
+  position: relative;
+  isolation: isolate;
+}
+.ambient-bg::before,
+.ambient-bg::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.45;
+}
+.ambient-bg::before {
+  width: 640px;
+  height: 640px;
+  /* 主题主色 blob - 左上 */
+  background: radial-gradient(circle, color-mix(in srgb, var(--gradient-from) 38%, transparent) 0%, transparent 70%);
+  top: -240px;
+  left: -160px;
+  animation: ambient-float-a 22s ease-in-out infinite;
+}
+.ambient-bg::after {
+  width: 560px;
+  height: 560px;
+  /* 主题辅色 blob - 右下 */
+  background: radial-gradient(circle, color-mix(in srgb, var(--gradient-to) 34%, transparent) 0%, transparent 70%);
+  bottom: -240px;
+  right: -160px;
+  animation: ambient-float-b 26s ease-in-out infinite;
+  animation-delay: -8s;
+}
+.dark .ambient-bg::before,
+.dark .ambient-bg::after {
+  opacity: 0.22;
+  filter: blur(100px);
+}
+/* 主壳内容需要 z-index 浮在 ambient 上 */
+.ambient-bg > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ==================== 呼吸辉光（用于强调元素） ==================== */
+@keyframes breathe-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(91, 140, 255, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(91, 140, 255, 0.15), 0 0 24px rgba(91, 140, 255, 0.25);
+  }
+}
+.breathe-glow {
+  animation: breathe-glow 3s ease-in-out infinite;
+}
+
+/* ==================== Page Hero（统一的页面顶部视觉容器） ==================== */
+.page-hero {
+  position: relative;
+  overflow: hidden;
+  border-radius: 1.5rem; /* 24px */
+  background-color: var(--glass-bg-strong);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* ==================== Page Surface（主页面内容区背景装饰） ==================== */
+.page-surface {
+  position: relative;
+  isolation: isolate;
+}
+.page-surface::before {
+  content: '';
+  position: absolute;
+  width: 400px;
+  height: 400px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(91, 140, 255, 0.07) 0%, transparent 70%);
+  top: -240px;
+  right: -240px;
+  filter: blur(100px);
+  pointer-events: none;
+  z-index: 0;
+}
+.page-surface::after {
+  content: '';
+  position: absolute;
+  width: 360px;
+  height: 360px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(139, 92, 246, 0.05) 0%, transparent 70%);
+  bottom: -220px;
+  right: -180px;
+  filter: blur(100px);
+  pointer-events: none;
+  z-index: 0;
+}
+.dark .page-surface::before { background: radial-gradient(circle, rgba(123, 163, 255, 0.06) 0%, transparent 70%); }
+.dark .page-surface::after { background: radial-gradient(circle, rgba(167, 139, 250, 0.04) 0%, transparent 70%); }
+.page-surface > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ==================== 微弱噪点纹理（frosted acrylic 质感） ==================== */
+.acrylic-noise {
+  position: relative;
+}
+.acrylic-noise::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.4'/%3E%3C/svg%3E");
+  opacity: 0.04;
+  mix-blend-mode: overlay;
+  border-radius: inherit;
+}
