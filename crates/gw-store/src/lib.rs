@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use gw_core::store::{
-    AuthenticatedKey, ControlStore, UsageByKey, UsageByModel, UsageFilter, UsageRecord, UsageSink,
-    UsageSummary,
+    ApiKeyRow, AuthenticatedKey, ControlStore, UsageByKey, UsageByModel, UsageFilter, UsageRecord,
+    UsageSink, UsageSummary,
 };
 use rusqlite::types::Value;
 use parking_lot::Mutex;
@@ -84,6 +84,93 @@ impl SqliteStore {
             (key, label),
         )?;
         Ok(())
+    }
+
+    // ───────── API key CRUD(admin 管理页) ─────────
+
+    /// 列出全部客户端 API key(created_at 倒序,同秒按 key 升序保证稳定)。
+    pub fn list_api_keys(&self) -> anyhow::Result<Vec<ApiKeyRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, label, disabled, created_at FROM api_keys \
+             ORDER BY created_at DESC, key ASC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::row_to_api_key)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 读取单个 key 的元数据(POST/PATCH 响应体用)。
+    pub fn get_api_key(&self, key: &str) -> anyhow::Result<Option<ApiKeyRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached("SELECT key, label, disabled, created_at FROM api_keys WHERE key = ?1")?;
+        match stmt.query_row([key], Self::row_to_api_key) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn row_to_api_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKeyRow> {
+        Ok(ApiKeyRow {
+            key: r.get(0)?,
+            label: r.get(1)?,
+            disabled: r.get::<_, i64>(2)? != 0,
+            created_at: r.get(3)?,
+        })
+    }
+
+    /// 严格新增:已存在返回 `false`(admin 创建需要感知冲突,区别于播种用的
+    /// [`Self::add_api_key`] 静默忽略)。
+    pub fn create_api_key(&self, key: &str, label: Option<&str>) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO api_keys (key, label) VALUES (?1, ?2)",
+            (key, label),
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 部分更新:`None` 字段不动;返回 `false` = key 不存在。
+    /// 两个字段都为 `None` 时只做存在性检查(no-op)。
+    pub fn update_api_key(
+        &self,
+        key: &str,
+        label: Option<&str>,
+        disabled: Option<bool>,
+    ) -> anyhow::Result<bool> {
+        // 动态拼 SET 子句(列名是代码常量,值全部参数化,无注入面)。
+        let mut sets: Vec<&str> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(l) = label {
+            sets.push("label = ?");
+            params.push(Value::Text(l.to_string()));
+        }
+        if let Some(d) = disabled {
+            sets.push("disabled = ?");
+            params.push(Value::Integer(d as i64));
+        }
+        let conn = self.conn.lock();
+        if sets.is_empty() {
+            // no-op:只回答 key 是否存在。
+            let exists: bool = conn
+                .prepare_cached("SELECT 1 FROM api_keys WHERE key = ?1")?
+                .exists([key])?;
+            return Ok(exists);
+        }
+        params.push(Value::Text(key.to_string()));
+        let sql = format!("UPDATE api_keys SET {} WHERE key = ?", sets.join(", "));
+        let changed = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(changed == 1)
+    }
+
+    /// 删除 key;返回 `false` = key 不存在。usage_records 中的历史归属不动。
+    pub fn delete_api_key(&self, key: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute("DELETE FROM api_keys WHERE key = ?1", [key])?;
+        Ok(changed == 1)
     }
 
     // ───────── 用量统计查询(admin 看板;按 [`UsageFilter`] 时间窗 + key 筛选) ─────────
@@ -426,6 +513,90 @@ mod tests {
             })
             .unwrap();
         assert_eq!(s.requests, 0, "since 在未来应过滤掉所有行");
+    }
+
+    // ───────── API key CRUD ─────────
+
+    #[test]
+    fn list_api_keys_returns_fields_newest_first() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.create_api_key("sk-old", Some("老客户")).unwrap());
+        assert!(store.create_api_key("sk-new", None).unwrap());
+        {
+            // created_at 默认同秒,手动拉开以测排序。
+            let conn = store.conn.lock();
+            conn.execute("UPDATE api_keys SET created_at=100 WHERE key='sk-old'", [])
+                .unwrap();
+            conn.execute("UPDATE api_keys SET created_at=200 WHERE key='sk-new'", [])
+                .unwrap();
+        }
+        let rows = store.list_api_keys().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, "sk-new", "新建的排前面");
+        assert_eq!(rows[0].label, None);
+        assert_eq!(rows[0].created_at, 200);
+        assert!(!rows[0].disabled);
+        assert_eq!(rows[1].key, "sk-old");
+        assert_eq!(rows[1].label.as_deref(), Some("老客户"));
+    }
+
+    #[test]
+    fn create_api_key_rejects_duplicate() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.create_api_key("sk-dup", None).unwrap(), "首次创建成功");
+        assert!(!store.create_api_key("sk-dup", Some("again")).unwrap(), "重复创建返回 false");
+        // 重复创建不得覆盖已有行。
+        let row = store.get_api_key("sk-dup").unwrap().unwrap();
+        assert_eq!(row.label, None, "重复创建不能改写已有 label");
+    }
+
+    #[test]
+    fn get_api_key_none_for_unknown() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.get_api_key("sk-nope").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_api_key_partial_fields() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_api_key("sk-u", Some("初始")).unwrap();
+
+        // 只改 disabled,label 不动。
+        assert!(store.update_api_key("sk-u", None, Some(true)).unwrap());
+        let row = store.get_api_key("sk-u").unwrap().unwrap();
+        assert!(row.disabled);
+        assert_eq!(row.label.as_deref(), Some("初始"));
+        // 禁用后鉴权应报告 disabled(router 据此拒绝)。
+        assert!(store.authenticate("sk-u").await.unwrap().unwrap().disabled);
+
+        // 只改 label,disabled 不动;空串=清空备注。
+        assert!(store.update_api_key("sk-u", Some(""), None).unwrap());
+        let row = store.get_api_key("sk-u").unwrap().unwrap();
+        assert_eq!(row.label.as_deref(), Some(""), "空串落库为空串(显示层处理)");
+        assert!(row.disabled, "改 label 不得动 disabled");
+
+        // 不存在的 key 返回 false。
+        assert!(!store.update_api_key("sk-ghost", Some("x"), None).unwrap());
+        // 双 None = 存在性检查。
+        assert!(store.update_api_key("sk-u", None, None).unwrap());
+        assert!(!store.update_api_key("sk-ghost", None, None).unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_api_key_removes_only_target() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_api_key("sk-del", None).unwrap();
+        store.create_api_key("sk-keep", None).unwrap();
+        // 删除前先留一条 usage,验证历史归属不被联动清除。
+        rec(&store, "sk-del", "m1", 10, 1, true).await;
+
+        assert!(store.delete_api_key("sk-del").unwrap());
+        assert!(!store.delete_api_key("sk-del").unwrap(), "二次删除返回 false");
+        assert!(store.authenticate("sk-del").await.unwrap().is_none(), "删除后鉴权失效");
+        assert!(store.get_api_key("sk-keep").unwrap().is_some());
+        // usage 历史保留(按 key 统计仍可见)。
+        let by_key = store.usage_by_key(&UsageFilter::default()).unwrap();
+        assert!(by_key.iter().any(|r| r.client_key_id == "sk-del"));
     }
 
     #[tokio::test]

@@ -75,6 +75,17 @@ pub struct AuthenticatedKey {
     pub disabled: bool,
 }
 
+/// 一条客户端 API key 元数据(admin 管理页 / CRUD 用)。
+/// `key` 即明文密钥本身(也是主键):admin 是密钥的发放方,需要完整值交付客户,
+/// 列表接口直接返回明文,前端负责掩码展示。
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyRow {
+    pub key: String,
+    pub label: Option<String>,
+    pub disabled: bool,
+    pub created_at: i64,
+}
+
 /// 控制面存储:鉴权、账号/key/组元数据。
 #[async_trait]
 pub trait ControlStore: Send + Sync {

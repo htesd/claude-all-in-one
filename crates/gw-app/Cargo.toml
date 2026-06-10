@@ -32,3 +32,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+# admin 端点测试:Router::oneshot + 读响应体。
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
