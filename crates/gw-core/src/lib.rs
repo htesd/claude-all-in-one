@@ -16,6 +16,7 @@
 pub mod account;
 pub mod config;
 pub mod error;
+pub mod fold;
 pub mod model;
 pub mod provider;
 pub mod routing;

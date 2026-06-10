@@ -19,8 +19,8 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use gw_core::account::Account;
 use gw_core::config::{AccountsConfig, InstancesConfig, SystemConfig};
-use gw_core::error::UpstreamErrorKind;
-use gw_core::provider::{CallCtx, ChatRequest, ChatUsage, Provider, StreamItem};
+use gw_core::error::{UpstreamError, UpstreamErrorKind};
+use gw_core::provider::{CallCtx, ChatRequest, ChatUsage, Provider, SseEvent, StreamItem};
 use gw_core::store::{UsageRecord, UsageSink};
 use gw_store::SqliteStore;
 
@@ -220,6 +220,7 @@ pub async fn run(
 
     let app = Router::new()
         .route("/v1/messages", post(messages))
+        .route("/v1/models", get(models))
         .route("/health", get(health))
         .with_state(state);
 
@@ -240,6 +241,40 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "usage_persist": st.usage_sink.is_some(),
         "status": "ok"
     }))
+}
+
+/// `GET /v1/models` —— 暴露 provider 的模型目录(Anthropic 线缆格式)。
+/// provider 一处实现 `list_models`,框架在此映射成对外响应(写一次,各 provider 共享)。
+async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response {
+    // created_at 占位:Kiro 不提供每模型创建时间(见 kiro-model-versioning 记忆),
+    // 但 Anthropic /v1/models 条目带 created_at,严格类型客户端会校验——给个固定占位值
+    // 以保证兼容(非真实日期,仅占位)。
+    const MODEL_CREATED_AT: &str = "2025-01-01T00:00:00Z";
+    match st.provider.list_models().await {
+        Ok(list) => {
+            let data: Vec<serde_json::Value> = list
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "type": "model",
+                        "id": m.id,
+                        "display_name": m.display_name.clone().unwrap_or_else(|| m.id.clone()),
+                        "created_at": MODEL_CREATED_AT,
+                    })
+                })
+                .collect();
+            let first = list.first().map(|m| m.id.clone());
+            let last = list.last().map(|m| m.id.clone());
+            Json(serde_json::json!({
+                "data": data,
+                "has_more": false,
+                "first_id": first,
+                "last_id": last,
+            }))
+            .into_response()
+        }
+        Err(e) => upstream_error_response(&e),
+    }
 }
 
 async fn messages(
@@ -299,7 +334,7 @@ async fn messages(
         //    - BadRequest:请求本身问题,换号无益,直接返回。
         //    - 其他可重试错误:上报失败、换号重试。
         match st.provider.chat(req.clone(), &ctx).await {
-            Ok(stream) => return stream_response(st.clone(), lease, stream, req.model.clone()),
+            Ok(stream) => return finish_response(st.clone(), lease, stream, &req).await,
             Err(e) if e.kind == UpstreamErrorKind::TokenInvalid => {
                 tracing::info!(account = %account_id, "chat 403 token 失效,尝试同号刷新后重试");
                 match st.force_refresh(ctx.account.clone()).await {
@@ -311,7 +346,7 @@ async fn messages(
                         };
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
-                                return stream_response(st.clone(), lease, stream, req.model.clone())
+                                return finish_response(st.clone(), lease, stream, &req).await
                             }
                             Err(e2) => {
                                 // 刷新后仍失败:这次才上报失败 + 换号。
@@ -393,6 +428,105 @@ async fn finalize_usage(
     };
     if let Err(e) = sink.record(rec).await {
         tracing::warn!(account = %account_id, "usage 落库失败(不影响响应): {e}");
+    }
+}
+
+/// 按客户端 `stream` 标志分发:provider 一律产流,这里决定回 SSE 还是折叠成单个
+/// 非流式 Messages 响应(折叠逻辑写一次,见 [`gw_core::fold`])。两条路径都做同一套
+/// 收尾(账号生命周期上报 + usage 落库)。
+async fn finish_response(
+    st: Arc<WorkerState>,
+    lease: scheduler::AccountLease,
+    stream: gw_core::provider::ChatStream,
+    req: &ChatRequest,
+) -> axum::response::Response {
+    if req.stream {
+        // 流式:返回惰性 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库)。
+        stream_response(st, lease, stream, req.model.clone())
+    } else {
+        // 非流式:此处即时抽干流、折叠成单个 Messages JSON。
+        collect_response(&st.scheduler, st.usage_sink.as_ref(), lease, stream, req.model.clone())
+            .await
+    }
+}
+
+/// 非流式路径:抽干 provider 流,折叠成单个 Anthropic Messages JSON 响应。
+///
+/// 抽干期间持有 `lease`(占并发槽);抽干完成后按结果上报账号生命周期 + usage 落库
+/// (与流式 [`stream_response`] 同口径)。流中出现硬错误 / SSE `error` 事件 → 回上游
+/// 错误响应(不重试:已开始消费流,符合 v60 不放大错误契约)。
+///
+/// 取显式依赖(scheduler / usage_sink)而非整个 WorkerState,便于单测。
+async fn collect_response(
+    scheduler: &AccountScheduler,
+    usage_sink: Option<&Arc<dyn UsageSink>>,
+    lease: scheduler::AccountLease,
+    mut stream: gw_core::provider::ChatStream,
+    model: String,
+) -> axum::response::Response {
+    /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
+    /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
+    const MAX_NONSTREAM_EVENTS: usize = 500_000;
+
+    let account_id = lease.account_id().to_string();
+    let mut events: Vec<SseEvent> = Vec::new();
+    let mut last_usage: Option<ChatUsage> = None;
+    let mut hard_err: Option<UpstreamError> = None;
+    let mut over_cap = false;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(StreamItem::Sse(ev)) => {
+                if events.len() >= MAX_NONSTREAM_EVENTS {
+                    over_cap = true;
+                    break;
+                }
+                events.push(ev);
+            }
+            Ok(StreamItem::Usage(u)) => last_usage = Some(u),
+            Err(e) => {
+                hard_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    // 先定结果,再统一收尾(账号生命周期 + usage 落库),保证 success 与真实结果一致
+    // (审查 #1:不能在折叠失败前就抢报 success / 记 success=true)。
+    enum Outcome {
+        Ok(serde_json::Value),
+        Upstream(UpstreamError),
+        Bad(serde_json::Value),
+    }
+    let outcome = if let Some(e) = hard_err {
+        Outcome::Upstream(e)
+    } else if over_cap {
+        Outcome::Bad(serde_json::json!({"type":"error","error":{"type":"api_error",
+            "message":"非流式响应事件数超上限,已中止"}}))
+    } else {
+        match gw_core::fold::fold_sse_to_message(&events) {
+            Ok(msg) => Outcome::Ok(msg),
+            Err(err_data) => Outcome::Bad(err_data),
+        }
+    };
+
+    let success = matches!(outcome, Outcome::Ok(_));
+    if success {
+        scheduler.report_success(&account_id);
+    } else {
+        let kind = match &outcome {
+            Outcome::Upstream(e) => e.kind,
+            _ => UpstreamErrorKind::ServerError,
+        };
+        scheduler.report_failure(&account_id, kind);
+    }
+    finalize_usage(usage_sink, &account_id, &model, last_usage.as_ref(), success).await;
+    drop(lease); // 释放并发槽(响应已抽干)。
+
+    match outcome {
+        Outcome::Ok(msg) => (StatusCode::OK, Json(msg)).into_response(),
+        Outcome::Upstream(e) => upstream_error_response(&e),
+        Outcome::Bad(data) => (StatusCode::BAD_GATEWAY, Json(data)).into_response(),
     }
 }
 
@@ -604,6 +738,113 @@ mod tests {
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].success, "失败流应记 success=false");
+    }
+
+    fn one_account_scheduler() -> AccountScheduler {
+        AccountScheduler::new(vec![Arc::new(acct(&[]))])
+    }
+
+    fn chat_stream(
+        items: Vec<Result<StreamItem, UpstreamError>>,
+    ) -> gw_core::provider::ChatStream {
+        Box::pin(futures::stream::iter(items))
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn collect_response_folds_nonstream_message_and_persists_usage() {
+        let sched = one_account_scheduler();
+        let lease = sched.acquire(Some("s")).await.unwrap();
+        let sink = fake_sink();
+        let dyn_sink: Arc<dyn UsageSink> = sink.clone();
+        let items = vec![
+            Ok(StreamItem::Sse(SseEvent::new(
+                "message_start",
+                serde_json::json!({"message":{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "content_block_start",
+                serde_json::json!({"index":0,"content_block":{"type":"text","text":""}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "content_block_delta",
+                serde_json::json!({"index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new("content_block_stop", serde_json::json!({"index":0})))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "message_delta",
+                serde_json::json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new("message_stop", serde_json::json!({})))),
+            Ok(StreamItem::Usage(ChatUsage {
+                input_tokens: 4,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            })),
+        ];
+        let resp =
+            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["usage"]["output_tokens"], 2);
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1, "非流式也应落库 usage");
+        assert_eq!(rows[0].output_tokens, 2);
+        assert!(rows[0].success);
+    }
+
+    #[tokio::test]
+    async fn collect_response_maps_sse_error_to_bad_gateway() {
+        let sched = one_account_scheduler();
+        let lease = sched.acquire(Some("s")).await.unwrap();
+        let items = vec![
+            Ok(StreamItem::Sse(SseEvent::new(
+                "message_start",
+                serde_json::json!({"message":{"id":"m","content":[]}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "error",
+                serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
+            ))),
+        ];
+        let resp = collect_response(&sched, None, lease, chat_stream(items), "m".into()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "overloaded_error");
+    }
+
+    #[tokio::test]
+    async fn collect_response_fold_failure_persists_failure() {
+        // 折叠失败(缺 message_start)→ 502,且 usage 必须记 success=false(审查 #1:
+        // 不能在折叠失败前抢报成功 / 记 success=true)。
+        let sched = one_account_scheduler();
+        let lease = sched.acquire(Some("s")).await.unwrap();
+        let sink = fake_sink();
+        let dyn_sink: Arc<dyn UsageSink> = sink.clone();
+        let items = vec![
+            Ok(StreamItem::Sse(SseEvent::new("content_block_stop", serde_json::json!({"index":0})))),
+            Ok(StreamItem::Usage(ChatUsage {
+                input_tokens: 5,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            })),
+        ];
+        let resp =
+            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].success, "折叠失败的请求 usage 应记 success=false");
     }
 
     fn acct(extra: &[(&str, &str)]) -> Account {
