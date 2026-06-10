@@ -1,6 +1,6 @@
 # KiroManager 激活端指纹 — 对齐参考(防封)
 
-| 能力点/字段 | 参考来源(文件:行号 函数/字段名) | 它做什么 | 不对齐会怎样 | kiro-gw对齐落点 | 建议Phase | confidence |
+| 能力点/字段 | 参考来源(文件:行号 函数/字段名) | 它做什么 | 不对齐会怎样 | claude-all-in-one对齐落点 | 建议Phase | confidence |
 |---|---|---|---|---|---|---|
 | machineId 总入口按 OS 真实值读取 | `main/machineId.ts:91 getCurrentMachineId`, `main/machineId.ts:313 getWindowsMachineId`, `main/machineId.ts:386 getMacOSMachineId`, `main/machineId.ts:458 getLinuxMachineId` | 激活端优先读取宿主机真实 machine identity，而不是纯随机值；Windows 读 `MachineGuid`，macOS 读 override/Kiro 文件再回退硬件 UUID，Linux 读 `/etc/machine-id` 或 dbus machine-id 并格式化成 UUID。 | 激活端和 gw 发包端若 machineId 来源不同，会形成“双指纹漂移”；同一账号先激活再使用时被云端视为换设备/换客户端，封号风险最高。 | `gw-kiro/machine_id` | P1 | high |
 | 随机 machineId 只作为生成能力，不是默认激活来源 | `main/machineId.ts:83 generateRandomMachineId` | 提供 GUID 生成函数，但实际读取当前机器码走 OS 真实值链路。 | gw 若偷懒每号随机一个 machineId，而激活端是 OS 真值，会立刻与激活痕迹脱锚。 | `gw-kiro/machine_id` | P1 | high |
