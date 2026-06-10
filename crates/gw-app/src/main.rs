@@ -69,7 +69,14 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::anyhow!("--mode worker 需要 --instance N")
             })?;
             tracing::info!(instance, "启动 worker 角色");
-            worker::run(instance, &args.instances, &args.accounts, &args.system).await
+            worker::run(
+                instance,
+                &args.instances,
+                &args.accounts,
+                &args.system,
+                &args.db,
+            )
+            .await
         }
     }
 }

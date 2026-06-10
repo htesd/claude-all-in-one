@@ -6,6 +6,10 @@
 use async_trait::async_trait;
 
 /// 一条 usage 记录(发往 UsageSink)。
+///
+/// 字段与 [`crate::provider::ChatUsage`] 对齐(忠实原始事件日志,不丢任何计费维度):
+/// uncached/cache_read/cache_creation 三类 token 经济性都要落库,上层(v59 聚合)才能
+/// 重建 cache 折扣成本。
 #[derive(Debug, Clone)]
 pub struct UsageRecord {
     pub client_key_id: String,
@@ -14,6 +18,7 @@ pub struct UsageRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     /// 是否成功。
     pub success: bool,
 }
