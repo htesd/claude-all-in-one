@@ -87,10 +87,12 @@ impl SqliteStore {
     /// 打开(或创建)数据库,启用 WAL,建表。
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let conn = Connection::open(path.as_ref())?;
+        // busy_timeout 必须最先设:router/worker 同时启动会并发执行 WAL 切换与建表,
+        // 没有它任何抢锁直接 "database is locked" 即死(而非等待重试)。
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         // WAL:多进程并发读友好;NORMAL 同步在 WAL 下安全且快。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
         Self::setup_schema(&conn)?;
         // 统计读连接(主连接建完表后再开);query_only 双保险防误写。
         let stats = Connection::open(path.as_ref())?;
