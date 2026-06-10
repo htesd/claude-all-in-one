@@ -115,6 +115,23 @@ impl AccountsConfig {
 pub struct SystemConfig {
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+/// admin 控制面配置。`token` 未设(None / 空串)→ admin API 关闭(router 不挂 /admin)。
+/// 与对外客户 apikey 完全分离:admin_token 是单一管理密钥(system.yaml 持有)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl AdminConfig {
+    /// 非空 admin token(启用 admin 的充要条件)。
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref().filter(|t| !t.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

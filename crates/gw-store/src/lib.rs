@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use gw_core::store::{AuthenticatedKey, ControlStore, UsageRecord, UsageSink};
+use gw_core::store::{
+    AuthenticatedKey, ControlStore, UsageByKey, UsageByModel, UsageRecord, UsageSink, UsageSummary,
+};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
@@ -80,6 +82,82 @@ impl SqliteStore {
             (key, label),
         )?;
         Ok(())
+    }
+
+    // ───────── 用量统计查询(admin 看板;`since_unix`=None 表示全部) ─────────
+
+    /// 用量总览。`since_unix` = 仅统计 created_at >= 该 Unix 秒的行(None=全部)。
+    pub fn usage_summary(&self, since_unix: Option<i64>) -> anyhow::Result<UsageSummary> {
+        let since = since_unix.unwrap_or(0);
+        let conn = self.conn.lock();
+        let s = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(success),0), COALESCE(SUM(input_tokens),0), \
+             COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
+             COALESCE(SUM(cache_creation_tokens),0) \
+             FROM usage_records WHERE created_at >= ?1",
+            [since],
+            |r| {
+                Ok(UsageSummary {
+                    requests: r.get::<_, i64>(0)? as u64,
+                    success_requests: r.get::<_, i64>(1)? as u64,
+                    input_tokens: r.get::<_, i64>(2)? as u64,
+                    output_tokens: r.get::<_, i64>(3)? as u64,
+                    cache_read_tokens: r.get::<_, i64>(4)? as u64,
+                    cache_creation_tokens: r.get::<_, i64>(5)? as u64,
+                })
+            },
+        )?;
+        Ok(s)
+    }
+
+    /// 按模型聚合(请求数降序)。
+    pub fn usage_by_model(&self, since_unix: Option<i64>) -> anyhow::Result<Vec<UsageByModel>> {
+        let since = since_unix.unwrap_or(0);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
+             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
+             FROM usage_records WHERE created_at >= ?1 GROUP BY model ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([since], |r| {
+                Ok(UsageByModel {
+                    model: r.get(0)?,
+                    requests: r.get::<_, i64>(1)? as u64,
+                    input_tokens: r.get::<_, i64>(2)? as u64,
+                    output_tokens: r.get::<_, i64>(3)? as u64,
+                    cache_read_tokens: r.get::<_, i64>(4)? as u64,
+                    cache_creation_tokens: r.get::<_, i64>(5)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 按客户 apikey(client_key_id)聚合(请求数降序)。
+    pub fn usage_by_key(&self, since_unix: Option<i64>) -> anyhow::Result<Vec<UsageByKey>> {
+        let since = since_unix.unwrap_or(0);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT client_key_id, COUNT(*), COALESCE(SUM(success),0), \
+             COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
+             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
+             FROM usage_records WHERE created_at >= ?1 GROUP BY client_key_id ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt
+            .query_map([since], |r| {
+                Ok(UsageByKey {
+                    client_key_id: r.get(0)?,
+                    requests: r.get::<_, i64>(1)? as u64,
+                    success_requests: r.get::<_, i64>(2)? as u64,
+                    input_tokens: r.get::<_, i64>(3)? as u64,
+                    output_tokens: r.get::<_, i64>(4)? as u64,
+                    cache_read_tokens: r.get::<_, i64>(5)? as u64,
+                    cache_creation_tokens: r.get::<_, i64>(6)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 }
 
@@ -241,6 +319,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ok, 0, "失败请求的 usage 行 success 应为 0");
+    }
+
+    async fn rec(store: &SqliteStore, key: &str, model: &str, inp: u64, out: u64, ok: bool) {
+        store
+            .record(UsageRecord {
+                client_key_id: key.into(),
+                account_id: "a".into(),
+                model: model.into(),
+                input_tokens: inp,
+                output_tokens: out,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                success: ok,
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_summary_aggregates_all() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        rec(&store, "k1", "m1", 100, 10, true).await;
+        rec(&store, "k2", "m1", 200, 20, true).await;
+        rec(&store, "k1", "m2", 50, 5, false).await;
+        let s = store.usage_summary(None).unwrap();
+        assert_eq!(s.requests, 3);
+        assert_eq!(s.success_requests, 2);
+        assert_eq!(s.input_tokens, 350);
+        assert_eq!(s.output_tokens, 35);
+    }
+
+    #[tokio::test]
+    async fn usage_by_model_groups() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        rec(&store, "k1", "m1", 100, 10, true).await;
+        rec(&store, "k2", "m1", 200, 20, true).await;
+        rec(&store, "k1", "m2", 50, 5, true).await;
+        let rows = store.usage_by_model(None).unwrap();
+        let m1 = rows.iter().find(|r| r.model == "m1").unwrap();
+        assert_eq!(m1.requests, 2);
+        assert_eq!(m1.input_tokens, 300);
+        let m2 = rows.iter().find(|r| r.model == "m2").unwrap();
+        assert_eq!(m2.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn usage_by_key_groups() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        rec(&store, "k1", "m1", 100, 10, true).await;
+        rec(&store, "k1", "m2", 50, 5, false).await;
+        rec(&store, "k2", "m1", 200, 20, true).await;
+        let rows = store.usage_by_key(None).unwrap();
+        let k1 = rows.iter().find(|r| r.client_key_id == "k1").unwrap();
+        assert_eq!(k1.requests, 2);
+        assert_eq!(k1.success_requests, 1);
+        assert_eq!(k1.input_tokens, 150);
+        let k2 = rows.iter().find(|r| r.client_key_id == "k2").unwrap();
+        assert_eq!(k2.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_respects_since_filter() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        rec(&store, "k1", "m1", 100, 10, true).await;
+        // since 在未来 → 过滤掉刚写入的行。
+        let future = 9_999_999_999i64;
+        let s = store.usage_summary(Some(future)).unwrap();
+        assert_eq!(s.requests, 0, "since 在未来应过滤掉所有行");
     }
 
     #[tokio::test]
