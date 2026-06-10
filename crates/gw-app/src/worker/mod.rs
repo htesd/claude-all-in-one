@@ -98,25 +98,30 @@ impl WorkerState {
             }
         }
         let refreshed = Arc::new(self.provider.refresh_auth(&account).await?);
-        // 先持久化再进内存:rolling refresh_token 不落库,重启即回退到旧 token
-        // (Kiro 旧 token 可能已被作废 → invalid_grant 永久失效)。写库失败只告警,
-        // 不拦请求(内存里仍是新 token,服务不中断)。
-        if let Some(store) = &self.store {
-            match serde_json::to_string(&refreshed.extra) {
-                Ok(extra_json) => {
-                    if let Err(e) =
-                        store.update_account_extra(&refreshed.account_id, &extra_json)
-                    {
-                        tracing::warn!(account = %refreshed.account_id,
-                            "刷新后回写 DB 失败(重启可能丢 rolling token): {e}");
-                    }
-                }
-                Err(e) => tracing::warn!(account = %refreshed.account_id, "extra 序列化失败: {e}"),
-            }
-        }
         // 回写 scheduler:带新 access_token / rolling refresh_token 的副本进入选号池
         // (单一事实来源;无独立 creds 缓存,避免两份凭证发散)。
         self.scheduler.update_account(refreshed.clone());
+        // 持久化(rolling refresh_token 不落库,重启即回退已作废旧 token):
+        // - **增量合并**只写本次刷新改动的字段,不整块替换——并发的 admin 修改
+        //   (priority/region 等)不被旧内存快照抹掉(审查 Architect#4);
+        // - 先置脏后持久化、成功才清位:任何失败窗口内 30s sync 都不会用 DB
+        //   旧值洗掉内存新 token,由 sync 循环负责重试(审查 Minimalist#1)。
+        if let Some(store) = &self.store {
+            self.scheduler.mark_extra_dirty(&refreshed.account_id);
+            let delta: std::collections::BTreeMap<&String, &serde_json::Value> = refreshed
+                .extra
+                .iter()
+                .filter(|(k, v)| account.extra.get(*k) != Some(*v))
+                .collect();
+            let persisted = serde_json::to_string(&delta)
+                .map_err(anyhow::Error::from)
+                .and_then(|j| store.merge_account_extra(&refreshed.account_id, &j));
+            match persisted {
+                Ok(_) => self.scheduler.clear_extra_dirty(&refreshed.account_id),
+                Err(e) => tracing::warn!(account = %refreshed.account_id,
+                    "刷新回写 DB 失败,已置脏待 sync 重试: {e}"),
+            }
+        }
         Ok(refreshed)
     }
 }
@@ -176,6 +181,7 @@ pub async fn run(
     db_path: &Path,
 ) -> anyhow::Result<()> {
     let instances: InstancesConfig = load_yaml(instances_path)?;
+    instances.validate()?; // 拓扑约束:同组多 worker 等违规直接拒绝启动。
     // accounts.yaml 自切片④起为可选:首启播种用,导入后 DB 是账号事实源。
     let accounts_cfg: Option<AccountsConfig> = match load_yaml::<AccountsConfig>(accounts_path) {
         Ok(c) => Some(c),
@@ -243,6 +249,10 @@ pub async fn run(
         })
         .unwrap_or_else(|| "kiro".to_string());
 
+    // 单 provider 组模型:与本 worker provider 家族不符的账号一律跳过——
+    // 否则会拿 Kiro 实现去刷新/调用别家凭据(审查 Architect#2)。
+    let accounts = filter_by_provider(accounts, &provider_family);
+
     let registry = Registry::with_builtins();
     tracing::debug!(providers = ?registry.families(), "已注册 provider");
     // 先按本 worker 的固定出口构造 egress client,注入 provider——
@@ -290,11 +300,28 @@ pub async fn run(
             tick.tick().await; // 首跳立即触发,跳过(启动时刚加载过)。
             loop {
                 tick.tick().await;
+                // 先重试上轮回写失败的 extra(脏账号),成功才清位——
+                // 清位前 sync 不会用 DB 旧值覆盖内存新 token。
+                for acc in st.scheduler.dirty_accounts() {
+                    let persisted = serde_json::to_string(&acc.extra)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|j| store.merge_account_extra(&acc.account_id, &j));
+                    match persisted {
+                        Ok(_) => {
+                            st.scheduler.clear_extra_dirty(&acc.account_id);
+                            tracing::info!(account = %acc.account_id, "脏 extra 重试持久化成功");
+                        }
+                        Err(e) => tracing::warn!(account = %acc.account_id,
+                            "脏 extra 重试仍失败,下轮再试: {e}"),
+                    }
+                }
                 match store.load_group_accounts(&st.group) {
                     Ok(accs) => {
-                        let out = st
-                            .scheduler
-                            .sync_accounts(accs.into_iter().map(Arc::new).collect());
+                        let accs = filter_by_provider(
+                            accs.into_iter().map(Arc::new).collect(),
+                            st.provider.family(),
+                        );
+                        let out = st.scheduler.sync_accounts(accs);
                         if out.added + out.removed > 0 {
                             tracing::info!(added = out.added, removed = out.removed,
                                 "账号集已按 DB 同步");
@@ -325,6 +352,22 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(&wcfg.listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// 过滤掉与本 worker provider 家族不符的账号(单 provider 组模型;
+/// provider 为空 = 跟随组家族,放行)。
+fn filter_by_provider(accounts: Vec<Arc<Account>>, family: &str) -> Vec<Arc<Account>> {
+    accounts
+        .into_iter()
+        .filter(|a| {
+            let ok = a.provider.is_empty() || a.provider == family;
+            if !ok {
+                tracing::warn!(account = %a.account_id, provider = %a.provider, family,
+                    "账号 provider 与本 worker 家族不符,跳过(不会被服务)");
+            }
+            ok
+        })
+        .collect()
 }
 
 /// listen 地址是否绑 loopback(127.0.0.1 / ::1 / localhost)。

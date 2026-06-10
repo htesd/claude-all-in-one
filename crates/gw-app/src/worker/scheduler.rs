@@ -80,6 +80,10 @@ struct CredentialState {
     /// 最近一次从配置(DB)看到的 disabled 值。sync 只在**翻转**时动 runtime:
     /// 配置 false→false 不得反复清掉运行时冷却/封禁(admin 显式开关才算意图)。
     config_disabled: bool,
+    /// 内存 extra 比 DB 新且尚未持久化成功(刷新回写失败时置位)。
+    /// 置位期间 sync 不得用 DB 旧值覆盖内存(否则丢已 roll 的 token),
+    /// 由 worker 的 sync 循环负责重试持久化、成功后清位。
+    extra_dirty: bool,
     /// 冷却到期时刻(仅 cooldown 类有效);到点后选号前 sweep 自愈。
     disabled_until: Option<Instant>,
     /// 连续 API 失败次数(成功清零;达 MAX_FAILURES 禁用)。
@@ -105,6 +109,7 @@ impl CredentialState {
             priority,
             disabled: account.disabled,
             config_disabled: account.disabled,
+            extra_dirty: false,
             disabled_reason: None,
             disabled_until: None,
             failure_count: 0,
@@ -453,6 +458,11 @@ impl AccountScheduler {
                             e.failure_count = 0;
                         }
                     }
+                    // 内存 extra 未持久化(刷新回写失败):跳过配置覆盖,保住新 token;
+                    // disabled 翻转仍生效(上方已处理),持久化由 worker 重试后清位。
+                    if e.extra_dirty {
+                        continue;
+                    }
                     // 并发上限变化 → 换新信号量(在途许可持旧信号量,自然衰减)。
                     if acc.max_concurrency != e.account.max_concurrency {
                         e.semaphore =
@@ -479,10 +489,37 @@ impl AccountScheduler {
         out
     }
 
+    /// 标记某账号内存 extra 未持久化(刷新回写 DB 失败时调用)。
+    pub fn mark_extra_dirty(&self, id: &str) {
+        if let Some(e) = self.entries.lock().get_mut(id) {
+            e.extra_dirty = true;
+        }
+    }
+
+    /// 取所有待持久化账号的内存副本(worker sync 循环重试回写用)。
+    pub fn dirty_accounts(&self) -> Vec<Arc<Account>> {
+        self.entries
+            .lock()
+            .values()
+            .filter(|e| e.extra_dirty)
+            .map(|e| e.account.clone())
+            .collect()
+    }
+
+    /// 持久化成功后清除脏标记。
+    pub fn clear_extra_dirty(&self, id: &str) {
+        if let Some(e) = self.entries.lock().get_mut(id) {
+            e.extra_dirty = false;
+        }
+    }
+
     /// 全账号运行态快照(worker /status → admin 账号页;id 升序稳定输出)。
+    /// 先做冷却自愈 sweep:无流量时快照才不会展示已到期的陈旧冷却态。
     pub fn status_snapshot(&self) -> Vec<AccountStatusSnapshot> {
         let now = Instant::now();
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
+        Self::heal_cooldowns(&mut entries, now);
+        let entries = &*entries;
         let mut snap: Vec<AccountStatusSnapshot> = entries
             .values()
             .map(|e| {
@@ -823,6 +860,32 @@ mod tests {
         assert_eq!(a.failure_count, 1, "sync 不得清运行时失败计数");
         assert_eq!(a.priority, 7, "priority 跟随新配置");
         assert_eq!(a.max_concurrency, 4);
+    }
+
+    #[tokio::test]
+    async fn sync_skips_extra_overwrite_when_dirty() {
+        let s = sched(vec![acct("a", 1, None)]);
+        // 刷新成功但回写 DB 失败:内存进新 token + 置脏。
+        let mut refreshed = (*acct("a", 1, None)).clone();
+        refreshed.extra.insert("refresh_token".into(), serde_json::json!("rt-new"));
+        s.update_account(Arc::new(refreshed));
+        s.mark_extra_dirty("a");
+
+        // DB 里还是旧 token:sync 不得把内存洗回去。
+        let mut stale = (*acct("a", 1, None)).clone();
+        stale.extra.insert("refresh_token".into(), serde_json::json!("rt-stale"));
+        s.sync_accounts(vec![Arc::new(stale.clone())]);
+        assert_eq!(
+            s.account("a").unwrap().extra_str("refresh_token"),
+            Some("rt-new"),
+            "脏标记期间 sync 不得用 DB 旧值覆盖内存新 token"
+        );
+        assert_eq!(s.dirty_accounts().len(), 1);
+
+        // 持久化成功 → 清脏,之后 sync 恢复正常覆盖。
+        s.clear_extra_dirty("a");
+        s.sync_accounts(vec![Arc::new(stale)]);
+        assert_eq!(s.account("a").unwrap().extra_str("refresh_token"), Some("rt-stale"));
     }
 
     // ───────── status_snapshot ─────────

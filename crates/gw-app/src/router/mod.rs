@@ -58,6 +58,7 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
             .map_err(|e| anyhow::anyhow!("读取 {} 失败: {e}", instances_path.display()))?;
         serde_yaml::from_str(&text)?
     };
+    instances.validate()?; // 拓扑约束:同组多 worker 等违规直接拒绝启动。
     let system: SystemConfig = std::fs::read_to_string(system_path)
         .ok()
         .and_then(|t| serde_yaml::from_str(&t).ok())
