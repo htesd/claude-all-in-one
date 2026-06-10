@@ -17,6 +17,35 @@ use clap::{Parser, ValueEnum};
 /// 仅在 router→worker 的 localhost 内网跳使用(对外 Authorization 不透传给 worker)。
 pub const CLIENT_KEY_HEADER: &str = "x-gw-client-key";
 
+/// 优雅停机信号:SIGTERM(docker stop / systemd)或 Ctrl-C。
+/// 触发后 axum 停止接收新连接,在途请求(含流式 SSE)自然跑完;不设排空上限——
+/// 硬截止由 supervisor 兜底(docker 默认 10s 后 SIGKILL,systemd TimeoutStopSec)。
+pub(crate) async fn shutdown_signal(role: &'static str) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("注册 SIGTERM 监听失败,仅响应 Ctrl-C: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("{role} 收到停机信号:停止接收新连接,等待在途请求完成");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
     /// 前置路由:鉴权 + session→worker 亲和 + 转发。

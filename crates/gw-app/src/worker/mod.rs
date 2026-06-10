@@ -40,6 +40,8 @@ struct WorkerState {
     refresh_locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// usage 落库汇(#130)。打开失败时为 None(降级:usage 仅记日志不入库)。
     usage_sink: Option<Arc<dyn UsageSink>>,
+    /// 在途异步 usage 落库登记(停机排空时等它们收尾)。
+    pending_writes: Arc<PendingWrites>,
     /// 控制面库(账号事实源):刷新后回写 rolling refresh_token、30s 周期 sync 账号集。
     /// None = 库打开失败(降级:账号只来自 yaml 启动快照,改动需重启)。
     store: Option<Arc<SqliteStore>>,
@@ -286,6 +288,7 @@ pub async fn run(
         scheduler: AccountScheduler::new(accounts),
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         usage_sink,
+        pending_writes: PendingWrites::new(),
         store: store.clone(),
         _client: client,
     });
@@ -300,21 +303,8 @@ pub async fn run(
             tick.tick().await; // 首跳立即触发,跳过(启动时刚加载过)。
             loop {
                 tick.tick().await;
-                // 先重试上轮回写失败的 extra(脏账号),成功才清位——
-                // 清位前 sync 不会用 DB 旧值覆盖内存新 token。
-                for acc in st.scheduler.dirty_accounts() {
-                    let persisted = serde_json::to_string(&acc.extra)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|j| store.merge_account_extra(&acc.account_id, &j));
-                    match persisted {
-                        Ok(_) => {
-                            st.scheduler.clear_extra_dirty(&acc.account_id);
-                            tracing::info!(account = %acc.account_id, "脏 extra 重试持久化成功");
-                        }
-                        Err(e) => tracing::warn!(account = %acc.account_id,
-                            "脏 extra 重试仍失败,下轮再试: {e}"),
-                    }
-                }
+                // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
+                flush_dirty_extras(&st.scheduler, &store, "sync 重试");
                 match store.load_group_accounts(&st.group) {
                     Ok(accs) => {
                         let accs = filter_by_provider(
@@ -337,7 +327,7 @@ pub async fn run(
         .route("/v1/messages", post(messages))
         .route("/v1/models", get(models))
         .route("/health", get(health))
-        .with_state(state);
+        .with_state(state.clone());
 
     // worker 不做对外鉴权、且信任 router 注入的 X-Gw-Client-Key;必须只绑 loopback,
     // 否则客户端可直连 worker 绕过 router 鉴权并伪造用量归属(审查 #2)。
@@ -350,8 +340,96 @@ pub async fn run(
     }
 
     let listener = tokio::net::TcpListener::bind(&wcfg.listen).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal("worker"))
+        .await?;
+
+    // 排空后先等 Drop 里 detach 的 usage/quota 落库任务收尾(graceful shutdown 只等
+    // 响应体,不等这些 spawn 任务;5s 上限防极端卡死)。
+    if !state
+        .pending_writes
+        .wait_idle(std::time::Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("停机:5s 内仍有 usage 落库任务未完成,最后一批记录可能丢失");
+    }
+    // 最后机会落盘脏 extra:30s 重试循环随进程退出被 drop,「刷新成功但 DB 回写
+    // 失败」的 rolling token 若不在此落盘,退出即丢(账号下次只能拿旧 token 刷新,
+    // 可能已被上游作废)。
+    if let Some(store) = &state.store {
+        flush_dirty_extras(&state.scheduler, store, "停机排空");
+    }
     Ok(())
+}
+
+/// 在途异步落库登记:SSE 收尾的 usage 落库是 Drop 里 detach 的 spawn 任务,
+/// graceful shutdown 只等响应体、不等这些任务——停机时经 wait_idle 等到清零
+/// (或超时),否则最后一批 usage/quota 增量会随 runtime 关闭静默丢失(审查 Skeptic#2)。
+struct PendingWrites {
+    count: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+/// RAII 登记凭据:创建即计数 +1,Drop -1 并唤醒等待者。
+struct PendingWriteGuard(Arc<PendingWrites>);
+
+impl PendingWrites {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn enter(self: &Arc<Self>) -> PendingWriteGuard {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PendingWriteGuard(self.clone())
+    }
+
+    /// 等到无在途落库或超时;返回最终是否清零。
+    async fn wait_idle(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return true;
+            }
+            let notified = self.notify.notified();
+            // 注册 waker 后复查,封住「最后一个 guard 在两步之间 drop」的丢唤醒窗口。
+            if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.count.load(std::sync::atomic::Ordering::Acquire) == 0;
+            }
+        }
+    }
+}
+
+impl Drop for PendingWriteGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            self.0.notify.notify_waiters();
+        }
+    }
+}
+
+/// 把调度器里标脏的 extra(刷新成功但 DB 回写失败的 rolling token)逐个落盘,
+/// 成功才清脏位——清位前 sync 不会用 DB 旧值覆盖内存新 token。
+/// 30s sync 循环(失败下轮重试)和停机排空(最后机会,失败即丢)共用。
+fn flush_dirty_extras(scheduler: &AccountScheduler, store: &SqliteStore, context: &str) {
+    for acc in scheduler.dirty_accounts() {
+        let persisted = serde_json::to_string(&acc.extra)
+            .map_err(anyhow::Error::from)
+            .and_then(|j| store.merge_account_extra(&acc.account_id, &j));
+        match persisted {
+            Ok(_) => {
+                scheduler.clear_extra_dirty(&acc.account_id);
+                tracing::info!(account = %acc.account_id, "{context}: 脏 extra 持久化成功");
+            }
+            Err(e) => tracing::warn!(account = %acc.account_id,
+                "{context}: 脏 extra 持久化失败: {e}"),
+        }
+    }
 }
 
 /// 过滤掉与本 worker provider 家族不符的账号(单 provider 组模型;
@@ -772,8 +850,11 @@ fn stream_response(
             let client_key = self.client_key.clone();
             let success = !self.saw_error;
             // detach 到当前运行时;无运行时上下文(理论上不会:SSE body 总在 tokio 内 drop)则跳过。
+            // guard 跟随任务存活:停机排空经 pending_writes.wait_idle 等这批落库收尾。
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let guard = self.st.pending_writes.enter();
                 handle.spawn(async move {
+                    let _guard = guard;
                     finalize_usage(
                         Some(&sink),
                         &account_id,
@@ -870,6 +951,68 @@ mod tests {
     use gw_core::provider::ChatUsage;
     use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn pending_writes_wait_idle_tracks_guards() {
+        let pw = PendingWrites::new();
+        assert!(
+            pw.wait_idle(std::time::Duration::from_millis(10)).await,
+            "无在途应立即 idle"
+        );
+
+        let guard = pw.enter();
+        assert!(
+            !pw.wait_idle(std::time::Duration::from_millis(50)).await,
+            "guard 未释放应超时返回 false"
+        );
+        drop(guard);
+        assert!(pw.wait_idle(std::time::Duration::from_millis(10)).await);
+
+        // 异步任务持有 guard:完成(drop)应唤醒等待者。
+        let g = pw.enter();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(g);
+        });
+        assert!(
+            pw.wait_idle(std::time::Duration::from_secs(2)).await,
+            "guard drop 应唤醒 wait_idle"
+        );
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn flush_dirty_extras_persists_rolled_token_and_clears_dirty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_account(
+                "acc-1",
+                "G0",
+                "kiro",
+                1,
+                r#"{"refresh_token":"rt-old","region":"us-east-1"}"#,
+            )
+            .unwrap();
+        // 内存里已是刷新后的新 token,但 DB 回写曾失败 → 标脏。
+        let mut acc = Account {
+            account_id: "acc-1".into(),
+            provider: "kiro".into(),
+            max_concurrency: 1,
+            disabled: false,
+            extra: BTreeMap::new(),
+        };
+        acc.extra
+            .insert("refresh_token".into(), serde_json::Value::String("rt-new".into()));
+        let scheduler = AccountScheduler::new(vec![Arc::new(acc)]);
+        scheduler.mark_extra_dirty("acc-1");
+
+        flush_dirty_extras(&scheduler, &store, "停机排空");
+
+        let row = store.get_account("acc-1").unwrap().unwrap();
+        assert!(row.extra.contains("rt-new"), "rolling token 应已落盘: {}", row.extra);
+        assert!(row.extra.contains("us-east-1"), "merge 语义:未带字段保留原值: {}", row.extra);
+        assert!(scheduler.dirty_accounts().is_empty(), "落盘成功后应清脏位");
+    }
 
     /// 记录到内存的假 sink,断言 finalize_usage 的落库决策。
     struct FakeSink {
