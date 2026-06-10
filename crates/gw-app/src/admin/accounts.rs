@@ -241,37 +241,39 @@ async fn delete_account(
     }
 }
 
-/// 运行态聚合:逐 worker 拉 `/health`(2s 超时),离线 worker 标 `online:false`。
-/// 串行拉取(worker 数通常 ≤ 个位数,简单优先;多了再并发)。
+/// 运行态聚合:并发拉各 worker 的 `/health`(单个 2s 超时),离线 worker 标 `online:false`。
+/// 并发使最坏耗时 ≈ 单个超时,而非随离线 worker 数串行累加;join_all 保持 worker 顺序。
 async fn runtime(State(st): State<AdminState>) -> axum::response::Response {
-    let mut out = Vec::with_capacity(st.workers.len());
-    for w in st.workers.iter() {
-        let url = format!("http://{}/health", w.listen);
-        let entry = match st.http.get(&url).send().await {
-            Ok(resp) => match resp.json::<serde_json::Value>().await {
-                Ok(v) => serde_json::json!({
-                    "instance": w.instance,
-                    "group": w.account_group,
-                    "online": true,
-                    "accounts_status": v.get("accounts_status").cloned()
-                        .unwrap_or(serde_json::Value::Array(vec![])),
-                }),
+    let fetches = st.workers.iter().map(|w| {
+        let http = st.http.clone();
+        async move {
+            let url = format!("http://{}/health", w.listen);
+            match http.get(&url).send().await {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(v) => serde_json::json!({
+                        "instance": w.instance,
+                        "group": w.account_group,
+                        "online": true,
+                        "accounts_status": v.get("accounts_status").cloned()
+                            .unwrap_or(serde_json::Value::Array(vec![])),
+                    }),
+                    Err(e) => {
+                        tracing::warn!(instance = w.instance, "worker /health 响应解析失败: {e}");
+                        serde_json::json!({
+                            "instance": w.instance, "group": w.account_group, "online": false,
+                        })
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!(instance = w.instance, "worker /health 响应解析失败: {e}");
+                    tracing::debug!(instance = w.instance, "worker 不在线: {e}");
                     serde_json::json!({
                         "instance": w.instance, "group": w.account_group, "online": false,
                     })
                 }
-            },
-            Err(e) => {
-                tracing::debug!(instance = w.instance, "worker 不在线: {e}");
-                serde_json::json!({
-                    "instance": w.instance, "group": w.account_group, "online": false,
-                })
             }
-        };
-        out.push(entry);
-    }
+        }
+    });
+    let out = futures::future::join_all(fetches).await;
     Json(out).into_response()
 }
 

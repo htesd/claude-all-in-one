@@ -9,6 +9,11 @@ license.workspace = true
 name = "kiro-gw"
 path = "src/main.rs"
 
+[features]
+# 把 admin-ui/dist 嵌进二进制(单文件部署,运行目录无需携带 dist)。
+# 构建前必须先 `cd admin-ui && bun run build`;默认关闭,保证 fresh clone(无 dist)可编译。
+embed-ui = ["dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
 gw-core.workspace = true
 gw-kiro.workspace = true
@@ -29,6 +34,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true
