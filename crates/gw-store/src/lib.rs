@@ -458,6 +458,46 @@ impl SqliteStore {
         Ok(changed == 1)
     }
 
+    /// **增量**合并 extra:只覆盖 `patch_json` 里出现的键,其余字段保持 DB 现值。
+    /// worker 刷新回写用它而非整块替换——刷新只改 token 字段,整块替换会把并发的
+    /// admin 修改(priority/region 等)用旧内存快照抹掉(对抗审查 Architect#4)。
+    /// 事务内读-合-写,跨进程(router admin 写 vs worker 回写)原子。
+    pub fn merge_account_extra(&self, account_id: &str, patch_json: &str) -> anyhow::Result<bool> {
+        let patch: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(patch_json)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let current: Option<String> = {
+            let mut stmt = tx.prepare("SELECT extra FROM accounts WHERE account_id = ?1")?;
+            match stmt.query_row([account_id], |r| r.get(0)) {
+                Ok(v) => Some(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let mut merged: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&current).unwrap_or_default();
+        merged.extend(patch);
+        tx.execute(
+            "UPDATE accounts SET extra = ?1 WHERE account_id = ?2",
+            (serde_json::to_string(&merged)?, account_id),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 分组是否存在(admin 写入 group_name 前的存在性校验,防"幽灵分组")。
+    pub fn group_exists(&self, name: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let exists = conn
+            .prepare_cached("SELECT 1 FROM groups WHERE name = ?1")?
+            .exists([name])?;
+        Ok(exists)
+    }
+
     /// 取某组账号并转换为运行时 [`Account`](gw_core::account::Account)
     /// (extra JSON 解码回字段表;含已禁用账号,调度器自行处理 disabled)。
     /// 单行 extra 损坏时跳过该账号并告警,不拖垮整组。
@@ -1078,6 +1118,38 @@ mod tests {
         assert!(store.delete_account("kiro-02").unwrap());
         assert!(!store.delete_account("kiro-02").unwrap());
         assert!(store.get_account("kiro-02").unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_account_extra_keeps_unrelated_fields() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_account(
+                "kiro-m",
+                "G0",
+                "kiro",
+                1,
+                r#"{"refresh_token":"rt-old","priority":5,"region":"us-east-1"}"#,
+            )
+            .unwrap();
+        // 模拟刷新回写:只带变化的 token 字段。
+        assert!(store
+            .merge_account_extra("kiro-m", r#"{"refresh_token":"rt-new","access_token":"at-1"}"#)
+            .unwrap());
+        let a = store.get_account("kiro-m").unwrap().unwrap();
+        assert!(a.extra.contains("rt-new"));
+        assert!(a.extra.contains("at-1"));
+        assert!(a.extra.contains(r#""priority":5"#), "未触及字段必须保留");
+        assert!(a.extra.contains("us-east-1"), "未触及字段必须保留");
+        assert!(!store.merge_account_extra("ghost", "{}").unwrap());
+    }
+
+    #[test]
+    fn group_exists_checks() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_group("G0", "", "").unwrap();
+        assert!(store.group_exists("G0").unwrap());
+        assert!(!store.group_exists("G0-typo").unwrap());
     }
 
     #[test]

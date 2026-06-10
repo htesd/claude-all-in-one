@@ -105,6 +105,13 @@ async fn create_key(
     };
     let label = body.label.as_deref().filter(|s| !s.is_empty());
     let group = body.group.as_deref().filter(|s| !s.is_empty());
+    if let Some(g) = group {
+        match st.store.group_exists(g) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::BAD_REQUEST, "分组不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     match st.store.create_api_key(&key, label, group) {
         Ok(true) => match st.store.get_api_key(&key) {
             Ok(Some(row)) => (StatusCode::CREATED, Json(row)).into_response(),
@@ -121,6 +128,13 @@ async fn update_key(
     Path(key): Path<String>,
     Json(body): Json<UpdateKeyBody>,
 ) -> axum::response::Response {
+    if let Some(g) = body.group_name.as_deref().filter(|g| !g.is_empty()) {
+        match st.store.group_exists(g) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::BAD_REQUEST, "分组不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     let patch = gw_core::store::ApiKeyPatch {
         label: body.label.clone(),
         disabled: body.disabled,
@@ -275,6 +289,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn key_group_must_exist() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 挂真实组 OK。
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/keys", Some(r#"{"key":"sk-grouped-01","group":"G0"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = json_body(resp).await;
+        assert_eq!(v["group_name"], "G0");
+        // 幽灵组 → 400(POST 与 PATCH)。
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/keys", Some(r#"{"key":"sk-grouped-02","group":"GO"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = app
+            .oneshot(req("PATCH", "/keys/sk-grouped-01", Some(r#"{"group_name":"GO"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

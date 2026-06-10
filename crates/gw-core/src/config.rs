@@ -61,6 +61,31 @@ impl InstancesConfig {
     pub fn worker(&self, instance: u32) -> Option<&WorkerConfig> {
         self.workers.iter().find(|w| w.instance == instance)
     }
+
+    /// 拓扑约束校验(router/worker 启动时调用,违规直接拒绝启动):
+    /// `account_group` 不得被多个 worker 绑定——账号运行态(并发槽/refresh 单飞/
+    /// 冷却)都在单 worker 内存,两 worker 共享一组会让 max_concurrency 翻倍、
+    /// rolling refresh_token 互相覆盖;instance 号与 listen 地址同理不得重复。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut groups = std::collections::HashSet::new();
+        let mut instances = std::collections::HashSet::new();
+        let mut listens = std::collections::HashSet::new();
+        for w in &self.workers {
+            if !groups.insert(&w.account_group) {
+                anyhow::bail!(
+                    "instances.yaml 非法:账号组 '{}' 被多个 worker 绑定(并发与凭据刷新会互踩)",
+                    w.account_group
+                );
+            }
+            if !instances.insert(w.instance) {
+                anyhow::bail!("instances.yaml 非法:instance={} 重复", w.instance);
+            }
+            if !listens.insert(&w.listen) {
+                anyhow::bail!("instances.yaml 非法:listen '{}' 重复", w.listen);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ───────────────────────── accounts.yaml ─────────────────────────
@@ -197,6 +222,31 @@ groups:
         assert_eq!(g.provider, "kiro");
         assert_eq!(g.accounts.len(), 2);
         assert_eq!(g.accounts[0].extra_str("refresh_token"), Some("t1"));
+    }
+
+    #[test]
+    fn instances_validate_rejects_duplicate_group() {
+        let yaml = r#"
+router: { listen: "0.0.0.0:8990" }
+workers:
+  - { instance: 0, listen: "127.0.0.1:9000", egress: { mode: direct }, account_group: "G0" }
+  - { instance: 1, listen: "127.0.0.1:9001", egress: { mode: direct }, account_group: "G0" }
+"#;
+        let cfg: InstancesConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("G0"), "应指出重复组,实际: {err}");
+    }
+
+    #[test]
+    fn instances_validate_accepts_distinct_topology() {
+        let yaml = r#"
+router: { listen: "0.0.0.0:8990" }
+workers:
+  - { instance: 0, listen: "127.0.0.1:9000", egress: { mode: direct }, account_group: "G0" }
+  - { instance: 1, listen: "127.0.0.1:9001", egress: { mode: direct }, account_group: "G1" }
+"#;
+        let cfg: InstancesConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

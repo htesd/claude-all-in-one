@@ -90,9 +90,13 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
                     let sensitive =
                         lk.contains("token") || lk.contains("secret") || lk.contains("password");
                     let v = if sensitive {
+                        // 按字符(非字节)取尾 4 位:非 ASCII 密钥按字节切会落在
+                        // UTF-8 编码中间直接 panic(审查 Minimalist#5)。
                         match v.as_str() {
-                            Some(s) if s.len() > 6 => {
-                                serde_json::json!(format!("***{}", &s[s.len() - 4..]))
+                            Some(s) if s.chars().count() > 6 => {
+                                let tail: String =
+                                    s.chars().skip(s.chars().count() - 4).collect();
+                                serde_json::json!(format!("***{tail}"))
                             }
                             _ => serde_json::json!("***"),
                         }
@@ -139,6 +143,15 @@ async fn create_account(
         None => "{}".to_string(),
     };
     let group = body.group.as_deref().unwrap_or("");
+    // 非空组名必须真实存在,防"幽灵分组"(typo 的账号永远不被任何 worker 服务,
+    // groups 页也看不见;审查 Minimalist#2)。
+    if !group.is_empty() {
+        match st.store.group_exists(group) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::BAD_REQUEST, "分组不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     let provider = body.provider.as_deref().filter(|p| !p.is_empty()).unwrap_or("kiro");
     let conc = body.max_concurrency.unwrap_or(1);
     match st
@@ -160,11 +173,44 @@ async fn update_account(
     Path(id): Path<String>,
     Json(body): Json<UpdateAccountBody>,
 ) -> axum::response::Response {
-    let extra = match &body.extra {
-        Some(map) => match serde_json::to_string(map) {
-            Ok(s) => Some(s),
+    if let Some(g) = body.group_name.as_deref().filter(|g| !g.is_empty()) {
+        match st.store.group_exists(g) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::BAD_REQUEST, "分组不存在"),
             Err(e) => return internal_error(e),
-        },
+        }
+    }
+    let extra = match &body.extra {
+        // `***` 开头的字符串值是脱敏哨兵 = "保留 DB 原值":GET 返回的就是脱敏形态,
+        // 前端整块回传时不需要(也不可能)还原真实凭据;没有这一层,带多个敏感字段
+        // 的账号在轮换单个 token 时会丢掉其余凭据(审查 Minimalist#6)。
+        Some(map) => {
+            let current = match st.store.get_account(&id) {
+                Ok(Some(row)) => row.extra,
+                Ok(None) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+                Err(e) => return internal_error(e),
+            };
+            let current: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&current).unwrap_or_default();
+            let mut resolved = serde_json::Map::new();
+            for (k, v) in map {
+                match v.as_str() {
+                    Some(s) if s.starts_with("***") => {
+                        if let Some(orig) = current.get(k) {
+                            resolved.insert(k.clone(), orig.clone());
+                        }
+                        // DB 已无该字段:脱敏占位无可保留,丢弃。
+                    }
+                    _ => {
+                        resolved.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            match serde_json::to_string(&resolved) {
+                Ok(s) => Some(s),
+                Err(e) => return internal_error(e),
+            }
+        }
         None => None,
     };
     let patch = AccountPatch {
@@ -257,6 +303,8 @@ mod tests {
     #[tokio::test]
     async fn account_crud_roundtrip_with_redaction() {
         let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store.create_group("G1", "", "").unwrap();
         // 创建(带敏感 extra)。
         let body = r#"{"account_id":"kiro-01","group":"G0","max_concurrency":2,
             "extra":{"refresh_token":"rt-secret-12345678","region":"us-east-1"}}"#;
@@ -317,6 +365,74 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let resp = app.oneshot(req("DELETE", "/accounts/kiro-01", None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rejects_nonexistent_group() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 创建账号挂不存在的组 → 400(防幽灵分组)。
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/accounts",
+                Some(r#"{"account_id":"kiro-g","group":"G0-typo"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // PATCH 到不存在的组同样 400。
+        store.create_account("kiro-g", "G0", "kiro", 1, "{}").unwrap();
+        let resp = app
+            .oneshot(req(
+                "PATCH",
+                "/accounts/kiro-g",
+                Some(r#"{"group_name":"GO"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn patch_extra_masked_sentinel_preserves_original() {
+        let (app, store) = app();
+        store
+            .create_account(
+                "kiro-rot",
+                "",
+                "kiro",
+                1,
+                r#"{"refresh_token":"rt-original-9999","client_secret":"cs-keep-1234","region":"eu"}"#,
+            )
+            .unwrap();
+        // 模拟前端整块回传:轮换 refresh_token,其余敏感字段还是脱敏形态。
+        let body = r#"{"extra":{"refresh_token":"rt-rotated-8888","client_secret":"***1234","region":"eu"}}"#;
+        let resp = app
+            .oneshot(req("PATCH", "/accounts/kiro-rot", Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = store.get_account("kiro-rot").unwrap().unwrap();
+        assert!(raw.extra.contains("rt-rotated-8888"), "新 token 应写入");
+        assert!(raw.extra.contains("cs-keep-1234"), "脱敏哨兵字段必须保留原值");
+        assert!(!raw.extra.contains("***"), "哨兵本身不得落库");
+    }
+
+    #[tokio::test]
+    async fn redaction_handles_non_ascii_secret() {
+        let (app, store) = app();
+        store
+            .create_account("kiro-cn", "", "kiro", 1, r#"{"password":"秘密口令一二三四"}"#)
+            .unwrap();
+        // 字节切片会 panic;按字符脱敏必须正常返回(审查 Minimalist#5)。
+        let resp = app.oneshot(req("GET", "/accounts", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        let masked = v[0]["extra"]["password"].as_str().unwrap();
+        assert!(masked.starts_with("***"));
+        assert!(masked.contains("一二三四"), "保尾 4 个字符,实际 {masked}");
     }
 
     #[tokio::test]

@@ -58,18 +58,15 @@ export function deriveAccountStatus(
 
 /**
  * 凭据轮换时构造整体替换的 extra：
- * 保留原 extra 中的非敏感字段（脱敏值以 `***` 开头的绝不回写！），
- * 再写入用户新输入的 refresh_token。
+ * 非敏感字段原样保留；脱敏字段（`***` 开头）也**原样回传**——后端把 `***` 前缀
+ * 视为「保留 DB 原值」哨兵，这样带多个敏感字段（如 client_secret）的账号在只换
+ * refresh_token 时不会丢其余凭据；最后写入用户新输入的 refresh_token。
  */
 export function buildRotatedExtra(
   original: Record<string, unknown>,
   refreshToken: string,
 ): Record<string, unknown> {
-  const next: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(original)) {
-    if (typeof value === 'string' && value.startsWith('***')) continue
-    next[key] = value
-  }
+  const next: Record<string, unknown> = { ...original }
   next.refresh_token = refreshToken
   return next
 }
