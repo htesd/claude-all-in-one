@@ -38,9 +38,8 @@ export function useDeleteKey() {
   return useMutation({
     mutationFn: (key: string) => deleteKey(key),
     onSuccess: () => {
+      // 删除只移除 api_keys 行；用量仍按原 client_key_id 聚合、数据不变，无需刷新 usage 域
       void queryClient.invalidateQueries({ queryKey: queryKeys.keys.root })
-      // 删除后该 key 的历史流量在用量端的归属展示口径可能变化（如归入"未归属"），联动刷新
-      void queryClient.invalidateQueries({ queryKey: queryKeys.usage.root })
     },
   })
 }

@@ -59,9 +59,10 @@ export function CreateKeyDialog({ open, onClose }: CreateKeyDialogProps) {
     event.preventDefault()
     if (mutation.isPending) return
 
-    const trimmedKey = customKey.trim()
-    // 自定义 key 先做客户端校验，省掉一次必然 400 的请求
-    if (trimmedKey !== '' && !CUSTOM_KEY_PATTERN.test(trimmedKey)) {
+    // 自定义 key 按原始输入校验，绝不 trim 改写：尾随空格/全空格输入都会
+    // 直接报格式错误，而不是被静默改写成另一个 key 或静默落回自动生成。
+    // 只有真正的空字符串（''）才走服务端自动生成。
+    if (customKey !== '' && !CUSTOM_KEY_PATTERN.test(customKey)) {
       setError(t('keys.error.invalidKey'))
       return
     }
@@ -70,7 +71,7 @@ export function CreateKeyDialog({ open, onClose }: CreateKeyDialogProps) {
     const payload: CreateKeyPayload = {}
     const trimmedLabel = label.trim()
     if (trimmedLabel !== '') payload.label = trimmedLabel
-    if (trimmedKey !== '') payload.key = trimmedKey
+    if (customKey !== '') payload.key = customKey
 
     mutation.mutate(payload, {
       onSuccess: (row) => setCreatedKey(row.key),

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Plus } from 'lucide-react'
+import { AlertTriangle, Plus } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
@@ -65,6 +65,14 @@ export default function ApiKeysPage() {
       {keysQuery.isError && <ErrorNote error={keysQuery.error} />}
       {/* 启停/删除失败时的提示（下一次操作发起时自动清除） */}
       {actionError !== null && <ErrorNote error={actionError} labelKey="common.actionFailed" />}
+
+      {/* 用量联表失败不致命：key 列表照常展示，但要明示用量列不可信，避免被当成"没用量" */}
+      {usageQuery.isError && (
+        <div className="flex items-center gap-1.5 px-1 text-xs text-warning">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>{t('keys.usageLoadFailed')}</span>
+        </div>
+      )}
 
       <KeysTable
         data={keysQuery.data}

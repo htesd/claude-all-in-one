@@ -49,30 +49,43 @@ CREATE INDEX IF NOT EXISTS idx_usage_client  ON usage_records(client_key_id, cre
 ///
 /// 连接用 Mutex 包裹:Phase 0 控制面访问量极低,单连接足够;
 /// P4 若热点化再换连接池。WAL 模式允许跨进程并发读。
+///
+/// `stats_conn` 是统计聚合专用的只读连接:admin 看板的全历史 GROUP BY
+/// 可能持锁数百毫秒,若与数据面共用一把锁,管理员开个页面就能把客户请求
+/// 的鉴权和计费落库排队(对抗审查 Architect#1)。WAL 下读写跨连接并发,
+/// 拆开后统计再慢也只占自己的锁。
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    stats_conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteStore {
     /// 打开(或创建)数据库,启用 WAL,建表。
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path.as_ref())?;
         // WAL:多进程并发读友好;NORMAL 同步在 WAL 下安全且快。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(SCHEMA)?;
+        // 统计读连接(主连接建完表后再开);query_only 双保险防误写。
+        let stats = Connection::open(path.as_ref())?;
+        stats.pragma_update(None, "busy_timeout", 5000)?;
+        stats.pragma_update(None, "query_only", true)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            stats_conn: Arc::new(Mutex::new(stats)),
         })
     }
 
-    /// 内存库(测试用)。
+    /// 内存库(测试用)。独立内存连接是另一个库,统计连接直接共享主连接。
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            stats_conn: conn.clone(),
+            conn,
         })
     }
 
@@ -88,12 +101,13 @@ impl SqliteStore {
 
     // ───────── API key CRUD(admin 管理页) ─────────
 
-    /// 列出全部客户端 API key(created_at 倒序,同秒按 key 升序保证稳定)。
+    /// 列出全部客户端 API key(created_at 倒序;同秒按 rowid 倒序兜底,
+    /// 保证"新建项在顶部"不被秒级精度破坏)。
     pub fn list_api_keys(&self) -> anyhow::Result<Vec<ApiKeyRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT key, label, disabled, created_at FROM api_keys \
-             ORDER BY created_at DESC, key ASC",
+             ORDER BY created_at DESC, rowid DESC",
         )?;
         let rows = stmt
             .query_map([], Self::row_to_api_key)?
@@ -146,7 +160,12 @@ impl SqliteStore {
         let mut params: Vec<Value> = Vec::new();
         if let Some(l) = label {
             sets.push("label = ?");
-            params.push(Value::Text(l.to_string()));
+            // 空串=清空 → 统一落 NULL,与创建路径一致(避免 ''/NULL 双态)。
+            params.push(if l.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(l.to_string())
+            });
         }
         if let Some(d) = disabled {
             sets.push("disabled = ?");
@@ -196,7 +215,7 @@ impl SqliteStore {
              COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
              COALESCE(SUM(cache_creation_tokens),0) FROM usage_records WHERE {where_}"
         );
-        let conn = self.conn.lock();
+        let conn = self.stats_conn.lock();
         let s = conn.query_row(&sql, rusqlite::params_from_iter(params), |r| {
             Ok(UsageSummary {
                 requests: r.get::<_, i64>(0)? as u64,
@@ -218,7 +237,7 @@ impl SqliteStore {
              COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
              FROM usage_records WHERE {where_} GROUP BY model ORDER BY COUNT(*) DESC"
         );
-        let conn = self.conn.lock();
+        let conn = self.stats_conn.lock();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params), |r| {
@@ -244,7 +263,7 @@ impl SqliteStore {
              COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
              FROM usage_records WHERE {where_} GROUP BY client_key_id ORDER BY COUNT(*) DESC"
         );
-        let conn = self.conn.lock();
+        let conn = self.stats_conn.lock();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params), |r| {
@@ -541,6 +560,22 @@ mod tests {
     }
 
     #[test]
+    fn list_api_keys_same_second_newest_insert_first() {
+        // created_at 秒级精度:同秒创建时按插入序(rowid)倒序兜底,
+        // 保证"新建项在顶部"(对抗审查 Skeptic#3)。
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_api_key("sk-aa-tiebreak", None).unwrap();
+        store.create_api_key("sk-zz-tiebreak", None).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute("UPDATE api_keys SET created_at=500", []).unwrap();
+        }
+        let rows = store.list_api_keys().unwrap();
+        assert_eq!(rows[0].key, "sk-zz-tiebreak", "同秒时后插入的排前面");
+        assert_eq!(rows[1].key, "sk-aa-tiebreak");
+    }
+
+    #[test]
     fn create_api_key_rejects_duplicate() {
         let store = SqliteStore::open_in_memory().unwrap();
         assert!(store.create_api_key("sk-dup", None).unwrap(), "首次创建成功");
@@ -569,10 +604,11 @@ mod tests {
         // 禁用后鉴权应报告 disabled(router 据此拒绝)。
         assert!(store.authenticate("sk-u").await.unwrap().unwrap().disabled);
 
-        // 只改 label,disabled 不动;空串=清空备注。
+        // 只改 label,disabled 不动;空串=清空备注 → NULL(与创建路径一致,
+        // 避免 ''/NULL 双态,对抗审查 Architect#5)。
         assert!(store.update_api_key("sk-u", Some(""), None).unwrap());
         let row = store.get_api_key("sk-u").unwrap().unwrap();
-        assert_eq!(row.label.as_deref(), Some(""), "空串落库为空串(显示层处理)");
+        assert_eq!(row.label, None, "清空备注应落 NULL 而非空串");
         assert!(row.disabled, "改 label 不得动 disabled");
 
         // 不存在的 key 返回 false。
@@ -597,6 +633,28 @@ mod tests {
         // usage 历史保留(按 key 统计仍可见)。
         let by_key = store.usage_by_key(&UsageFilter::default()).unwrap();
         assert!(by_key.iter().any(|r| r.client_key_id == "sk-del"));
+    }
+
+    #[tokio::test]
+    async fn file_backed_stats_see_writes_from_main_connection() {
+        // 守卫:统计查询走独立读连接后,必须仍能看到主连接的已提交写入
+        // (WAL 跨连接可见性),否则 admin 看板会展示陈旧/空数据。
+        let path = std::env::temp_dir().join(format!(
+            "gw-store-stats-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            rec(&store, "k1", "m1", 100, 10, true).await;
+            let s = store.usage_summary(&UsageFilter::default()).unwrap();
+            assert_eq!(s.requests, 1, "统计读连接必须看到主连接的写入");
+            assert!(store.create_api_key("sk-file-guard-1", None).unwrap());
+            assert_eq!(store.list_api_keys().unwrap().len(), 1);
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
     }
 
     #[tokio::test]
