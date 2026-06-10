@@ -4,6 +4,41 @@
 //! 不依赖具体存储(SQLite/Postgres),便于未来替换与测试 mock。
 
 use async_trait::async_trait;
+use serde::Serialize;
+
+/// 用量总览(admin 看板顶部卡)。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UsageSummary {
+    pub requests: u64,
+    pub success_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+/// 按模型聚合行。
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageByModel {
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+/// 按客户 apikey(client_key_id)聚合行。空 client_key_id = 未归属桶。
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageByKey {
+    pub client_key_id: String,
+    pub requests: u64,
+    pub success_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
 
 /// 一条 usage 记录(发往 UsageSink)。
 ///

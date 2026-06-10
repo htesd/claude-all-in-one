@@ -3,6 +3,7 @@
 //! 单二进制多角色:`--mode router` 或 `--mode worker --instance N`。
 //! 见 docs/ARCHITECTURE.md §1。
 
+mod admin;
 mod egress;
 mod registry;
 mod router;
@@ -11,6 +12,10 @@ mod worker;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+
+/// 内网头:router 鉴权后把客户 key 透传给 worker,worker 据此把 usage 归属到该客户。
+/// 仅在 router→worker 的 localhost 内网跳使用(对外 Authorization 不透传给 worker)。
+pub const CLIENT_KEY_HEADER: &str = "x-gw-client-key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -62,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     match args.mode {
         Mode::Router => {
             tracing::info!("启动 router 角色");
-            router::run(&args.instances, &args.db).await
+            router::run(&args.instances, &args.db, &args.system).await
         }
         Mode::Worker => {
             let instance = args.instance.ok_or_else(|| {

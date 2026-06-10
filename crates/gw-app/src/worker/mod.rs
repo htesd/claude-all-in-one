@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -279,9 +279,16 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
 
 async fn messages(
     State(st): State<Arc<WorkerState>>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     let req = ChatRequest::from_anthropic_body(body);
+    // 客户 key 归属:router 鉴权后经内网头透传(对外 Authorization 不到 worker)。
+    let client_key = headers
+        .get(crate::CLIENT_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     // 会话亲和键 = provider 派生的 conversationId(Kiro)。None → 无亲和按负载选号。
     let affinity_key = st.provider.affinity_key(&req);
 
@@ -334,7 +341,9 @@ async fn messages(
         //    - BadRequest:请求本身问题,换号无益,直接返回。
         //    - 其他可重试错误:上报失败、换号重试。
         match st.provider.chat(req.clone(), &ctx).await {
-            Ok(stream) => return finish_response(st.clone(), lease, stream, &req).await,
+            Ok(stream) => {
+                return finish_response(st.clone(), lease, stream, &req, &client_key).await
+            }
             Err(e) if e.kind == UpstreamErrorKind::TokenInvalid => {
                 tracing::info!(account = %account_id, "chat 403 token 失效,尝试同号刷新后重试");
                 match st.force_refresh(ctx.account.clone()).await {
@@ -346,7 +355,8 @@ async fn messages(
                         };
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
-                                return finish_response(st.clone(), lease, stream, &req).await
+                                return finish_response(st.clone(), lease, stream, &req, &client_key)
+                                    .await
                             }
                             Err(e2) => {
                                 // 刷新后仍失败:这次才上报失败 + 换号。
@@ -403,13 +413,13 @@ fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response:
 /// 流结束时把本次 usage 落库(#130)。`usage=None`(空/错误流无终结用量)或 `sink=None`
 /// (控制面库打开失败降级)时直接跳过。落库失败仅告警,**绝不影响**已发给客户端的响应。
 ///
-/// `client_key_id` 暂留空:router 转发到内网 worker 时不透传客户 Authorization
-/// (见 router::forward 注释),按客户归属(v61)需另开 router→worker key 传递通路。
-/// 但 `account_id` 已可用,本表足以支撑按账号的用量/成本观测。
+/// `client_key` = router 经内网头透传的客户 key(无则空串,归到"未归属"桶);连同
+/// `account_id` 一起落库,支撑按账号 + 按客户(apikey)两个维度的用量/成本统计。
 async fn finalize_usage(
     sink: Option<&Arc<dyn UsageSink>>,
     account_id: &str,
     model: &str,
+    client_key: &str,
     usage: Option<&ChatUsage>,
     success: bool,
 ) {
@@ -417,7 +427,7 @@ async fn finalize_usage(
         return;
     };
     let rec = UsageRecord {
-        client_key_id: String::new(),
+        client_key_id: client_key.to_string(),
         account_id: account_id.to_string(),
         model: model.to_string(),
         input_tokens: u.input_tokens,
@@ -439,14 +449,22 @@ async fn finish_response(
     lease: scheduler::AccountLease,
     stream: gw_core::provider::ChatStream,
     req: &ChatRequest,
+    client_key: &str,
 ) -> axum::response::Response {
     if req.stream {
         // 流式:返回惰性 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库)。
-        stream_response(st, lease, stream, req.model.clone())
+        stream_response(st, lease, stream, req.model.clone(), client_key.to_string())
     } else {
         // 非流式:此处即时抽干流、折叠成单个 Messages JSON。
-        collect_response(&st.scheduler, st.usage_sink.as_ref(), lease, stream, req.model.clone())
-            .await
+        collect_response(
+            &st.scheduler,
+            st.usage_sink.as_ref(),
+            lease,
+            stream,
+            req.model.clone(),
+            client_key.to_string(),
+        )
+        .await
     }
 }
 
@@ -463,6 +481,7 @@ async fn collect_response(
     lease: scheduler::AccountLease,
     mut stream: gw_core::provider::ChatStream,
     model: String,
+    client_key: String,
 ) -> axum::response::Response {
     /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
     /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
@@ -520,7 +539,15 @@ async fn collect_response(
         };
         scheduler.report_failure(&account_id, kind);
     }
-    finalize_usage(usage_sink, &account_id, &model, last_usage.as_ref(), success).await;
+    finalize_usage(
+        usage_sink,
+        &account_id,
+        &model,
+        &client_key,
+        last_usage.as_ref(),
+        success,
+    )
+    .await;
     drop(lease); // 释放并发槽(响应已抽干)。
 
     match outcome {
@@ -541,12 +568,14 @@ fn stream_response(
     lease: scheduler::AccountLease,
     stream: gw_core::provider::ChatStream,
     model: String,
+    client_key: String,
 ) -> axum::response::Response {
     /// unfold 累积态:lease 持有到流结束;reported 防重复上报;last_usage 缓存终结用量。
     struct StreamCtx {
         st: Arc<WorkerState>,
         account_id: String,
         model: String,
+        client_key: String,
         _lease: scheduler::AccountLease,
         inner: gw_core::provider::ChatStream,
         saw_error: bool,
@@ -579,11 +608,20 @@ fn stream_response(
             };
             let account_id = self.account_id.clone();
             let model = self.model.clone();
+            let client_key = self.client_key.clone();
             let success = !self.saw_error;
             // detach 到当前运行时;无运行时上下文(理论上不会:SSE body 总在 tokio 内 drop)则跳过。
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    finalize_usage(Some(&sink), &account_id, &model, Some(&usage), success).await;
+                    finalize_usage(
+                        Some(&sink),
+                        &account_id,
+                        &model,
+                        &client_key,
+                        Some(&usage),
+                        success,
+                    )
+                    .await;
                 });
             }
         }
@@ -594,6 +632,7 @@ fn stream_response(
         st,
         account_id,
         model,
+        client_key,
         _lease: lease,
         inner: stream,
         saw_error: false,
@@ -698,7 +737,7 @@ mod tests {
             cache_read_tokens: 50,
             cache_creation_tokens: 7,
         };
-        finalize_usage(Some(&dyn_sink), "acct-1", "claude-x", Some(&usage), true).await;
+        finalize_usage(Some(&dyn_sink), "acct-1", "claude-x", "sk-cust", Some(&usage), true).await;
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].account_id, "acct-1");
@@ -708,14 +747,14 @@ mod tests {
         assert_eq!(rows[0].cache_read_tokens, 50);
         assert_eq!(rows[0].cache_creation_tokens, 7, "cache_creation 不得丢失");
         assert!(rows[0].success);
-        assert_eq!(rows[0].client_key_id, "", "client key 暂未透传到 worker,留空");
+        assert_eq!(rows[0].client_key_id, "sk-cust", "客户 key 应归属落库");
     }
 
     #[tokio::test]
     async fn finalize_usage_skips_when_no_usage() {
         let sink = fake_sink();
         let dyn_sink: Arc<dyn UsageSink> = sink.clone();
-        finalize_usage(Some(&dyn_sink), "acct-1", "m", None, true).await;
+        finalize_usage(Some(&dyn_sink), "acct-1", "m", "", None, true).await;
         assert_eq!(sink.rows.lock().unwrap().len(), 0, "无 usage 不应落库");
     }
 
@@ -723,7 +762,7 @@ mod tests {
     async fn finalize_usage_no_sink_is_noop() {
         // sink=None(库打开失败降级)→ 不 panic、不记录。
         let usage = ChatUsage::default();
-        finalize_usage(None, "acct-1", "m", Some(&usage), false).await;
+        finalize_usage(None, "acct-1", "m", "", Some(&usage), false).await;
     }
 
     #[tokio::test]
@@ -734,7 +773,7 @@ mod tests {
             output_tokens: 5,
             ..Default::default()
         };
-        finalize_usage(Some(&dyn_sink), "a", "m", Some(&usage), false).await;
+        finalize_usage(Some(&dyn_sink), "a", "m", "", Some(&usage), false).await;
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].success, "失败流应记 success=false");
@@ -790,7 +829,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into()).await;
+            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into(), String::new()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
@@ -816,7 +855,7 @@ mod tests {
                 serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
             ))),
         ];
-        let resp = collect_response(&sched, None, lease, chat_stream(items), "m".into()).await;
+        let resp = collect_response(&sched, None, lease, chat_stream(items), "m".into(), String::new()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "overloaded_error");
@@ -840,7 +879,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into()).await;
+            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into(), String::new()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);

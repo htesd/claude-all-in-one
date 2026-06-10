@@ -17,11 +17,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use gw_core::config::InstancesConfig;
+use gw_core::config::{InstancesConfig, SystemConfig};
 use gw_core::routing::extract_session_from_metadata;
 use gw_core::store::ControlStore;
 use gw_store::SqliteStore;
 use parking_lot::Mutex;
+
+use crate::admin::{self, AdminState};
+use crate::CLIENT_KEY_HEADER;
 
 /// 一个 worker 的转发目标。
 #[derive(Clone)]
@@ -48,12 +51,16 @@ struct RouterState {
     http: reqwest::Client,
 }
 
-pub async fn run(instances_path: &Path, db_path: &Path) -> anyhow::Result<()> {
+pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> anyhow::Result<()> {
     let instances: InstancesConfig = {
         let text = std::fs::read_to_string(instances_path)
             .map_err(|e| anyhow::anyhow!("读取 {} 失败: {e}", instances_path.display()))?;
         serde_yaml::from_str(&text)?
     };
+    let system: SystemConfig = std::fs::read_to_string(system_path)
+        .ok()
+        .and_then(|t| serde_yaml::from_str(&t).ok())
+        .unwrap_or_default();
 
     let workers: Vec<WorkerTarget> = instances
         .workers
@@ -77,6 +84,19 @@ pub async fn run(instances_path: &Path, db_path: &Path) -> anyhow::Result<()> {
         }
     };
 
+    // admin 控制面:仅当配置了非空 admin_token 且控制面库可用时启用。
+    let admin_state = match (system.admin.token(), &store) {
+        (Some(token), Some(store)) => Some(AdminState {
+            token: Arc::new(token.to_string()),
+            store: store.clone(),
+        }),
+        (Some(_), None) => {
+            tracing::warn!("配置了 admin_token 但控制面库不可用,admin 未启用");
+            None
+        }
+        (None, _) => None,
+    };
+
     tracing::info!(
         listen = %instances.router.listen,
         workers = workers.len(),
@@ -91,11 +111,17 @@ pub async fn run(instances_path: &Path, db_path: &Path) -> anyhow::Result<()> {
         http: reqwest::Client::new(),
     });
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/v1/messages", post(forward))
         .route("/v1/models", get(forward_models))
         .route("/health", get(health))
         .with_state(state);
+
+    // admin API 挂在 /admin/api(自带 AdminState + 鉴权中间件)。SPA 静态资源后续接 /admin。
+    if let Some(admin_state) = admin_state {
+        tracing::info!("admin 控制面已启用: /admin/api/*");
+        app = app.nest("/admin/api", admin::admin_api_router(admin_state));
+    }
 
     let listener = tokio::net::TcpListener::bind(&instances.router.listen).await?;
     axum::serve(listener, app).await?;
@@ -128,10 +154,11 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    // ① 鉴权。
-    if let Some(resp) = authorize(&st, &headers).await {
-        return resp;
-    }
+    // ① 鉴权(并拿到客户 key,用于用量归属)。
+    let client_key = match authorize(&st, &headers).await {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
 
     // ② 选 worker(会话亲和)。
     let session_id = parse_session_id(&body);
@@ -149,6 +176,10 @@ async fn forward(
     }
     if let Some(ac) = headers.get(axum::http::header::ACCEPT) {
         req = req.header(axum::http::header::ACCEPT, ac);
+    }
+    // 客户 key 归属:经内网头透传给 worker(worker 据此把 usage 归到该客户 #v61)。
+    if let Some(k) = &client_key {
+        req = req.header(CLIENT_KEY_HEADER, k);
     }
 
     match req.send().await {
@@ -172,21 +203,27 @@ async fn forward(
     }
 }
 
-/// 鉴权(forward / forward_models 共用)。OK→`None`;失败→`Some(错误响应)`。
-/// `store=None`(P0 库打不开降级)直接放行。
-async fn authorize(st: &RouterState, headers: &HeaderMap) -> Option<axum::response::Response> {
-    let store = st.store.as_ref()?;
+/// 鉴权(forward / forward_models 共用)。
+/// `Ok(Some(key_id))`=通过且拿到客户 key;`Ok(None)`=放行但无归属(store=None 的 P0 降级);
+/// `Err(resp)`=拒绝(401/500)。key_id 用于把客户用量归属(X-Gw-Client-Key 透传给 worker)。
+async fn authorize(
+    st: &RouterState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, axum::response::Response> {
+    let Some(store) = st.store.as_ref() else {
+        return Ok(None); // P0:无控制面库,放行且无归属。
+    };
     match extract_bearer(headers) {
         Some(k) => match store.authenticate(&k).await {
-            Ok(Some(auth)) if !auth.disabled => None,
-            Ok(Some(_)) => Some(unauthorized("API key 已禁用")),
-            Ok(None) => Some(unauthorized("无效 API key")),
+            Ok(Some(auth)) if !auth.disabled => Ok(Some(auth.key_id)),
+            Ok(Some(_)) => Err(unauthorized("API key 已禁用")),
+            Ok(None) => Err(unauthorized("无效 API key")),
             Err(e) => {
                 tracing::error!("鉴权查询失败: {e}");
-                Some((StatusCode::INTERNAL_SERVER_ERROR, "鉴权失败").into_response())
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "鉴权失败").into_response())
             }
         },
-        None => Some(unauthorized("缺少 Authorization")),
+        None => Err(unauthorized("缺少 Authorization")),
     }
 }
 
@@ -200,7 +237,7 @@ async fn forward_models(
     State(st): State<Arc<RouterState>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if let Some(resp) = authorize(&st, &headers).await {
+    if let Err(resp) = authorize(&st, &headers).await {
         return resp;
     }
     let Some(target) = least_loaded(&st) else {
