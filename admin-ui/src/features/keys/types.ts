@@ -4,6 +4,12 @@ export interface ApiKeyRow {
   /** 备注；后端允许 null（从未设置过）。 */
   label: string | null
   disabled: boolean
+  /** 所属分组名；'' = 未分组。 */
+  group_name: string
+  /** Token 限额；null = 不限。 */
+  quota_tokens: number | null
+  /** 已用 tokens（限额进度分子）。 */
+  used_tokens: number
   /** 创建时间，Unix 秒。 */
   created_at: number
 }
@@ -12,15 +18,21 @@ export interface ApiKeyRow {
 export interface CreateKeyPayload {
   label?: string | null
   key?: string
+  group?: string
 }
 
 /**
  * PATCH /keys/{key} 请求体。
- * 后端语义：字段缺省 = 不修改；`label: ''` = 清空备注 —— 所以这里不需要 null。
+ * 后端语义：字段缺省 = 不修改；`label: ''` = 清空备注；
+ * `group_name: ''` = 移出分组；`quota_tokens <= 0` = 清除限额；
+ * `reset_used: true` = 已用归零。
  */
 export interface UpdateKeyPayload {
   label?: string
   disabled?: boolean
+  group_name?: string
+  quota_tokens?: number
+  reset_used?: boolean
 }
 
 /**

@@ -2,8 +2,10 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 
 import { AppShell } from '@/components/layout/AppShell'
 import { RequireAuth } from '@/features/auth/RequireAuth'
+import AccountsPage from '@/pages/AccountsPage'
 import ApiKeysPage from '@/pages/ApiKeysPage'
 import DashboardPage from '@/pages/DashboardPage'
+import GroupsPage from '@/pages/GroupsPage'
 import LoginPage from '@/pages/LoginPage'
 import UsagePage from '@/pages/UsagePage'
 
@@ -21,7 +23,9 @@ export default function App() {
         >
           <Route index element={<DashboardPage />} />
           <Route path="usage" element={<UsagePage />} />
+          <Route path="accounts" element={<AccountsPage />} />
           <Route path="keys" element={<ApiKeysPage />} />
+          <Route path="groups" element={<GroupsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
