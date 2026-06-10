@@ -27,8 +27,10 @@ export default function LoginPage() {
 
     setLoading(true)
     setError(null)
-    setToken(token)
     try {
+      // setToken 在 try 内:隐私模式等场景 sessionStorage 可能抛异常,
+      // 放外面会跳过 finally 把按钮卡死在 loading。
+      setToken(token)
       const ok = await pingAdmin(token)
       if (ok) {
         navigate('/', { replace: true })
