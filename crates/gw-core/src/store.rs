@@ -6,6 +6,16 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+/// 用量统计筛选条件。`None` 字段 = 该维度不限。
+/// - `since_unix` / `until_unix`:时间窗 [since, until)(Unix 秒);
+/// - `client_key_id`:只统计该客户 key(Some("") 表示只看"未归属"桶)。
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    pub since_unix: Option<i64>,
+    pub until_unix: Option<i64>,
+    pub client_key_id: Option<String>,
+}
+
 /// 用量总览(admin 看板顶部卡)。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageSummary {
