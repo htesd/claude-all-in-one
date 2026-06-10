@@ -40,6 +40,9 @@ struct WorkerState {
     refresh_locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// usage 落库汇(#130)。打开失败时为 None(降级:usage 仅记日志不入库)。
     usage_sink: Option<Arc<dyn UsageSink>>,
+    /// 控制面库(账号事实源):刷新后回写 rolling refresh_token、30s 周期 sync 账号集。
+    /// None = 库打开失败(降级:账号只来自 yaml 启动快照,改动需重启)。
+    store: Option<Arc<SqliteStore>>,
     /// worker 的 egress client(provider 已持有同一个;此处保留供诊断)。
     _client: reqwest::Client,
 }
@@ -95,6 +98,22 @@ impl WorkerState {
             }
         }
         let refreshed = Arc::new(self.provider.refresh_auth(&account).await?);
+        // 先持久化再进内存:rolling refresh_token 不落库,重启即回退到旧 token
+        // (Kiro 旧 token 可能已被作废 → invalid_grant 永久失效)。写库失败只告警,
+        // 不拦请求(内存里仍是新 token,服务不中断)。
+        if let Some(store) = &self.store {
+            match serde_json::to_string(&refreshed.extra) {
+                Ok(extra_json) => {
+                    if let Err(e) =
+                        store.update_account_extra(&refreshed.account_id, &extra_json)
+                    {
+                        tracing::warn!(account = %refreshed.account_id,
+                            "刷新后回写 DB 失败(重启可能丢 rolling token): {e}");
+                    }
+                }
+                Err(e) => tracing::warn!(account = %refreshed.account_id, "extra 序列化失败: {e}"),
+            }
+        }
         // 回写 scheduler:带新 access_token / rolling refresh_token 的副本进入选号池
         // (单一事实来源;无独立 creds 缓存,避免两份凭证发散)。
         self.scheduler.update_account(refreshed.clone());
@@ -157,7 +176,14 @@ pub async fn run(
     db_path: &Path,
 ) -> anyhow::Result<()> {
     let instances: InstancesConfig = load_yaml(instances_path)?;
-    let accounts_cfg: AccountsConfig = load_yaml(accounts_path)?;
+    // accounts.yaml 自切片④起为可选:首启播种用,导入后 DB 是账号事实源。
+    let accounts_cfg: Option<AccountsConfig> = match load_yaml::<AccountsConfig>(accounts_path) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::info!("accounts.yaml 不可用(账号将只来自 DB): {e}");
+            None
+        }
+    };
     let system: SystemConfig = load_yaml(system_path).unwrap_or_default();
 
     let wcfg = instances
@@ -165,9 +191,57 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("instances.yaml 中无 instance={instance}"))?
         .clone();
 
-    let group = accounts_cfg
-        .group(&wcfg.account_group)
-        .ok_or_else(|| anyhow::anyhow!("accounts.yaml 中无组 '{}'", wcfg.account_group))?;
+    // 控制面库:账号事实源 + usage 落库(与 router 共享同一 SQLite,WAL 多进程并发)。
+    // 打不开则降级:账号退回 yaml 启动快照、usage 仅记日志不入库。
+    let store: Option<Arc<SqliteStore>> = match SqliteStore::open(db_path) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::warn!("控制面库打开失败(账号回退 yaml,usage 不落库): {e}");
+            None
+        }
+    };
+
+    // 首启播种:yaml → DB 幂等导入(已有行不覆盖,绝不回滚已 roll 的 token)。
+    if let (Some(store), Some(cfg)) = (&store, &accounts_cfg) {
+        match store.import_accounts(cfg) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(imported = n, "accounts.yaml 新账号已导入 DB"),
+            Err(e) => tracing::warn!("accounts.yaml 导入失败: {e}"),
+        }
+    }
+
+    // 账号集:DB 优先(admin 可管理),无库时退回 yaml。
+    let accounts: Vec<Arc<Account>> = match &store {
+        Some(store) => store
+            .load_group_accounts(&wcfg.account_group)?
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+        None => accounts_cfg
+            .as_ref()
+            .and_then(|c| c.group_accounts_with_provider(&wcfg.account_group))
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+    };
+    if accounts.is_empty() {
+        tracing::warn!(group = %wcfg.account_group,
+            "组内暂无账号(可经 admin 添加,30s 内生效);期间请求将报『组内无账号』");
+    }
+
+    // provider 家族:yaml 组定义优先,否则取组内首个账号的 provider,缺省 kiro。
+    let provider_family = accounts_cfg
+        .as_ref()
+        .and_then(|c| c.group(&wcfg.account_group))
+        .map(|g| g.provider.clone())
+        .or_else(|| {
+            accounts
+                .first()
+                .map(|a| a.provider.clone())
+                .filter(|p| !p.is_empty())
+        })
+        .unwrap_or_else(|| "kiro".to_string());
 
     let registry = Registry::with_builtins();
     tracing::debug!(providers = ?registry.families(), "已注册 provider");
@@ -178,23 +252,10 @@ pub async fn run(
     // provider 工厂 cfg:注入 system.cache(缓存计费 multiplier/cap/floor)。序列化失败
     // 退回 Null(provider 各自回退默认参数,不致命)。
     let provider_cfg = serde_json::to_value(&system.cache).unwrap_or(serde_json::Value::Null);
-    let provider = registry.build(&group.provider, &provider_cfg, client.clone())?;
-    let accounts: Vec<Arc<Account>> = accounts_cfg
-        .group_accounts_with_provider(&wcfg.account_group)
-        .unwrap_or_default()
-        .into_iter()
-        .map(Arc::new)
-        .collect();
+    let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
 
-    // usage 落库汇:与 router 共享同一 SQLite(WAL,多进程并发)。打不开则降级为
-    // 仅记日志不入库(对齐 router 鉴权库的容忍降级,不因控制面库缺失而拒绝服务)。
-    let usage_sink: Option<Arc<dyn UsageSink>> = match SqliteStore::open(db_path) {
-        Ok(s) => Some(Arc::new(s)),
-        Err(e) => {
-            tracing::warn!("usage 库打开失败,usage 不落库(降级): {e}");
-            None
-        }
-    };
+    let usage_sink: Option<Arc<dyn UsageSink>> =
+        store.clone().map(|s| s as Arc<dyn UsageSink>);
 
     tracing::info!(
         instance,
@@ -215,8 +276,35 @@ pub async fn run(
         scheduler: AccountScheduler::new(accounts),
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         usage_sink,
+        store: store.clone(),
         _client: client,
     });
+
+    // 账号配置 sync:30s 从 DB 重读组内账号集,admin 增删改无需重启 worker 即生效。
+    // (翻转语义见 scheduler::sync_accounts;读库失败跳过本轮,不影响服务。)
+    if let Some(store) = store {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // 首跳立即触发,跳过(启动时刚加载过)。
+            loop {
+                tick.tick().await;
+                match store.load_group_accounts(&st.group) {
+                    Ok(accs) => {
+                        let out = st
+                            .scheduler
+                            .sync_accounts(accs.into_iter().map(Arc::new).collect());
+                        if out.added + out.removed > 0 {
+                            tracing::info!(added = out.added, removed = out.removed,
+                                "账号集已按 DB 同步");
+                        }
+                    }
+                    Err(e) => tracing::warn!("账号 sync 读库失败,跳过本轮: {e}"),
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/v1/messages", post(messages))
@@ -265,6 +353,8 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "group": st.group,
         "provider": st.provider.family(),
         "accounts": st.scheduler.total(),
+        // 每账号运行态(冷却/封禁/并发占用),admin 账号页经 router 聚合展示。
+        "accounts_status": st.scheduler.status_snapshot(),
         // usage 是否在落库:库打开失败时为 false(降级,usage 不入库),便于运维发现。
         "usage_persist": st.usage_sink.is_some(),
         "status": "ok"

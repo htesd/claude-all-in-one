@@ -87,10 +87,11 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
 
     // admin 控制面:仅当配置了非空 admin_token 且控制面库可用时启用。
     let admin_state = match (system.admin.token(), &store) {
-        (Some(token), Some(store)) => Some(AdminState {
-            token: Arc::new(token.to_string()),
-            store: store.clone(),
-        }),
+        (Some(token), Some(store)) => Some(AdminState::new(
+            Arc::new(token.to_string()),
+            store.clone(),
+            instances.workers.clone(),
+        )),
         (Some(_), None) => {
             tracing::warn!("配置了 admin_token 但控制面库不可用,admin 未启用");
             None
@@ -226,8 +227,16 @@ async fn authorize(
     };
     match extract_bearer(headers) {
         Some(k) => match store.authenticate(&k).await {
-            Ok(Some(auth)) if !auth.disabled => Ok(Some(auth.key_id)),
-            Ok(Some(_)) => Err(unauthorized("API key 已禁用")),
+            Ok(Some(auth)) if auth.disabled => Err(unauthorized("API key 已禁用")),
+            // 限额用尽:429(语义对齐 rate limit 家族,客户端可识别;admin 提额或
+            // 重置 used 后立即恢复——逐请求查库,无缓存)。
+            Ok(Some(auth)) if auth.over_quota => Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"type":"error","error":{
+                    "type":"rate_limit_error","message":"API key 限额已用尽,请联系管理员"}})),
+            )
+                .into_response()),
+            Ok(Some(auth)) => Ok(Some(auth.key_id)),
             Ok(None) => Err(unauthorized("无效 API key")),
             Err(e) => {
                 tracing::error!("鉴权查询失败: {e}");

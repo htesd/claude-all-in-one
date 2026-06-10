@@ -14,6 +14,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gw_store::SqliteStore;
 
+mod accounts;
+mod groups;
 mod keys;
 mod usage;
 
@@ -22,6 +24,29 @@ mod usage;
 pub struct AdminState {
     pub token: Arc<String>,
     pub store: Arc<SqliteStore>,
+    /// worker 拓扑(来自 instances.yaml):账号运行态聚合时逐个拉 /health。
+    pub workers: Arc<Vec<gw_core::config::WorkerConfig>>,
+    /// 聚合 worker /health 用的内网客户端(短超时,worker 掉线不拖死页面)。
+    pub http: reqwest::Client,
+}
+
+impl AdminState {
+    pub fn new(
+        token: Arc<String>,
+        store: Arc<SqliteStore>,
+        workers: Vec<gw_core::config::WorkerConfig>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("reqwest client 构造失败");
+        Self {
+            token,
+            store,
+            workers: Arc::new(workers),
+            http,
+        }
+    }
 }
 
 /// 组装 admin API 子路由(全部受鉴权中间件保护)。挂到 `/admin/api` 下。
@@ -30,6 +55,8 @@ pub fn admin_api_router(state: AdminState) -> Router {
         .route("/ping", get(ping))
         .merge(usage::router())
         .merge(keys::router())
+        .merge(groups::router())
+        .merge(accounts::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state)
 }
@@ -99,6 +126,40 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// 各端点测试共用的 app/req 构造(in-memory 库 + 空 worker 拓扑)。
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use gw_store::SqliteStore;
+
+    use super::{admin_api_router, AdminState};
+
+    pub const TOKEN: &str = "admt-test";
+
+    pub fn app() -> (axum::Router, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let st = AdminState::new(Arc::new(TOKEN.to_string()), store.clone(), vec![]);
+        (admin_api_router(st), store)
+    }
+
+    pub fn req(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
+        let b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-api-key", TOKEN);
+        match body {
+            Some(s) => b
+                .header("content-type", "application/json")
+                .body(Body::from(s.to_string()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        }
+    }
 }
 
 #[cfg(test)]

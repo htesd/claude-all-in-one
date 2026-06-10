@@ -77,6 +77,9 @@ struct CredentialState {
     disabled: bool,
     /// 禁用原因(决定自愈)。
     disabled_reason: Option<DisabledReason>,
+    /// 最近一次从配置(DB)看到的 disabled 值。sync 只在**翻转**时动 runtime:
+    /// 配置 false→false 不得反复清掉运行时冷却/封禁(admin 显式开关才算意图)。
+    config_disabled: bool,
     /// 冷却到期时刻(仅 cooldown 类有效);到点后选号前 sweep 自愈。
     disabled_until: Option<Instant>,
     /// 连续 API 失败次数(成功清零;达 MAX_FAILURES 禁用)。
@@ -101,6 +104,7 @@ impl CredentialState {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             priority,
             disabled: account.disabled,
+            config_disabled: account.disabled,
             disabled_reason: None,
             disabled_until: None,
             failure_count: 0,
@@ -110,6 +114,30 @@ impl CredentialState {
             account,
         }
     }
+}
+
+/// 单账号运行态快照(worker /status → admin 账号页)。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountStatusSnapshot {
+    pub account_id: String,
+    pub priority: i64,
+    pub disabled: bool,
+    /// 禁用原因:rate_limited / empty_response / quota_exhausted /
+    /// invalid_refresh_token / too_many_failures / config('' = 正常)。
+    pub reason: String,
+    /// 冷却剩余秒(仅冷却类 > 0)。
+    pub cooldown_remaining_secs: u64,
+    pub failure_count: u32,
+    /// 当前空闲并发许可数(max_concurrency - 在途)。
+    pub available_permits: usize,
+    pub max_concurrency: u32,
+}
+
+/// [`AccountScheduler::sync_accounts`] 的变更统计(日志用)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub added: usize,
+    pub removed: usize,
 }
 
 /// 会话亲和记录:session_key → 当前 primary 账号(带 TTL 淘汰)。
@@ -384,6 +412,108 @@ impl AccountScheduler {
         healed
     }
 
+    /// 用 DB 最新配置同步账号集(后台周期调用,admin 增删改无需重启 worker):
+    /// 新增建态、消失移除(并清其亲和)、已有替换配置副本但保留运行态;
+    /// 配置 disabled **翻转**才动 runtime(→true 强制禁用,→false 视为 admin
+    /// 显式复活,清运行时禁用)。
+    pub fn sync_accounts(&self, accounts: Vec<Arc<Account>>) -> SyncOutcome {
+        let mut out = SyncOutcome::default();
+        let mut entries = self.entries.lock();
+
+        let incoming: HashSet<String> =
+            accounts.iter().map(|a| a.account_id.clone()).collect();
+        let removed_ids: Vec<String> = entries
+            .keys()
+            .filter(|id| !incoming.contains(*id))
+            .cloned()
+            .collect();
+        for id in &removed_ids {
+            entries.remove(id);
+            out.removed += 1;
+        }
+
+        for acc in accounts {
+            match entries.get_mut(&acc.account_id) {
+                None => {
+                    tracing::info!(account = %acc.account_id, "sync:新增账号");
+                    entries.insert(acc.account_id.clone(), CredentialState::new(acc));
+                    out.added += 1;
+                }
+                Some(e) => {
+                    // 配置 disabled 翻转才动 runtime(同值保持,避免周期 sync 洗状态)。
+                    if acc.disabled != e.config_disabled {
+                        e.config_disabled = acc.disabled;
+                        e.disabled = acc.disabled;
+                        e.disabled_reason = None;
+                        e.disabled_until = None;
+                        if acc.disabled {
+                            tracing::info!(account = %acc.account_id, "sync:配置禁用");
+                        } else {
+                            tracing::info!(account = %acc.account_id, "sync:配置启用(清运行时禁用)");
+                            e.failure_count = 0;
+                        }
+                    }
+                    // 并发上限变化 → 换新信号量(在途许可持旧信号量,自然衰减)。
+                    if acc.max_concurrency != e.account.max_concurrency {
+                        e.semaphore =
+                            Arc::new(Semaphore::new(acc.max_concurrency.max(1) as usize));
+                    }
+                    e.priority = acc
+                        .extra
+                        .get("priority")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(100);
+                    e.account = acc;
+                }
+            }
+        }
+        drop(entries);
+
+        // 清掉指向已移除账号的亲和(下次该会话自然重选)。
+        if !removed_ids.is_empty() {
+            let removed: HashSet<&String> = removed_ids.iter().collect();
+            self.affinity
+                .lock()
+                .retain(|_, v| !removed.contains(&v.primary));
+        }
+        out
+    }
+
+    /// 全账号运行态快照(worker /status → admin 账号页;id 升序稳定输出)。
+    pub fn status_snapshot(&self) -> Vec<AccountStatusSnapshot> {
+        let now = Instant::now();
+        let entries = self.entries.lock();
+        let mut snap: Vec<AccountStatusSnapshot> = entries
+            .values()
+            .map(|e| {
+                let reason = match e.disabled_reason {
+                    Some(DisabledReason::RateLimited) => "rate_limited",
+                    Some(DisabledReason::EmptyResponse) => "empty_response",
+                    Some(DisabledReason::QuotaExhausted) => "quota_exhausted",
+                    Some(DisabledReason::InvalidRefreshToken) => "invalid_refresh_token",
+                    Some(DisabledReason::TooManyFailures) => "too_many_failures",
+                    None if e.disabled => "config",
+                    None => "",
+                };
+                AccountStatusSnapshot {
+                    account_id: e.account.account_id.clone(),
+                    priority: e.priority,
+                    disabled: e.disabled,
+                    reason: reason.to_string(),
+                    cooldown_remaining_secs: e
+                        .disabled_until
+                        .map(|t| t.saturating_duration_since(now).as_secs())
+                        .unwrap_or(0),
+                    failure_count: e.failure_count,
+                    available_permits: e.semaphore.available_permits(),
+                    max_concurrency: e.account.max_concurrency,
+                }
+            })
+            .collect();
+        snap.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+        snap
+    }
+
     /// 刷新后回写账号(带新 token 的副本),供下次选号使用。保留运行态(并发/计数/LRU)。
     pub fn update_account(&self, account: Arc<Account>) {
         let mut entries = self.entries.lock();
@@ -616,6 +746,109 @@ mod tests {
         s.update_account(updated);
         let lease = s.acquire(Some("s")).await.unwrap();
         assert_eq!(lease.account.extra_str("access_token"), Some("new"));
+    }
+
+    // ───────── sync_accounts(admin 增删改免重启) ─────────
+
+    fn acct_disabled(id: &str, disabled: bool) -> Arc<Account> {
+        let mut a = (*acct(id, 2, None)).clone();
+        a.disabled = disabled;
+        Arc::new(a)
+    }
+
+    #[tokio::test]
+    async fn sync_adds_and_removes_accounts() {
+        let s = sched(vec![acct("a", 2, None), acct("b", 2, None)]);
+        // 钉一个会话到 a(平局按 id,首选 a)。
+        let first = s.acquire(Some("sess-pin")).await.unwrap().account_id().to_string();
+        assert_eq!(first, "a");
+
+        let out = s.sync_accounts(vec![acct("b", 2, None), acct("c", 2, None)]);
+        assert_eq!((out.added, out.removed), (1, 1), "新增 c,移除 a");
+        assert_eq!(s.total(), 2);
+        // a 已移除:原钉 a 的会话必须改钉存活账号,不得报错。
+        let next = s.acquire(Some("sess-pin")).await.unwrap().account_id().to_string();
+        assert_ne!(next, "a");
+        // c 可被租用。
+        assert!(s.account("c").is_some());
+        assert!(s.account("a").is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_config_disable_then_enable() {
+        let s = sched(vec![acct("a", 2, None)]);
+        // 配置翻转 → 禁用。
+        s.sync_accounts(vec![acct_disabled("a", true)]);
+        assert_eq!(s.acquire(None).await.err(), Some(AcquireError::AllDisabled));
+        // 同配置重复 sync:保持禁用(不抖动)。
+        s.sync_accounts(vec![acct_disabled("a", true)]);
+        assert_eq!(s.acquire(None).await.err(), Some(AcquireError::AllDisabled));
+        // 翻回 false → 复活。
+        s.sync_accounts(vec![acct_disabled("a", false)]);
+        assert!(s.acquire(None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sync_unchanged_config_keeps_runtime_disable() {
+        let s = sched(vec![acct("a", 2, None)]);
+        s.report_failure("a", UpstreamErrorKind::QuotaExhausted);
+        assert_eq!(s.acquire(None).await.err(), Some(AcquireError::AllDisabled));
+        // 配置一直是 false → false:30s 周期 sync 不得把运行时封禁洗掉。
+        s.sync_accounts(vec![acct("a", 2, None)]);
+        assert_eq!(
+            s.acquire(None).await.err(),
+            Some(AcquireError::AllDisabled),
+            "配置未翻转,运行时禁用必须保留"
+        );
+        // admin 显式禁用→启用一轮 = 人工复活。
+        s.sync_accounts(vec![acct_disabled("a", true)]);
+        s.sync_accounts(vec![acct_disabled("a", false)]);
+        assert!(s.acquire(None).await.is_ok(), "显式开关翻转应清运行时禁用");
+    }
+
+    #[tokio::test]
+    async fn sync_replaces_account_config_keeps_runtime() {
+        let s = sched(vec![acct("a", 2, None)]);
+        s.report_failure("a", UpstreamErrorKind::ServerError);
+        // 换 extra(凭据轮换)+ 提并发。
+        let mut newer = (*acct("a", 4, Some(7))).clone();
+        newer.extra.insert("refresh_token".into(), serde_json::json!("rt-new"));
+        s.sync_accounts(vec![Arc::new(newer)]);
+        let got = s.account("a").unwrap();
+        assert_eq!(got.extra_str("refresh_token"), Some("rt-new"));
+        assert_eq!(got.max_concurrency, 4);
+        // 运行态保留:failure_count 不归零(snapshot 验证)。
+        let snap = s.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert_eq!(a.failure_count, 1, "sync 不得清运行时失败计数");
+        assert_eq!(a.priority, 7, "priority 跟随新配置");
+        assert_eq!(a.max_concurrency, 4);
+    }
+
+    // ───────── status_snapshot ─────────
+
+    #[tokio::test]
+    async fn status_snapshot_reflects_runtime_states() {
+        let s = sched(vec![acct("a", 2, None), acct("b", 1, None)]);
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+
+        let snap = s.status_snapshot();
+        assert_eq!(snap.len(), 2);
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(a.disabled);
+        assert_eq!(a.reason, "rate_limited");
+        assert!(a.cooldown_remaining_secs > 0 && a.cooldown_remaining_secs <= 60);
+        let b = snap.iter().find(|x| x.account_id == "b").unwrap();
+        assert!(!b.disabled);
+        assert_eq!(b.reason, "");
+        assert_eq!(b.available_permits, 1);
+        assert_eq!(b.max_concurrency, 1);
+
+        // 在途租约要反映到 available_permits。
+        let _lease = s.acquire(None).await.unwrap(); // a 禁用 → 租到 b
+        let snap = s.status_snapshot();
+        let b = snap.iter().find(|x| x.account_id == "b").unwrap();
+        assert_eq!(b.available_permits, 0, "持有租约期间并发槽占用");
     }
 }
 

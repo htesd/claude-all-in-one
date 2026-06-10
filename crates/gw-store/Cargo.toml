@@ -12,6 +12,10 @@ rusqlite.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+# accounts.extra(provider 专属字段)与 yaml 导入的 JSON 编解码。
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# import_accounts 测试构造 AccountsConfig 用。
+serde_yaml.workspace = true
