@@ -8,9 +8,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use gw_core::account::Account;
+use gw_core::config::AccountsConfig;
 use gw_core::store::{
-    ApiKeyRow, AuthenticatedKey, ControlStore, UsageByKey, UsageByModel, UsageFilter, UsageRecord,
-    UsageSink, UsageSummary,
+    AccountPatch, AccountRow, ApiKeyPatch, ApiKeyRow, AuthenticatedKey, ControlStore, GroupRow,
+    UsageByKey, UsageByModel, UsageFilter, UsageRecord, UsageSink, UsageSummary,
 };
 use rusqlite::types::Value;
 use parking_lot::Mutex;
@@ -43,6 +45,28 @@ CREATE TABLE IF NOT EXISTS usage_records (
 CREATE INDEX IF NOT EXISTS idx_usage_created  ON usage_records(created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_records(account_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_client  ON usage_records(client_key_id, created_at);
+
+-- 分组(账号组,同时用于 key 归类)。name 即 accounts.yaml 的组名(G0/G1...)。
+CREATE TABLE IF NOT EXISTS groups (
+    name       TEXT PRIMARY KEY,
+    color      TEXT NOT NULL DEFAULT '',
+    note       TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+-- 上游账号(配置态;运行态在 worker 调度器内存里,经 /status 暴露)。
+-- extra 为 provider 专属字段 JSON(refresh_token 等,与 Account.extra 对应);
+-- worker 刷新 token 后回写本表,重启不再丢 rolling refresh_token。
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id      TEXT PRIMARY KEY,
+    group_name      TEXT NOT NULL DEFAULT '',
+    provider        TEXT NOT NULL DEFAULT 'kiro',
+    max_concurrency INTEGER NOT NULL DEFAULT 1,
+    disabled        INTEGER NOT NULL DEFAULT 0,
+    extra           TEXT NOT NULL DEFAULT '{}',
+    created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_name);
 "#;
 
 /// SQLite 控制面存储。
@@ -67,7 +91,7 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.execute_batch(SCHEMA)?;
+        Self::setup_schema(&conn)?;
         // 统计读连接(主连接建完表后再开);query_only 双保险防误写。
         let stats = Connection::open(path.as_ref())?;
         stats.pragma_update(None, "busy_timeout", 5000)?;
@@ -81,12 +105,36 @@ impl SqliteStore {
     /// 内存库(测试用)。独立内存连接是另一个库,统计连接直接共享主连接。
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        Self::setup_schema(&conn)?;
         let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             stats_conn: conn.clone(),
             conn,
         })
+    }
+
+    /// 建表 + 增量列迁移(新旧库统一走这里)。
+    fn setup_schema(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(SCHEMA)?;
+        // api_keys 增量列(SQLite 不支持 ALTER COLUMN,只能 ADD COLUMN;
+        // CREATE TABLE IF NOT EXISTS 不会给已存在的表补列,故逐列探测)。
+        Self::ensure_column(conn, "api_keys", "group_name", "group_name TEXT NOT NULL DEFAULT ''")?;
+        Self::ensure_column(conn, "api_keys", "quota_tokens", "quota_tokens INTEGER")?;
+        Self::ensure_column(conn, "api_keys", "used_tokens", "used_tokens INTEGER NOT NULL DEFAULT 0")?;
+        Ok(())
+    }
+
+    /// 列不存在则 ADD COLUMN(表名/DDL 为代码常量,无注入面)。
+    fn ensure_column(conn: &Connection, table: &str, col: &str, ddl: &str) -> anyhow::Result<()> {
+        let exists: bool = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+            ))?
+            .exists([col])?;
+        if !exists {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"), [])?;
+        }
+        Ok(())
     }
 
     /// 新增一个客户端 API key(admin / 播种用)。
@@ -101,14 +149,17 @@ impl SqliteStore {
 
     // ───────── API key CRUD(admin 管理页) ─────────
 
+    const API_KEY_COLS: &'static str =
+        "key, label, disabled, group_name, quota_tokens, used_tokens, created_at";
+
     /// 列出全部客户端 API key(created_at 倒序;同秒按 rowid 倒序兜底,
     /// 保证"新建项在顶部"不被秒级精度破坏)。
     pub fn list_api_keys(&self) -> anyhow::Result<Vec<ApiKeyRow>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT key, label, disabled, created_at FROM api_keys \
-             ORDER BY created_at DESC, rowid DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM api_keys ORDER BY created_at DESC, rowid DESC",
+            Self::API_KEY_COLS
+        ))?;
         let rows = stmt
             .query_map([], Self::row_to_api_key)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -118,8 +169,10 @@ impl SqliteStore {
     /// 读取单个 key 的元数据(POST/PATCH 响应体用)。
     pub fn get_api_key(&self, key: &str) -> anyhow::Result<Option<ApiKeyRow>> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached("SELECT key, label, disabled, created_at FROM api_keys WHERE key = ?1")?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {} FROM api_keys WHERE key = ?1",
+            Self::API_KEY_COLS
+        ))?;
         match stmt.query_row([key], Self::row_to_api_key) {
             Ok(row) => Ok(Some(row)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -132,44 +185,59 @@ impl SqliteStore {
             key: r.get(0)?,
             label: r.get(1)?,
             disabled: r.get::<_, i64>(2)? != 0,
-            created_at: r.get(3)?,
+            group_name: r.get(3)?,
+            quota_tokens: r.get(4)?,
+            used_tokens: r.get(5)?,
+            created_at: r.get(6)?,
         })
     }
 
     /// 严格新增:已存在返回 `false`(admin 创建需要感知冲突,区别于播种用的
     /// [`Self::add_api_key`] 静默忽略)。
-    pub fn create_api_key(&self, key: &str, label: Option<&str>) -> anyhow::Result<bool> {
+    pub fn create_api_key(
+        &self,
+        key: &str,
+        label: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO api_keys (key, label) VALUES (?1, ?2)",
-            (key, label),
+            "INSERT OR IGNORE INTO api_keys (key, label, group_name) VALUES (?1, ?2, ?3)",
+            (key, label, group.unwrap_or("")),
         )?;
         Ok(changed == 1)
     }
 
-    /// 部分更新:`None` 字段不动;返回 `false` = key 不存在。
-    /// 两个字段都为 `None` 时只做存在性检查(no-op)。
-    pub fn update_api_key(
-        &self,
-        key: &str,
-        label: Option<&str>,
-        disabled: Option<bool>,
-    ) -> anyhow::Result<bool> {
+    /// 部分更新(见 [`ApiKeyPatch`] 各字段语义);返回 `false` = key 不存在。
+    /// 全字段缺省时只做存在性检查(no-op)。
+    pub fn update_api_key(&self, key: &str, patch: &ApiKeyPatch) -> anyhow::Result<bool> {
         // 动态拼 SET 子句(列名是代码常量,值全部参数化,无注入面)。
         let mut sets: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
-        if let Some(l) = label {
+        if let Some(l) = &patch.label {
             sets.push("label = ?");
             // 空串=清空 → 统一落 NULL,与创建路径一致(避免 ''/NULL 双态)。
             params.push(if l.is_empty() {
                 Value::Null
             } else {
-                Value::Text(l.to_string())
+                Value::Text(l.clone())
             });
         }
-        if let Some(d) = disabled {
+        if let Some(d) = patch.disabled {
             sets.push("disabled = ?");
             params.push(Value::Integer(d as i64));
+        }
+        if let Some(g) = &patch.group_name {
+            sets.push("group_name = ?");
+            params.push(Value::Text(g.clone()));
+        }
+        if let Some(q) = patch.quota_tokens {
+            sets.push("quota_tokens = ?");
+            // <= 0 视为清除限额(NULL = 不限)。
+            params.push(if q > 0 { Value::Integer(q) } else { Value::Null });
+        }
+        if patch.reset_used {
+            sets.push("used_tokens = 0");
         }
         let conn = self.conn.lock();
         if sets.is_empty() {
@@ -190,6 +258,273 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let changed = conn.execute("DELETE FROM api_keys WHERE key = ?1", [key])?;
         Ok(changed == 1)
+    }
+
+    // ───────── 分组 CRUD(admin 管理页;账号组 + key 归类) ─────────
+
+    /// 列出全部分组(含组内账号数/绑定 key 数,创建序)。
+    pub fn list_groups(&self) -> anyhow::Result<Vec<GroupRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT g.name, g.color, g.note, g.created_at, \
+             (SELECT COUNT(*) FROM accounts a WHERE a.group_name = g.name), \
+             (SELECT COUNT(*) FROM api_keys k WHERE k.group_name = g.name) \
+             FROM groups g ORDER BY g.created_at ASC, g.name ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(GroupRow {
+                    name: r.get(0)?,
+                    color: r.get(1)?,
+                    note: r.get(2)?,
+                    created_at: r.get(3)?,
+                    account_count: r.get::<_, i64>(4)? as u64,
+                    key_count: r.get::<_, i64>(5)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 严格新增分组;已存在返回 `false`。
+    pub fn create_group(&self, name: &str, color: &str, note: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO groups (name, color, note) VALUES (?1, ?2, ?3)",
+            (name, color, note),
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 部分更新 color/note(`None` 不动);`false` = 组不存在。
+    pub fn update_group(
+        &self,
+        name: &str,
+        color: Option<&str>,
+        note: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(c) = color {
+            sets.push("color = ?");
+            params.push(Value::Text(c.to_string()));
+        }
+        if let Some(n) = note {
+            sets.push("note = ?");
+            params.push(Value::Text(n.to_string()));
+        }
+        let conn = self.conn.lock();
+        if sets.is_empty() {
+            let exists: bool = conn
+                .prepare_cached("SELECT 1 FROM groups WHERE name = ?1")?
+                .exists([name])?;
+            return Ok(exists);
+        }
+        params.push(Value::Text(name.to_string()));
+        let sql = format!("UPDATE groups SET {} WHERE name = ?", sets.join(", "));
+        let changed = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(changed == 1)
+    }
+
+    /// 删除分组,并把引用它的账号/key 的 group_name 清为 ''(未分组);
+    /// `false` = 组不存在。三条语句包成事务,避免删组成功但引用残留。
+    pub fn delete_group(&self, name: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let changed = tx.execute("DELETE FROM groups WHERE name = ?1", [name])?;
+        if changed == 1 {
+            tx.execute("UPDATE accounts SET group_name = '' WHERE group_name = ?1", [name])?;
+            tx.execute("UPDATE api_keys SET group_name = '' WHERE group_name = ?1", [name])?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    // ───────── 账号 CRUD(配置态;运行态见 worker /status) ─────────
+
+    const ACCOUNT_COLS: &'static str =
+        "account_id, group_name, provider, max_concurrency, disabled, extra, created_at";
+
+    fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
+        Ok(AccountRow {
+            account_id: r.get(0)?,
+            group_name: r.get(1)?,
+            provider: r.get(2)?,
+            max_concurrency: r.get(3)?,
+            disabled: r.get::<_, i64>(4)? != 0,
+            extra: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    }
+
+    /// 列出全部账号(组名升序、组内 account_id 升序)。extra 含敏感凭据,
+    /// admin 端点返回前必须脱敏。
+    pub fn list_accounts(&self) -> anyhow::Result<Vec<AccountRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM accounts ORDER BY group_name ASC, account_id ASC",
+            Self::ACCOUNT_COLS
+        ))?;
+        let rows = stmt
+            .query_map([], Self::row_to_account)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 读取单个账号。
+    pub fn get_account(&self, account_id: &str) -> anyhow::Result<Option<AccountRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {} FROM accounts WHERE account_id = ?1",
+            Self::ACCOUNT_COLS
+        ))?;
+        match stmt.query_row([account_id], Self::row_to_account) {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 严格新增账号;已存在返回 `false`。`extra_json` 须是合法 JSON 对象文本
+    /// (调用方校验;此处只管落库)。
+    pub fn create_account(
+        &self,
+        account_id: &str,
+        group_name: &str,
+        provider: &str,
+        max_concurrency: i64,
+        extra_json: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO accounts \
+             (account_id, group_name, provider, max_concurrency, extra) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (account_id, group_name, provider, max_concurrency.max(1), extra_json),
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 部分更新(见 [`AccountPatch`]);`false` = 账号不存在。
+    pub fn update_account(&self, account_id: &str, patch: &AccountPatch) -> anyhow::Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(g) = &patch.group_name {
+            sets.push("group_name = ?");
+            params.push(Value::Text(g.clone()));
+        }
+        if let Some(m) = patch.max_concurrency {
+            sets.push("max_concurrency = ?");
+            params.push(Value::Integer(m.max(1)));
+        }
+        if let Some(d) = patch.disabled {
+            sets.push("disabled = ?");
+            params.push(Value::Integer(d as i64));
+        }
+        if let Some(e) = &patch.extra {
+            sets.push("extra = ?");
+            params.push(Value::Text(e.clone()));
+        }
+        let conn = self.conn.lock();
+        if sets.is_empty() {
+            let exists: bool = conn
+                .prepare_cached("SELECT 1 FROM accounts WHERE account_id = ?1")?
+                .exists([account_id])?;
+            return Ok(exists);
+        }
+        params.push(Value::Text(account_id.to_string()));
+        let sql = format!("UPDATE accounts SET {} WHERE account_id = ?", sets.join(", "));
+        let changed = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(changed == 1)
+    }
+
+    /// 删除账号;`false` = 不存在。usage_records 历史归属不动。
+    pub fn delete_account(&self, account_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute("DELETE FROM accounts WHERE account_id = ?1", [account_id])?;
+        Ok(changed == 1)
+    }
+
+    /// worker 刷新 token 后回写 extra(rolling refresh_token 持久化,
+    /// 重启不丢);`false` = 账号不存在。
+    pub fn update_account_extra(&self, account_id: &str, extra_json: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE accounts SET extra = ?1 WHERE account_id = ?2",
+            (extra_json, account_id),
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 取某组账号并转换为运行时 [`Account`](gw_core::account::Account)
+    /// (extra JSON 解码回字段表;含已禁用账号,调度器自行处理 disabled)。
+    /// 单行 extra 损坏时跳过该账号并告警,不拖垮整组。
+    pub fn load_group_accounts(&self, group: &str) -> anyhow::Result<Vec<Account>> {
+        let rows = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {} FROM accounts WHERE group_name = ?1 ORDER BY account_id ASC",
+                Self::ACCOUNT_COLS
+            ))?;
+            let collected = stmt
+                .query_map([group], Self::row_to_account)?
+                .collect::<Result<Vec<_>, _>>()?;
+            collected
+        };
+        let mut accounts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let extra: std::collections::BTreeMap<String, serde_json::Value> =
+                match serde_json::from_str(&row.extra) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(account = %row.account_id, "extra JSON 损坏,跳过该账号: {e}");
+                        continue;
+                    }
+                };
+            accounts.push(Account {
+                account_id: row.account_id,
+                provider: row.provider,
+                max_concurrency: row.max_concurrency.clamp(1, u32::MAX as i64) as u32,
+                disabled: row.disabled,
+                extra,
+            });
+        }
+        Ok(accounts)
+    }
+
+    /// 幂等导入 accounts.yaml(组 + 账号,INSERT OR IGNORE,已有行不覆盖——
+    /// DB 是事实源,yaml 只做首次播种,绝不回滚已 roll 的 token);
+    /// 返回本次新插入的账号数。worker 启动时调用,完成 yaml → SQLite 的迁移。
+    pub fn import_accounts(&self, cfg: &AccountsConfig) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut inserted = 0usize;
+        for (gname, group) in &cfg.groups {
+            tx.execute("INSERT OR IGNORE INTO groups (name) VALUES (?1)", [gname])?;
+            for acc in &group.accounts {
+                let provider = if acc.provider.is_empty() {
+                    group.provider.as_str()
+                } else {
+                    acc.provider.as_str()
+                };
+                let extra_json = serde_json::to_string(&acc.extra)?;
+                inserted += tx.execute(
+                    "INSERT OR IGNORE INTO accounts \
+                     (account_id, group_name, provider, max_concurrency, disabled, extra) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        acc.account_id,
+                        gname,
+                        provider,
+                        acc.max_concurrency.max(1) as i64,
+                        acc.disabled as i64,
+                        extra_json,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 
     // ───────── 用量统计查询(admin 看板;按 [`UsageFilter`] 时间窗 + key 筛选) ─────────
@@ -286,12 +621,18 @@ impl SqliteStore {
 impl ControlStore for SqliteStore {
     async fn authenticate(&self, api_key: &str) -> anyhow::Result<Option<AuthenticatedKey>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached("SELECT key, disabled FROM api_keys WHERE key = ?1")?;
+        // over_quota 在 SQL 内算好(quota_tokens NULL = 不限),鉴权路径零额外查询。
+        let mut stmt = conn.prepare_cached(
+            "SELECT key, disabled, \
+             (quota_tokens IS NOT NULL AND used_tokens >= quota_tokens) \
+             FROM api_keys WHERE key = ?1",
+        )?;
         let row = stmt
             .query_row([api_key], |r| {
                 Ok(AuthenticatedKey {
                     key_id: r.get::<_, String>(0)?,
                     disabled: r.get::<_, i64>(1)? != 0,
+                    over_quota: r.get::<_, i64>(2)? != 0,
                 })
             })
             .ok();
@@ -326,6 +667,18 @@ impl UsageSink for SqliteStore {
                 usage.success as i64,
             ],
         )?;
+        // 限额计量:把本次消耗累加到 key 的 used_tokens(v1 口径 = input+output;
+        // cache 两类暂不计,后续换加权成本时一并调整)。锁内两条语句,无并发缝隙。
+        if !usage.client_key_id.is_empty() {
+            let consumed =
+                clamp_i64(usage.input_tokens).saturating_add(clamp_i64(usage.output_tokens));
+            if consumed > 0 {
+                conn.execute(
+                    "UPDATE api_keys SET used_tokens = used_tokens + ?1 WHERE key = ?2",
+                    rusqlite::params![consumed, usage.client_key_id],
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -539,8 +892,8 @@ mod tests {
     #[test]
     fn list_api_keys_returns_fields_newest_first() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert!(store.create_api_key("sk-old", Some("老客户")).unwrap());
-        assert!(store.create_api_key("sk-new", None).unwrap());
+        assert!(store.create_api_key("sk-old", Some("老客户"), None).unwrap());
+        assert!(store.create_api_key("sk-new", None, None).unwrap());
         {
             // created_at 默认同秒,手动拉开以测排序。
             let conn = store.conn.lock();
@@ -564,8 +917,8 @@ mod tests {
         // created_at 秒级精度:同秒创建时按插入序(rowid)倒序兜底,
         // 保证"新建项在顶部"(对抗审查 Skeptic#3)。
         let store = SqliteStore::open_in_memory().unwrap();
-        store.create_api_key("sk-aa-tiebreak", None).unwrap();
-        store.create_api_key("sk-zz-tiebreak", None).unwrap();
+        store.create_api_key("sk-aa-tiebreak", None, None).unwrap();
+        store.create_api_key("sk-zz-tiebreak", None, None).unwrap();
         {
             let conn = store.conn.lock();
             conn.execute("UPDATE api_keys SET created_at=500", []).unwrap();
@@ -578,8 +931,8 @@ mod tests {
     #[test]
     fn create_api_key_rejects_duplicate() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert!(store.create_api_key("sk-dup", None).unwrap(), "首次创建成功");
-        assert!(!store.create_api_key("sk-dup", Some("again")).unwrap(), "重复创建返回 false");
+        assert!(store.create_api_key("sk-dup", None, None).unwrap(), "首次创建成功");
+        assert!(!store.create_api_key("sk-dup", Some("again"), None).unwrap(), "重复创建返回 false");
         // 重复创建不得覆盖已有行。
         let row = store.get_api_key("sk-dup").unwrap().unwrap();
         assert_eq!(row.label, None, "重复创建不能改写已有 label");
@@ -594,10 +947,11 @@ mod tests {
     #[tokio::test]
     async fn update_api_key_partial_fields() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.create_api_key("sk-u", Some("初始")).unwrap();
+        store.create_api_key("sk-u", Some("初始"), None).unwrap();
 
         // 只改 disabled,label 不动。
-        assert!(store.update_api_key("sk-u", None, Some(true)).unwrap());
+        let only_disable = ApiKeyPatch { disabled: Some(true), ..Default::default() };
+        assert!(store.update_api_key("sk-u", &only_disable).unwrap());
         let row = store.get_api_key("sk-u").unwrap().unwrap();
         assert!(row.disabled);
         assert_eq!(row.label.as_deref(), Some("初始"));
@@ -606,23 +960,25 @@ mod tests {
 
         // 只改 label,disabled 不动;空串=清空备注 → NULL(与创建路径一致,
         // 避免 ''/NULL 双态,对抗审查 Architect#5)。
-        assert!(store.update_api_key("sk-u", Some(""), None).unwrap());
+        let clear_label = ApiKeyPatch { label: Some(String::new()), ..Default::default() };
+        assert!(store.update_api_key("sk-u", &clear_label).unwrap());
         let row = store.get_api_key("sk-u").unwrap().unwrap();
         assert_eq!(row.label, None, "清空备注应落 NULL 而非空串");
         assert!(row.disabled, "改 label 不得动 disabled");
 
         // 不存在的 key 返回 false。
-        assert!(!store.update_api_key("sk-ghost", Some("x"), None).unwrap());
-        // 双 None = 存在性检查。
-        assert!(store.update_api_key("sk-u", None, None).unwrap());
-        assert!(!store.update_api_key("sk-ghost", None, None).unwrap());
+        let set_label = ApiKeyPatch { label: Some("x".into()), ..Default::default() };
+        assert!(!store.update_api_key("sk-ghost", &set_label).unwrap());
+        // 全缺省 = 存在性检查。
+        assert!(store.update_api_key("sk-u", &ApiKeyPatch::default()).unwrap());
+        assert!(!store.update_api_key("sk-ghost", &ApiKeyPatch::default()).unwrap());
     }
 
     #[tokio::test]
     async fn delete_api_key_removes_only_target() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.create_api_key("sk-del", None).unwrap();
-        store.create_api_key("sk-keep", None).unwrap();
+        store.create_api_key("sk-del", None, None).unwrap();
+        store.create_api_key("sk-keep", None, None).unwrap();
         // 删除前先留一条 usage,验证历史归属不被联动清除。
         rec(&store, "sk-del", "m1", 10, 1, true).await;
 
@@ -633,6 +989,204 @@ mod tests {
         // usage 历史保留(按 key 统计仍可见)。
         let by_key = store.usage_by_key(&UsageFilter::default()).unwrap();
         assert!(by_key.iter().any(|r| r.client_key_id == "sk-del"));
+    }
+
+    // ───────── 分组 CRUD ─────────
+
+    #[test]
+    fn groups_crud_lifecycle() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.create_group("G0", "#7c6cf6", "主组").unwrap());
+        assert!(!store.create_group("G0", "", "").unwrap(), "重名返回 false");
+        assert!(store.create_group("G1", "", "").unwrap());
+
+        // 计数:G0 挂 1 账号 + 2 key;G1 空。
+        store
+            .create_account("kiro-01", "G0", "kiro", 1, r#"{"refresh_token":"rt-1"}"#)
+            .unwrap();
+        store.create_api_key("sk-g0-a", None, Some("G0")).unwrap();
+        store.create_api_key("sk-g0-b", None, Some("G0")).unwrap();
+
+        let groups = store.list_groups().unwrap();
+        assert_eq!(groups.len(), 2);
+        let g0 = groups.iter().find(|g| g.name == "G0").unwrap();
+        assert_eq!(g0.color, "#7c6cf6");
+        assert_eq!(g0.note, "主组");
+        assert_eq!(g0.account_count, 1);
+        assert_eq!(g0.key_count, 2);
+        let g1 = groups.iter().find(|g| g.name == "G1").unwrap();
+        assert_eq!((g1.account_count, g1.key_count), (0, 0));
+
+        // 部分更新:只改 color,note 不动。
+        assert!(store.update_group("G0", Some("#ff0000"), None).unwrap());
+        let g0 = store.list_groups().unwrap().into_iter().find(|g| g.name == "G0").unwrap();
+        assert_eq!(g0.color, "#ff0000");
+        assert_eq!(g0.note, "主组");
+        assert!(!store.update_group("GX", Some("#000"), None).unwrap());
+
+        // 删除:引用方 group_name 清空,而非级联删除。
+        assert!(store.delete_group("G0").unwrap());
+        assert!(!store.delete_group("G0").unwrap(), "二次删除 false");
+        assert_eq!(store.get_account("kiro-01").unwrap().unwrap().group_name, "");
+        assert_eq!(store.get_api_key("sk-g0-a").unwrap().unwrap().group_name, "");
+    }
+
+    // ───────── 账号 CRUD ─────────
+
+    #[test]
+    fn accounts_crud_lifecycle() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store
+            .create_account("kiro-01", "G0", "kiro", 2, r#"{"refresh_token":"rt-1","priority":10}"#)
+            .unwrap());
+        assert!(!store
+            .create_account("kiro-01", "G1", "kiro", 1, "{}")
+            .unwrap(), "重复 account_id 返回 false");
+
+        let a = store.get_account("kiro-01").unwrap().unwrap();
+        assert_eq!(a.group_name, "G0");
+        assert_eq!(a.provider, "kiro");
+        assert_eq!(a.max_concurrency, 2);
+        assert!(!a.disabled);
+        assert!(a.extra.contains("rt-1"));
+
+        // 部分更新:换组 + 禁用,extra 不动。
+        let patch = AccountPatch {
+            group_name: Some("G1".into()),
+            disabled: Some(true),
+            ..Default::default()
+        };
+        assert!(store.update_account("kiro-01", &patch).unwrap());
+        let a = store.get_account("kiro-01").unwrap().unwrap();
+        assert_eq!(a.group_name, "G1");
+        assert!(a.disabled);
+        assert!(a.extra.contains("rt-1"), "未指定 extra 不得改动");
+
+        // 刷新回写:整体替换 extra(rolling refresh_token 持久化)。
+        assert!(store
+            .update_account_extra("kiro-01", r#"{"refresh_token":"rt-2-rolled"}"#)
+            .unwrap());
+        let a = store.get_account("kiro-01").unwrap().unwrap();
+        assert!(a.extra.contains("rt-2-rolled"));
+        assert!(!store.update_account_extra("ghost", "{}").unwrap());
+
+        // 列表 + 删除。
+        store.create_account("kiro-02", "G0", "kiro", 1, "{}").unwrap();
+        assert_eq!(store.list_accounts().unwrap().len(), 2);
+        assert!(store.delete_account("kiro-02").unwrap());
+        assert!(!store.delete_account("kiro-02").unwrap());
+        assert!(store.get_account("kiro-02").unwrap().is_none());
+    }
+
+    #[test]
+    fn load_group_accounts_converts_to_runtime_account() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_account(
+                "kiro-01",
+                "G0",
+                "kiro",
+                3,
+                r#"{"refresh_token":"rt-1","priority":5}"#,
+            )
+            .unwrap();
+        store.create_account("kiro-02", "G1", "kiro", 1, "{}").unwrap();
+        // 禁用的账号也要返回(调度器自己看 disabled 字段)。
+        store.create_account("kiro-03", "G0", "kiro", 1, "{}").unwrap();
+        store
+            .update_account("kiro-03", &AccountPatch { disabled: Some(true), ..Default::default() })
+            .unwrap();
+
+        let accounts = store.load_group_accounts("G0").unwrap();
+        assert_eq!(accounts.len(), 2, "只取 G0,含禁用账号");
+        let a1 = accounts.iter().find(|a| a.account_id == "kiro-01").unwrap();
+        assert_eq!(a1.provider, "kiro");
+        assert_eq!(a1.max_concurrency, 3);
+        assert_eq!(a1.extra_str("refresh_token"), Some("rt-1"));
+        assert_eq!(a1.extra.get("priority").and_then(|v| v.as_i64()), Some(5));
+        let a3 = accounts.iter().find(|a| a.account_id == "kiro-03").unwrap();
+        assert!(a3.disabled);
+    }
+
+    #[test]
+    fn import_accounts_yaml_idempotent() {
+        let yaml = r#"
+groups:
+  G0:
+    provider: kiro
+    accounts:
+      - account_id: kiro-01
+        refresh_token: rt-1
+      - account_id: kiro-02
+        refresh_token: rt-2
+  G1:
+    provider: kiro
+    accounts:
+      - account_id: kiro-03
+        refresh_token: rt-3
+"#;
+        let cfg: AccountsConfig = serde_yaml::from_str(yaml).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let n = store.import_accounts(&cfg).unwrap();
+        assert_eq!(n, 3, "首次导入 3 账号");
+        assert_eq!(store.list_groups().unwrap().len(), 2, "组同步建出");
+        let a = store.get_account("kiro-01").unwrap().unwrap();
+        assert_eq!(a.group_name, "G0");
+        assert!(a.extra.contains("rt-1"), "extra 字段(refresh_token)进库");
+
+        // 二次导入:已有行不覆盖(DB 是事实源,yaml 只是首次播种)。
+        store.update_account_extra("kiro-01", r#"{"refresh_token":"rt-1-rolled"}"#).unwrap();
+        let n = store.import_accounts(&cfg).unwrap();
+        assert_eq!(n, 0, "幂等:无新增");
+        let a = store.get_account("kiro-01").unwrap().unwrap();
+        assert!(a.extra.contains("rt-1-rolled"), "导入不得回滚已 roll 的 token");
+    }
+
+    // ───────── per-key 限额 ─────────
+
+    #[tokio::test]
+    async fn quota_set_clear_and_over_quota_in_auth() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_api_key("sk-q", None, None).unwrap();
+
+        // 无限额:over_quota = false。
+        assert!(!store.authenticate("sk-q").await.unwrap().unwrap().over_quota);
+
+        // 设限额 100:未用 → false。
+        let set = ApiKeyPatch { quota_tokens: Some(100), ..Default::default() };
+        assert!(store.update_api_key("sk-q", &set).unwrap());
+        let row = store.get_api_key("sk-q").unwrap().unwrap();
+        assert_eq!(row.quota_tokens, Some(100));
+        assert!(!store.authenticate("sk-q").await.unwrap().unwrap().over_quota);
+
+        // 消耗 120(input 100 + output 20)→ 超限。
+        rec(&store, "sk-q", "m1", 100, 20, true).await;
+        let row = store.get_api_key("sk-q").unwrap().unwrap();
+        assert_eq!(row.used_tokens, 120, "used = input+output");
+        assert!(store.authenticate("sk-q").await.unwrap().unwrap().over_quota);
+
+        // 重置已用 → 恢复。
+        let reset = ApiKeyPatch { reset_used: true, ..Default::default() };
+        assert!(store.update_api_key("sk-q", &reset).unwrap());
+        assert!(!store.authenticate("sk-q").await.unwrap().unwrap().over_quota);
+
+        // 清除限额(<=0)→ NULL,不限。
+        rec(&store, "sk-q", "m1", 500, 0, true).await;
+        let clear = ApiKeyPatch { quota_tokens: Some(0), ..Default::default() };
+        assert!(store.update_api_key("sk-q", &clear).unwrap());
+        let row = store.get_api_key("sk-q").unwrap().unwrap();
+        assert_eq!(row.quota_tokens, None);
+        assert!(!store.authenticate("sk-q").await.unwrap().unwrap().over_quota);
+    }
+
+    #[tokio::test]
+    async fn record_skips_quota_bump_for_unattributed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_api_key("sk-other", None, None).unwrap();
+        // 未归属 usage(client_key_id 空)不影响任何 key 的 used_tokens。
+        rec(&store, "", "m1", 999, 1, true).await;
+        assert_eq!(store.get_api_key("sk-other").unwrap().unwrap().used_tokens, 0);
     }
 
     #[tokio::test]
@@ -649,7 +1203,7 @@ mod tests {
             rec(&store, "k1", "m1", 100, 10, true).await;
             let s = store.usage_summary(&UsageFilter::default()).unwrap();
             assert_eq!(s.requests, 1, "统计读连接必须看到主连接的写入");
-            assert!(store.create_api_key("sk-file-guard-1", None).unwrap());
+            assert!(store.create_api_key("sk-file-guard-1", None, None).unwrap());
             assert_eq!(store.list_api_keys().unwrap().len(), 1);
         }
         for suffix in ["", "-wal", "-shm"] {

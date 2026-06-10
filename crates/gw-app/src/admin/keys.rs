@@ -27,6 +27,9 @@ pub struct CreateKeyBody {
     /// 自定义 key(迁移已有 key 用);缺省 = 服务端生成。
     #[serde(default)]
     key: Option<String>,
+    /// 所属分组('' / 缺省 = 未分组)。
+    #[serde(default)]
+    group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +39,15 @@ pub struct UpdateKeyBody {
     label: Option<String>,
     #[serde(default)]
     disabled: Option<bool>,
+    /// `Some("")` = 移出分组。
+    #[serde(default)]
+    group_name: Option<String>,
+    /// > 0 设限额(token);<= 0 清除限额(不限)。
+    #[serde(default)]
+    quota_tokens: Option<i64>,
+    /// true = used_tokens 归零(限额周期重置)。
+    #[serde(default)]
+    reset_used: Option<bool>,
 }
 
 pub fn router() -> Router<AdminState> {
@@ -92,7 +104,8 @@ async fn create_key(
         None => format!("sk-gw-{}", uuid::Uuid::new_v4().simple()),
     };
     let label = body.label.as_deref().filter(|s| !s.is_empty());
-    match st.store.create_api_key(&key, label) {
+    let group = body.group.as_deref().filter(|s| !s.is_empty());
+    match st.store.create_api_key(&key, label, group) {
         Ok(true) => match st.store.get_api_key(&key) {
             Ok(Some(row)) => (StatusCode::CREATED, Json(row)).into_response(),
             Ok(None) => internal_error("创建后读取不到 key"),
@@ -108,10 +121,14 @@ async fn update_key(
     Path(key): Path<String>,
     Json(body): Json<UpdateKeyBody>,
 ) -> axum::response::Response {
-    match st
-        .store
-        .update_api_key(&key, body.label.as_deref(), body.disabled)
-    {
+    let patch = gw_core::store::ApiKeyPatch {
+        label: body.label.clone(),
+        disabled: body.disabled,
+        group_name: body.group_name.clone(),
+        quota_tokens: body.quota_tokens,
+        reset_used: body.reset_used.unwrap_or(false),
+    };
+    match st.store.update_api_key(&key, &patch) {
         Ok(true) => match st.store.get_api_key(&key) {
             Ok(Some(row)) => Json(row).into_response(),
             Ok(None) => internal_error("更新后读取不到 key"),
@@ -135,40 +152,12 @@ async fn delete_key(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use gw_store::SqliteStore;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::admin::{admin_api_router, AdminState};
-
-    const TOKEN: &str = "admt-test";
-
-    fn app() -> (axum::Router, Arc<SqliteStore>) {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let st = AdminState {
-            token: Arc::new(TOKEN.to_string()),
-            store: store.clone(),
-        };
-        (admin_api_router(st), store)
-    }
-
-    fn req(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
-        let b = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("x-api-key", TOKEN);
-        match body {
-            Some(s) => b
-                .header("content-type", "application/json")
-                .body(Body::from(s.to_string()))
-                .unwrap(),
-            None => b.body(Body::empty()).unwrap(),
-        }
-    }
+    use crate::admin::tests_support::{app, req};
 
     async fn json_body(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -190,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn list_keys_returns_seeded_rows() {
         let (app, store) = app();
-        store.create_api_key("sk-alice-prod-7788", Some("alice")).unwrap();
+        store.create_api_key("sk-alice-prod-7788", Some("alice"), None).unwrap();
         let resp = app.oneshot(req("GET", "/keys", None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
@@ -256,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn patch_updates_fields_and_404s() {
         let (app, store) = app();
-        store.create_api_key("sk-patch-me-1", Some("旧备注")).unwrap();
+        store.create_api_key("sk-patch-me-1", Some("旧备注"), None).unwrap();
 
         // 禁用,label 不动。
         let resp = app
@@ -291,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn delete_then_404() {
         let (app, store) = app();
-        store.create_api_key("sk-del-me-99", None).unwrap();
+        store.create_api_key("sk-del-me-99", None, None).unwrap();
         let resp = app
             .clone()
             .oneshot(req("DELETE", "/keys/sk-del-me-99", None))

@@ -73,6 +73,9 @@ pub struct UsageRecord {
 pub struct AuthenticatedKey {
     pub key_id: String,
     pub disabled: bool,
+    /// 已超限额(quota_tokens 非 NULL 且 used_tokens >= quota_tokens)。
+    /// router 据此拒绝(429),计算在 SQL 内完成,鉴权路径零额外查询。
+    pub over_quota: bool,
 }
 
 /// 一条客户端 API key 元数据(admin 管理页 / CRUD 用)。
@@ -83,7 +86,64 @@ pub struct ApiKeyRow {
     pub key: String,
     pub label: Option<String>,
     pub disabled: bool,
+    /// 所属分组(组织/筛选用;'' = 未分组)。
+    pub group_name: String,
+    /// 限额(单位 token,input+output 计;NULL = 不限)。
+    pub quota_tokens: Option<i64>,
+    /// 已用量(token,由 UsageSink 落库时原子累加;admin 可重置)。
+    pub used_tokens: i64,
     pub created_at: i64,
+}
+
+/// API key 部分更新(None 字段不动)。
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeyPatch {
+    /// `Some("")` = 清空备注(落 NULL)。
+    pub label: Option<String>,
+    pub disabled: Option<bool>,
+    /// `Some("")` = 移出分组。
+    pub group_name: Option<String>,
+    /// `Some(v)`:v > 0 设限额;v <= 0 清除限额(NULL,不限)。
+    pub quota_tokens: Option<i64>,
+    /// true = 把 used_tokens 归零(限额周期重置)。
+    pub reset_used: bool,
+}
+
+/// 一个分组(账号组,同时用于 key 的组织归类)。
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupRow {
+    pub name: String,
+    /// 前端 chip 颜色(如 "#7c6cf6";'' = 默认)。
+    pub color: String,
+    pub note: String,
+    /// 组内账号数 / 绑定 key 数(列表页直接展示,免前端二次聚合)。
+    pub account_count: u64,
+    pub key_count: u64,
+    pub created_at: i64,
+}
+
+/// 一个上游账号(配置态;运行态由 worker 调度器快照提供)。
+/// `extra` 是 provider 专属字段的 JSON 文本(refresh_token 等敏感值在内,
+/// admin 端点返回前须脱敏)。
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountRow {
+    pub account_id: String,
+    pub group_name: String,
+    pub provider: String,
+    pub max_concurrency: i64,
+    pub disabled: bool,
+    pub extra: String,
+    pub created_at: i64,
+}
+
+/// 账号部分更新(None 字段不动)。
+#[derive(Debug, Clone, Default)]
+pub struct AccountPatch {
+    pub group_name: Option<String>,
+    pub max_concurrency: Option<i64>,
+    pub disabled: Option<bool>,
+    /// 整体替换 extra JSON(凭据轮换/修正)。
+    pub extra: Option<String>,
 }
 
 /// 控制面存储:鉴权、账号/key/组元数据。

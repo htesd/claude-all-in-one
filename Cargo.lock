@@ -643,6 +643,8 @@ dependencies = [
  "gw-core",
  "parking_lot",
  "rusqlite",
+ "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
 ]
