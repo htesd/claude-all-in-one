@@ -110,6 +110,63 @@ async fn main() {
             "content": "Use the get_weather tool to check the weather in San Francisco. You must call the tool."}]
     });
     run_and_report(&provider, ChatRequest::from_anthropic_body(body), &acct, "2", "tool").await;
+
+    // ---- 4. 非流式折叠(框架:provider 产流 → gw-core 折叠成单个 Messages JSON)----
+    println!("[4] non-stream fold...");
+    let body = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "stream": false,
+        "messages": [{"role": "user", "content": "Reply with exactly: E2E-FOLD-OK"}]
+    });
+    run_nonstream_fold(&provider, ChatRequest::from_anthropic_body(body), &acct, "3").await;
+}
+
+/// 抽干真实 Kiro 流 → 用 gw-core 折叠成单个非流式 Messages JSON,验证折叠对真实线缆生效。
+async fn run_nonstream_fold(
+    provider: &KiroProvider,
+    req: ChatRequest,
+    account: &Arc<Account>,
+    sess: &str,
+) {
+    use gw_core::provider::SseEvent;
+    let ctx = CallCtx {
+        account: account.clone(),
+        session_id: format!("e2e-sess-{sess}"),
+        cache_key: format!("e2e-{sess}"),
+    };
+    let mut stream = match provider.chat(req, &ctx).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("    [fold] chat 启动失败: {e}");
+            return;
+        }
+    };
+    let mut events: Vec<SseEvent> = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(StreamItem::Sse(ev)) => events.push(ev),
+            Ok(StreamItem::Usage(_)) => {}
+            Err(e) => {
+                eprintln!("    [fold] 流错误: {e}");
+                return;
+            }
+        }
+    }
+    match gw_core::fold::fold_sse_to_message(&events) {
+        Ok(msg) => {
+            let text = msg["content"]
+                .as_array()
+                .and_then(|a| a.iter().find(|b| b["type"] == "text"))
+                .and_then(|b| b["text"].as_str())
+                .unwrap_or("");
+            println!(
+                "    [fold] role={} stop_reason={} text={:?} usage_out={}",
+                msg["role"], msg["stop_reason"], text, msg["usage"]["output_tokens"]
+            );
+        }
+        Err(e) => eprintln!("    [fold] 折叠失败: {e}"),
+    }
 }
 
 async fn run_and_report(

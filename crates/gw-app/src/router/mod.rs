@@ -93,6 +93,7 @@ pub async fn run(instances_path: &Path, db_path: &Path) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/v1/messages", post(forward))
+        .route("/v1/models", get(forward_models))
         .route("/health", get(health))
         .with_state(state);
 
@@ -128,20 +129,8 @@ async fn forward(
     body: Bytes,
 ) -> axum::response::Response {
     // ① 鉴权。
-    if let Some(store) = &st.store {
-        let key = extract_bearer(&headers);
-        match key {
-            Some(k) => match store.authenticate(&k).await {
-                Ok(Some(auth)) if !auth.disabled => {}
-                Ok(Some(_)) => return unauthorized("API key 已禁用"),
-                Ok(None) => return unauthorized("无效 API key"),
-                Err(e) => {
-                    tracing::error!("鉴权查询失败: {e}");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "鉴权失败").into_response();
-                }
-            },
-            None => return unauthorized("缺少 Authorization"),
-        }
+    if let Some(resp) = authorize(&st, &headers).await {
+        return resp;
     }
 
     // ② 选 worker(会话亲和)。
@@ -178,6 +167,60 @@ async fn forward(
         }
         Err(e) => {
             tracing::error!(instance = target.instance, "转发到 worker 失败: {e}");
+            (StatusCode::BAD_GATEWAY, "worker 不可达").into_response()
+        }
+    }
+}
+
+/// 鉴权(forward / forward_models 共用)。OK→`None`;失败→`Some(错误响应)`。
+/// `store=None`(P0 库打不开降级)直接放行。
+async fn authorize(st: &RouterState, headers: &HeaderMap) -> Option<axum::response::Response> {
+    let store = st.store.as_ref()?;
+    match extract_bearer(headers) {
+        Some(k) => match store.authenticate(&k).await {
+            Ok(Some(auth)) if !auth.disabled => None,
+            Ok(Some(_)) => Some(unauthorized("API key 已禁用")),
+            Ok(None) => Some(unauthorized("无效 API key")),
+            Err(e) => {
+                tracing::error!("鉴权查询失败: {e}");
+                Some((StatusCode::INTERNAL_SERVER_ERROR, "鉴权失败").into_response())
+            }
+        },
+        None => Some(unauthorized("缺少 Authorization")),
+    }
+}
+
+/// `GET /v1/models` —— 模型目录与会话无关,鉴权后转发到任一(最空)worker。
+///
+/// 已知局限(单 provider 框架下正确,多 provider 待补):每个 worker 绑定一个账号组、
+/// 一个 provider,这里只问最空的那个 worker。一旦插入第二个 provider 家族,对外目录会
+/// 取决于当下哪个 worker 最空,而非聚合所有可路由 provider。多 provider 部署需改为按
+/// 家族聚合(各 family 取一个代表 worker 并合并),留作 provider 真正异构时再做。
+async fn forward_models(
+    State(st): State<Arc<RouterState>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if let Some(resp) = authorize(&st, &headers).await {
+        return resp;
+    }
+    let Some(target) = least_loaded(&st) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "无可用 worker").into_response();
+    };
+    let url = format!("{}/v1/models", target.base_url);
+    match st.http.get(&url).timeout(Duration::from_secs(10)).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let mut builder = axum::response::Response::builder().status(status);
+            if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+            }
+            let body = axum::body::Body::from_stream(resp.bytes_stream());
+            builder.body(body).unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "构造响应失败").into_response()
+            })
+        }
+        Err(e) => {
+            tracing::error!(instance = target.instance, "转发 models 到 worker 失败: {e}");
             (StatusCode::BAD_GATEWAY, "worker 不可达").into_response()
         }
     }
