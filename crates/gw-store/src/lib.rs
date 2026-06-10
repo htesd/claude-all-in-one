@@ -19,6 +19,26 @@ CREATE TABLE IF NOT EXISTS api_keys (
     disabled  INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+-- 原始 usage 事件日志(#130 UsageSink)。每次上游调用结束追加一行;
+-- 上层(按账号/按客户聚合、成本统计)从此表读,本表只管忠实记录,永不裁剪。
+-- client_key_id 暂可为空("":router 未把客户 key 透传给内网 worker,v61 另开按客户归属)。
+CREATE TABLE IF NOT EXISTS usage_records (
+    id            INTEGER PRIMARY KEY,
+    client_key_id TEXT    NOT NULL DEFAULT '',
+    account_id    TEXT    NOT NULL DEFAULT '',
+    model         TEXT    NOT NULL DEFAULT '',
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    success       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+-- 时间序(全局/按模型时间窗聚合的基础);account/client 维度各带 created_at 便于钉维度后排序。
+CREATE INDEX IF NOT EXISTS idx_usage_created  ON usage_records(created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_records(account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_client  ON usage_records(client_key_id, created_at);
 "#;
 
 /// SQLite 控制面存储。
@@ -80,10 +100,33 @@ impl ControlStore for SqliteStore {
     }
 }
 
+/// u64 token 数 → SQLite i64,超 i64::MAX 饱和封顶(不回绕)。
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 #[async_trait]
 impl UsageSink for SqliteStore {
-    async fn record(&self, _usage: UsageRecord) -> anyhow::Result<()> {
-        // P0:no-op。P2/P4 落 usage 表 + 状态机(见 IMPROVEMENTS §1.9)。
+    async fn record(&self, usage: UsageRecord) -> anyhow::Result<()> {
+        // u64 → i64(SQLite INTEGER):token 计数实际远小于 i64::MAX;万一上游/解析异常
+        // 给出超大值,饱和到 i64::MAX 而非静默回绕成负数污染计费(审查 Skeptic#4)。
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO usage_records \
+             (client_key_id, account_id, model, input_tokens, output_tokens, \
+              cache_read_tokens, cache_creation_tokens, success) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                usage.client_key_id,
+                usage.account_id,
+                usage.model,
+                clamp_i64(usage.input_tokens),
+                clamp_i64(usage.output_tokens),
+                clamp_i64(usage.cache_read_tokens),
+                clamp_i64(usage.cache_creation_tokens),
+                usage.success as i64,
+            ],
+        )?;
         Ok(())
     }
 }
@@ -116,5 +159,115 @@ mod tests {
         }
         let auth = store.authenticate("sk-x").await.unwrap().unwrap();
         assert!(auth.disabled);
+    }
+
+    #[tokio::test]
+    async fn usage_record_persists_and_reads_back() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .record(UsageRecord {
+                client_key_id: "sk-cust".into(),
+                account_id: "acct-7".into(),
+                model: "claude-sonnet-4-5".into(),
+                input_tokens: 1200,
+                output_tokens: 345,
+                cache_read_tokens: 900,
+                cache_creation_tokens: 64,
+                success: true,
+            })
+            .await
+            .unwrap();
+
+        let conn = store.conn.lock();
+        let (acct, model, in_t, out_t, cache_t, cache_w, ok): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT account_id, model, input_tokens, output_tokens, cache_read_tokens, \
+                 cache_creation_tokens, success \
+                 FROM usage_records WHERE client_key_id = 'sk-cust'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(acct, "acct-7");
+        assert_eq!(model, "claude-sonnet-4-5");
+        assert_eq!(in_t, 1200);
+        assert_eq!(out_t, 345);
+        assert_eq!(cache_t, 900);
+        assert_eq!(cache_w, 64, "cache_creation 不得在落库时丢失");
+        assert_eq!(ok, 1);
+    }
+
+    #[tokio::test]
+    async fn usage_record_persists_failure_flag() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .record(UsageRecord {
+                client_key_id: String::new(),
+                account_id: "acct-fail".into(),
+                model: "m".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                success: false,
+            })
+            .await
+            .unwrap();
+
+        let conn = store.conn.lock();
+        let ok: i64 = conn
+            .query_row(
+                "SELECT success FROM usage_records WHERE account_id = 'acct-fail'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ok, 0, "失败请求的 usage 行 success 应为 0");
+    }
+
+    #[tokio::test]
+    async fn usage_record_saturates_huge_token_count() {
+        // u64 超 i64::MAX 时应饱和(不静默回绕成负数,污染计费)。
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .record(UsageRecord {
+                client_key_id: String::new(),
+                account_id: "big".into(),
+                model: "m".into(),
+                input_tokens: u64::MAX,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                success: true,
+            })
+            .await
+            .unwrap();
+        let conn = store.conn.lock();
+        let in_t: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM usage_records WHERE account_id='big'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_t, i64::MAX, "超 i64 的 token 数应饱和而非回绕成负数");
     }
 }

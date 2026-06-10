@@ -20,7 +20,9 @@ use futures::StreamExt;
 use gw_core::account::Account;
 use gw_core::config::{AccountsConfig, InstancesConfig, SystemConfig};
 use gw_core::error::UpstreamErrorKind;
-use gw_core::provider::{CallCtx, ChatRequest, Provider, StreamItem};
+use gw_core::provider::{CallCtx, ChatRequest, ChatUsage, Provider, StreamItem};
+use gw_core::store::{UsageRecord, UsageSink};
+use gw_store::SqliteStore;
 
 use crate::egress;
 use crate::registry::Registry;
@@ -36,6 +38,8 @@ struct WorkerState {
     /// per-account 刷新单飞锁:同一账号同时只允许一个 in-flight refresh(契约 H4)。
     /// 避免两个首请求并发刷新、互相覆盖 rolling refresh_token 导致一方 invalid_grant。
     refresh_locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// usage 落库汇(#130)。打开失败时为 None(降级:usage 仅记日志不入库)。
+    usage_sink: Option<Arc<dyn UsageSink>>,
     /// worker 的 egress client(provider 已持有同一个;此处保留供诊断)。
     _client: reqwest::Client,
 }
@@ -150,6 +154,7 @@ pub async fn run(
     instances_path: &Path,
     accounts_path: &Path,
     system_path: &Path,
+    db_path: &Path,
 ) -> anyhow::Result<()> {
     let instances: InstancesConfig = load_yaml(instances_path)?;
     let accounts_cfg: AccountsConfig = load_yaml(accounts_path)?;
@@ -181,6 +186,16 @@ pub async fn run(
         .map(Arc::new)
         .collect();
 
+    // usage 落库汇:与 router 共享同一 SQLite(WAL,多进程并发)。打不开则降级为
+    // 仅记日志不入库(对齐 router 鉴权库的容忍降级,不因控制面库缺失而拒绝服务)。
+    let usage_sink: Option<Arc<dyn UsageSink>> = match SqliteStore::open(db_path) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::warn!("usage 库打开失败,usage 不落库(降级): {e}");
+            None
+        }
+    };
+
     tracing::info!(
         instance,
         listen = %wcfg.listen,
@@ -188,6 +203,7 @@ pub async fn run(
         group = %wcfg.account_group,
         accounts = accounts.len(),
         provider = provider.family(),
+        usage_sink = usage_sink.is_some(),
         "worker 就绪"
     );
 
@@ -198,6 +214,7 @@ pub async fn run(
         provider,
         scheduler: AccountScheduler::new(accounts),
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        usage_sink,
         _client: client,
     });
 
@@ -219,6 +236,8 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "group": st.group,
         "provider": st.provider.family(),
         "accounts": st.scheduler.total(),
+        // usage 是否在落库:库打开失败时为 false(降级,usage 不入库),便于运维发现。
+        "usage_persist": st.usage_sink.is_some(),
         "status": "ok"
     }))
 }
@@ -280,7 +299,7 @@ async fn messages(
         //    - BadRequest:请求本身问题,换号无益,直接返回。
         //    - 其他可重试错误:上报失败、换号重试。
         match st.provider.chat(req.clone(), &ctx).await {
-            Ok(stream) => return stream_response(st.clone(), lease, stream),
+            Ok(stream) => return stream_response(st.clone(), lease, stream, req.model.clone()),
             Err(e) if e.kind == UpstreamErrorKind::TokenInvalid => {
                 tracing::info!(account = %account_id, "chat 403 token 失效,尝试同号刷新后重试");
                 match st.force_refresh(ctx.account.clone()).await {
@@ -291,7 +310,9 @@ async fn messages(
                             cache_key: affinity_key.clone().unwrap_or_default(),
                         };
                         match st.provider.chat(req.clone(), &retry_ctx).await {
-                            Ok(stream) => return stream_response(st.clone(), lease, stream),
+                            Ok(stream) => {
+                                return stream_response(st.clone(), lease, stream, req.model.clone())
+                            }
                             Err(e2) => {
                                 // 刷新后仍失败:这次才上报失败 + 换号。
                                 tracing::warn!(account = %account_id, kind = ?e2.kind, "刷新后重试仍失败: {e2}");
@@ -344,34 +365,106 @@ fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response:
         .into_response()
 }
 
-/// 把 provider 的 StreamItem 流转成 axum SSE 响应,并在流结束时按结果上报账号生命周期。
+/// 流结束时把本次 usage 落库(#130)。`usage=None`(空/错误流无终结用量)或 `sink=None`
+/// (控制面库打开失败降级)时直接跳过。落库失败仅告警,**绝不影响**已发给客户端的响应。
+///
+/// `client_key_id` 暂留空:router 转发到内网 worker 时不透传客户 Authorization
+/// (见 router::forward 注释),按客户归属(v61)需另开 router→worker key 传递通路。
+/// 但 `account_id` 已可用,本表足以支撑按账号的用量/成本观测。
+async fn finalize_usage(
+    sink: Option<&Arc<dyn UsageSink>>,
+    account_id: &str,
+    model: &str,
+    usage: Option<&ChatUsage>,
+    success: bool,
+) {
+    let (Some(sink), Some(u)) = (sink, usage) else {
+        return;
+    };
+    let rec = UsageRecord {
+        client_key_id: String::new(),
+        account_id: account_id.to_string(),
+        model: model.to_string(),
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_tokens: u.cache_read_tokens,
+        cache_creation_tokens: u.cache_creation_tokens,
+        success,
+    };
+    if let Err(e) = sink.record(rec).await {
+        tracing::warn!(account = %account_id, "usage 落库失败(不影响响应): {e}");
+    }
+}
+
+/// 把 provider 的 StreamItem 流转成 axum SSE 响应,并在流结束时按结果上报账号生命周期
+/// + 把终结 usage 落库(#130)。
 ///
 /// 关键:`lease`(并发许可)被 move 进流的状态,持有到流耗尽才 Drop → 整个响应期间
 /// 占用该账号一个并发槽,符合 v52 并发语义。流内出现 error 事件 / Err → 上报失败;
-/// 干净结束 → 上报成功。usage 事件不转发客户端(仅记日志,#130 接 UsageSink)。
+/// 干净结束 → 上报成功。usage 事件不转发客户端(缓存到 `last_usage`,流终态统一落库)。
 fn stream_response(
     st: Arc<WorkerState>,
     lease: scheduler::AccountLease,
     stream: gw_core::provider::ChatStream,
+    model: String,
 ) -> axum::response::Response {
-    /// unfold 累积态:lease 持有到流结束;reported 防重复上报。
+    /// unfold 累积态:lease 持有到流结束;reported 防重复上报;last_usage 缓存终结用量。
     struct StreamCtx {
         st: Arc<WorkerState>,
         account_id: String,
+        model: String,
         _lease: scheduler::AccountLease,
         inner: gw_core::provider::ChatStream,
         saw_error: bool,
         reported: bool,
+        last_usage: Option<ChatUsage>,
+    }
+
+    // 收尾(账号生命周期上报 + usage 落库)统一放 Drop:无论流跑到 None 正常结束,
+    // **还是客户端中途断开导致 axum 直接 drop 响应体**(此时 unfold 不再被 poll、永远到不了
+    // None 分支),Drop 都会触发,确保 usage 不漏记、账号信号不丢(审查 Skeptic#1/Architect#1)。
+    // 生命周期上报是同步的(parking_lot,Drop 内直接做);usage 落库是 async,detach 到运行时
+    // 异步执行——既不阻塞 SSE 收尾 poll(审查 Skeptic#2),又不依赖流被读到 EOF。
+    impl Drop for StreamCtx {
+        fn drop(&mut self) {
+            // 账号生命周期上报(一次)。Err 分支可能已按具体 kind 上报过(reported=true)。
+            if !self.reported {
+                self.reported = true;
+                if self.saw_error {
+                    self.st
+                        .scheduler
+                        .report_failure(&self.account_id, UpstreamErrorKind::ServerError);
+                } else {
+                    self.st.scheduler.report_success(&self.account_id);
+                }
+            }
+            // usage 落库(Drop 仅执行一次,无需额外去重标记)。
+            let (Some(sink), Some(usage)) = (self.st.usage_sink.clone(), self.last_usage.take())
+            else {
+                return;
+            };
+            let account_id = self.account_id.clone();
+            let model = self.model.clone();
+            let success = !self.saw_error;
+            // detach 到当前运行时;无运行时上下文(理论上不会:SSE body 总在 tokio 内 drop)则跳过。
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    finalize_usage(Some(&sink), &account_id, &model, Some(&usage), success).await;
+                });
+            }
+        }
     }
 
     let account_id = lease.account_id().to_string();
     let init = StreamCtx {
         st,
         account_id,
+        model,
         _lease: lease,
         inner: stream,
         saw_error: false,
         reported: false,
+        last_usage: None,
     };
 
     let sse = futures::stream::unfold(init, |mut ctx| async move {
@@ -401,11 +494,14 @@ fn stream_response(
                         input = u.input_tokens,
                         output = u.output_tokens,
                         cache_read = u.cache_read_tokens,
-                        "chat usage (P1: 暂不入库,#130 接 UsageSink)"
+                        "chat usage (缓存待流终态落库 #130)"
                     );
+                    // 缓存终结用量,流干净/失败收尾时统一落库(success 以最终状态为准)。
+                    ctx.last_usage = Some(u);
                     continue; // 不转发客户端,取下一个。
                 }
                 Some(Err(e)) => {
+                    ctx.saw_error = true; // 硬错误 → 本次响应失败(usage success=false)。
                     if !ctx.reported {
                         ctx.reported = true;
                         ctx.st.scheduler.report_failure(&ctx.account_id, e.kind);
@@ -417,17 +513,8 @@ fn stream_response(
                     return Some((Ok(out), ctx));
                 }
                 None => {
-                    // 流正常结束:无 error 事件 → 上报成功;有 error → 上报失败。
-                    if !ctx.reported {
-                        ctx.reported = true;
-                        if ctx.saw_error {
-                            ctx.st
-                                .scheduler
-                                .report_failure(&ctx.account_id, UpstreamErrorKind::ServerError);
-                        } else {
-                            ctx.st.scheduler.report_success(&ctx.account_id);
-                        }
-                    }
+                    // 流正常结束。收尾(生命周期上报 + usage 落库)由 StreamCtx::drop 统一处理,
+                    // 与"客户端中断致响应体被 drop"走同一条路径,避免两处逻辑分叉。
                     return None;
                 }
             }
@@ -446,7 +533,78 @@ fn load_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gw_core::provider::ChatUsage;
+    use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
+
+    /// 记录到内存的假 sink,断言 finalize_usage 的落库决策。
+    struct FakeSink {
+        rows: std::sync::Mutex<Vec<UsageRecord>>,
+    }
+    #[async_trait::async_trait]
+    impl UsageSink for FakeSink {
+        async fn record(&self, usage: UsageRecord) -> anyhow::Result<()> {
+            self.rows.lock().unwrap().push(usage);
+            Ok(())
+        }
+    }
+    fn fake_sink() -> Arc<FakeSink> {
+        Arc::new(FakeSink {
+            rows: std::sync::Mutex::new(vec![]),
+        })
+    }
+
+    #[tokio::test]
+    async fn finalize_usage_records_when_usage_present() {
+        let sink = fake_sink();
+        let dyn_sink: Arc<dyn UsageSink> = sink.clone();
+        let usage = ChatUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 50,
+            cache_creation_tokens: 7,
+        };
+        finalize_usage(Some(&dyn_sink), "acct-1", "claude-x", Some(&usage), true).await;
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].account_id, "acct-1");
+        assert_eq!(rows[0].model, "claude-x");
+        assert_eq!(rows[0].input_tokens, 100);
+        assert_eq!(rows[0].output_tokens, 20);
+        assert_eq!(rows[0].cache_read_tokens, 50);
+        assert_eq!(rows[0].cache_creation_tokens, 7, "cache_creation 不得丢失");
+        assert!(rows[0].success);
+        assert_eq!(rows[0].client_key_id, "", "client key 暂未透传到 worker,留空");
+    }
+
+    #[tokio::test]
+    async fn finalize_usage_skips_when_no_usage() {
+        let sink = fake_sink();
+        let dyn_sink: Arc<dyn UsageSink> = sink.clone();
+        finalize_usage(Some(&dyn_sink), "acct-1", "m", None, true).await;
+        assert_eq!(sink.rows.lock().unwrap().len(), 0, "无 usage 不应落库");
+    }
+
+    #[tokio::test]
+    async fn finalize_usage_no_sink_is_noop() {
+        // sink=None(库打开失败降级)→ 不 panic、不记录。
+        let usage = ChatUsage::default();
+        finalize_usage(None, "acct-1", "m", Some(&usage), false).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_usage_propagates_failure_flag() {
+        let sink = fake_sink();
+        let dyn_sink: Arc<dyn UsageSink> = sink.clone();
+        let usage = ChatUsage {
+            output_tokens: 5,
+            ..Default::default()
+        };
+        finalize_usage(Some(&dyn_sink), "a", "m", Some(&usage), false).await;
+        let rows = sink.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].success, "失败流应记 success=false");
+    }
 
     fn acct(extra: &[(&str, &str)]) -> Account {
         let mut map = BTreeMap::new();
