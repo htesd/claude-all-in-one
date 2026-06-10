@@ -1,7 +1,7 @@
 //! Provider trait —— 新增上游只需实现它(借鉴 ALLinOne 的"扩展一处")。
 //!
 //! 关键设计:**内部 IR = Anthropic Messages**(不是 OpenAI)。
-//! 主链路 Claude Code(Anthropic)→ kiro-gw → 上游(Kiro / claude-subprocess /
+//! 主链路 Claude Code(Anthropic)→ claude-all-in-one → 上游(Kiro / claude-subprocess /
 //! claude-dario)全程 Anthropic 家族,近乎零转换,保住 thinking 签名透传与
 //! cache_read 计费。见 docs/ARCHITECTURE.md §3.1。
 //!

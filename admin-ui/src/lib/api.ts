@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-export const TOKEN_STORAGE_KEY = 'kiroGwAdminToken'
+export const TOKEN_STORAGE_KEY = 'caioAdminToken'
 
 export function getToken(): string | null {
   try {

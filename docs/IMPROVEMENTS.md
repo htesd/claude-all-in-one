@@ -1,6 +1,6 @@
-# kiro-gw 实现参考表(IMPROVEMENTS)
+# claude-all-in-one 实现参考表(IMPROVEMENTS)
 
-> 全新写 kiro-gw 时,**每个能力点参考哪份代码**的可追溯清单。不是"重构旧项目",是"从零写新项目,有据可依"。
+> 全新写 claude-all-in-one 时,**每个能力点参考哪份代码**的可追溯清单。不是"重构旧项目",是"从零写新项目,有据可依"。
 > 来源:三参考项目(static_flow / xkiro.rs / KiroManager)+ 旧 kiro.rs 搬运资产。
 > 生成:2026-06-05,7 个 sonnet 子代理逐文件核对行号(详见 §附录原始片段)。
 
@@ -33,15 +33,15 @@
 
 ## ⚠️ 三个关键判断(影响架构决策)
 
-1. **三参考项目都不做 local_address 源IP绑定**(static_flow `provider/client.rs:14` 实锤、xkiro `http_client.rs:46` 同样、KiroManager 靠 TLS+代理)。kiro-gw 的「多进程 egress 绑本机IP」是 🟣**全新自创**,没有现成参考,Phase 3 要自己实测 reqwest `local_address` 对 Kiro 上游(纯IPv4)是否生效。
+1. **三参考项目都不做 local_address 源IP绑定**(static_flow `provider/client.rs:14` 实锤、xkiro `http_client.rs:46` 同样、KiroManager 靠 TLS+代理)。claude-all-in-one 的「多进程 egress 绑本机IP」是 🟣**全新自创**,没有现成参考,Phase 3 要自己实测 reqwest `local_address` 对 Kiro 上游(纯IPv4)是否生效。
 
 2. **xkiro 的 `fingerprint.rs` 是半成品/未接线**(确认:`kiro/endpoint/ide.rs:37` 真实路径直接手拼 UA,从不调用 `Fingerprint::generate_from_seed`)。**别照搬整文件**,只借鉴"确定性多字段画像"思路,且必须真接进 header 装配路径。
 
-3. **machineId 必须跨"激活/刷新/发包"一致**(KiroManager `machineId.ts:91` 读OS真值 + `proxy/kiroApi.ts:170` 嵌UA;static_flow `kiro_headers.rs:85` 嵌UA)。这是 ¥900 封号根因。kiro-gw 的 machineId 是头等防封资产,§2 详述。
+3. **machineId 必须跨"激活/刷新/发包"一致**(KiroManager `machineId.ts:91` 读OS真值 + `proxy/kiroApi.ts:170` 嵌UA;static_flow `kiro_headers.rs:85` 嵌UA)。这是 ¥900 封号根因。claude-all-in-one 的 machineId 是头等防封资产,§2 详述。
 
 ---
 
-# §1 按 kiro-gw 模块组织的实现参考
+# §1 按 claude-all-in-one 模块组织的实现参考
 
 每个模块列出:该实现什么能力、参考哪份源码、类型、Phase。精确行号见 §附录的 7 份原始片段。
 
@@ -58,7 +58,7 @@
 | Grapheme 安全截断工具 | xkiro `anthropic/compressor.rs:733` | 🟢借鉴 | P1 |
 | SDK version 常量按链路分离(不同版本本身是指纹) | static_flow `kiro_protocol.rs:5`、`kiro_refresh.rs:28-30` | 🟢借鉴 | P1 |
 
-## 1.2 `gw-kiro/converter`(报文转换 — kiro-gw 心脏)
+## 1.2 `gw-kiro/converter`(报文转换 — claude-all-in-one 心脏)
 
 | 能力 | 参考来源 | 类型 | Phase |
 |---|---|---|---|
@@ -214,11 +214,11 @@
 
 # §2 防封专章(横切,命根)
 
-封号 = 风控发现"激活时的指纹 ≠ 发包时的指纹",或"一堆号共用同一指纹"。kiro-gw 要在 4 个指纹维度上做到「激活=发包一致 + 账号间隔离」。
+封号 = 风控发现"激活时的指纹 ≠ 发包时的指纹",或"一堆号共用同一指纹"。claude-all-in-one 要在 4 个指纹维度上做到「激活=发包一致 + 账号间隔离」。
 
 ## 2.1 四个指纹维度 × 三个参考的现状
 
-| 维度 | KiroManager(激活端真值) | static_flow(发包端) | 旧 kiro.rs | kiro-gw 目标 |
+| 维度 | KiroManager(激活端真值) | static_flow(发包端) | 旧 kiro.rs | claude-all-in-one 目标 |
 |---|---|---|---|---|
 | **machineId** | 读 OS 真值(`machineId.ts:91`),嵌 UA | refreshToken 派生,嵌 UA(`kiro_headers.rs:85`) | refreshToken 派生(`machine_id.rs`) | 派生确定性 + 跨激活/刷新/发包一致;**理想是导入激活时的真值** |
 | **出口 IP** | 走代理/TLS出口 | route.proxy 统一出口 | 全裸奔同 IP | 🟣多进程 egress:一 worker 一 IP,一组号钉一 IP |
@@ -229,7 +229,7 @@
 
 - **事实**:machineId 嵌在 `x-amz-user-agent` = `aws-sdk-js/... KiroIDE-{ver}-{machineId}`。激活端(KiroManager)用 OS 真值,发包端若用别的值 → 双指纹漂移 → 秒封。
 - **KiroManager 怎么来**:`machineId.ts:91 getCurrentMachineId` → Windows 读 `MachineGuid`、macOS 读 override/Kiro文件回退硬件UUID、Linux 读 `/etc/machine-id`。还会**写回**覆盖文件(`setMacOSMachineId:424`)。
-- **kiro-gw 对策**:
+- **claude-all-in-one 对策**:
   1. machineId 作为账号的**持久化字段**(gw-store),导入时若有真值就存真值,没有才 refreshToken 派生(`machine_id.rs:24-109` 搬运)。
   2. 单一事实来源:`Provider::machine_identity()`(gw-core 已定义)产出,header 装配只从这里取,杜绝散落手拼(static_flow `kiro_headers.rs:46` 的做法)。
   3. social refresh 带 machineId、IDC refresh 不带(static_flow `kiro_refresh.rs:84` 的细节差异,容易漏)。
@@ -237,7 +237,7 @@
 ## 2.3 出口 IP 一致性(多进程的核心价值)
 
 - **事实**:三参考都靠"统一 route.proxy"保证 refresh/usage/generate/MCP 同出口(static_flow `kiro_dispatch.rs:1435`+`kiro_refresh.rs:282-705`),**没人做本机源IP绑定**。
-- **kiro-gw 🟣自创**:多进程,一 worker 绑一个固定出口(egress local_ip 或 proxy),一组号钉死在一个 worker → 同号永远同 IP。**激活=发包同 IP** 靠"未来在服务器IP上激活"或"固定IP代理池"达成。
+- **claude-all-in-one 🟣自创**:多进程,一 worker 绑一个固定出口(egress local_ip 或 proxy),一组号钉死在一个 worker → 同号永远同 IP。**激活=发包同 IP** 靠"未来在服务器IP上激活"或"固定IP代理池"达成。
 - **必须保证**(从 static_flow 学的铁律):worker 内 refresh / usage 查询 / 发包 / 状态刷新 **全部走本 worker 的出口**,绝不串。
 - **Phase 3 待实测**:reqwest `local_address` 绑定对 Kiro 上游(纯IPv4,无AAAA)是否生效。
 
@@ -254,11 +254,11 @@
 
 - KiroManager 激活端用 `tlsclientwrapper` 的 chrome_146(`tlsClientPool.ts:29`)。static_flow 和旧 kiro.rs 都是裸 reqwest TLS。
 - **判断**:激活端是 Chrome TLS、发包端是 Rust rustls TLS——理论上是个 JA3 差异点。但 static_flow 生产可用证明"发包端不模拟 TLS 也能跑",说明 Kiro 风控当前没把 TLS 指纹卡死。
-- **kiro-gw 策略**:Phase 不做,记为 later 风险项。若未来封号压力大,再评估 rustls 定制 ClientHello 或上游 TLS 代理。
+- **claude-all-in-one 策略**:Phase 不做,记为 later 风险项。若未来封号压力大,再评估 rustls 定制 ClientHello 或上游 TLS 代理。
 
 ## 2.6 激活端时序(未来自建服务端激活的蓝本)
 
-KiroManager `registrar.ts:1518 run` 是完整 BuilderID 激活时序(OIDC→Device→Email→Portal→Signup→OTP→CreateIdentity→SetPassword→SSO→Token→VerifyAlive,每步带加密浏览器指纹 blob)。**kiro-gw 现阶段不实现激活**(还是用 KiroManager/手工激活后导入),但若将来要"在服务器IP上激活以彻底对齐",这是蓝本。记 later。
+KiroManager `registrar.ts:1518 run` 是完整 BuilderID 激活时序(OIDC→Device→Email→Portal→Signup→OTP→CreateIdentity→SetPassword→SSO→Token→VerifyAlive,每步带加密浏览器指纹 blob)。**claude-all-in-one 现阶段不实现激活**(还是用 KiroManager/手工激活后导入),但若将来要"在服务器IP上激活以彻底对齐",这是蓝本。记 later。
 
 ---
 

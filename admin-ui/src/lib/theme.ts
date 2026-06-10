@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react'
 
-const THEME_STORAGE_KEY = 'kiroGwTheme'
+const THEME_STORAGE_KEY = 'caioTheme'
 
 /**
  * Dark/light theme hook. The initial `.dark` class is applied by an inline

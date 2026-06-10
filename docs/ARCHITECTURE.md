@@ -1,4 +1,4 @@
-# kiro-gw 架构设计
+# claude-all-in-one 架构设计
 
 > Kiro 账号反代网关 · 全新重写 · 多进程模型
 > 状态:设计稿 v0.1 · 2026-06-04
@@ -85,7 +85,7 @@ vultr 单机:
 ## 2. Crate 划分(4 个,不照搬 static_flow 的 16 个)
 
 ```
-kiro-gw/
+claude-all-in-one/
 ├── Cargo.toml              # workspace,统一依赖版本
 ├── crates/
 │   ├── gw-core/            # 契约层:纯类型 + trait,无 I/O
@@ -183,7 +183,7 @@ pub type ChatStream =
 
 ALLinOne 内部 IR 是 OpenAI chunk,对外用 anthropic_adapter 转回。**我们不这么做**,理由:
 
-| | ALLinOne(OpenAI IR) | kiro-gw(Anthropic IR) |
+| | ALLinOne(OpenAI IR) | claude-all-in-one(Anthropic IR) |
 |---|---|---|
 | 客户端 | 多种,OpenAI 为主 | Claude Code(Anthropic) |
 | 主上游 | 多个免费 LLM | Kiro(Anthropic 家族) |
@@ -191,7 +191,7 @@ ALLinOne 内部 IR 是 OpenAI chunk,对外用 anthropic_adapter 转回。**我�
 | thinking 签名 | 转换中丢失 | **无损透传(保住 v42)** |
 | cache_read 计费 | 难注入 | **原生保留(保住 v53)** |
 
-主链路 `Claude Code (Anthropic) → kiro-gw → Kiro (Anthropic)` 全程 Anthropic,不脱衣服。未来若加 OpenAI 客户端入口或 Codex 上游,**在边界做适配**(入口 adapter 或 provider 内部转换),不污染主链路。这是唯一一处刻意偏离 ALLinOne 的设计,目的是保护旧项目最值钱的资产。
+主链路 `Claude Code (Anthropic) → claude-all-in-one → Kiro (Anthropic)` 全程 Anthropic,不脱衣服。未来若加 OpenAI 客户端入口或 Codex 上游,**在边界做适配**(入口 adapter 或 provider 内部转换),不污染主链路。这是唯一一处刻意偏离 ALLinOne 的设计,目的是保护旧项目最值钱的资产。
 
 ### 3.2 新增 provider 仍只改三处
 

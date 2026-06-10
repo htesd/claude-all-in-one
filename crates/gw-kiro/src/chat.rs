@@ -71,7 +71,7 @@ pub async fn chat_stream(
     // 在把 conversation_state move 进 KiroRequest 前算一次。
     //
     // session_key 必须按**账号**隔离(审查 Architect#1):kiro.rs 是单进程单账号池,
-    // 仅用 conversationId 即可;kiro-gw 一个 worker 固定一组多账号,真实 Kiro prefix cache
+    // 仅用 conversationId 即可;claude-all-in-one 一个 worker 固定一组多账号,真实 Kiro prefix cache
     // 是 per-account 后端会话隔离的。若两账号撞同一派生 conversationId(同 system+前2条 user),
     // 仅用 convId 作键会让 A 账号的前缀污染 B 账号的命中估算 → 误报缓存折扣/串号计费。
     // 故 key = account_id + '\x1f' + conversationId,与上游缓存粒度对齐。
@@ -392,7 +392,7 @@ impl BlockTracker {
     }
 
     /// 处理 toolUseEvent:开/续 tool_use 块,input 增量透传为 input_json_delta。
-    /// 🔵 对齐 kiro.rs stream.rs process_tool_use。kiro-gw 不做 tool 名重映射
+    /// 🔵 对齐 kiro.rs stream.rs process_tool_use。claude-all-in-one 不做 tool 名重映射
     /// (请求侧原样转发客户端 tool 定义,上游回原名),无需 tool_name_map。
     ///
     /// **顺序流式假设**:Kiro 按 `stop` 字段分隔顺序流式工具(一个工具 stop=true 后才下一个),

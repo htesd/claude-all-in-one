@@ -7,10 +7,10 @@ import {
   type ReactNode,
 } from 'react'
 
-const LANG_STORAGE_KEY = 'kiroGwLang'
+const LANG_STORAGE_KEY = 'caioLang'
 
 const zh = {
-  'app.title': 'Kiro Gateway',
+  'app.title': 'Claude All in One',
   'app.subtitle': '管理控制台',
   'nav.dashboard': '看板',
   'nav.usage': '用量',
@@ -22,7 +22,7 @@ const zh = {
   'nav.expand': '展开侧边栏',
   'theme.toLight': '切换浅色模式',
   'theme.toDark': '切换深色模式',
-  'login.title': 'Kiro Gateway',
+  'login.title': 'Claude All in One',
   'login.subtitle': '输入管理员令牌以继续',
   'login.placeholder': '管理员令牌',
   'login.submit': '进入',
@@ -191,7 +191,7 @@ export type I18nKey = keyof typeof zh
 export type Lang = 'zh' | 'en'
 
 const en: Record<I18nKey, string> = {
-  'app.title': 'Kiro Gateway',
+  'app.title': 'Claude All in One',
   'app.subtitle': 'Admin Console',
   'nav.dashboard': 'Dashboard',
   'nav.usage': 'Usage',
@@ -203,7 +203,7 @@ const en: Record<I18nKey, string> = {
   'nav.expand': 'Expand sidebar',
   'theme.toLight': 'Switch to light mode',
   'theme.toDark': 'Switch to dark mode',
-  'login.title': 'Kiro Gateway',
+  'login.title': 'Claude All in One',
   'login.subtitle': 'Enter the admin token to continue',
   'login.placeholder': 'Admin token',
   'login.submit': 'Enter',

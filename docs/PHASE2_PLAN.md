@@ -1,4 +1,4 @@
-# kiro-gw Phase 2 计划:上下文处理 + thinking + 签名
+# claude-all-in-one Phase 2 计划:上下文处理 + thinking + 签名
 
 > 三块按用户定的优先级:① 上下文处理(去 Claude Code 恶心 + projection 双锚提缓存)
 > ② thinking 注入(保智力)③ 签名(换 f6 + 保留加密体)。

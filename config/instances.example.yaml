@@ -1,8 +1,8 @@
 # 进程拓扑(多进程核心)。单机双 IPv4 灰度示例。
 # 启动:
-#   kiro-gw --mode router
-#   kiro-gw --mode worker --instance 0
-#   kiro-gw --mode worker --instance 1
+#   claude-all-in-one --mode router
+#   claude-all-in-one --mode worker --instance 0
+#   claude-all-in-one --mode worker --instance 1
 router:
   listen: "0.0.0.0:8990"
 

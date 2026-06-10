@@ -1,4 +1,4 @@
-//! kiro-gw 二进制入口。
+//! claude-all-in-one 二进制入口。
 //!
 //! 单二进制多角色:`--mode router` 或 `--mode worker --instance N`。
 //! 见 docs/ARCHITECTURE.md §1。
@@ -55,7 +55,7 @@ enum Mode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "kiro-gw", about = "Kiro 反代网关(多进程)")]
+#[command(name = "claude-all-in-one", about = "Claude All in One —— 多账号多进程反代")]
 struct Args {
     /// 进程角色。
     #[arg(long, value_enum)]

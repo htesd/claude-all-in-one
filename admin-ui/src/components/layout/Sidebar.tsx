@@ -21,7 +21,7 @@ import { useI18n, type I18nKey } from '@/lib/i18n'
 import { useTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 
-const COLLAPSE_STORAGE_KEY = 'kiroGwSidebarCollapsed'
+const COLLAPSE_STORAGE_KEY = 'caioSidebarCollapsed'
 
 interface NavItem {
   to: string

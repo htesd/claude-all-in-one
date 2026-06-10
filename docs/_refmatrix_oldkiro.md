@@ -1,6 +1,6 @@
 # 旧 kiro.rs 搬运资产 — 实现参考(搬运非重写)
 
-| 资产 | 旧位置(文件:行号 函数名) | 是什么 | 为什么不能重写要搬运 | 搬到kiro-gw模块 | 建议Phase | confidence |
+| 资产 | 旧位置(文件:行号 函数名) | 是什么 | 为什么不能重写要搬运 | 搬到claude-all-in-one模块 | 建议Phase | confidence |
 |---|---|---|---|---|---|---|
 | AWS eventstream 单帧解析 | `src/kiro/parser/frame.rs:63-153 (parse_frame)` | AWS Event Stream 单帧解析，处理 prelude、header/payload 边界、prelude CRC、message CRC，并产出 `Frame { headers, payload }` | 这是 Kiro 上游流协议的底层兼容实现，长度/CRC/边界一旦偏一点就会整流失真；已在生产和测试里验证过，不值得重摸协议细节 | `gw-kiro/parser` | P1 | high |
 | AWS eventstream Header 解析 | `src/kiro/parser/header.rs:130-182 (parse_headers)`; `src/kiro/parser/header.rs:186-257 (parse_header_value)` | 解析 AWS eventstream header 名称、类型和值，覆盖 string/int/uuid/bytearray 等协议字段，并封装 `Headers` 访问器 | 这是事件类型识别的根基，直接影响 `:message-type` / `:event-type` / `:exception-type` 识别；重写极易漏类型或边界校验 | `gw-kiro/parser` | P1 | high |

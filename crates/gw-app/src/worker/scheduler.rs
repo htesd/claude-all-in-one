@@ -2,7 +2,7 @@
 //!
 //! ## 为什么在 worker 层
 //!
-//! kiro.rs 是单进程,一个 `MultiTokenManager` 既做选号又做亲和。kiro-gw 拆成多进程:
+//! kiro.rs 是单进程,一个 `MultiTokenManager` 既做选号又做亲和。claude-all-in-one 拆成多进程:
 //! - **router** 做 session→worker 亲和(同会话钉同 worker,已实现);
 //! - **worker**(本模块)做 session→**组内账号**亲和:同会话钉同一上游账号。
 //!
