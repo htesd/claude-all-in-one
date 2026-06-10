@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use gw_core::store::{
-    AuthenticatedKey, ControlStore, UsageByKey, UsageByModel, UsageRecord, UsageSink, UsageSummary,
+    AuthenticatedKey, ControlStore, UsageByKey, UsageByModel, UsageFilter, UsageRecord, UsageSink,
+    UsageSummary,
 };
+use rusqlite::types::Value;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
@@ -84,43 +86,55 @@ impl SqliteStore {
         Ok(())
     }
 
-    // ───────── 用量统计查询(admin 看板;`since_unix`=None 表示全部) ─────────
+    // ───────── 用量统计查询(admin 看板;按 [`UsageFilter`] 时间窗 + key 筛选) ─────────
 
-    /// 用量总览。`since_unix` = 仅统计 created_at >= 该 Unix 秒的行(None=全部)。
-    pub fn usage_summary(&self, since_unix: Option<i64>) -> anyhow::Result<UsageSummary> {
-        let since = since_unix.unwrap_or(0);
-        let conn = self.conn.lock();
-        let s = conn.query_row(
+    /// 把筛选条件编译成 SQL WHERE 子句 + 位置参数(?1=since, ?2=until, ?3=key 可选)。
+    fn filter_where(f: &UsageFilter) -> (String, Vec<Value>) {
+        let since = f.since_unix.unwrap_or(0);
+        let until = f.until_unix.unwrap_or(i64::MAX);
+        let mut clause = String::from("created_at >= ?1 AND created_at < ?2");
+        let mut params = vec![Value::Integer(since), Value::Integer(until)];
+        if let Some(k) = &f.client_key_id {
+            clause.push_str(" AND client_key_id = ?3");
+            params.push(Value::Text(k.clone()));
+        }
+        (clause, params)
+    }
+
+    /// 用量总览(按筛选)。
+    pub fn usage_summary(&self, filter: &UsageFilter) -> anyhow::Result<UsageSummary> {
+        let (where_, params) = Self::filter_where(filter);
+        let sql = format!(
             "SELECT COUNT(*), COALESCE(SUM(success),0), COALESCE(SUM(input_tokens),0), \
              COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
-             COALESCE(SUM(cache_creation_tokens),0) \
-             FROM usage_records WHERE created_at >= ?1",
-            [since],
-            |r| {
-                Ok(UsageSummary {
-                    requests: r.get::<_, i64>(0)? as u64,
-                    success_requests: r.get::<_, i64>(1)? as u64,
-                    input_tokens: r.get::<_, i64>(2)? as u64,
-                    output_tokens: r.get::<_, i64>(3)? as u64,
-                    cache_read_tokens: r.get::<_, i64>(4)? as u64,
-                    cache_creation_tokens: r.get::<_, i64>(5)? as u64,
-                })
-            },
-        )?;
+             COALESCE(SUM(cache_creation_tokens),0) FROM usage_records WHERE {where_}"
+        );
+        let conn = self.conn.lock();
+        let s = conn.query_row(&sql, rusqlite::params_from_iter(params), |r| {
+            Ok(UsageSummary {
+                requests: r.get::<_, i64>(0)? as u64,
+                success_requests: r.get::<_, i64>(1)? as u64,
+                input_tokens: r.get::<_, i64>(2)? as u64,
+                output_tokens: r.get::<_, i64>(3)? as u64,
+                cache_read_tokens: r.get::<_, i64>(4)? as u64,
+                cache_creation_tokens: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
         Ok(s)
     }
 
-    /// 按模型聚合(请求数降序)。
-    pub fn usage_by_model(&self, since_unix: Option<i64>) -> anyhow::Result<Vec<UsageByModel>> {
-        let since = since_unix.unwrap_or(0);
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
+    /// 按模型聚合(请求数降序,按筛选)。
+    pub fn usage_by_model(&self, filter: &UsageFilter) -> anyhow::Result<Vec<UsageByModel>> {
+        let (where_, params) = Self::filter_where(filter);
+        let sql = format!(
             "SELECT model, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
              COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
-             FROM usage_records WHERE created_at >= ?1 GROUP BY model ORDER BY COUNT(*) DESC",
-        )?;
+             FROM usage_records WHERE {where_} GROUP BY model ORDER BY COUNT(*) DESC"
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([since], |r| {
+            .query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(UsageByModel {
                     model: r.get(0)?,
                     requests: r.get::<_, i64>(1)? as u64,
@@ -134,18 +148,19 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    /// 按客户 apikey(client_key_id)聚合(请求数降序)。
-    pub fn usage_by_key(&self, since_unix: Option<i64>) -> anyhow::Result<Vec<UsageByKey>> {
-        let since = since_unix.unwrap_or(0);
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
+    /// 按客户 apikey(client_key_id)聚合(请求数降序,按筛选——通常不传 key)。
+    pub fn usage_by_key(&self, filter: &UsageFilter) -> anyhow::Result<Vec<UsageByKey>> {
+        let (where_, params) = Self::filter_where(filter);
+        let sql = format!(
             "SELECT client_key_id, COUNT(*), COALESCE(SUM(success),0), \
              COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
              COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
-             FROM usage_records WHERE created_at >= ?1 GROUP BY client_key_id ORDER BY COUNT(*) DESC",
-        )?;
+             FROM usage_records WHERE {where_} GROUP BY client_key_id ORDER BY COUNT(*) DESC"
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([since], |r| {
+            .query_map(rusqlite::params_from_iter(params), |r| {
                 Ok(UsageByKey {
                     client_key_id: r.get(0)?,
                     requests: r.get::<_, i64>(1)? as u64,
@@ -343,11 +358,30 @@ mod tests {
         rec(&store, "k1", "m1", 100, 10, true).await;
         rec(&store, "k2", "m1", 200, 20, true).await;
         rec(&store, "k1", "m2", 50, 5, false).await;
-        let s = store.usage_summary(None).unwrap();
+        let s = store.usage_summary(&UsageFilter::default()).unwrap();
         assert_eq!(s.requests, 3);
         assert_eq!(s.success_requests, 2);
         assert_eq!(s.input_tokens, 350);
         assert_eq!(s.output_tokens, 35);
+    }
+
+    #[tokio::test]
+    async fn usage_summary_filters_by_key() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        rec(&store, "k1", "m1", 100, 10, true).await;
+        rec(&store, "k1", "m2", 50, 5, true).await;
+        rec(&store, "k2", "m1", 200, 20, true).await;
+        let only_k1 = UsageFilter {
+            client_key_id: Some("k1".into()),
+            ..Default::default()
+        };
+        let s = store.usage_summary(&only_k1).unwrap();
+        assert_eq!(s.requests, 2, "只统计 k1");
+        assert_eq!(s.input_tokens, 150);
+        // by-model 也应只含 k1 的模型
+        let models = store.usage_by_model(&only_k1).unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().all(|m| m.model == "m1" || m.model == "m2"));
     }
 
     #[tokio::test]
@@ -356,7 +390,7 @@ mod tests {
         rec(&store, "k1", "m1", 100, 10, true).await;
         rec(&store, "k2", "m1", 200, 20, true).await;
         rec(&store, "k1", "m2", 50, 5, true).await;
-        let rows = store.usage_by_model(None).unwrap();
+        let rows = store.usage_by_model(&UsageFilter::default()).unwrap();
         let m1 = rows.iter().find(|r| r.model == "m1").unwrap();
         assert_eq!(m1.requests, 2);
         assert_eq!(m1.input_tokens, 300);
@@ -370,7 +404,7 @@ mod tests {
         rec(&store, "k1", "m1", 100, 10, true).await;
         rec(&store, "k1", "m2", 50, 5, false).await;
         rec(&store, "k2", "m1", 200, 20, true).await;
-        let rows = store.usage_by_key(None).unwrap();
+        let rows = store.usage_by_key(&UsageFilter::default()).unwrap();
         let k1 = rows.iter().find(|r| r.client_key_id == "k1").unwrap();
         assert_eq!(k1.requests, 2);
         assert_eq!(k1.success_requests, 1);
@@ -385,7 +419,12 @@ mod tests {
         rec(&store, "k1", "m1", 100, 10, true).await;
         // since 在未来 → 过滤掉刚写入的行。
         let future = 9_999_999_999i64;
-        let s = store.usage_summary(Some(future)).unwrap();
+        let s = store
+            .usage_summary(&UsageFilter {
+                since_unix: Some(future),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(s.requests, 0, "since 在未来应过滤掉所有行");
     }
 
