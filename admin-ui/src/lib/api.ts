@@ -1,22 +1,8 @@
 import axios from 'axios'
 
-export const TOKEN_STORAGE_KEY = 'caioAdminToken'
+import { clearToken, getToken } from './token-storage'
 
-export function getToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_STORAGE_KEY)
-  } catch {
-    return null
-  }
-}
-
-export function setToken(token: string): void {
-  localStorage.setItem(TOKEN_STORAGE_KEY, token)
-}
-
-export function clearToken(): void {
-  localStorage.removeItem(TOKEN_STORAGE_KEY)
-}
+export { clearToken, getToken, setToken, TOKEN_STORAGE_KEY } from './token-storage'
 
 /** Shared admin API client. Base path matches the gateway's mount point. */
 export const api = axios.create({
