@@ -46,8 +46,13 @@ impl ModelInfo {
 /// 关键事实(见 memory rewrite-recon-findings):`machine_id` 嵌在
 /// 上游请求的 `User-Agent` / `x-amz-user-agent` 末尾
 /// (`KiroIDE-{version}-{machine_id}`)。**同一账号的 machine_id 必须
-/// 跨"激活/刷新/发包"始终一致**,否则触发风控(¥900 封号根因)。account
-/// 必须**显式持有** machine_id;provider 不得在发包时静默派生/生成。
+/// 跨"激活/刷新/发包"始终一致**,否则触发风控(¥900 封号根因)。
+///
+/// 一致性保证(审查 Architect#5):理想是账号**显式持有** machine_id。但 Social/OAuth
+/// 号常无显式值,此时 Kiro provider 按 `sha256("KotlinNativeAPI/"+refresh_token)` 派生
+/// (对齐上游客户端派生公式),并在**首次刷新**时把该值冻结为显式 `machine_id` 持久化
+/// (见 `gw_kiro::machine_id::freeze_machine_id_if_absent`),避免随 rolling token 漂移。
+/// 即"显式优先,缺失则派生一次后即冻结",而非每次发包重新派生。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineIdentity {
     /// 64 字符小写 hex 机器码。

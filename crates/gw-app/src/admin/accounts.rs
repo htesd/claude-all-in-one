@@ -87,8 +87,12 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
                 .into_iter()
                 .map(|(k, v)| {
                     let lk = k.to_lowercase();
-                    let sensitive =
-                        lk.contains("token") || lk.contains("secret") || lk.contains("password");
+                    // 含 key 也算敏感:kiro_api_key / anthropic_api_key 等不含 token/secret/password
+                    // 的凭据字段否则会经 GET 明文泄漏(本仓库凭据语境下 *_key 一律视为机密)。
+                    let sensitive = lk.contains("token")
+                        || lk.contains("secret")
+                        || lk.contains("password")
+                        || lk.contains("key");
                     let v = if sensitive {
                         // 按字符(非字节)取尾 4 位:非 ASCII 密钥按字节切会落在
                         // UTF-8 编码中间直接 panic(审查 Minimalist#5)。
@@ -435,6 +439,20 @@ mod tests {
         let masked = v[0]["extra"]["password"].as_str().unwrap();
         assert!(masked.starts_with("***"));
         assert!(masked.contains("一二三四"), "保尾 4 个字符,实际 {masked}");
+    }
+
+    #[tokio::test]
+    async fn redaction_covers_api_key_fields() {
+        let (app, store) = app();
+        store
+            .create_account("kiro-ak", "", "kiro", 1, r#"{"kiro_api_key":"ksk-super-secret-9999"}"#)
+            .unwrap();
+        let resp = app.oneshot(req("GET", "/accounts", None)).await.unwrap();
+        let v = json_body(resp).await;
+        let masked = v[0]["extra"]["kiro_api_key"].as_str().unwrap();
+        // kiro_api_key 不含 token/secret/password,必须靠 "key" 规则脱敏,否则明文泄漏。
+        assert!(masked.starts_with("***"), "kiro_api_key 必须脱敏,实际 {masked}");
+        assert!(!masked.contains("ksk-super-secret"), "明文不得出现:{masked}");
     }
 
     #[tokio::test]

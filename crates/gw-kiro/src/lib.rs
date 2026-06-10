@@ -15,6 +15,7 @@ pub mod cache_sim;
 pub mod chat;
 pub mod converter;
 pub mod error_map;
+pub mod headers;
 pub mod inline_thinking;
 pub mod kiro_types;
 pub mod machine_id;
@@ -32,9 +33,6 @@ use gw_core::account::{Account, FieldSpec, FieldType};
 use gw_core::error::UpstreamError;
 use gw_core::model::{MachineIdentity, ModelInfo};
 use gw_core::provider::{CallCtx, ChatRequest, ChatStream, Provider};
-
-/// Kiro 默认客户端版本。
-const DEFAULT_KIRO_VERSION: &str = "0.12.155";
 
 /// 缓存计费参数(v53:multiplier/cap/floor)。worker 从 `system.yaml` 的 `cache` 段注入,
 /// 替代旧 kiro.rs 的 admin 热调控制面(本项目 Phase 4 再做真正热调,当前为启动期定值)。
@@ -72,12 +70,29 @@ impl CacheBilling {
 }
 
 /// 账号字段 schema(驱动 admin 表单 + accounts.yaml 校验)。
+///
+/// 字段全集对齐 static_flow `KiroAuthRecord`,覆盖 Social / IdC / API Key 三种凭据。
+/// **防封关键**:`machine_id` —— Social 号(KiroManager 导出)必须带原始真机指纹,
+/// 否则按 `sha256("KotlinNativeAPI/"+refresh_token)` 派生,会随 rolling token 漂移触发风控。
 const KIRO_ACCOUNT_SCHEMA: &[FieldSpec] = &[
     FieldSpec::new("account_id", "账号 ID", FieldType::String, true),
     FieldSpec::new("refresh_token", "Refresh Token", FieldType::Password, true),
     FieldSpec::new("access_token", "Access Token", FieldType::Password, false),
     FieldSpec::new("profile_arn", "Profile ARN", FieldType::String, false),
-    FieldSpec::new("region", "区域", FieldType::String, false),
+    FieldSpec::new("region", "区域", FieldType::String, false)
+        .with_help("AWS 区域,默认 us-east-1;同时兜底 api/auth 区域"),
+    FieldSpec::new("machine_id", "设备指纹 (machineId)", FieldType::String, false)
+        .with_help("Social 号防封关键:填原始真机 machineId(64 hex 或 UUID);留空则按 refresh_token 派生,会随 token 刷新漂移"),
+    FieldSpec::new("auth_method", "认证方式", FieldType::String, false)
+        .with_help("social / idc;留空按 client_id+secret 自动判定"),
+    FieldSpec::new("kiro_provider", "身份来源", FieldType::String, false)
+        .with_help("github / google / builderid / enterprise;用于缺失 profileArn 时取固定兜底"),
+    FieldSpec::new("client_id", "IdC Client ID", FieldType::String, false)
+        .with_help("IdC(企业 SSO)账号必填,与 Client Secret 成对"),
+    FieldSpec::new("client_secret", "IdC Client Secret", FieldType::Password, false)
+        .with_help("IdC 账号必填;走 AWS OIDC 刷新,不易封"),
+    FieldSpec::new("kiro_version", "客户端版本", FieldType::String, false)
+        .with_help("⚠️ UA 里的 KiroIDE 版本,默认 0.12.155;改它而不同步 OS/Node 版本会造成现实不存在的指纹组合,非必要勿动"),
 ];
 
 /// Kiro provider。持有 worker 注入的 egress client(固定出口 IP)。
@@ -125,16 +140,14 @@ impl KiroProvider {
     /// UA 把 machineId 嵌在末尾:`...KiroIDE-{version}-{machineId}`(封号根因点)。
     pub fn machine_identity(&self, account: &Account) -> MachineIdentity {
         let machine_id = machine_id::generate_from_account(account);
-        // 客户端版本:账号可显式覆盖,否则用默认(P1+ 从指纹配置取)。
-        let client_version = account
-            .extra_str("kiro_version")
-            .filter(|v| !v.is_empty())
-            .unwrap_or(DEFAULT_KIRO_VERSION)
-            .to_string();
-        let ua = format!("aws-sdk-js/1.0.0 KiroIDE-{client_version}-{machine_id}");
+        // 客户端版本:账号可显式覆盖,否则用默认。
+        let client_version = headers::kiro_version(account);
+        // UA 与实际发包(headers 模块)同源,避免版本号漂移(此前写死 1.0.0 是陷阱)。
+        let (x_amz_user_agent, user_agent) =
+            headers::streaming_user_agents(&client_version, &machine_id);
         MachineIdentity {
-            user_agent: ua.clone(),
-            x_amz_user_agent: ua,
+            user_agent,
+            x_amz_user_agent,
             machine_id,
             client_version,
         }
@@ -152,12 +165,13 @@ impl Provider for KiroProvider {
     }
 
     fn validate_account(&self, account: &Account) -> Result<(), UpstreamError> {
-        // 必须能派生出有效 machineId 的材料:refresh_token(social/IdC)或 kiro_api_key。
+        // 当前只支持 social/IdC(均需 refresh_token);API Key 路径尚未实现 token 换取流程
+        // (审查 Skeptic#1/Architect#1:此前 schema 暴露 kiro_api_key 但调用链不支持,
+        // 现撤下并在此明确拒绝,避免"加载通过、首请求才报缺 refresh_token"的边界破裂)。
         let has_refresh = account.extra_str("refresh_token").is_some_and(|s| !s.is_empty());
-        let has_api_key = account.extra_str("kiro_api_key").is_some_and(|s| !s.is_empty());
-        if !has_refresh && !has_api_key {
+        if !has_refresh {
             return Err(UpstreamError::bad_request(format!(
-                "Kiro 账号 '{}' 缺少 refresh_token 或 kiro_api_key",
+                "Kiro 账号 '{}' 缺少 refresh_token(social/IdC 必需;API Key 凭据暂不支持)",
                 account.account_id
             )));
         }
@@ -204,6 +218,15 @@ impl Provider for KiroProvider {
         // 持久化由 gw-app 负责(契约 H4)。
         let refreshed = token::refresh_auth(&self.egress_client, account).await?;
         let mut updated = account.clone();
+        // 冻结 machineId(用**旧** refresh_token 派生,务必在覆盖 rolling token 之前):
+        // 否则下次刷新后 machineId 随新 token 漂移 = 换设备 = 封号。见 machine_id::freeze。
+        if machine_id::freeze_machine_id_if_absent(&mut updated) {
+            tracing::info!(
+                account_id = %updated.account_id,
+                "已冻结派生 machineId 防 rolling token 漂移;若该号由 Kiro IDE/KiroManager 导出,\
+                 建议在账号里填真机 machine_id 以彻底规避风控"
+            );
+        }
         updated.extra.insert(
             "access_token".into(),
             serde_json::Value::String(refreshed.access_token),
