@@ -46,14 +46,13 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
     None
 }
 
-/// 账号是否为 API Key 凭据(🟢 适配:旧 KiroCredentials::is_api_key_credential)。
+/// 账号是否为 API Key 凭据:**必须**带非空 `kiro_api_key`。
 ///
-/// 规则与旧代码一致:`auth_method == "api_key"`,或显式带了非空 `kiro_api_key`。
-/// API Key 与 refreshToken 两条派生路径**互斥**,不回落。
+/// 仅凭 `auth_method == "api_key"` 标签不够(审查 Skeptic#5):否则一个误配
+/// `auth_method=api_key` 但实为 refresh_token 的账号,会被判成 api_key 分支、因无 key
+/// 落到随机兜底指纹,而 refresh 路径却按 social 刷新——指纹与刷新分叉,且被 freeze 固化。
+/// 以"是否真有派生材料"判定,与 refresh_auth 的分流口径一致。
 fn is_api_key_credential(account: &Account) -> bool {
-    if account.extra_str("auth_method") == Some("api_key") {
-        return true;
-    }
     account
         .extra_str("kiro_api_key")
         .is_some_and(|k| !k.is_empty())
@@ -89,6 +88,32 @@ pub fn generate_from_account(account: &Account) -> String {
 
     // 3. 兜底
     fallback_machine_id(account)
+}
+
+/// 账号是否已带**合法**的显式 machine_id(64hex 或 UUID)。
+pub fn has_explicit_machine_id(account: &Account) -> bool {
+    account
+        .extra_str("machine_id")
+        .and_then(normalize_machine_id)
+        .is_some()
+}
+
+/// 冻结 machineId:若账号无显式 machine_id,把**当前**派生值钉成显式 `machine_id`。
+/// 返回是否发生了冻结。
+///
+/// **防封核心**:social/OAuth 的 machineId 派生自 refresh_token,而 token 是 rolling 的
+/// (每次刷新都换)。不冻结则每次刷新 machineId 漂移 = 上游看到"同账号换设备" = 封号。
+/// 在 token roll **之前**用旧 token 派生并钉死,设备指纹此后恒定。调用方须在覆盖
+/// refresh_token 前调用(否则会用新 token 派生,失去冻结意义)。
+pub fn freeze_machine_id_if_absent(account: &mut Account) -> bool {
+    if has_explicit_machine_id(account) {
+        return false;
+    }
+    let derived = generate_from_account(account);
+    account
+        .extra
+        .insert("machine_id".into(), serde_json::Value::String(derived));
+    true
 }
 
 /// 为缺失派生材料的账号生成兜底 machineId(🔵 照搬旧 fallback_machine_id)。
@@ -183,15 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn api_key_auth_method_empty_falls_to_fallback_not_refresh() {
-        // auth_method=api_key 但 kiro_api_key 缺失:不回落 refresh_token,走兜底
+    fn api_key_label_without_key_uses_refresh_token() {
+        // 审查 Skeptic#5 修正:auth_method=api_key 但无 kiro_api_key、有 refresh_token,
+        // 应按 refresh_token 派生(与 refresh_auth 的 social 刷新口径一致),不再落随机兜底。
         let acct = account_with(&[
             ("auth_method", "api_key"),
-            ("refresh_token", "should_not_be_used"),
+            ("refresh_token", "rt_present"),
         ]);
         let mid = generate_from_account(&acct);
-        assert_eq!(mid.len(), 64);
-        assert_ne!(mid, sha256_hex("KotlinNativeAPI/should_not_be_used"));
+        assert_eq!(mid, sha256_hex("KotlinNativeAPI/rt_present"));
     }
 
     #[test]
@@ -213,6 +238,42 @@ mod tests {
     fn normalize_rejects_invalid() {
         assert!(normalize_machine_id("invalid").is_none());
         assert!(normalize_machine_id(&"g".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn has_explicit_machine_id_detects_valid_and_invalid() {
+        assert!(has_explicit_machine_id(&account_with(&[("machine_id", &"a".repeat(64))])));
+        assert!(has_explicit_machine_id(&account_with(&[(
+            "machine_id",
+            "2582956e-cc88-4669-b546-07adbffcb894"
+        )])));
+        // 非法格式 / 缺失 → 视为无显式指纹。
+        assert!(!has_explicit_machine_id(&account_with(&[("machine_id", "nope")])));
+        assert!(!has_explicit_machine_id(&account_with(&[("refresh_token", "rt")])));
+    }
+
+    #[test]
+    fn freeze_pins_derived_id_and_survives_token_roll() {
+        // social 号无显式 machine_id:冻结前后派生值一致。
+        let mut acct = account_with(&[("refresh_token", "RT0")]);
+        let pre = generate_from_account(&acct);
+        assert!(freeze_machine_id_if_absent(&mut acct), "首次应冻结");
+        assert_eq!(acct.extra_str("machine_id"), Some(pre.as_str()), "应钉成显式");
+
+        // 模拟 token roll:refresh_token 变了,但 machineId 已显式 → 不再漂移。
+        acct.extra
+            .insert("refresh_token".into(), serde_json::Value::String("RT1".into()));
+        assert!(!freeze_machine_id_if_absent(&mut acct), "已有显式不再冻结");
+        assert_eq!(generate_from_account(&acct), pre, "roll 后 machineId 保持冻结值");
+        // 反证:若按新 token 派生会不同 → 证明冻结确实挡住了漂移。
+        assert_ne!(pre, sha256_hex("KotlinNativeAPI/RT1"));
+    }
+
+    #[test]
+    fn freeze_noop_when_explicit_present() {
+        let mut acct = account_with(&[("machine_id", &"b".repeat(64)), ("refresh_token", "RT0")]);
+        assert!(!freeze_machine_id_if_absent(&mut acct));
+        assert_eq!(acct.extra_str("machine_id"), Some("b".repeat(64).as_str()));
     }
 
     #[test]

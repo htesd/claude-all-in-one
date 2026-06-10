@@ -1,16 +1,32 @@
 # 账号(按组分配到 worker)。组名对应 instances.yaml 的 account_group。
-# ⚠️ 真实 refresh_token 是密钥,勿提交。复制为 accounts.yaml 后填写。
+# ⚠️ 真实 refresh_token / client_secret / api_key 是密钥,勿提交。复制为 accounts.yaml 后填写。
+#
+# 支持三种 Kiro 凭据:
+#   - Social(GitHub/Google 登录):只需 refresh_token。
+#     ⚠️ 防封关键:Social 号注册时绑了真机 machineId,KiroManager 导出常丢失该值。
+#        不填 machine_id 则按 sha256("KotlinNativeAPI/"+refresh_token) 派生,会随 token
+#        刷新漂移触发风控。如有真机 machineId(64 hex 或 UUID),强烈建议填上。
+#   - IdC(企业 SSO,不易封):带 client_id + client_secret,走 AWS 标准 OIDC 刷新。
+#   - API Key:auth_method: api_key + kiro_api_key。
 groups:
   G0:
     provider: kiro
     accounts:
+      # Social 号(推荐补 machine_id 防封)
       - account_id: kiro-01
         refresh_token: "REPLACE_ME"
+        machine_id: "REPLACE_ME_64HEX_OR_UUID"   # 可选但强烈建议:原始真机指纹
+        kiro_provider: github                    # github/google:缺 profileArn 时取固定兜底
       - account_id: kiro-02
         refresh_token: "REPLACE_ME"
 
   G1:
     provider: kiro
     accounts:
+      # IdC 号(企业 SSO,封号风险低)
       - account_id: kiro-03
+        auth_method: idc
         refresh_token: "REPLACE_ME"
+        client_id: "REPLACE_ME"
+        client_secret: "REPLACE_ME"
+        region: us-east-1

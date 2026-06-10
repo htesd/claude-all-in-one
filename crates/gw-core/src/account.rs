@@ -47,6 +47,12 @@ impl FieldSpec {
             help: None,
         }
     }
+
+    /// 链式附加提示文本(const,可用于 static schema 表)。
+    pub const fn with_help(mut self, help: &'static str) -> Self {
+        self.help = Some(help);
+        self
+    }
 }
 
 /// 一个账号实例。

@@ -27,10 +27,6 @@ use crate::error_map::classify_chat_error;
 use crate::kiro_types::request::KiroRequest;
 use crate::parser::decoder::EventStreamDecoder;
 
-const DEFAULT_KIRO_VERSION: &str = "0.12.155";
-const DEFAULT_OS: &str = "darwin";
-const DEFAULT_NODE: &str = "20.0.0";
-
 /// api 区域:`api_region` > `region` > us-east-1。
 fn api_region(account: &Account) -> String {
     account
@@ -83,8 +79,8 @@ pub async fn chat_stream(
         (sim.cache_read_tokens as i32, sim.total_tokens as i32)
     };
 
-    // 3. 组装顶层 KiroRequest(注入 profileArn)
-    let profile_arn = account.extra_str("profile_arn").map(|s| s.to_string());
+    // 3. 组装顶层 KiroRequest(注入 profileArn:显式值 > 按 idp 固定兜底,对齐 static_flow)
+    let profile_arn = crate::headers::resolve_profile_arn(&account);
     let kiro_req = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: profile_arn.clone(),
@@ -101,29 +97,22 @@ pub async fn chat_stream(
         })?
         .to_string();
 
-    // 5. 发包(金标准请求头)
+    // 5. 发包(金标准请求头,逐字对齐 static_flow —— 见 [`crate::headers`])。
+    //    端点 runtime.{region}.kiro.dev(env 可覆盖);UA/Accept/条件头集中在 headers 模块。
     let region = api_region(&account);
-    let url = format!("https://q.{region}.amazonaws.com/generateAssistantResponse");
-    let version = account
-        .extra_str("kiro_version")
-        .filter(|v| !v.is_empty())
-        .unwrap_or(DEFAULT_KIRO_VERSION);
-    let x_amz_ua = format!("aws-sdk-js/1.0.34 KiroIDE-{version}-{machine_id}");
-    let ua = format!(
-        "aws-sdk-js/1.0.34 ua/2.1 os/{DEFAULT_OS} lang/js md/nodejs#{DEFAULT_NODE} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{version}-{machine_id}"
-    );
+    let base_url = crate::headers::runtime_base_url(&region);
+    let url = format!("{base_url}/generateAssistantResponse");
+    let version = crate::headers::kiro_version(&account);
 
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("x-amzn-codewhisperer-optout", "true")
-        .header("x-amzn-kiro-agent-mode", "vibe")
-        .header("x-amz-user-agent", &x_amz_ua)
-        .header("user-agent", &ua)
-        .header("host", format!("q.{region}.amazonaws.com"))
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=3")
-        .header("Authorization", format!("Bearer {access_token}"))
+    let rb = crate::headers::apply_streaming_headers(
+        client.post(&url),
+        &account,
+        &base_url,
+        &access_token,
+        &machine_id,
+        &version,
+    );
+    let resp = rb
         .body(body)
         .send()
         .await

@@ -18,11 +18,6 @@ use crate::machine_id;
 
 /// 默认 region(对齐旧 default_region)。
 const DEFAULT_REGION: &str = "us-east-1";
-/// 默认 Kiro 客户端版本。
-const DEFAULT_KIRO_VERSION: &str = "0.12.155";
-/// UA 里的 OS / node 版本(对齐旧 config 默认)。
-const DEFAULT_OS: &str = "darwin";
-const DEFAULT_NODE: &str = "20.0.0";
 
 /// 刷新得到的新凭证材料(调用方据此更新 Account.extra 并存盘)。
 #[derive(Debug, Clone)]
@@ -122,10 +117,7 @@ async fn refresh_social(
     let url = format!("https://prod.{region}.auth.desktop.kiro.dev/refreshToken");
     let domain = format!("prod.{region}.auth.desktop.kiro.dev");
     let machine = machine_id::generate_from_account(account);
-    let version = account
-        .extra_str("kiro_version")
-        .filter(|v| !v.is_empty())
-        .unwrap_or(DEFAULT_KIRO_VERSION);
+    let version = crate::headers::kiro_version(account);
 
     let resp = client
         .post(&url)
@@ -170,19 +162,11 @@ async fn refresh_idc(
     let url = format!("https://oidc.{region}.amazonaws.com/token");
     let client_id = account.extra_str("client_id").unwrap_or_default();
     let client_secret = account.extra_str("client_secret").unwrap_or_default();
-    let user_agent = format!(
-        "aws-sdk-js/3.980.0 ua/2.1 os/{DEFAULT_OS} lang/js md/nodejs#{DEFAULT_NODE} api/sso-oidc#3.980.0 m/E KiroIDE"
-    );
+    // IdC 刷新头集合/顺序/UA 逐字对齐 static_flow refresh_idc(含 accept: */*)。
+    let version = crate::headers::kiro_version(account);
+    let rb = crate::headers::apply_idc_refresh_headers(client.post(&url), &region, &version);
 
-    let resp = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("x-amz-user-agent", "aws-sdk-js/3.980.0 KiroIDE")
-        .header("user-agent", &user_agent)
-        .header("host", format!("oidc.{region}.amazonaws.com"))
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
+    let resp = rb
         .json(&IdcRefreshRequest {
             client_id: client_id.to_string(),
             client_secret: client_secret.to_string(),
