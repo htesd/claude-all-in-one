@@ -32,11 +32,11 @@ interface NavItem {
 const navItems: NavItem[] = [
   { to: '/', labelKey: 'nav.dashboard', icon: LayoutDashboard },
   { to: '/usage', labelKey: 'nav.usage', icon: BarChart3 },
+  { to: '/keys', labelKey: 'nav.apiKeys', icon: KeyRound },
 ]
 
 const comingSoonItems: { labelKey: I18nKey; icon: LucideIcon }[] = [
   { labelKey: 'nav.accounts', icon: Users },
-  { labelKey: 'nav.apiKeys', icon: KeyRound },
   { labelKey: 'nav.groups', icon: FolderKanban },
 ]
 
