@@ -14,6 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gw_store::SqliteStore;
 
+mod keys;
 mod usage;
 
 /// admin 路由共享态:管理密钥 + 控制面存储(keys / usage / groups / accounts)。
@@ -28,6 +29,7 @@ pub fn admin_api_router(state: AdminState) -> Router {
     Router::new()
         .route("/ping", get(ping))
         .merge(usage::router())
+        .merge(keys::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state)
 }
