@@ -4,5 +4,10 @@ cache:
   cap_ratio: 0.9
   floor_ratio: 0.1
 
+# admin 控制面:设了非空 token 才启用(router 进程挂 /admin/api)。这是单一管理密钥,
+# 与对外客户 apikey 完全分离;前端登录用它,经 x-api-key / Bearer 传入。留空=不启用 admin。
+admin:
+  token: ""   # 例如:openssl rand -hex 32
+
 # 空响应无配置:v60 起不做反代侧重试/兜底,固定为记一条 empty_response error +
 # 阈值冷却 + 客户端自重试。
