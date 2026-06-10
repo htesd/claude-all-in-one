@@ -22,6 +22,7 @@ use gw_core::routing::extract_session_from_metadata;
 use gw_core::store::ControlStore;
 use gw_store::SqliteStore;
 use parking_lot::Mutex;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::admin::{self, AdminState};
 use crate::CLIENT_KEY_HEADER;
@@ -117,10 +118,20 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
         .route("/health", get(health))
         .with_state(state);
 
-    // admin API 挂在 /admin/api(自带 AdminState + 鉴权中间件)。SPA 静态资源后续接 /admin。
+    // admin 启用时:/admin/api 挂 API(自带鉴权);/admin 挂 SPA 静态资源(更具体的
+    // /admin/api 优先匹配)。SPA 用 ServeDir + index.html 兜底,支撑前端 BrowserRouter
+    // 的客户端路由(/admin/usage 等找不到文件→回 index.html)。dist 路径相对运行目录,
+    // 缺失时静默 404(admin API 仍可用);生产单二进制可后续改 rust-embed 内嵌。
     if let Some(admin_state) = admin_state {
-        tracing::info!("admin 控制面已启用: /admin/api/*");
-        app = app.nest("/admin/api", admin::admin_api_router(admin_state));
+        // 用 .fallback(不是 .not_found_service):后者把兜底响应裹成 404(SetStatus),
+        // 会让 SPA 客户端路由(/admin/usage 等)拿到 404+index.html;.fallback 保留
+        // ServeFile 原状态 200。
+        let spa = ServeDir::new("admin-ui/dist")
+            .fallback(ServeFile::new("admin-ui/dist/index.html"));
+        tracing::info!("admin 控制面已启用: /admin(SPA) + /admin/api/*");
+        app = app
+            .nest("/admin/api", admin::admin_api_router(admin_state))
+            .nest_service("/admin", spa);
     }
 
     let listener = tokio::net::TcpListener::bind(&instances.router.listen).await?;
