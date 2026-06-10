@@ -24,7 +24,8 @@ export interface UpdateKeyPayload {
 }
 
 /**
- * 自定义 key 规则（与后端一致）：8–128 个 ASCII 可见字符（0x21–0x7E，无空格）。
+ * 自定义 key 规则（与后端一致）：8–128 个 URL-safe 字符 [A-Za-z0-9._~-]
+ * （RFC 3986 unreserved，避免 / # ? 等保留字符进入 PATCH/DELETE 的路径段）。
  * 提交前先在客户端校验，避免一次必然 400 的请求。
  */
-export const CUSTOM_KEY_PATTERN = /^[\x21-\x7E]{8,128}$/
+export const CUSTOM_KEY_PATTERN = /^[A-Za-z0-9._~-]{8,128}$/

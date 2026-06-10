@@ -53,13 +53,19 @@ fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
         .into_response()
 }
 
-/// 校验自定义 key:8–128 个 ASCII 可见字符(无空格/控制符/非 ASCII)。
+/// 校验自定义 key:8–128 个 URL-safe 字符(字母/数字/`-_.~`,即 RFC 3986
+/// unreserved)。收紧而非放任任意可见 ASCII:key 会进 PATCH/DELETE 的路径段,
+/// `/`、`#`、`%` 等字符要靠 URL 编码穿透浏览器/代理/路由,任一环节解码或拒绝
+/// 编码斜杠就会造出"建得出来却停不掉"的 key(对抗审查 Minimalist#1)。
 fn validate_custom_key(key: &str) -> Result<(), &'static str> {
     if !KEY_LEN.contains(&key.len()) {
         return Err("key 长度须在 8–128 字符之间");
     }
-    if !key.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err("key 只能含 ASCII 可见字符(不含空格)");
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+    {
+        return Err("key 只能含字母、数字及 - _ . ~");
     }
     Ok(())
 }
@@ -235,6 +241,8 @@ mod tests {
             r#"{"key":"short"}"#,                  // 太短
             r#"{"key":"sk has space"}"#,           // 含空格
             r#"{"key":"sk-中文键-8888"}"#,          // 非 ASCII
+            r#"{"key":"sk-bad/slash8"}"#,          // URL 路径敌对字符(PATCH/DELETE 路径段)
+            r#"{"key":"sk-bad#hash888"}"#,         // 同上
         ] {
             let resp = app.clone().oneshot(req("POST", "/keys", Some(bad))).await.unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "应拒绝 {bad}");
@@ -261,7 +269,7 @@ mod tests {
         assert_eq!(v["disabled"], true);
         assert_eq!(v["label"], "旧备注");
 
-        // 清空备注("")。
+        // 清空备注("")→ NULL(与创建路径一致)。
         let resp = app
             .clone()
             .oneshot(req("PATCH", "/keys/sk-patch-me-1", Some(r#"{"label":""}"#)))
@@ -269,7 +277,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
-        assert_eq!(v["label"], "");
+        assert_eq!(v["label"], serde_json::Value::Null, "清空备注应回 null");
         assert_eq!(v["disabled"], true, "改 label 不得动 disabled");
 
         // 不存在 → 404。
