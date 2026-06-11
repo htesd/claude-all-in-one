@@ -7,3 +7,6 @@
 *.db
 *.db-wal
 *.db-shm
+# 运行日志(debug 日志可能含 token)
+/logs
+*.log
