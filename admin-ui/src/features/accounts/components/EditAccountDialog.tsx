@@ -37,6 +37,8 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   const [concurrency, setConcurrency] = useState('1')
   const [rotateOpen, setRotateOpen] = useState(false)
   const [token, setToken] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [initialProxyUrl, setInitialProxyUrl] = useState('')
   const [error, setError] = useState<string | null>(null)
 
   // 打开时预填当前值；编辑过程中列表 refetch 换引用不打断草稿
@@ -46,6 +48,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
       setConcurrency(String(row.max_concurrency))
       setRotateOpen(false)
       setToken('')
+      const currentProxy = typeof row.extra.proxy === 'string' ? row.extra.proxy : ''
+      setProxyUrl(currentProxy)
+      setInitialProxyUrl(currentProxy)
       setError(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -70,6 +75,8 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     if (parsedConcurrency !== row.max_concurrency) patch.max_concurrency = parsedConcurrency
     const trimmedToken = token.trim()
     if (trimmedToken !== '') patch.extra = buildRotatedExtra(row.extra, trimmedToken)
+    // proxy_url: 不传=不动，'' = 清除，非空字符串 = 设置
+    if (proxyUrl !== initialProxyUrl) patch.proxy_url = proxyUrl
 
     if (Object.keys(patch).length === 0) {
       onClose()
@@ -139,6 +146,26 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
               step={1}
               value={concurrency}
               onChange={(event) => setConcurrency(event.target.value)}
+              className={inputClass}
+            />
+          </div>
+
+          {/* 出口代理（可选） */}
+          <div className="space-y-1.5">
+            <label
+              htmlFor="edit-account-proxy"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t('accounts.field.proxy')}
+            </label>
+            <input
+              id="edit-account-proxy"
+              type="text"
+              value={proxyUrl}
+              onChange={(event) => setProxyUrl(event.target.value)}
+              placeholder={t('accounts.field.proxyPlaceholder')}
+              spellCheck={false}
+              autoComplete="off"
               className={inputClass}
             />
           </div>

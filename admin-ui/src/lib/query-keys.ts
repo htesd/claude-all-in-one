@@ -25,4 +25,9 @@ export const queryKeys = {
     /** worker 运行态，15s 轮询。 */
     runtime: () => ['accounts', 'runtime'] as const,
   },
+  settings: {
+    /** 系统设置域根 key。 */
+    root: ['settings'] as const,
+    detail: () => ['settings', 'detail'] as const,
+  },
 } as const

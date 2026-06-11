@@ -30,6 +30,14 @@ export interface UpdateAccountPayload {
   max_concurrency?: number
   disabled?: boolean
   extra?: Record<string, unknown>
+  /**
+   * 出口代理 URL。
+   * - 非空字符串 = 设置该账号代理
+   * - 空字符串 `""` = 清除（走全局默认）
+   * - 不传 = 不动
+   * 注意：不要传 null，后端以 null 表示"不修改"。
+   */
+  proxy_url?: string
 }
 
 /** worker 侧账号不可用原因枚举（'' = 无）。 */
@@ -74,6 +82,8 @@ export interface ImportAccountsPayload {
   group_name?: string
   /** KiroManager 导出内容(原文字符串或已解析对象均可)。 */
   json: string
+  /** 批量出口代理：非空时应用到本次导入的所有账号。 */
+  batch_proxy?: string
 }
 
 /** POST /accounts/import 响应。 */

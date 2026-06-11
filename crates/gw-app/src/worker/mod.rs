@@ -479,16 +479,40 @@ pub async fn run(
     // 保证该 provider 所有上游请求走同一出口 IP(防关联封号)。
     let client = egress::build_client(&wcfg.egress)?;
     let egress_desc = egress::describe(&wcfg.egress);
-    // cache_sim 全局 store 的 TTL/容量从 system.cache 同步(否则恒用编译期默认 300s/4096)。
-    gw_kiro::cache_sim::global().set_ttl_secs(system.cache.sim_ttl_secs);
-    gw_kiro::cache_sim::global().set_max_sessions(system.cache.max_sessions);
+    // DB 设置 overlay:叠在 system.yaml 基线上得"有效配置"(热调首启即生效)。
+    // default_proxy 单独取出注入 provider(出口选择,不属运行开关)。
+    let mut effective_system = system.clone();
+    let initial_default_proxy: Option<String> = match store
+        .as_ref()
+        .and_then(|s| s.get_settings().ok().flatten())
+    {
+        Some(json) => match serde_json::from_str::<gw_core::config::SystemSettings>(&json) {
+            Ok(s) => {
+                s.apply_to(&mut effective_system);
+                s.default_proxy.clone()
+            }
+            Err(e) => {
+                tracing::warn!("settings overlay 解析失败,用 YAML 默认: {e}");
+                None
+            }
+        },
+        None => None,
+    };
 
-    // provider 工厂 cfg:注入 system.cache(缓存计费 multiplier/cap/floor)+ system.image
-    // (图像压缩,嵌为 "image" 子对象)。序列化失败退回 Null/缺省(provider 各自回退,不致命)。
-    let mut provider_cfg = serde_json::to_value(&system.cache).unwrap_or(serde_json::Value::Null);
+    // cache_sim 全局 store 的 TTL/容量从有效 cache 同步(否则恒用编译期默认 300s/4096)。
+    gw_kiro::cache_sim::global().set_ttl_secs(effective_system.cache.sim_ttl_secs);
+    gw_kiro::cache_sim::global().set_max_sessions(effective_system.cache.max_sessions);
+
+    // provider 工厂 cfg:注入有效 cache(缓存计费)+ image(图像压缩,"image" 子对象)+
+    // 可选 default_proxy(全局默认出口代理)。序列化失败退回缺省(provider 各自回退,不致命)。
+    let mut provider_cfg =
+        serde_json::to_value(&effective_system.cache).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut provider_cfg {
-        if let Ok(img) = serde_json::to_value(&system.image) {
+        if let Ok(img) = serde_json::to_value(&effective_system.image) {
             map.insert("image".into(), img);
+        }
+        if let Some(dp) = &initial_default_proxy {
+            map.insert("default_proxy".into(), serde_json::json!(dp));
         }
     }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
@@ -512,7 +536,7 @@ pub async fn run(
         egress_desc,
         group: wcfg.account_group.clone(),
         provider,
-        scheduler: AccountScheduler::new(accounts, &system.scheduler),
+        scheduler: AccountScheduler::new(accounts, &effective_system.scheduler),
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         usage_sink,
         pending_writes: PendingWrites::new(),
@@ -527,6 +551,8 @@ pub async fn run(
     // (翻转语义见 scheduler::sync_accounts;读库失败跳过本轮,不影响服务。)
     if let Some(store) = store {
         let st = state.clone();
+        // YAML 基线快照:每轮把 DB overlay 叠在它之上算"有效配置"再热应用。
+        let sys_base = system.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -550,6 +576,31 @@ pub async fn run(
                         }
                     }
                     Err(e) => tracing::warn!("账号 sync 读库失败,跳过本轮: {e}"),
+                }
+                // 热应用 DB 设置 overlay:代理/计费/图像(provider)+ 调度参数 + cache_sim。
+                // 用**有效全量**(YAML 基线叠 overlay,再回灌 from_effective)喂给 provider,
+                // 这样 overlay 删某字段时能正确恢复到 YAML 默认(而非停留在上次热值)。
+                match store.get_settings() {
+                    Ok(opt) => {
+                        let overlay = opt
+                            .and_then(|j| {
+                                serde_json::from_str::<gw_core::config::SystemSettings>(&j).ok()
+                            })
+                            .unwrap_or_default();
+                        let mut eff = sys_base.clone();
+                        overlay.apply_to(&mut eff);
+                        let full = gw_core::config::SystemSettings::from_effective(
+                            &eff,
+                            overlay.default_proxy.clone(),
+                        );
+                        if let Ok(sv) = serde_json::to_value(&full) {
+                            st.provider.apply_hot_settings(&sv);
+                        }
+                        st.scheduler.update_tuning(&eff.scheduler);
+                        gw_kiro::cache_sim::global().set_ttl_secs(eff.cache.sim_ttl_secs);
+                        gw_kiro::cache_sim::global().set_max_sessions(eff.cache.max_sessions);
+                    }
+                    Err(e) => tracing::warn!("settings sync 读库失败,跳过本轮: {e}"),
                 }
             }
         });

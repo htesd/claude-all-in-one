@@ -309,6 +309,107 @@ impl Default for CacheConfig {
     }
 }
 
+// ───────────────────────── 热调设置 overlay(DB 持久) ─────────────────────────
+
+/// DB 持久的**热调设置 overlay**:叠在 `system.yaml`([`SystemConfig`])基线之上。
+///
+/// 每个字段 `Option<T>`:`None` = 不覆盖(用 YAML 默认),`Some` = 覆盖。router 经
+/// admin API 写库,worker 30s 轮询读库后 [`Self::apply_to`] 叠加并热应用——改参无需重启。
+/// 进程拓扑(端口/每 worker 源 IP)**不在此**(留 instances.yaml,需重启)。
+///
+/// `default_proxy` 是唯一不进 [`SystemConfig`] 的字段:它不属于运行开关,而是出口选择,
+/// 由 worker 单独取出注入 provider 的 egress resolver(账号无专属代理时的兜底出口)。
+///
+/// `deny_unknown_fields`:PUT 进来的设置若拼错 key(如 `max_failure`)直接拒绝,
+/// 而非静默落库一个永不生效的死 overlay(对抗审查 Skeptic#5/Architect#8/Minimalist#2)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_proxy: Option<String>,
+    // —— cache ——
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_multiplier: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_cap_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_floor_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_sim_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_max_sessions: Option<usize>,
+    // —— scheduler ——
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_cooldown_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_response_cooldown_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_response_window_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_response_threshold: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_failures: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_ttl_secs: Option<u64>,
+    // —— image ——
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_max_long_edge: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_max_pixels_single: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_max_pixels_multi: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_multi_threshold: Option<usize>,
+}
+
+impl SystemSettings {
+    /// 把非 None 字段叠加到 `base`(原地)。`default_proxy` 不属 SystemConfig,不在此处理。
+    pub fn apply_to(&self, base: &mut SystemConfig) {
+        if let Some(v) = self.cache_read_multiplier { base.cache.read_multiplier = v; }
+        if let Some(v) = self.cache_cap_ratio { base.cache.cap_ratio = v; }
+        if let Some(v) = self.cache_floor_ratio { base.cache.floor_ratio = v; }
+        if let Some(v) = self.cache_sim_ttl_secs { base.cache.sim_ttl_secs = v; }
+        if let Some(v) = self.cache_max_sessions { base.cache.max_sessions = v; }
+        if let Some(v) = self.rate_limit_cooldown_secs { base.scheduler.rate_limit_cooldown_secs = v; }
+        if let Some(v) = self.empty_response_cooldown_secs { base.scheduler.empty_response_cooldown_secs = v; }
+        if let Some(v) = self.empty_response_window_secs { base.scheduler.empty_response_window_secs = v; }
+        if let Some(v) = self.empty_response_threshold { base.scheduler.empty_response_threshold = v; }
+        if let Some(v) = self.max_failures { base.scheduler.max_failures = v; }
+        if let Some(v) = self.affinity_ttl_secs { base.scheduler.affinity_ttl_secs = v; }
+        if let Some(v) = self.image_enabled { base.image.enabled = v; }
+        if let Some(v) = self.image_max_long_edge { base.image.max_long_edge = v; }
+        if let Some(v) = self.image_max_pixels_single { base.image.max_pixels_single = v; }
+        if let Some(v) = self.image_max_pixels_multi { base.image.max_pixels_multi = v; }
+        if let Some(v) = self.image_multi_threshold { base.image.multi_threshold = v; }
+    }
+
+    /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
+    /// admin `GET /settings` 用它把"有效值"回灌给前端(前端展示当前生效值)。
+    pub fn from_effective(cfg: &SystemConfig, default_proxy: Option<String>) -> Self {
+        Self {
+            default_proxy,
+            cache_read_multiplier: Some(cfg.cache.read_multiplier),
+            cache_cap_ratio: Some(cfg.cache.cap_ratio),
+            cache_floor_ratio: Some(cfg.cache.floor_ratio),
+            cache_sim_ttl_secs: Some(cfg.cache.sim_ttl_secs),
+            cache_max_sessions: Some(cfg.cache.max_sessions),
+            rate_limit_cooldown_secs: Some(cfg.scheduler.rate_limit_cooldown_secs),
+            empty_response_cooldown_secs: Some(cfg.scheduler.empty_response_cooldown_secs),
+            empty_response_window_secs: Some(cfg.scheduler.empty_response_window_secs),
+            empty_response_threshold: Some(cfg.scheduler.empty_response_threshold),
+            max_failures: Some(cfg.scheduler.max_failures),
+            affinity_ttl_secs: Some(cfg.scheduler.affinity_ttl_secs),
+            image_enabled: Some(cfg.image.enabled),
+            image_max_long_edge: Some(cfg.image.max_long_edge),
+            image_max_pixels_single: Some(cfg.image.max_pixels_single),
+            image_max_pixels_multi: Some(cfg.image.max_pixels_multi),
+            image_multi_threshold: Some(cfg.image.multi_threshold),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +495,41 @@ workers:
         let yaml = "cache:\n  read_multiplier: 1.0\n  cap_ratio: 0.9\n  floor_ratio: 0.1\nempty_response:\n  buffered_fallback: true\n";
         let cfg: SystemConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.cache.cap_ratio, 0.9);
+    }
+
+    #[test]
+    fn settings_apply_to_overwrites_only_present_fields() {
+        let mut base = SystemConfig::default();
+        let before_cooldown = base.scheduler.empty_response_cooldown_secs;
+        let s = SystemSettings {
+            max_failures: Some(1),
+            cache_read_multiplier: Some(2.5),
+            image_enabled: Some(false),
+            ..Default::default()
+        };
+        s.apply_to(&mut base);
+        // 覆盖的字段变了。
+        assert_eq!(base.scheduler.max_failures, 1);
+        assert_eq!(base.cache.read_multiplier, 2.5);
+        assert!(!base.image.enabled);
+        // 未提供的字段不动。
+        assert_eq!(base.scheduler.empty_response_cooldown_secs, before_cooldown);
+        assert_eq!(base.cache.cap_ratio, 0.9);
+        // default_proxy 不进 SystemConfig(此处仅确认 apply_to 不 panic 即可)。
+    }
+
+    #[test]
+    fn settings_from_effective_is_identity_under_apply_to() {
+        // from_effective(默认配置) 再 apply_to 回默认配置,应得到同一份配置。
+        let base = SystemConfig::default();
+        let full = SystemSettings::from_effective(&base, Some("socks5://h:1".into()));
+        assert_eq!(full.default_proxy.as_deref(), Some("socks5://h:1"));
+        let mut target = SystemConfig::default();
+        // 先扰动,再用 full 叠回,验证全字段都被 Some 覆盖。
+        target.scheduler.max_failures = 999;
+        target.cache.read_multiplier = 999.0;
+        full.apply_to(&mut target);
+        assert_eq!(target.scheduler.max_failures, base.scheduler.max_failures);
+        assert_eq!(target.cache.read_multiplier, base.cache.read_multiplier);
     }
 }

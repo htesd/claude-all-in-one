@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use gw_core::store::{AccountPatch, AccountRow};
 use serde::Deserialize;
 
-use super::{internal_error, AdminState};
+use super::{internal_error, redact_proxy_url, validate_proxy_url, AdminState};
 
 /// account_id 规则:1–64 个 URL-safe 字符(进路径段)。
 fn validate_account_id(id: &str) -> Result<(), &'static str> {
@@ -58,6 +58,12 @@ pub struct UpdateAccountBody {
     /// 整体替换 extra(凭据轮换);缺省不动。
     #[serde(default)]
     extra: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 定点更新出口代理(走 merge_account_extra,**绝不**碰其它凭据字段)。
+    /// 字段缺省=不动 proxy;`""`(空串)=清除;非空串=设代理 URL。
+    /// (用 `Option<String>` 而非 `Option<Value>`:serde 会把 JSON `null` 折叠成 `None`,
+    /// 无法区分"清除"与"不动";故清除约定为传空串。)
+    #[serde(default)]
+    proxy_url: Option<String>,
 }
 
 pub fn router() -> Router<AdminState> {
@@ -88,6 +94,14 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
             let redacted: serde_json::Map<String, serde_json::Value> = map
                 .into_iter()
                 .map(|(k, v)| {
+                    // proxy URL 可含 user:pass@(代理订阅密钥):掩码密码段,保留 host 供识别
+                    // (审查 Architect#3)。真实值仍在库里,resolver 用真实值发包。
+                    if k == "proxy" {
+                        if let Some(s) = v.as_str() {
+                            return (k, serde_json::json!(redact_proxy_url(s)));
+                        }
+                        return (k, v);
+                    }
                     let lk = k.to_lowercase();
                     // 含 key 也算敏感:kiro_api_key / anthropic_api_key 等不含 token/secret/password
                     // 的凭据字段否则会经 GET 明文泄漏(本仓库凭据语境下 *_key 一律视为机密)。
@@ -141,12 +155,24 @@ async fn create_account(
     if let Err(msg) = validate_account_id(&body.account_id) {
         return api_error(StatusCode::BAD_REQUEST, msg);
     }
-    let extra_json = match &body.extra {
-        Some(map) => match serde_json::to_string(map) {
-            Ok(s) => s,
-            Err(e) => return internal_error(e),
-        },
-        None => "{}".to_string(),
+    // extra.proxy(若有,非空)写入边界校验 + 归一为 trim 后的值(fail-closed)。
+    let mut extra_map = body.extra.clone().unwrap_or_default();
+    if let Some(p) = extra_map.get("proxy").and_then(|v| v.as_str()).map(str::to_string) {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            extra_map.remove("proxy");
+        } else {
+            match validate_proxy_url(trimmed) {
+                Ok(valid) => {
+                    extra_map.insert("proxy".into(), serde_json::json!(valid));
+                }
+                Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+            }
+        }
+    }
+    let extra_json = match serde_json::to_string(&extra_map) {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
     };
     let group = body.group.as_deref().unwrap_or("");
     // 非空组名必须真实存在,防"幽灵分组"(typo 的账号永远不被任何 worker 服务,
@@ -181,6 +207,9 @@ pub struct ImportBody {
     group_name: Option<String>,
     /// KiroManager 导出原文(字符串)。前端就是粘贴文本,单一形态,服务端解析一次。
     json: String,
+    /// 批量出口代理(可选):给本批所有导入账号写 extra.proxy。空/缺省=不设。
+    #[serde(default)]
+    batch_proxy: Option<String>,
 }
 
 /// 账号的稳定身份(user_id 优先,否则 email),用于导入碰撞核对。
@@ -228,6 +257,15 @@ async fn import_accounts(
         Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
     };
 
+    // 批量代理写入边界校验一次(非空则必须合法,fail-closed),归一为 trim 后的值。
+    let batch_proxy: Option<String> = match body.batch_proxy.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => match validate_proxy_url(s) {
+            Ok(valid) => Some(valid),
+            Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+        },
+        _ => None,
+    };
+
     let mut created = 0u32;
     let mut merged = 0u32;
     let mut skipped = 0u32;
@@ -250,7 +288,12 @@ async fn import_accounts(
         let Some(row) = existing else {
             // 新账号:全字段写入(含 token)。create_account 是 INSERT OR IGNORE,
             // 返回 false = 并发下别人刚插了同 id(竞态)→ 当 skipped,不谎报 created。
-            let extra_json = match serde_json::to_string(&imp.extra) {
+            // 批量代理:操作员显式意图,写进新账号 extra.proxy(已校验归一)。
+            let mut new_extra = imp.extra.clone();
+            if let Some(bp) = &batch_proxy {
+                new_extra.insert("proxy".into(), serde_json::json!(bp));
+            }
+            let extra_json = match serde_json::to_string(&new_extra) {
                 Ok(s) => s,
                 Err(e) => return internal_error(e),
             };
@@ -311,6 +354,10 @@ async fn import_accounts(
             } else {
                 delta.insert(k.clone(), v.clone());
             }
+        }
+        // 批量代理:操作员显式意图,合并时直接设(可覆盖旧 proxy;让"仅设代理"也算有效合并)。
+        if let Some(bp) = &batch_proxy {
+            delta.insert("proxy".into(), serde_json::json!(bp));
         }
         if delta.is_empty() {
             skipped += 1;
@@ -387,19 +434,47 @@ async fn update_account(
         }
         None => None,
     };
-    let patch = AccountPatch {
-        group_name: body.group_name.clone(),
-        max_concurrency: body.max_concurrency,
-        disabled: body.disabled,
-        extra,
-    };
-    match st.store.update_account(&id, &patch) {
-        Ok(true) => match st.store.get_account(&id) {
-            Ok(Some(row)) => Json(redacted_view(row)).into_response(),
-            Ok(None) => internal_error("更新后读取不到账号"),
-            Err(e) => internal_error(e),
-        },
-        Ok(false) => api_error(StatusCode::NOT_FOUND, "账号不存在"),
+    // 主体更新:仅当存在可改字段时才打 update_account(避免 all-None 空 patch 语义歧义)。
+    let has_patch = body.group_name.is_some()
+        || body.max_concurrency.is_some()
+        || body.disabled.is_some()
+        || extra.is_some();
+    if has_patch {
+        let patch = AccountPatch {
+            group_name: body.group_name.clone(),
+            max_concurrency: body.max_concurrency,
+            disabled: body.disabled,
+            extra,
+        };
+        match st.store.update_account(&id, &patch) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
+    // 定点代理合并:**在整块替换之后**,绝不被 extra 整块替换覆盖(规避 PATCH extra 坑)。
+    // 空/纯空白 = 清除该号专属代理(写 proxy:null → resolver 回落默认/源 IP);
+    // 非空 = 写入边界校验(非法直接 400,fail-closed 不静默回退裸 IP,审查 Skeptic#2)。
+    if let Some(proxy) = &body.proxy_url {
+        let trimmed = proxy.trim();
+        let proxy_val = if trimmed.is_empty() {
+            serde_json::Value::Null
+        } else {
+            match validate_proxy_url(trimmed) {
+                Ok(valid) => serde_json::Value::String(valid),
+                Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+            }
+        };
+        let delta = serde_json::json!({ "proxy": proxy_val }).to_string();
+        match st.store.merge_account_extra(&id, &delta) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
+    match st.store.get_account(&id) {
+        Ok(Some(row)) => Json(redacted_view(row)).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "账号不存在"),
         Err(e) => internal_error(e),
     }
 }
@@ -703,6 +778,70 @@ mod tests {
         assert!(row.extra.contains("\"kiro_provider\":\"enterprise\""));
         // 不得映射 auth_method(避免误触发 TokenType 头)。
         assert!(!row.extra.contains("auth_method"));
+    }
+
+    #[tokio::test]
+    async fn import_with_batch_proxy_sets_proxy_on_new_account() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        let export = serde_json::json!({
+            "accounts": [{
+                "email": "proxied@example.com",
+                "machineId": "b".repeat(64),
+                "credentials": {"refreshToken": "rt-x", "provider": "BuilderId"}
+            }]
+        });
+        let body = serde_json::json!({
+            "group_name": "G0",
+            "json": export.to_string(),
+            "batch_proxy": "socks5://user:pass@h:1080"
+        })
+        .to_string();
+        let resp = app.oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = store.get_account("proxied-example.com").unwrap().unwrap();
+        assert!(
+            row.extra.contains("\"proxy\":\"socks5://user:pass@h:1080\""),
+            "批量代理应写进 extra.proxy: {}",
+            row.extra
+        );
+    }
+
+    #[tokio::test]
+    async fn update_proxy_url_merges_without_touching_credentials() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account(
+                "acc1",
+                "G0",
+                "kiro",
+                2,
+                r#"{"refresh_token":"rt-secret","client_secret":"cs"}"#,
+            )
+            .unwrap();
+        // 仅设 proxy_url:不带 extra,凭据必须原样保留。
+        let body = serde_json::json!({"proxy_url": "http://p:8888"}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains("\"proxy\":\"http://p:8888\""), "proxy 应写入");
+        assert!(row.extra.contains("rt-secret"), "凭据不得被定点合并冲掉");
+        assert!(row.extra.contains("\"client_secret\":\"cs\""));
+        // proxy_url="" 清除(写入 JSON null,resolver 视作无代理)。
+        let body2 = serde_json::json!({"proxy_url": ""}).to_string();
+        let resp2 = app
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body2)))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let row2 = store.get_account("acc1").unwrap().unwrap();
+        assert!(row2.extra.contains("\"proxy\":null"), "清除应写 proxy:null: {}", row2.extra);
+        assert!(row2.extra.contains("rt-secret"), "清除代理不得动凭据");
     }
 
     #[tokio::test]

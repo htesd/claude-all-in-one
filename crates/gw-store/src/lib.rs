@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_name);
+
+-- 系统热调设置(单行 key='system',value=SystemSettings JSON overlay)。
+-- 字段级覆盖叠在 system.yaml 基线之上;router 写、worker 30s 轮询热应用,无需重启。
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 "#;
 
 /// SQLite 控制面存储。
@@ -489,6 +497,32 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// 读系统设置 overlay(单行 key='system')。无行 = `None`(用 YAML 默认)。
+    pub fn get_settings(&self) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT value FROM settings WHERE key = 'system'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 写系统设置 overlay(整段 JSON 覆盖单行 key='system')。
+    pub fn upsert_settings(&self, json: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('system', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+             updated_at = strftime('%s','now')",
+            [json],
+        )?;
+        Ok(())
+    }
+
     /// 分组是否存在(admin 写入 group_name 前的存在性校验,防"幽灵分组")。
     pub fn group_exists(&self, name: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
@@ -728,6 +762,25 @@ impl UsageSink for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_absent_then_roundtrip_then_overwrite() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // 空库:无 overlay。
+        assert_eq!(store.get_settings().unwrap(), None);
+        // 写读往返。
+        store.upsert_settings(r#"{"default_proxy":"socks5://h:1080"}"#).unwrap();
+        assert_eq!(
+            store.get_settings().unwrap().as_deref(),
+            Some(r#"{"default_proxy":"socks5://h:1080"}"#)
+        );
+        // 二次写覆盖(不新增行)。
+        store.upsert_settings(r#"{"max_failures":1}"#).unwrap();
+        assert_eq!(
+            store.get_settings().unwrap().as_deref(),
+            Some(r#"{"max_failures":1}"#)
+        );
+    }
 
     #[tokio::test]
     async fn authenticate_known_and_unknown_key() {

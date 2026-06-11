@@ -29,11 +29,13 @@ use std::time::{Duration, Instant};
 use gw_core::account::Account;
 use gw_core::config::SchedulerConfig;
 use gw_core::error::UpstreamErrorKind;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// 调度参数(由 system.yaml `scheduler` 段注入;默认值见 [`SchedulerConfig`],
 /// 对齐 kiro.rs 生产配置)。全部 clamp 到 ≥1,杜绝 0 值造成"必禁用/必过期"。
+/// `Copy`:各方法顶部一次性 `let t = *self.tuning.read()` 拷出快照,避免反复持锁。
+#[derive(Clone, Copy)]
 struct Tuning {
     /// 会话亲和映射 TTL:超时未访问惰性淘汰(等于会话重开,自然再平衡)。
     affinity_ttl: Duration,
@@ -222,8 +224,9 @@ pub struct AccountScheduler {
     entries: Mutex<HashMap<String, CredentialState>>,
     /// 会话亲和映射:session_key → primary。
     affinity: Mutex<HashMap<String, AffinityEntry>>,
-    /// 调度参数(启动注入,运行期不变)。
-    tuning: Tuning,
+    /// 调度参数(可热更:admin 设置面板改后 worker 30s 轮询经 [`Self::update_tuning`] 替换;
+    /// **已生效的冷却**用绝对 `Instant`,不受改参影响,只影响其后新设的冷却/阈值判定)。
+    tuning: RwLock<Tuning>,
 }
 
 impl AccountScheduler {
@@ -236,8 +239,14 @@ impl AccountScheduler {
         Self {
             entries: Mutex::new(entries),
             affinity: Mutex::new(HashMap::new()),
-            tuning: Tuning::from(cfg),
+            tuning: RwLock::new(Tuning::from(cfg)),
         }
+    }
+
+    /// 热更新调度参数(worker 30s 轮询经 settings overlay 调用)。整体替换 Tuning 快照;
+    /// 不动任何账号运行态(已生效冷却/失败计数保留),只影响其后的判定。
+    pub fn update_tuning(&self, cfg: &SchedulerConfig) {
+        *self.tuning.write() = Tuning::from(cfg);
     }
 
     /// 组内账号总数。
@@ -322,8 +331,9 @@ impl AccountScheduler {
         let chosen = match session_key {
             None => Self::tiered_lru(&entries, &eligible),
             Some(key) => {
+                let affinity_ttl = self.tuning.read().affinity_ttl;
                 let mut map = self.affinity.lock();
-                map.retain(|_, v| now.duration_since(v.last_access) < self.tuning.affinity_ttl);
+                map.retain(|_, v| now.duration_since(v.last_access) < affinity_ttl);
                 let eligible_set: HashSet<&String> = eligible.iter().collect();
                 match map.get_mut(key) {
                     None => {
@@ -701,6 +711,7 @@ impl AccountScheduler {
     /// report_quota_exhausted / report_refresh_token_invalid。
     pub fn report_failure(&self, id: &str, kind: UpstreamErrorKind) {
         let now = Instant::now();
+        let tuning = *self.tuning.read();
         let mut entries = self.entries.lock();
         let Some(e) = entries.get_mut(id) else { return };
         // 已禁用(含手动/额度)不覆盖原因,幂等。
@@ -711,14 +722,14 @@ impl AccountScheduler {
             UpstreamErrorKind::RateLimited | UpstreamErrorKind::TemporarilyBlocked => {
                 e.disabled = true;
                 e.disabled_reason = Some(DisabledReason::RateLimited);
-                e.disabled_until = Some(now + self.tuning.rate_limit_cooldown);
+                e.disabled_until = Some(now + tuning.rate_limit_cooldown);
                 tracing::warn!(account = %id, "命中限流,冷却 {}s",
-                    self.tuning.rate_limit_cooldown.as_secs());
+                    tuning.rate_limit_cooldown.as_secs());
             }
             UpstreamErrorKind::EmptyResponse => {
                 // v58 固定窗口阈值:窗口内累计达阈值才冷却,避免误伤偶发 empty 的健康号。
                 match e.empty_window_start {
-                    Some(start) if now.duration_since(start) <= self.tuning.empty_window => {
+                    Some(start) if now.duration_since(start) <= tuning.empty_window => {
                         e.empty_count_in_window += 1;
                     }
                     _ => {
@@ -726,14 +737,14 @@ impl AccountScheduler {
                         e.empty_count_in_window = 1;
                     }
                 }
-                if e.empty_count_in_window >= self.tuning.empty_threshold {
+                if e.empty_count_in_window >= tuning.empty_threshold {
                     e.disabled = true;
                     e.disabled_reason = Some(DisabledReason::EmptyResponse);
-                    e.disabled_until = Some(now + self.tuning.empty_cooldown);
+                    e.disabled_until = Some(now + tuning.empty_cooldown);
                     e.empty_window_start = None;
                     e.empty_count_in_window = 0;
                     tracing::warn!(account = %id, "空响应达阈值,冷却 {}s",
-                        self.tuning.empty_cooldown.as_secs());
+                        tuning.empty_cooldown.as_secs());
                 }
             }
             UpstreamErrorKind::QuotaExhausted => {
@@ -752,7 +763,7 @@ impl AccountScheduler {
             }
             UpstreamErrorKind::ServerError | UpstreamErrorKind::Network | UpstreamErrorKind::Other => {
                 e.failure_count += 1;
-                if e.failure_count >= self.tuning.max_failures {
+                if e.failure_count >= tuning.max_failures {
                     e.disabled = true;
                     e.disabled_reason = Some(DisabledReason::TooManyFailures);
                     tracing::warn!(account = %id, "连续失败 {} 次,自动禁用", e.failure_count);
@@ -1126,6 +1137,25 @@ mod tests {
         s.report_failure("a", UpstreamErrorKind::ServerError);
         let got = s.acquire(None).await;
         assert!(got.is_ok(), "全灭自愈后应能租到刚恢复的账号: {:?}", got.err());
+    }
+
+    #[tokio::test]
+    async fn update_tuning_changes_empty_threshold_live() {
+        // EmptyResponse 是冷却类(不被全灭自愈复活),可在单账号上直接观测。
+        // 默认阈值 3:一次 empty 不冷却。热更阈值到 1 后:首个 empty 即冷却。
+        let s = AccountScheduler::new(vec![acct("a", 2, None)], &SchedulerConfig::default());
+        s.report_failure("a", UpstreamErrorKind::EmptyResponse);
+        assert!(s.acquire(None).await.is_ok(), "默认阈值 3:单个 empty 不应冷却");
+        s.update_tuning(&SchedulerConfig {
+            empty_response_threshold: 1,
+            ..SchedulerConfig::default()
+        });
+        s.report_failure("a", UpstreamErrorKind::EmptyResponse);
+        assert_eq!(
+            s.acquire(None).await.err(),
+            Some(AcquireError::AllDisabled),
+            "热更阈值到 1 后,再来一个 empty 即应冷却禁用"
+        );
     }
 
     // ───────── reset_account / merge_extra ─────────
