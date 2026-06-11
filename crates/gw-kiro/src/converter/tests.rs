@@ -652,7 +652,7 @@ fn test_structured_output_injects_schema_instruction() {
         tool_choice: None,
         thinking: None,
         output_config: Some(crate::anthropic_types::OutputConfig {
-            effort: "high".to_string(),
+            effort: None,
             format: Some(crate::anthropic_types::OutputFormat {
                 format_type: "json_schema".to_string(),
                 schema: Some(serde_json::json!({
@@ -697,6 +697,34 @@ fn test_structured_output_instruction_absent_without_schema() {
 }
 
 #[test]
+fn test_identity_override_and_privacy_always_injected() {
+    // 防封:即使客户端无 system,history[0] 也必须带 identity_override + 两条隐私策略
+    // (逐字对齐 static_flow,阻止上游自曝 Kiro)。
+    let req = MessagesRequest {
+        model: "claude-opus-4-8".to_string(),
+        max_tokens: 256,
+        messages: vec![crate::anthropic_types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("你是谁"),
+        }],
+        stream: true,
+        system: None, // 完全无 system
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: None,
+        context_management: None,
+    };
+    let result = convert_request(&req).unwrap();
+    let h0 = first_history_user_text(&result);
+    assert!(h0.contains("<identity_override>"), "应注入 identity_override: {h0}");
+    assert!(h0.contains("Never claim to be Kiro"), "identity_override 文案应逐字: {h0}");
+    assert!(h0.contains("Visible thinking may be shown"), "应注入可见思考隐私策略");
+    assert!(h0.contains("When answering identity, platform, routing"), "应注入系统提示隐私策略");
+}
+
+#[test]
 fn test_structured_output_with_empty_system_still_injects() {
     // 回归(对抗审查发现): system="" 时, 结构化指令不应被漏掉
     let req = MessagesRequest {
@@ -712,7 +740,7 @@ fn test_structured_output_with_empty_system_still_injects() {
         tool_choice: None,
         thinking: None,
         output_config: Some(crate::anthropic_types::OutputConfig {
-            effort: "high".to_string(),
+            effort: None,
             format: Some(crate::anthropic_types::OutputFormat {
                 format_type: "json_schema".to_string(),
                 schema: Some(serde_json::json!({"type": "object", "properties": {"r": {"type": "integer"}}})),

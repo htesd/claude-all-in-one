@@ -7,9 +7,15 @@ import {
   deleteAccount,
   fetchAccounts,
   fetchAccountsRuntime,
+  importAccounts,
+  resetAccount,
   updateAccount,
 } from './api'
-import type { CreateAccountPayload, UpdateAccountPayload } from './types'
+import type {
+  CreateAccountPayload,
+  ImportAccountsPayload,
+  UpdateAccountPayload,
+} from './types'
 
 export function useAccounts() {
   return useQuery({
@@ -54,6 +60,23 @@ export function useDeleteAccount() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => deleteAccount(id),
+    onSuccess: () => invalidateAccountDomains(queryClient),
+  })
+}
+
+export function useImportAccounts() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: ImportAccountsPayload) => importAccounts(payload),
+    onSuccess: () => invalidateAccountDomains(queryClient),
+  })
+}
+
+/** 人工救号（清冷却/封禁/失败计数）；成功后立刻刷新 runtime 让状态列回正。 */
+export function useResetAccount() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => resetAccount(id),
     onSuccess: () => invalidateAccountDomains(queryClient),
   })
 }

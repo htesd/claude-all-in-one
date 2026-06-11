@@ -83,3 +83,14 @@ export function parseConcurrency(input: string): number | null {
   const value = Number(input)
   return Number.isInteger(value) && value >= 1 ? value : null
 }
+
+/** 积分展示格式化:整数千分位;< 0 当 0。 */
+export function formatCredits(n: number): string {
+  return Math.round(Math.max(n, 0)).toLocaleString()
+}
+
+/** 剩余是否吃紧(< 上限 10% 或为 0)—— 用于标红提示该换号。 */
+export function isQuotaLow(remaining: number, limit: number): boolean {
+  if (limit <= 0) return false
+  return remaining <= 0 || remaining / limit < 0.1
+}

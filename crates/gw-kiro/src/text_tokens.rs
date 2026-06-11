@@ -68,6 +68,64 @@ pub fn estimate_output_tokens(text: &str) -> i64 {
     (chinese_tokens + other_tokens).max(1)
 }
 
+/// 估算一个完整 Anthropic Messages 请求体的 input token(`/v1/messages/count_tokens` 用)。
+///
+/// 🔵 口径对齐 kiro.rs `token::count_all_tokens_local`:system 文本 + 各消息的
+/// 字符串/数组 text 块 + 工具 name/description/input_schema(序列化后计字)。
+/// 纯本地估算,零网络;结果至少 1。计费不依赖它(计费走上游 usage),只为
+/// NewAPI/客户端预估兼容。
+pub fn count_request_tokens(body: &serde_json::Value) -> u64 {
+    let mut total: u64 = 0;
+
+    // system:字符串或 [{type:text, text}] 数组两种形态。
+    match body.get("system") {
+        Some(serde_json::Value::String(s)) => total += count_tokens(s),
+        Some(serde_json::Value::Array(arr)) => {
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    total += count_tokens(text);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // messages:content 为字符串,或内容块数组(只计 text 字段,对齐 kiro.rs)。
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            match msg.get("content") {
+                Some(serde_json::Value::String(s)) => total += count_tokens(s),
+                Some(serde_json::Value::Array(arr)) => {
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            total += count_tokens(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // tools:name + description + input_schema(JSON 字符串化计字)。
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        for tool in tools {
+            if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                total += count_tokens(name);
+            }
+            if let Some(desc) = tool.get("description").and_then(|v| v.as_str()) {
+                total += count_tokens(desc);
+            }
+            if let Some(schema) = tool.get("input_schema") {
+                let schema_json = serde_json::to_string(schema).unwrap_or_default();
+                total += count_tokens(&schema_json);
+            }
+        }
+    }
+
+    total.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +166,36 @@ mod tests {
         // 3 个中文 → (3*2+2)/3 = 2;8 个英文 → (8+3)/4 = 2
         assert_eq!(estimate_output_tokens("你好吗"), 2);
         assert_eq!(estimate_output_tokens("abcdefgh"), 2);
+    }
+
+    #[test]
+    fn request_tokens_sums_system_messages_tools() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hi there"},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]}
+            ],
+            "tools": [{"name": "f", "description": "does things", "input_schema": {"type": "object"}}]
+        });
+        let total = count_request_tokens(&body);
+        // 各段独立估算后求和;精确值依赖估算公式,这里只锚定关键性质。
+        let sys = count_tokens("You are helpful.");
+        assert!(total > sys, "应包含 system 之外的消息与工具贡献: {total}");
+    }
+
+    #[test]
+    fn request_tokens_system_array_form_and_min_one() {
+        let body = serde_json::json!({
+            "system": [{"type": "text", "text": "anchor"}],
+            "messages": []
+        });
+        assert!(count_request_tokens(&body) >= 1);
+        // 空请求也至少 1(对齐 kiro.rs .max(1))。
+        assert_eq!(count_request_tokens(&serde_json::json!({})), 1);
     }
 }

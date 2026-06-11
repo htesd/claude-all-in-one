@@ -42,6 +42,20 @@ export type AccountUnavailableReason =
   | 'too_many_failures'
   | 'config'
 
+/** 账号配额(积分)只读快照,来自 worker 的 getUsageLimits;尚未查到时为 null。 */
+export interface AccountQuota {
+  /** 已用额度(Credits)。 */
+  used: number
+  /** 额度上限。 */
+  limit: number
+  /** 剩余 = max(limit - used, 0)。 */
+  remaining: number
+  /** 已用百分比(可超 100 = 已进 overage)。 */
+  percent_used: number
+  /** 订阅/单位标签(如 KIRO PRO),可空。 */
+  label?: string | null
+}
+
 export interface AccountRuntimeStatus {
   account_id: string
   priority: number
@@ -51,6 +65,29 @@ export interface AccountRuntimeStatus {
   failure_count: number
   available_permits: number
   max_concurrency: number
+  /** 配额(积分);null = 后台查询中/未取到。 */
+  quota?: AccountQuota | null
+}
+
+/** POST /accounts/import 请求体。 */
+export interface ImportAccountsPayload {
+  group_name?: string
+  /** KiroManager 导出内容(原文字符串或已解析对象均可)。 */
+  json: string
+}
+
+/** POST /accounts/import 响应。 */
+export interface ImportAccountsResult {
+  created: number
+  merged: number
+  skipped: number
+  items: Array<{
+    account_id: string
+    action: 'created' | 'merged' | 'skipped'
+    has_machine_id?: boolean
+    machine_id_conflict?: boolean
+    reason?: string
+  }>
 }
 
 /** GET /accounts/runtime 单条：一个 worker 实例（按 group 服务）。 */

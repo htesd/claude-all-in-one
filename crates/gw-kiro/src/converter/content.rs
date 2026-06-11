@@ -126,14 +126,13 @@ pub(super) fn get_document_format(media_type: &str) -> Option<String> {
 /// 把 Anthropic 文档块的 source 转为 KiroDocument。
 ///
 /// - `type:"base64"` + `data` + `media_type` → 直接透传 base64 字节
+/// - `type:"text"` + `data`(纯文本 media_type)→ base64 编码后透传(对齐 static_flow)
 /// - `type:"url"` / `"file"` → 暂不支持（需异步抓取），跳过
-///
-/// 注：Anthropic 文档块的 base64 是标准用法（检测平台与 SDK 均如此发送）；
-/// `text` 源文档需要 base64 编码，本 crate 未直接依赖 base64，暂不处理（跳过并记日志）。
 pub(super) fn anthropic_document_to_kiro(
     name: Option<&str>,
     source: &crate::anthropic_types::ImageSource,
 ) -> Option<KiroDocument> {
+    use base64::Engine;
     let media_type = source.media_type.as_deref()?;
     let format = get_document_format(media_type)?;
     let doc_name = name.filter(|n| !n.is_empty()).unwrap_or("document").to_string();
@@ -142,10 +141,59 @@ pub(super) fn anthropic_document_to_kiro(
             let data = source.data.as_ref()?;
             Some(KiroDocument::from_base64(doc_name, format, data.clone()))
         }
+        "text" => {
+            // text 源仅纯文本类 media_type 合法(对齐 static_flow);Kiro 仍要 base64 字节。
+            if !matches!(media_type, "text/plain" | "text/markdown" | "text/html" | "text/csv") {
+                tracing::warn!(media_type, "text 源仅支持纯文本类 media_type，已跳过");
+                return None;
+            }
+            let data = source.data.as_ref()?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+            Some(KiroDocument::from_base64(doc_name, format, b64))
+        }
         other => {
             tracing::warn!(source_type = other, media_type, "暂不支持的文档源类型，已跳过");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod doc_source_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn src(stype: &str, media: &str, data: &str) -> crate::anthropic_types::ImageSource {
+        crate::anthropic_types::ImageSource {
+            source_type: stype.to_string(),
+            media_type: Some(media.to_string()),
+            data: Some(data.to_string()),
+            url: None,
+            file_id: None,
+        }
+    }
+
+    #[test]
+    fn text_source_markdown_is_base64_encoded() {
+        let s = src("text", "text/markdown", "# Title\nbody");
+        let doc = anthropic_document_to_kiro(Some("notes"), &s).expect("text 源应被接受");
+        // KiroDocument 的 bytes 应是原文 base64。
+        let want = base64::engine::general_purpose::STANDARD.encode("# Title\nbody".as_bytes());
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(json.to_string().contains(&want), "text 文档应 base64 编码: {json}");
+    }
+
+    #[test]
+    fn text_source_rejected_for_binary_media() {
+        // PDF 不能走 text 源。
+        let s = src("text", "application/pdf", "not-really-pdf");
+        assert!(anthropic_document_to_kiro(Some("x"), &s).is_none());
+    }
+
+    #[test]
+    fn base64_source_still_passthrough() {
+        let s = src("base64", "application/pdf", "JVBERi0=");
+        assert!(anthropic_document_to_kiro(Some("x"), &s).is_some());
     }
 }
 

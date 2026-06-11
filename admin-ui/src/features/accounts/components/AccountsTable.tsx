@@ -22,6 +22,7 @@ interface AccountsTableProps {
   onToggleDisabled: (row: AccountRow) => void
   onEdit: (row: AccountRow) => void
   onDelete: (id: string) => void
+  onReset: (id: string) => void
 }
 
 /** 账号列表玻璃卡表格：配置行 + worker 运行态的 merge 视图。 */
@@ -35,6 +36,7 @@ export function AccountsTable({
   onToggleDisabled,
   onEdit,
   onDelete,
+  onReset,
 }: AccountsTableProps) {
   const { t } = useI18n()
 
@@ -43,6 +45,7 @@ export function AccountsTable({
     { label: t('table.group') },
     { label: t('table.provider') },
     { label: t('table.status') },
+    { label: t('table.credits'), right: true },
     { label: t('table.concurrency'), right: true },
     { label: t('table.failures'), right: true },
     { label: t('table.actions'), right: true },
@@ -98,6 +101,7 @@ export function AccountsTable({
                 onToggleDisabled={onToggleDisabled}
                 onEdit={onEdit}
                 onDelete={onDelete}
+                onReset={onReset}
               />
             ))
           )}

@@ -16,15 +16,19 @@ pub mod chat;
 pub mod converter;
 pub mod error_map;
 pub mod headers;
+pub mod image;
 pub mod inline_thinking;
 pub mod kiro_types;
 pub mod machine_id;
 pub mod parser;
+pub mod profiles;
 pub mod signature;
 pub mod text_tokens;
 pub mod thinking_policy;
+pub mod import;
 pub mod token;
 pub mod usage;
+pub mod usage_limits;
 
 use std::sync::Arc;
 
@@ -32,7 +36,7 @@ use async_trait::async_trait;
 use gw_core::account::{Account, FieldSpec, FieldType};
 use gw_core::error::UpstreamError;
 use gw_core::model::{MachineIdentity, ModelInfo};
-use gw_core::provider::{CallCtx, ChatRequest, ChatStream, Provider};
+use gw_core::provider::{AccountQuota, CallCtx, ChatRequest, ChatStream, Provider};
 
 /// 缓存计费参数(v53:multiplier/cap/floor)。worker 从 `system.yaml` 的 `cache` 段注入,
 /// 替代旧 kiro.rs 的 admin 热调控制面(本项目 Phase 4 再做真正热调,当前为启动期定值)。
@@ -102,6 +106,8 @@ pub struct KiroProvider {
     egress_client: reqwest::Client,
     /// 缓存计费参数(从 system.yaml 注入,见 [`CacheBilling`])。
     cache_billing: CacheBilling,
+    /// 图像压缩参数(system.yaml `image` 段;chat 前对 body 内 base64 图瘦身 + OOM 护栏)。
+    image_cfg: gw_core::config::ImageConfig,
 }
 
 impl KiroProvider {
@@ -110,6 +116,7 @@ impl KiroProvider {
             family: "kiro",
             egress_client,
             cache_billing: CacheBilling::default(),
+            image_cfg: gw_core::config::ImageConfig::default(),
         }
     }
 
@@ -119,14 +126,28 @@ impl KiroProvider {
         self
     }
 
+    /// 显式指定图像压缩参数(测试 / 配置注入用)。
+    pub fn with_image_config(mut self, cfg: gw_core::config::ImageConfig) -> Self {
+        self.image_cfg = cfg;
+        self
+    }
+
     /// registry 工厂:接收 worker 的 egress client(固定出口 IP),注入 provider。
-    /// `cfg` 携带 `system.cache` 段(read_multiplier/cap_ratio/floor_ratio)。
+    /// `cfg` 携带 `system.cache` 段(read_multiplier/cap_ratio/floor_ratio)+
+    /// 可选 `image` 子对象(图像压缩;缺失/解析失败回退默认,容错优先)。
     pub fn from_config(
         cfg: &serde_json::Value,
         egress_client: reqwest::Client,
     ) -> anyhow::Result<Arc<dyn Provider>> {
+        let image_cfg = cfg
+            .get("image")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
         Ok(Arc::new(
-            Self::new(egress_client).with_cache_billing(CacheBilling::from_cfg(cfg)),
+            Self::new(egress_client)
+                .with_cache_billing(CacheBilling::from_cfg(cfg))
+                .with_image_config(image_cfg),
         ))
     }
 }
@@ -194,7 +215,10 @@ impl Provider for KiroProvider {
         ])
     }
 
-    async fn chat(&self, req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
+    async fn chat(&self, mut req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
+        // 图像压缩(转换前):base64 大图按四档瘦身,解压炸弹在解码前被护栏拦截。
+        // 失败回退原图,绝不阻断请求。
+        image::compress_body_images(&mut req.body, &self.image_cfg).await;
         // 设备指纹(machineId 嵌 UA);egress client 固定出口 IP。
         let machine_id = self.machine_identity(&ctx.account).machine_id;
         chat::chat_stream(
@@ -247,6 +271,41 @@ impl Provider for KiroProvider {
                 .insert("expires_at".into(), serde_json::Value::String(exp));
         }
         Ok(updated)
+    }
+
+    /// 查询账号配额(只读 getUsageLimits)。account 须已带有效 access_token
+    /// (worker 调用前已 ensure_credentialed)。用同一冻结 machineId,设备指纹与发包一致。
+    async fn account_quota(
+        &self,
+        account: &Account,
+    ) -> Result<Option<AccountQuota>, UpstreamError> {
+        usage_limits::get_account_quota(&self.egress_client, account)
+            .await
+            .map(Some)
+    }
+
+    /// 发现 profileArn(`ListAvailableProfiles`):企业/IdC 号 chat 与配额都要求
+    /// profileArn,但凭据常不带;此处运行时向后端查询。account 已有显式值或可固定
+    /// 兜底(social/builderid)时返回 None(不发请求)。见 [`profiles`]。
+    async fn discover_profile_arn(
+        &self,
+        account: &Account,
+    ) -> Result<Option<String>, UpstreamError> {
+        profiles::discover_profile_arn(&self.egress_client, account).await
+    }
+
+    /// 订阅能力过滤(对齐 kiro.rs `supports_opus`,credentials.rs:256):
+    /// opus 系仅非 FREE 订阅可用——不过滤的话 opus 请求落到 FREE 号,上游 403 会被
+    /// 误判 TokenInvalid 而永久禁用健康号。`subscription_title` 缺失(未导入且未查过
+    /// 配额)放行,首次配额查询回填该字段后收敛。非 opus 模型全部放行。
+    fn account_supports_model(&self, account: &Account, model: &str) -> bool {
+        if !model.to_ascii_lowercase().contains("opus") {
+            return true;
+        }
+        match account.extra_str("subscription_title") {
+            Some(title) => !title.to_uppercase().contains("FREE"),
+            None => true,
+        }
     }
 }
 
@@ -306,6 +365,22 @@ mod tests {
         let b = CacheBilling::from_cfg(&serde_json::Value::Null);
         assert_eq!(b.read_multiplier, CacheBilling::default().read_multiplier);
         assert_eq!(b.floor_ratio, CacheBilling::default().floor_ratio);
+    }
+
+    #[test]
+    fn account_supports_model_filters_free_for_opus() {
+        let p = KiroProvider::new(client());
+        let free = account_with(&[("subscription_title", "KIRO FREE")]);
+        let pro = account_with(&[("subscription_title", "KIRO PRO")]);
+        let unknown = account_with(&[]);
+        // opus:FREE 拒、PRO 放、未知放行(待配额回填)。
+        assert!(!p.account_supports_model(&free, "claude-opus-4-8"));
+        assert!(p.account_supports_model(&pro, "claude-opus-4-8"));
+        assert!(p.account_supports_model(&unknown, "claude-opus-4-8"));
+        // 非 opus:FREE 也放。
+        assert!(p.account_supports_model(&free, "claude-sonnet-4-5"));
+        // 大小写不敏感。
+        assert!(!p.account_supports_model(&free, "Claude-OPUS-4-8"));
     }
 
     #[test]

@@ -15,10 +15,9 @@
 //! 导致 4.7/4.8 带后缀也退化 enabled、effort 传不进、不带后缀完全无思维链。改为"Opus 系列
 //! 默认 adaptive"避免逐版本硬编码过时,也省去客户端配后缀。
 
-use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking};
+use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking, DEFAULT_EFFORT};
 
 const DEFAULT_THINKING_BUDGET: i32 = 20000;
-const DEFAULT_EFFORT: &str = "high";
 
 /// 按模型名覆写 thinking 配置。在 converter 之前调用,直接 mutate 请求。
 pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
@@ -45,11 +44,11 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
         if req.thinking.is_some() {
             return;
         }
-        // effort 客户端传入优先,缺省 high。
+        // effort 客户端传入优先,缺省 xhigh(深推理;旧 high 仅产桩推理)。
         let effort = req
             .output_config
             .as_ref()
-            .map(|c| c.effort.clone())
+            .map(|c| c.effective_effort().to_string())
             .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
 
         tracing::info!(
@@ -65,7 +64,7 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
             budget_tokens: DEFAULT_THINKING_BUDGET,
         });
         req.output_config = Some(OutputConfig {
-            effort,
+            effort: Some(effort),
             format: None,
         });
     } else if has_thinking_suffix {
@@ -105,12 +104,13 @@ mod tests {
     }
 
     #[test]
-    fn opus_defaults_to_adaptive_without_suffix() {
+    fn opus_defaults_to_adaptive_xhigh_without_suffix() {
         let mut r = req("claude-opus-4-8", None, None);
         override_thinking_from_model_name(&mut r);
         let t = r.thinking.expect("opus 应默认开 thinking");
         assert_eq!(t.thinking_type, "adaptive");
-        assert_eq!(r.output_config.unwrap().effort, "high");
+        // 缺省 effort 应为 xhigh(深推理),非旧的 high(桩推理)。
+        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some("xhigh"));
     }
 
     #[test]
@@ -125,10 +125,19 @@ mod tests {
 
     #[test]
     fn opus_uses_client_effort() {
-        let oc = OutputConfig { effort: "xhigh".to_string(), format: None };
+        let oc = OutputConfig { effort: Some("low".to_string()), format: None };
         let mut r = req("claude-opus-4-8", None, Some(oc));
         override_thinking_from_model_name(&mut r);
-        assert_eq!(r.output_config.unwrap().effort, "xhigh", "effort 客户端优先");
+        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some("low"), "effort 客户端优先");
+    }
+
+    #[test]
+    fn opus_with_output_config_but_no_effort_defaults_xhigh() {
+        // 客户端带 output_config 但 effort 缺省(None)→ effective_effort 回退 xhigh。
+        let oc = OutputConfig { effort: None, format: None };
+        let mut r = req("claude-opus-4-8", None, Some(oc));
+        override_thinking_from_model_name(&mut r);
+        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some("xhigh"));
     }
 
     #[test]
@@ -148,7 +157,7 @@ mod tests {
     #[test]
     fn structured_output_excludes_thinking() {
         let oc = OutputConfig {
-            effort: "high".to_string(),
+            effort: None,
             format: Some(OutputFormat {
                 format_type: "json_schema".to_string(),
                 schema: Some(serde_json::json!({"type": "object"})),
@@ -165,7 +174,7 @@ mod tests {
         // 走 Opus 分支但因已有 thinking 而尊重客户端。
         let explicit = Thinking { thinking_type: "adaptive".to_string(), display: None, budget_tokens: 8000 };
         let oc = OutputConfig {
-            effort: "high".to_string(),
+            effort: None,
             format: Some(OutputFormat {
                 format_type: "json_schema".to_string(),
                 schema: Some(serde_json::json!({"type": "object"})),

@@ -82,7 +82,9 @@ pub struct Account {
 }
 
 fn default_max_concurrency() -> u32 {
-    1
+    // 对齐 kiro.rs 生产默认(credential.maxConcurrency=2):单号串行会让同会话的
+    // 并行 tool-call / 子代理请求排队。DB 中已有显式值的存量账号不受影响。
+    2
 }
 
 impl Account {
@@ -116,7 +118,7 @@ region: us-east-1
 "#;
         let acct: Account = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(acct.account_id, "k1");
-        assert_eq!(acct.max_concurrency, 1); // default
+        assert_eq!(acct.max_concurrency, 2); // default(对齐 kiro.rs)
         assert_eq!(acct.extra_str("refresh_token"), Some("tok123"));
         assert_eq!(acct.extra_str("region"), Some("us-east-1"));
     }

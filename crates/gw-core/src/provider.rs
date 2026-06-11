@@ -104,6 +104,40 @@ pub struct ChatUsage {
     pub cache_creation_tokens: u64,
 }
 
+/// 账号配额(积分/额度)只读快照。`getUsageLimits` 这类接口产出,admin 账号页展示
+/// "已用 / 上限 / 剩余"。非 Kiro provider 可不实现(默认 `None`)。
+///
+/// `used`/`limit` 用浮点:Kiro 的 Credit 配额带小数(如 10236.75)。`remaining`
+/// 由实现保证 `= (limit - used).max(0.0)`(超额 clamp 到 0,不为负)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountQuota {
+    /// 已用额度(Credits)。
+    pub used: f64,
+    /// 额度上限(base limit)。
+    pub limit: f64,
+    /// 剩余额度 = (limit - used).max(0)。
+    pub remaining: f64,
+    /// 已用百分比(0–100+,可超 100 表示已进入 overage)。
+    pub percent_used: f64,
+    /// 订阅/单位标签(如 "KIRO PRO"),admin 悬浮展示,可空。
+    pub currency: Option<String>,
+}
+
+impl AccountQuota {
+    /// 由已用/上限构造,自动算 remaining(clamp 0)与 percent。
+    pub fn from_used_limit(used: f64, limit: f64) -> Self {
+        let remaining = (limit - used).max(0.0);
+        let percent_used = if limit > 0.0 { used / limit * 100.0 } else { 0.0 };
+        Self {
+            used,
+            limit,
+            remaining,
+            percent_used,
+            currency: None,
+        }
+    }
+}
+
 /// `Provider::chat` 产出的流元素。
 #[derive(Debug, Clone)]
 pub enum StreamItem {
@@ -175,6 +209,17 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// 该账号能否服务该模型(调度选号过滤)。默认全部支持。
+    ///
+    /// Kiro 覆盖:FREE 订阅不支持 opus——不过滤的话 opus 请求会落到 FREE 号,
+    /// 上游 403 被误判 TokenInvalid 而**永久禁用健康号**(对齐 kiro.rs
+    /// `supports_opus` 过滤,token_manager.rs:833)。订阅信息未知时放行
+    /// (首次配额查询会回填 subscription_title)。**必须无副作用且快**:
+    /// 调度器在锁内对每个候选账号调用。
+    fn account_supports_model(&self, _account: &Account, _model: &str) -> bool {
+        true
+    }
+
     /// 刷新账号凭据(token),返回更新后的 `Account`。
     ///
     /// **回写契约(H4)**:返回的 `Account` 由 **gw-app 负责写回 store**;provider
@@ -182,6 +227,29 @@ pub trait Provider: Send + Sync {
     /// refresh(gw-app 以 per-account 锁/单飞去重保证),避免两请求并发刷新互相
     /// 覆盖 token。出口 IP 已由进程固定,实现无需关心绑定。
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError>;
+
+    /// 查询账号配额(只读;`getUsageLimits` 这类接口)。返回 `Ok(None)` = 该 provider
+    /// 不支持配额查询(默认)。**安全契约**:实现只发只读请求(刷新 + GET),绝不触发
+    /// 计费/发包动作。account 应已带有效 access_token(调用方先 ensure_credentialed)。
+    async fn account_quota(
+        &self,
+        _account: &Account,
+    ) -> Result<Option<AccountQuota>, UpstreamError> {
+        Ok(None)
+    }
+
+    /// 发现该账号缺失的 profileArn(如 Kiro 的 `ListAvailableProfiles`)。
+    ///
+    /// 返回 `Ok(Some(arn))` = 发现到一个新 profileArn(gw-app 负责持久化进账号 extra,
+    /// 与 [`Self::refresh_auth`] 同样的 H4 回写契约);`Ok(None)` = 账号已有可用值、
+    /// 不需要、或该 provider 无此概念(默认)。**只读发现调用**,绝不发推理包。
+    /// account 应已带有效 access_token(调用方先 ensure_credentialed)。
+    async fn discover_profile_arn(
+        &self,
+        _account: &Account,
+    ) -> Result<Option<String>, UpstreamError> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

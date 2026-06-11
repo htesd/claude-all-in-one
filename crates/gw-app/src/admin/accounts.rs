@@ -12,7 +12,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use gw_core::store::{AccountPatch, AccountRow};
 use serde::Deserialize;
@@ -63,8 +63,10 @@ pub struct UpdateAccountBody {
 pub fn router() -> Router<AdminState> {
     Router::new()
         .route("/accounts", get(list_accounts).post(create_account))
+        .route("/accounts/import", post(import_accounts))
         .route("/accounts/runtime", get(runtime))
         .route("/accounts/{id}", patch(update_account).delete(delete_account))
+        .route("/accounts/{id}/reset", post(reset_account))
 }
 
 fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
@@ -157,7 +159,7 @@ async fn create_account(
         }
     }
     let provider = body.provider.as_deref().filter(|p| !p.is_empty()).unwrap_or("kiro");
-    let conc = body.max_concurrency.unwrap_or(1);
+    let conc = body.max_concurrency.unwrap_or(2); // 缺省对齐 kiro.rs maxConcurrency=2
     match st
         .store
         .create_account(&body.account_id, group, provider, conc, &extra_json)
@@ -170,6 +172,174 @@ async fn create_account(
         Ok(false) => api_error(StatusCode::CONFLICT, "account_id 已存在"),
         Err(e) => internal_error(e),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportBody {
+    /// 目标组(账号挂到哪个 worker 组);非空时必须真实存在。
+    #[serde(default)]
+    group_name: Option<String>,
+    /// KiroManager 导出原文(字符串)。前端就是粘贴文本,单一形态,服务端解析一次。
+    json: String,
+}
+
+/// 账号的稳定身份(user_id 优先,否则 email),用于导入碰撞核对。
+fn identity_of(extra: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    extra
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            extra
+                .get("email")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+/// `POST /accounts/import` —— 完整导入 KiroManager 导出 JSON(智能合并)。
+///
+/// 智能合并(已与用户确认):新账号全字段写入;已存在账号**只补缺失字段**(machineId/
+/// clientId/secret/profileArn 等身份字段),**不覆盖**服务器已 roll 的 refresh_token/
+/// access_token,已有 machineId 也不覆盖(若与导入值不同则在结果里标 conflict 提示)。
+///
+/// 安全:响应**只回** account_id + 动作,绝不回显任何 token/secret。
+async fn import_accounts(
+    State(st): State<AdminState>,
+    Json(body): Json<ImportBody>,
+) -> axum::response::Response {
+    // 目标组校验(防幽灵分组:typo 的账号永不被任何 worker 服务)。
+    let group = body.group_name.as_deref().unwrap_or("");
+    if !group.is_empty() {
+        match st.store.group_exists(group) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::BAD_REQUEST, "分组不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
+
+    let root: serde_json::Value = match serde_json::from_str(&body.json) {
+        Ok(v) => v,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("JSON 解析失败: {e}")),
+    };
+
+    let imported = match gw_kiro::import::parse_kiromanager_export(&root) {
+        Ok(v) => v,
+        Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let mut created = 0u32;
+    let mut merged = 0u32;
+    let mut skipped = 0u32;
+    let mut items = Vec::new();
+
+    for imp in imported {
+        // account_id 已由 import 清洗;再校验一次防御。
+        if validate_account_id(&imp.account_id).is_err() {
+            skipped += 1;
+            items.push(serde_json::json!({
+                "account_id": imp.account_id, "action": "skipped", "reason": "非法 account_id"
+            }));
+            continue;
+        }
+        let has_mid = imp.has_machine_id();
+        let existing = match st.store.get_account(&imp.account_id) {
+            Ok(v) => v,
+            Err(e) => return internal_error(e),
+        };
+        let Some(row) = existing else {
+            // 新账号:全字段写入(含 token)。create_account 是 INSERT OR IGNORE,
+            // 返回 false = 并发下别人刚插了同 id(竞态)→ 当 skipped,不谎报 created。
+            let extra_json = match serde_json::to_string(&imp.extra) {
+                Ok(s) => s,
+                Err(e) => return internal_error(e),
+            };
+            match st.store.create_account(&imp.account_id, group, "kiro", 2, &extra_json) {
+                Ok(true) => {
+                    created += 1;
+                    items.push(serde_json::json!({
+                        "account_id": imp.account_id, "action": "created", "has_machine_id": has_mid
+                    }));
+                }
+                Ok(false) => {
+                    skipped += 1;
+                    items.push(serde_json::json!({
+                        "account_id": imp.account_id, "action": "skipped", "reason": "并发已存在"
+                    }));
+                }
+                Err(e) => return internal_error(e),
+            }
+            continue;
+        };
+
+        // 已存在账号:智能合并。
+        let existing_extra: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&row.extra).unwrap_or_default();
+
+        // 碰撞防护(审查 H1):邮箱清洗派生的 account_id 可能让两个不同真号撞同一 ID。
+        // 用稳定身份(user_id 优先,否则 email)核对:双方都有且不同 → 是不同账号撞 ID,
+        // 跳过(绝不把两个真号合并成一个)。
+        if let (Some(a), Some(b)) = (identity_of(&imp.extra), identity_of(&existing_extra)) {
+            if a != b {
+                skipped += 1;
+                items.push(serde_json::json!({
+                    "account_id": imp.account_id, "action": "skipped",
+                    "reason": "account_id 派生碰撞(不同账号映射到同一 ID),未合并"
+                }));
+                continue;
+            }
+        }
+
+        // delta 只放"现账号缺失/空"的 key → 已有字段天然不覆盖。**token 字段(refresh_token/
+        // access_token/expires_at)在合并时一律跳过**:服务器拥有并轮换它们,导出里的是旧值,
+        // 既消除"用旧 token 覆盖刚 roll 的新 token"竞态(审查 H3),也兑现"不回退 server token"。
+        const MERGE_SKIP_TOKEN_FIELDS: [&str; 3] = ["refresh_token", "access_token", "expires_at"];
+        let mut delta = serde_json::Map::new();
+        let mut machine_id_conflict = false;
+        for (k, v) in &imp.extra {
+            if MERGE_SKIP_TOKEN_FIELDS.contains(&k.as_str()) {
+                continue; // token 仅创建时写,合并不碰。
+            }
+            let present_nonempty = matches!(
+                existing_extra.get(k),
+                Some(ev) if ev.as_str() != Some("")
+            );
+            if present_nonempty {
+                if k == "machine_id" && existing_extra.get(k) != Some(v) {
+                    machine_id_conflict = true; // 已有不同设备指纹,不覆盖,仅提示。
+                }
+            } else {
+                delta.insert(k.clone(), v.clone());
+            }
+        }
+        if delta.is_empty() {
+            skipped += 1;
+            items.push(serde_json::json!({
+                "account_id": imp.account_id, "action": "skipped",
+                "machine_id_conflict": machine_id_conflict
+            }));
+            continue;
+        }
+        let delta_json = match serde_json::to_string(&delta) {
+            Ok(s) => s,
+            Err(e) => return internal_error(e),
+        };
+        match st.store.merge_account_extra(&imp.account_id, &delta_json) {
+            Ok(_) => {
+                merged += 1;
+                items.push(serde_json::json!({
+                    "account_id": imp.account_id, "action": "merged",
+                    "machine_id_conflict": machine_id_conflict
+                }));
+            }
+            Err(e) => return internal_error(e),
+        }
+    }
+
+    Json(serde_json::json!({
+        "created": created, "merged": merged, "skipped": skipped, "items": items
+    }))
+    .into_response()
 }
 
 async fn update_account(
@@ -279,6 +449,49 @@ async fn runtime(State(st): State<AdminState>) -> axum::response::Response {
     });
     let out = futures::future::join_all(fetches).await;
     Json(out).into_response()
+}
+
+/// `POST /accounts/{id}/reset` —— 人工救号:清该账号在 worker 内存里的运行时
+/// 禁用/冷却/失败计数(quota_exhausted、invalid_refresh_token、too_many_failures
+/// 等均立即解除;配置层 disabled 不动)。
+///
+/// 运行态在 worker 进程内存,且 DB 不记录账号↔worker 的实际归属(组配置可能刚改),
+/// 故对**所有** worker 扇出(并发,单个 2s 超时);各 worker 对不在本组的账号回 404,
+/// 幂等无副作用。任一 worker 命中即视为成功。
+async fn reset_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let fanout = st.workers.iter().map(|w| {
+        let http = st.http.clone();
+        let id = id.clone();
+        async move {
+            let url = format!("http://{}/accounts/{}/reset", w.listen, id);
+            match http.post(&url).send().await {
+                Ok(resp) if resp.status().is_success() => Some(w.instance),
+                Ok(_) => None,  // 404 = 账号不在该 worker 组
+                Err(e) => {
+                    tracing::debug!(instance = w.instance, "reset 扇出失败(worker 离线?): {e}");
+                    None
+                }
+            }
+        }
+    });
+    let hits: Vec<u32> = futures::future::join_all(fanout)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    if hits.is_empty() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+        );
+    }
+    Json(serde_json::json!({"reset": true, "account_id": id, "workers": hits})).into_response()
 }
 
 #[cfg(test)]
@@ -453,6 +666,169 @@ mod tests {
         // kiro_api_key 不含 token/secret/password,必须靠 "key" 规则脱敏,否则明文泄漏。
         assert!(masked.starts_with("***"), "kiro_api_key 必须脱敏,实际 {masked}");
         assert!(!masked.contains("ksk-super-secret"), "明文不得出现:{masked}");
+    }
+
+    #[tokio::test]
+    async fn import_creates_account_with_machine_id() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // KiroManager 导出(单 Enterprise 号),json 以字符串形式传入。
+        let export = serde_json::json!({
+            "version": "1.7.5",
+            "accounts": [{
+                "email": "newco@example.com",
+                "machineId": "a".repeat(64),
+                "credentials": {
+                    "refreshToken": "rt-export-aaa",
+                    "accessToken": "at-export",
+                    "clientId": "cid", "clientSecret": "csecret",
+                    "region": "us-east-1", "provider": "Enterprise",
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X"
+                },
+                "subscription": {"title": "KIRO POWER"}
+            }]
+        });
+        let body = serde_json::json!({"group_name": "G0", "json": export.to_string()}).to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["created"], 1);
+        assert_eq!(v["items"][0]["account_id"], "newco-example.com");
+        assert_eq!(v["items"][0]["has_machine_id"], true);
+        // 库里:machineId 等关键字段落库,client_secret/refresh_token 是完整值。
+        let row = store.get_account("newco-example.com").unwrap().unwrap();
+        assert!(row.extra.contains(&"a".repeat(64)), "machineId 必须落库");
+        assert!(row.extra.contains("rt-export-aaa"));
+        assert!(row.extra.contains("\"client_secret\":\"csecret\""));
+        assert!(row.extra.contains("\"kiro_provider\":\"enterprise\""));
+        // 不得映射 auth_method(避免误触发 TokenType 头)。
+        assert!(!row.extra.contains("auth_method"));
+    }
+
+    #[tokio::test]
+    async fn import_smart_merge_backfills_machine_id_keeps_server_token() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 已存在账号:有服务器已 roll 的 rt,但无 machineId(正是待修复的老号)。
+        store
+            .create_account(
+                "dave-example.com",
+                "G0",
+                "kiro",
+                1,
+                r#"{"refresh_token":"rt-server-rolled","region":"us-east-1"}"#,
+            )
+            .unwrap();
+        // 导入同一号(email 派生同 account_id),带真机 machineId + 旧 rt。
+        let export = serde_json::json!({
+            "accounts": [{
+                "email": "dave@example.com",
+                "machineId": "b".repeat(64),
+                "credentials": {"refreshToken": "rt-export-STALE", "region": "us-east-1", "provider": "BuilderId"}
+            }]
+        });
+        let body = serde_json::json!({"group_name": "G0", "json": export.to_string()}).to_string();
+        let resp = app.oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["merged"], 1, "已存在 → merged");
+        let row = store.get_account("dave-example.com").unwrap().unwrap();
+        // machineId 被补上(关键修复)。
+        assert!(row.extra.contains(&"b".repeat(64)), "machineId 应补齐");
+        // 服务器已 roll 的 rt **不被**导出里的旧 rt 覆盖。
+        assert!(row.extra.contains("rt-server-rolled"), "服务器 token 必须保留");
+        assert!(!row.extra.contains("rt-export-STALE"), "导出里的旧 rt 不得覆盖");
+        // kiro_provider 是新补的字段。
+        assert!(row.extra.contains("\"kiro_provider\":\"builderid\""));
+    }
+
+    #[tokio::test]
+    async fn import_collision_does_not_merge_two_real_accounts() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 两个不同真号(不同 userId),email 清洗后撞同一 account_id "a-b-x.com"。
+        let export = serde_json::json!({
+            "accounts": [
+                {"email": "a+b@x.com", "userId": "u-FIRST", "machineId": "a".repeat(64),
+                 "credentials": {"refreshToken": "rt-first", "provider": "BuilderId"}},
+                {"email": "a-b@x.com", "userId": "u-SECOND", "machineId": "b".repeat(64),
+                 "credentials": {"refreshToken": "rt-second", "provider": "BuilderId"}}
+            ]
+        });
+        let body = serde_json::json!({"group_name": "G0", "json": export.to_string()}).to_string();
+        let resp = app.oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        let v = json_body(resp).await;
+        // 第一个创建,第二个因碰撞被跳过——绝不合并进第一个。
+        assert_eq!(v["created"], 1);
+        assert_eq!(v["skipped"], 1);
+        let row = store.get_account("a-b-x.com").unwrap().unwrap();
+        assert!(row.extra.contains("u-FIRST"), "应是第一个真号");
+        assert!(!row.extra.contains("u-SECOND"), "第二个真号绝不能并进来");
+        assert!(!row.extra.contains("rt-second"), "第二个号的凭据不得污染第一个");
+    }
+
+    #[tokio::test]
+    async fn import_merge_never_overwrites_server_token_even_if_missing() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 已存在号:有 machineId,但 access_token 为空(待刷新)。
+        store
+            .create_account(
+                "joe-x.com",
+                "G0",
+                "kiro",
+                1,
+                &serde_json::json!({"refresh_token":"rt-srv","machine_id":"c".repeat(64),"email":"joe@x.com"}).to_string(),
+            )
+            .unwrap();
+        // 导入带 access_token —— 但 token 是"仅创建"字段,合并不得写入(消除覆盖竞态)。
+        let export = serde_json::json!({"accounts": [{
+            "email": "joe@x.com",
+            "credentials": {"refreshToken": "rt-export", "accessToken": "at-export-STALE",
+                            "region": "us-east-1", "provider": "BuilderId"}
+        }]});
+        let body = serde_json::json!({"group_name": "G0", "json": export.to_string()}).to_string();
+        let resp = app.oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        let v = json_body(resp).await;
+        let row = store.get_account("joe-x.com").unwrap().unwrap();
+        assert!(!row.extra.contains("at-export-STALE"), "access_token 合并时不得写入");
+        assert!(!row.extra.contains("rt-export"), "refresh_token 合并时不得覆盖");
+        assert!(row.extra.contains("rt-srv"), "服务器 token 保留");
+        // 但非 token 身份字段(region/kiro_provider)正常补齐。
+        assert!(row.extra.contains("\"kiro_provider\":\"builderid\""));
+        assert_eq!(v["merged"], 1);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_nonexistent_group_and_bad_json() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 不存在的组 → 400。
+        let body = serde_json::json!({"group_name": "GHOST", "json": "{}"}).to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 非 KiroManager 格式(无 accounts)→ 400。
+        let body = serde_json::json!({"group_name": "G0", "json": "{\"version\":\"x\"}"}).to_string();
+        let resp = app.oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reset_validates_id_and_404s_without_workers() {
+        let (app, _) = app();
+        // 非法 id → 400(不发起任何扇出)。
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/bad%2Fid/reset", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 无 worker 在线 → 404(运行态只存在于 worker 内存,无人持有即无可重置)。
+        let resp = app
+            .oneshot(req("POST", "/accounts/k1/reset", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

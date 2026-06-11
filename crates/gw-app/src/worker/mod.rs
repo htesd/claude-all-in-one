@@ -20,7 +20,9 @@ use futures::StreamExt;
 use gw_core::account::Account;
 use gw_core::config::{AccountsConfig, InstancesConfig, SystemConfig};
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
-use gw_core::provider::{CallCtx, ChatRequest, ChatUsage, Provider, SseEvent, StreamItem};
+use gw_core::provider::{
+    AccountQuota, CallCtx, ChatRequest, ChatUsage, Provider, SseEvent, StreamItem,
+};
 use gw_core::store::{UsageRecord, UsageSink};
 use gw_store::SqliteStore;
 
@@ -45,17 +47,31 @@ struct WorkerState {
     /// 控制面库(账号事实源):刷新后回写 rolling refresh_token、30s 周期 sync 账号集。
     /// None = 库打开失败(降级:账号只来自 yaml 启动快照,改动需重启)。
     store: Option<Arc<SqliteStore>>,
+    /// 账号配额缓存(account_id → (配额或 None, 上次**尝试**时刻)),TTL [`QUOTA_TTL`]。
+    /// 关键:成功与失败都写入时刻 → 失败也受 TTL 节流(否则每次 /health 都重打上游,
+    /// 审查 Skeptic#5)。value 的 `Option` 为 None 表示"查过但失败/无配额"。
+    quota_cache: parking_lot::Mutex<
+        std::collections::HashMap<String, (Option<AccountQuota>, std::time::Instant)>,
+    >,
+    /// 配额刷新在途去重:同账号同时只一个 getUsageLimits 在跑。
+    quota_inflight: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// 配额刷新并发上限信号量:防 /health 一次性给上百个账号同时刷新造成 stampede
+    /// (审查 Architect#4)。后台任务先抢 permit 再打上游。
+    quota_sem: Arc<tokio::sync::Semaphore>,
     /// worker 的 egress client(provider 已持有同一个;此处保留供诊断)。
     _client: reqwest::Client,
 }
 
+/// 配额缓存 TTL:被查看时每账号 ≤1 次/分钟打上游(只读 getUsageLimits,安全)。
+const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// 配额刷新最大并发(stampede 护栏):上百账号同时被查看也只 N 个在打上游。
+const QUOTA_MAX_CONCURRENCY: usize = 3;
+
 impl WorkerState {
-    /// 取该账号的 per-account 刷新锁(单飞:同账号同时只一个刷新)。
+    /// 取该账号的 per-account 刷新锁(单飞:同账号同时只一个刷新;
+    /// flush_dirty_extras / 配额回填同表取锁,互斥持久化)。
     fn refresh_lock(&self, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.refresh_locks.lock();
-        map.entry(account_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        lock_for(&self.refresh_locks, account_id)
     }
 
     /// 确保账号持有**未过期**的 access_token。
@@ -93,38 +109,240 @@ impl WorkerState {
     ) -> Result<Arc<Account>, gw_core::error::UpstreamError> {
         let lock = self.refresh_lock(&account.account_id);
         let _guard = lock.lock().await;
-        // 二次检查:拿到锁后,scheduler 里可能已是别的请求刷新好的新账号。
-        if let Some(fresh) = self.scheduler.account(&account.account_id) {
-            if has_fresh_token(&fresh) {
-                return Ok(fresh);
+        // 锁内取**最新**副本作为刷新基底:他人可能刚刷好(直接用);即便仍需刷新,
+        // 基底也必须是 scheduler 真值——用调用方旧快照会 (a) 拿已作废的 rolling
+        // refresh_token 去刷新,(b) 整块回写时抹掉期间 merge_extra 进来的字段
+        // (如配额回填的 subscription_title)(审查②R Architect#2/Minimalist#2)。
+        let base = match self.scheduler.account(&account.account_id) {
+            Some(fresh) => {
+                if has_fresh_token(&fresh) {
+                    return Ok(fresh);
+                }
+                fresh
             }
-        }
-        let refreshed = Arc::new(self.provider.refresh_auth(&account).await?);
-        // 回写 scheduler:带新 access_token / rolling refresh_token 的副本进入选号池
-        // (单一事实来源;无独立 creds 缓存,避免两份凭证发散)。
-        self.scheduler.update_account(refreshed.clone());
+            None => account,
+        };
+        let refreshed = Arc::new(self.provider.refresh_auth(&base).await?);
+        // 回写 scheduler:带新 token 的副本进入选号池(单一事实来源)。
+        // **原子**「替换 + 置脏」(同一把 entries 锁):分两步的话,30s sync 会在
+        // 中间窗口看到 dirty=false,用 DB 旧值洗掉新 token(审查②R Skeptic#1)。
+        self.scheduler.update_account_dirty(refreshed.clone());
         // 持久化(rolling refresh_token 不落库,重启即回退已作废旧 token):
-        // - **增量合并**只写本次刷新改动的字段,不整块替换——并发的 admin 修改
-        //   (priority/region 等)不被旧内存快照抹掉(审查 Architect#4);
-        // - 先置脏后持久化、成功才清位:任何失败窗口内 30s sync 都不会用 DB
-        //   旧值洗掉内存新 token,由 sync 循环负责重试(审查 Minimalist#1)。
-        if let Some(store) = &self.store {
-            self.scheduler.mark_extra_dirty(&refreshed.account_id);
-            let delta: std::collections::BTreeMap<&String, &serde_json::Value> = refreshed
-                .extra
-                .iter()
-                .filter(|(k, v)| account.extra.get(*k) != Some(*v))
-                .collect();
-            let persisted = serde_json::to_string(&delta)
-                .map_err(anyhow::Error::from)
-                .and_then(|j| store.merge_account_extra(&refreshed.account_id, &j));
-            match persisted {
-                Ok(_) => self.scheduler.clear_extra_dirty(&refreshed.account_id),
-                Err(e) => tracing::warn!(account = %refreshed.account_id,
-                    "刷新回写 DB 失败,已置脏待 sync 重试: {e}"),
+        // - **增量合并**只写本次刷新改动的字段(相对 base),不整块替换——并发的
+        //   admin 修改(priority/region 等)不被旧内存快照抹掉(审查 Architect#4);
+        // - 置脏后持久化、成功才清位:失败窗口内 sync 不会用 DB 旧值洗内存,
+        //   由 sync 循环负责重试(审查 Minimalist#1)。
+        match &self.store {
+            Some(store) => {
+                let delta: std::collections::BTreeMap<&String, &serde_json::Value> = refreshed
+                    .extra
+                    .iter()
+                    .filter(|(k, v)| base.extra.get(*k) != Some(*v))
+                    .collect();
+                let persisted = serde_json::to_string(&delta)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|j| store.merge_account_extra(&refreshed.account_id, &j));
+                match persisted {
+                    Ok(_) => self.scheduler.clear_extra_dirty(&refreshed.account_id),
+                    Err(e) => tracing::warn!(account = %refreshed.account_id,
+                        "刷新回写 DB 失败,已置脏待 sync 重试: {e}"),
+                }
             }
+            // 无库(降级模式):没有 sync 循环、也没人会清脏,直接清掉避免悬挂标记。
+            None => self.scheduler.clear_extra_dirty(&refreshed.account_id),
         }
         Ok(refreshed)
+    }
+
+    /// 读账号配额缓存;命中(<TTL,含失败记录)直接返回,陈旧/缺失则触发**后台**刷新
+    /// (去重)并返回当前缓存值(可能旧/None)。**不阻塞 /health**:只读查询在后台跑。
+    fn quota_cached_or_refresh(self: &Arc<Self>, account_id: &str) -> Option<AccountQuota> {
+        let now = std::time::Instant::now();
+        let cached = self.quota_cache.lock().get(account_id).cloned();
+        // fresh 看"上次尝试时刻"(成功或失败都算),失败也受 TTL 节流。
+        let fresh = cached
+            .as_ref()
+            .is_some_and(|(_, at)| now.duration_since(*at) < QUOTA_TTL);
+        if !fresh {
+            self.spawn_quota_refresh(account_id.to_string());
+        }
+        cached.and_then(|(q, _)| q)
+    }
+
+    /// 后台刷新某账号配额(去重:同账号同时只一个在途)。无 tokio 上下文则跳过。
+    fn spawn_quota_refresh(self: &Arc<Self>, account_id: String) {
+        if !self.quota_inflight.lock().insert(account_id.clone()) {
+            return; // 已有刷新在途。
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.quota_inflight.lock().remove(&account_id);
+            return;
+        }
+        let st = self.clone();
+        tokio::spawn(async move {
+            st.refresh_quota_once(&account_id).await;
+            st.quota_inflight.lock().remove(&account_id);
+        });
+    }
+
+    /// 实际查一次配额并写缓存:抢并发 permit → 确保 token 有效(可能刷新,安全)→
+    /// provider.account_quota。**无论成功失败都写"尝试时刻"**(失败写 None),让 TTL 同样
+    /// 节流失败重试。只读 getUsageLimits + 刷新,绝不发 chat(见 no-chat-test-on-real-accounts)。
+    async fn refresh_quota_once(self: &Arc<Self>, account_id: &str) {
+        let _permit = match self.quota_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return, // 信号量被关闭(停机),放弃。
+        };
+        let result = self.try_fetch_quota(account_id).await;
+        // 顺手回填订阅档位:getUsageLimits 的 subscriptionTitle 是模型能力过滤
+        // (FREE 不给 opus)的数据源——只导了 rt 的账号缺 subscription_title,
+        // 首次配额查询后在此收敛。
+        if let Ok(Some(q)) = &result {
+            if let Some(title) = &q.currency {
+                self.backfill_subscription_title(account_id, title).await;
+            }
+        }
+        let value = match result {
+            Ok(q) => q, // Some(配额) 或 None(账号已不在/无配额)
+            Err(e) => {
+                tracing::debug!(account = %account_id, "配额查询失败(节流后重试): {e}");
+                None
+            }
+        };
+        // 写时刻(成功 Some / 失败或无 None),fresh 判定据此节流。
+        self.quota_cache
+            .lock()
+            .insert(account_id.to_string(), (value, std::time::Instant::now()));
+    }
+
+    /// 把配额响应里的订阅档位写回账号 extra(内存就地合并 + 持久化 DB)。
+    ///
+    /// - 内存:`merge_extra` 在调度器锁内单字段合并,不携带旧账号快照,与并发
+    ///   token 刷新互不覆盖;值未变(60s 周期刷新的常态)直接跳过。
+    /// - 持久化:取 per-account 刷新锁与 token 刷新的「置脏→落库→清脏」互斥,
+    ///   避免本函数 clear 误清掉刷新失败留下的脏标记(丢 rolling token 重试)。
+    async fn backfill_subscription_title(&self, account_id: &str, title: &str) {
+        self.persist_extra_field(
+            account_id,
+            "subscription_title",
+            serde_json::Value::String(title.to_string()),
+            "订阅档位(模型过滤数据源)",
+        )
+        .await;
+    }
+
+    /// 把一个**发现/查询得来的持久字段**写回账号 extra(内存就地合并 + DB 持久化)。
+    /// subscription_title(配额回填)、profile_arn(ListAvailableProfiles 发现)共用。
+    ///
+    /// 必须先拿 per-account 刷新锁再动内存:token 刷新在锁内「读基底→整块替换」,
+    /// 锁外 merge 会落进它的读写窗口被整块覆盖(审查②R Minimalist#2)。
+    async fn persist_extra_field(
+        &self,
+        account_id: &str,
+        key: &str,
+        value: serde_json::Value,
+        what: &str,
+    ) {
+        let lock = self.refresh_lock(account_id);
+        let _guard = lock.lock().await;
+        if !self.scheduler.merge_extra(account_id, key, value.clone()) {
+            return; // 值未变,无事可做。
+        }
+        let Some(store) = &self.store else { return };
+        // 账号已有待重试的整块脏 extra(刷新回写失败):不抢着写,30s sync 的
+        // flush_dirty_extras 会连本字段一起落库。
+        if self.scheduler.is_extra_dirty(account_id) {
+            return;
+        }
+        self.scheduler.mark_extra_dirty(account_id);
+        let delta = serde_json::json!({ key: value }).to_string();
+        match store.merge_account_extra(account_id, &delta) {
+            Ok(_) => self.scheduler.clear_extra_dirty(account_id),
+            Err(e) => tracing::warn!(account = %account_id,
+                "{what} 回写 DB 失败,置脏待 sync 重试: {e}"),
+        }
+        tracing::debug!(account = %account_id, key, "已回填 {what}");
+    }
+
+    /// 确保企业/IdC 账号带 profileArn:缺失则 `ListAvailableProfiles` 发现并持久化,
+    /// 返回带 profileArn 的更新副本(chat / 配额本次即用)。发现失败不阻断——让后续
+    /// 上游 400「profileArn is required」自然报错(BadRequest,不惩罚账号)。
+    /// social/builderid(固定兜底)与已有显式值的账号直接短路返回,无网络调用。
+    async fn ensure_profile_arn(&self, account: Arc<Account>) -> Arc<Account> {
+        if account
+            .extra_str("profile_arn")
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return account; // 已有显式值(含上次发现后持久化的)。
+        }
+        match self.provider.discover_profile_arn(&account).await {
+            Ok(Some(arn)) => {
+                self.persist_extra_field(
+                    &account.account_id,
+                    "profile_arn",
+                    serde_json::Value::String(arn.clone()),
+                    "profileArn(ListAvailableProfiles 发现)",
+                )
+                .await;
+                tracing::info!(account = %account.account_id, "已发现并持久化 profileArn");
+                // 取回带新 profile_arn 的副本供本次请求使用。
+                self.scheduler.account(&account.account_id).unwrap_or(account)
+            }
+            Ok(None) => account, // 固定兜底或无可用 profile,按原样(headers 兜底处理)。
+            Err(e) => {
+                tracing::debug!(account = %account.account_id,
+                    "ListAvailableProfiles 发现失败(不阻断): {e}");
+                account
+            }
+        }
+    }
+
+    /// 预热订阅档位:对缺 `subscription_title` 的账号后台拉一次配额(getUsageLimits
+    /// 只读,安全)。它是模型能力过滤的数据源——不预热的话,只导了 rt 的 FREE 号在
+    /// 冷启动期间会被「未知放行」接 opus 然后 403(审查②R Architect#3)。
+    /// 受 quota_sem(并发 3)+ TTL 节流,账号多也不会打爆;完整导入(KiroManager)
+    /// 的账号自带该字段,不产生任何调用。
+    fn warm_subscription_titles(self: &Arc<Self>) {
+        for snap in self.scheduler.status_snapshot() {
+            let Some(acc) = self.scheduler.account(&snap.account_id) else { continue };
+            if acc.extra_str("subscription_title").is_none() {
+                self.spawn_quota_refresh(snap.account_id);
+            }
+        }
+    }
+
+    /// 拉一次配额(可能触发 token 刷新)。Ok(None) = 账号已不在/上游无配额。
+    async fn try_fetch_quota(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> anyhow::Result<Option<AccountQuota>> {
+        let Some(account) = self.scheduler.account(account_id) else {
+            return Ok(None);
+        };
+        let account = self
+            .ensure_credentialed(account)
+            .await
+            .map_err(|e| anyhow::anyhow!("ensure token: {e}"))?;
+        // 企业/IdC 号 getUsageLimits 同样要求 profileArn:缺则先发现+持久化。
+        let account = self.ensure_profile_arn(account).await;
+        self.provider
+            .account_quota(&account)
+            .await
+            .map_err(|e| anyhow::anyhow!("getUsageLimits: {e}"))
+    }
+}
+
+/// 配额 → JSON(null = 尚无缓存/查询中或查询失败,前端显示 —)。
+fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
+    match q {
+        Some(q) => serde_json::json!({
+            "used": q.used,
+            "limit": q.limit,
+            "remaining": q.remaining,
+            "percent_used": q.percent_used,
+            "label": q.currency,
+        }),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -261,9 +479,18 @@ pub async fn run(
     // 保证该 provider 所有上游请求走同一出口 IP(防关联封号)。
     let client = egress::build_client(&wcfg.egress)?;
     let egress_desc = egress::describe(&wcfg.egress);
-    // provider 工厂 cfg:注入 system.cache(缓存计费 multiplier/cap/floor)。序列化失败
-    // 退回 Null(provider 各自回退默认参数,不致命)。
-    let provider_cfg = serde_json::to_value(&system.cache).unwrap_or(serde_json::Value::Null);
+    // cache_sim 全局 store 的 TTL/容量从 system.cache 同步(否则恒用编译期默认 300s/4096)。
+    gw_kiro::cache_sim::global().set_ttl_secs(system.cache.sim_ttl_secs);
+    gw_kiro::cache_sim::global().set_max_sessions(system.cache.max_sessions);
+
+    // provider 工厂 cfg:注入 system.cache(缓存计费 multiplier/cap/floor)+ system.image
+    // (图像压缩,嵌为 "image" 子对象)。序列化失败退回 Null/缺省(provider 各自回退,不致命)。
+    let mut provider_cfg = serde_json::to_value(&system.cache).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut provider_cfg {
+        if let Ok(img) = serde_json::to_value(&system.image) {
+            map.insert("image".into(), img);
+        }
+    }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
 
     let usage_sink: Option<Arc<dyn UsageSink>> =
@@ -285,11 +512,14 @@ pub async fn run(
         egress_desc,
         group: wcfg.account_group.clone(),
         provider,
-        scheduler: AccountScheduler::new(accounts),
+        scheduler: AccountScheduler::new(accounts, &system.scheduler),
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         usage_sink,
         pending_writes: PendingWrites::new(),
         store: store.clone(),
+        quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        quota_sem: Arc::new(tokio::sync::Semaphore::new(QUOTA_MAX_CONCURRENCY)),
         _client: client,
     });
 
@@ -304,7 +534,7 @@ pub async fn run(
             loop {
                 tick.tick().await;
                 // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
-                flush_dirty_extras(&st.scheduler, &store, "sync 重试");
+                flush_dirty_extras(&st.scheduler, &store, &st.refresh_locks, "sync 重试").await;
                 match store.load_group_accounts(&st.group) {
                     Ok(accs) => {
                         let accs = filter_by_provider(
@@ -315,6 +545,8 @@ pub async fn run(
                         if out.added + out.removed > 0 {
                             tracing::info!(added = out.added, removed = out.removed,
                                 "账号集已按 DB 同步");
+                            // 新进账号若缺订阅档位,预热配额查询补齐(模型过滤数据源)。
+                            st.warm_subscription_titles();
                         }
                     }
                     Err(e) => tracing::warn!("账号 sync 读库失败,跳过本轮: {e}"),
@@ -323,21 +555,30 @@ pub async fn run(
         });
     }
 
-    let app = Router::new()
+    // 启动预热:缺订阅档位的账号后台拉一次配额(getUsageLimits 只读,安全),
+    // 让模型能力过滤(FREE 不给 opus)冷启动即有数据源,而非等 /health 被动触发。
+    state.warm_subscription_titles();
+
+    let mut app = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/models", get(models))
-        .route("/health", get(health))
-        .with_state(state.clone());
+        .route("/health", get(health));
 
     // worker 不做对外鉴权、且信任 router 注入的 X-Gw-Client-Key;必须只绑 loopback,
     // 否则客户端可直连 worker 绕过 router 鉴权并伪造用量归属(审查 #2)。
-    if !is_loopback_listen(&wcfg.listen) {
+    let loopback = is_loopback_listen(&wcfg.listen);
+    if loopback {
+        // 内网管理端点(无鉴权,信任同机 router):人工救号。**仅 loopback 才挂载**——
+        // 非 loopback 误配下暴露它等于把"清禁用保护"开给整个网络(审查②R 共识 high)。
+        app = app.route("/accounts/{id}/reset", post(reset_account));
+    } else {
         tracing::warn!(
             listen = %wcfg.listen,
-            "⚠️ worker 绑定到非 loopback 地址:这会让客户端绕过 router 鉴权并伪造 client_key 归属。\
-             请改绑 127.0.0.1,或为 router→worker 内网跳加共享密钥。"
+            "⚠️ worker 绑定到非 loopback 地址:这会让客户端绕过 router 鉴权并伪造 client_key 归属;\
+             reset 管理端点已禁用。请改绑 127.0.0.1,或为 router→worker 内网跳加共享密钥。"
         );
     }
+    let app = app.with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&wcfg.listen).await?;
     axum::serve(listener, app)
@@ -357,7 +598,7 @@ pub async fn run(
     // 失败」的 rolling token 若不在此落盘,退出即丢(账号下次只能拿旧 token 刷新,
     // 可能已被上游作废)。
     if let Some(store) = &state.store {
-        flush_dirty_extras(&state.scheduler, store, "停机排空");
+        flush_dirty_extras(&state.scheduler, store, &state.refresh_locks, "停机排空").await;
     }
     Ok(())
 }
@@ -413,20 +654,52 @@ impl Drop for PendingWriteGuard {
     }
 }
 
+/// per-account 刷新锁表的取锁(WorkerState::refresh_lock 与 flush 共用同一张表,
+/// 保证 flush 与 token 刷新/配额回填互斥)。
+type RefreshLocks = parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+fn lock_for(locks: &RefreshLocks, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = locks.lock();
+    map.entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// 把调度器里标脏的 extra(刷新成功但 DB 回写失败的 rolling token)逐个落盘,
 /// 成功才清脏位——清位前 sync 不会用 DB 旧值覆盖内存新 token。
 /// 30s sync 循环(失败下轮重试)和停机排空(最后机会,失败即丢)共用。
-fn flush_dirty_extras(scheduler: &AccountScheduler, store: &SqliteStore, context: &str) {
-    for acc in scheduler.dirty_accounts() {
+///
+/// **必须**逐账号持 refresh_lock 并在锁内重读副本+重查脏位:用入口处的旧快照
+/// 直接 merge 会与并发刷新竞速——刷新已落库新 token 并清脏后,本函数再把旧快照
+/// 整块写回 = DB 回滚到已作废 refresh_token(审查②R Skeptic#2)。
+async fn flush_dirty_extras(
+    scheduler: &AccountScheduler,
+    store: &SqliteStore,
+    refresh_locks: &RefreshLocks,
+    context: &str,
+) {
+    let dirty_ids: Vec<String> = scheduler
+        .dirty_accounts()
+        .iter()
+        .map(|a| a.account_id.clone())
+        .collect();
+    for id in dirty_ids {
+        let lock = lock_for(refresh_locks, &id);
+        let _guard = lock.lock().await;
+        // 锁内重读:并发刷新可能已替换副本/自行落库清脏。
+        if !scheduler.is_extra_dirty(&id) {
+            continue;
+        }
+        let Some(acc) = scheduler.account(&id) else { continue };
         let persisted = serde_json::to_string(&acc.extra)
             .map_err(anyhow::Error::from)
-            .and_then(|j| store.merge_account_extra(&acc.account_id, &j));
+            .and_then(|j| store.merge_account_extra(&id, &j));
         match persisted {
             Ok(_) => {
-                scheduler.clear_extra_dirty(&acc.account_id);
-                tracing::info!(account = %acc.account_id, "{context}: 脏 extra 持久化成功");
+                scheduler.clear_extra_dirty(&id);
+                tracing::info!(account = %id, "{context}: 脏 extra 持久化成功");
             }
-            Err(e) => tracing::warn!(account = %acc.account_id,
+            Err(e) => tracing::warn!(account = %id,
                 "{context}: 脏 extra 持久化失败: {e}"),
         }
     }
@@ -467,6 +740,20 @@ fn is_loopback_listen(listen: &str) -> bool {
 }
 
 async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
+    // 每账号运行态 + 配额(配额读缓存,陈旧时后台刷新,不阻塞本响应)。
+    let accounts_status: Vec<serde_json::Value> = st
+        .scheduler
+        .status_snapshot()
+        .into_iter()
+        .map(|s| {
+            let quota = st.quota_cached_or_refresh(&s.account_id);
+            let mut v = serde_json::to_value(&s).unwrap_or(serde_json::Value::Null);
+            if let serde_json::Value::Object(map) = &mut v {
+                map.insert("quota".into(), quota_to_json(quota));
+            }
+            v
+        })
+        .collect();
     Json(serde_json::json!({
         "role": "worker",
         "instance": st.instance,
@@ -474,12 +761,30 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "group": st.group,
         "provider": st.provider.family(),
         "accounts": st.scheduler.total(),
-        // 每账号运行态(冷却/封禁/并发占用),admin 账号页经 router 聚合展示。
-        "accounts_status": st.scheduler.status_snapshot(),
+        // 每账号运行态(冷却/封禁/并发占用)+ 配额,admin 账号页经 router 聚合展示。
+        "accounts_status": accounts_status,
         // usage 是否在落库:库打开失败时为 false(降级,usage 不入库),便于运维发现。
         "usage_persist": st.usage_sink.is_some(),
         "status": "ok"
     }))
+}
+
+/// `POST /accounts/{id}/reset` —— 内网管理:人工救号。清运行时禁用/冷却/失败计数
+/// (配置层 disabled 不动,那走 PATCH)。由 admin(router 进程)扇出调用;
+/// worker 只绑 loopback,信任内网调用方。404 = 账号不在本 worker 组。
+async fn reset_account(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if st.scheduler.reset_account(&id) {
+        Json(serde_json::json!({"reset": true, "account_id": id})).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"reset": false, "account_id": id})),
+        )
+            .into_response()
+    }
 }
 
 /// `GET /v1/models` —— 暴露 provider 的模型目录(Anthropic 线缆格式)。
@@ -538,12 +843,25 @@ async fn messages(
 
     loop {
         attempts += 1;
-        // 1. 按会话亲和取并发租约(持有到流结束)。
-        let lease = match st.scheduler.acquire(affinity_key.as_deref()).await {
+        // 1. 按会话亲和取并发租约(持有到流结束)。合格账号须支持本次模型
+        //    (FREE 订阅不支持 opus,过滤掉避免 403 误杀,对齐 kiro.rs supports_opus)。
+        let lease = match st
+            .scheduler
+            .acquire_where(affinity_key.as_deref(), |a| {
+                st.provider.account_supports_model(a, &req.model)
+            })
+            .await
+        {
             Ok(l) => l,
             Err(e) => {
+                // NoModelSupport 是客户侧可解(换模型/升级订阅),给 400;其余是池子状态,503。
+                let code = if e == scheduler::AcquireError::NoModelSupport {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    code,
                     Json(serde_json::json!({"type":"error","error":{"message": e.to_string()}})),
                 )
                     .into_response();
@@ -566,6 +884,9 @@ async fn messages(
                 continue;
             }
         };
+        // 企业/IdC 号确保带 profileArn(缺则 ListAvailableProfiles 发现+持久化);
+        // social/builderid/已有值直接短路。发现失败不阻断,让上游自然报 400。
+        let account = st.ensure_profile_arn(account).await;
 
         let ctx = CallCtx {
             account,
@@ -981,8 +1302,8 @@ mod tests {
         task.await.unwrap();
     }
 
-    #[test]
-    fn flush_dirty_extras_persists_rolled_token_and_clears_dirty() {
+    #[tokio::test]
+    async fn flush_dirty_extras_persists_rolled_token_and_clears_dirty() {
         let store = SqliteStore::open_in_memory().unwrap();
         store
             .create_account(
@@ -1003,15 +1324,28 @@ mod tests {
         };
         acc.extra
             .insert("refresh_token".into(), serde_json::Value::String("rt-new".into()));
-        let scheduler = AccountScheduler::new(vec![Arc::new(acc)]);
+        let scheduler = AccountScheduler::new(vec![Arc::new(acc)], &Default::default());
         scheduler.mark_extra_dirty("acc-1");
 
-        flush_dirty_extras(&scheduler, &store, "停机排空");
+        let locks: RefreshLocks = parking_lot::Mutex::new(std::collections::HashMap::new());
+        flush_dirty_extras(&scheduler, &store, &locks, "停机排空").await;
 
         let row = store.get_account("acc-1").unwrap().unwrap();
         assert!(row.extra.contains("rt-new"), "rolling token 应已落盘: {}", row.extra);
         assert!(row.extra.contains("us-east-1"), "merge 语义:未带字段保留原值: {}", row.extra);
         assert!(scheduler.dirty_accounts().is_empty(), "落盘成功后应清脏位");
+
+        // 并发刷新已自行落库清脏的账号:flush 锁内重查脏位后跳过,不回滚 DB。
+        store
+            .merge_account_extra("acc-1", r#"{"refresh_token":"rt-newer"}"#)
+            .unwrap();
+        flush_dirty_extras(&scheduler, &store, &locks, "二次排空").await;
+        let row = store.get_account("acc-1").unwrap().unwrap();
+        assert!(
+            row.extra.contains("rt-newer"),
+            "非脏账号不得被旧快照回滚: {}",
+            row.extra
+        );
     }
 
     /// 记录到内存的假 sink,断言 finalize_usage 的落库决策。
@@ -1084,7 +1418,7 @@ mod tests {
     }
 
     fn one_account_scheduler() -> AccountScheduler {
-        AccountScheduler::new(vec![Arc::new(acct(&[]))])
+        AccountScheduler::new(vec![Arc::new(acct(&[]))], &Default::default())
     }
 
     fn chat_stream(

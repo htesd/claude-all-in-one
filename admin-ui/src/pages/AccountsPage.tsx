@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { AlertTriangle, Plus } from 'lucide-react'
+import { AlertTriangle, Plus, Upload } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
@@ -7,10 +7,12 @@ import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import type { RuntimeQueryState } from '@/features/accounts/components/AccountTableRow'
 import { CreateAccountDialog } from '@/features/accounts/components/CreateAccountDialog'
 import { EditAccountDialog } from '@/features/accounts/components/EditAccountDialog'
+import { ImportAccountsDialog } from '@/features/accounts/components/ImportAccountsDialog'
 import {
   useAccounts,
   useAccountsRuntime,
   useDeleteAccount,
+  useResetAccount,
   useUpdateAccount,
 } from '@/features/accounts/hooks'
 import { mergeRuntimeByAccount } from '@/features/accounts/lib'
@@ -28,8 +30,10 @@ export default function AccountsPage() {
 
   const updateMutation = useUpdateAccount()
   const deleteMutation = useDeleteAccount()
+  const resetMutation = useResetAccount()
 
   const [createOpen, setCreateOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
 
   const groupColors = useMemo(() => {
@@ -61,17 +65,22 @@ export default function AccountsPage() {
     ? (updateMutation.variables?.id ?? null)
     : deleteMutation.isPending
       ? (deleteMutation.variables ?? null)
-      : null
+      : resetMutation.isPending
+        ? (resetMutation.variables ?? null)
+        : null
 
   const handleToggleDisabled = (row: AccountRow) =>
     updateMutation.mutate({ id: row.account_id, patch: { disabled: !row.disabled } })
   const handleDelete = (id: string) => deleteMutation.mutate(id)
+  const handleReset = (id: string) => resetMutation.mutate(id)
 
   const actionError = updateMutation.isError
     ? updateMutation.error
     : deleteMutation.isError
       ? deleteMutation.error
-      : null
+      : resetMutation.isError
+        ? resetMutation.error
+        : null
 
   return (
     <div className="space-y-6">
@@ -81,10 +90,16 @@ export default function AccountsPage() {
           <h1 className="text-2xl font-bold tracking-tight">{t('accounts.title')}</h1>
           <p className="mt-1 text-sm text-muted-foreground">{t('accounts.subtitle')}</p>
         </div>
-        <Button onClick={() => setCreateOpen(true)}>
-          <Plus className="h-4 w-4" />
-          {t('accounts.new')}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={() => setImportOpen(true)}>
+            <Upload className="h-4 w-4" />
+            {t('accounts.import')}
+          </Button>
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus className="h-4 w-4" />
+            {t('accounts.new')}
+          </Button>
+        </div>
       </div>
 
       {accountsQuery.isError && <ErrorNote error={accountsQuery.error} />}
@@ -109,9 +124,11 @@ export default function AccountsPage() {
         onToggleDisabled={handleToggleDisabled}
         onEdit={(row) => setEditingId(row.account_id)}
         onDelete={handleDelete}
+        onReset={handleReset}
       />
 
       <CreateAccountDialog open={createOpen} onClose={() => setCreateOpen(false)} />
+      <ImportAccountsDialog open={importOpen} onClose={() => setImportOpen(false)} />
       <EditAccountDialog
         open={editingRow !== null}
         row={editingRow}

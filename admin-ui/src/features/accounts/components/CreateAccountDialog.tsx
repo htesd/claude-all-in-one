@@ -29,7 +29,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
   const [accountId, setAccountId] = useState('')
   const [group, setGroup] = useState('')
   const [token, setToken] = useState('')
-  const [concurrency, setConcurrency] = useState('1')
+  const [concurrency, setConcurrency] = useState('2')
   const [error, setError] = useState<string | null>(null)
 
   // 每次打开都从干净的表单态开始
@@ -38,7 +38,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       setAccountId('')
       setGroup('')
       setToken('')
-      setConcurrency('1')
+      setConcurrency('2')
       setError(null)
     }
   }, [open])
