@@ -27,21 +27,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gw_core::account::Account;
+use gw_core::config::SchedulerConfig;
 use gw_core::error::UpstreamErrorKind;
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// 会话亲和映射 TTL:超过此时长未访问的会话条目惰性淘汰(等于会话重开,自然再平衡)。
-const AFFINITY_TTL: Duration = Duration::from_secs(30 * 60);
-/// 429 限流冷却时长(到期自愈)。
-const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
-/// 空响应冷却时长(与 429 解耦,默认更短;v58 阈值冷却用)。
-const EMPTY_RESPONSE_COOLDOWN: Duration = Duration::from_secs(20);
-/// 空响应固定窗口:窗口内累计 empty 达阈值才冷却(避免误伤偶发 empty 的健康号)。
-const EMPTY_WINDOW: Duration = Duration::from_secs(120);
-const EMPTY_THRESHOLD: u32 = 3;
-/// 连续 API 失败达此次数 → 自动禁用(TooManyFailures,可被全灭自愈)。
-const MAX_FAILURES: u32 = 5;
+/// 调度参数(由 system.yaml `scheduler` 段注入;默认值见 [`SchedulerConfig`],
+/// 对齐 kiro.rs 生产配置)。全部 clamp 到 ≥1,杜绝 0 值造成"必禁用/必过期"。
+struct Tuning {
+    /// 会话亲和映射 TTL:超时未访问惰性淘汰(等于会话重开,自然再平衡)。
+    affinity_ttl: Duration,
+    /// 429 限流冷却时长(到期自愈)。
+    rate_limit_cooldown: Duration,
+    /// 空响应冷却时长(v58 阈值冷却用)。
+    empty_cooldown: Duration,
+    /// 空响应固定窗口:窗口内累计 empty 达阈值才冷却(避免误伤偶发 empty 的健康号)。
+    empty_window: Duration,
+    empty_threshold: u32,
+    /// 连续 API 失败达此次数 → 自动禁用(TooManyFailures,可被全灭自愈)。
+    max_failures: u32,
+}
+
+impl From<&SchedulerConfig> for Tuning {
+    fn from(c: &SchedulerConfig) -> Self {
+        Self {
+            affinity_ttl: Duration::from_secs(c.affinity_ttl_secs.max(1)),
+            rate_limit_cooldown: Duration::from_secs(c.rate_limit_cooldown_secs.max(1)),
+            empty_cooldown: Duration::from_secs(c.empty_response_cooldown_secs.max(1)),
+            empty_window: Duration::from_secs(c.empty_response_window_secs.max(1)),
+            empty_threshold: c.empty_response_threshold.max(1),
+            max_failures: c.max_failures.max(1),
+        }
+    }
+}
 
 /// 账号被禁用/冷却的原因(决定自愈策略)。🟢 对齐 kiro.rs DisabledReason。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +104,7 @@ struct CredentialState {
     extra_dirty: bool,
     /// 冷却到期时刻(仅 cooldown 类有效);到点后选号前 sweep 自愈。
     disabled_until: Option<Instant>,
-    /// 连续 API 失败次数(成功清零;达 MAX_FAILURES 禁用)。
+    /// 连续 API 失败次数(成功清零;达 tuning.max_failures 禁用)。
     failure_count: u32,
     /// 会话亲和 LRU:最后被选中的时刻(选中即更新,新会话按"最久未用优先"分配)。
     last_selected_at: Option<Instant>,
@@ -178,6 +196,9 @@ pub enum AcquireError {
     AllBusy,
     /// 组内无任何账号。
     Empty,
+    /// 组内没有任何账号支持请求的模型(如全 FREE 订阅请求 opus)。
+    /// 与 AllDisabled 区分:这不是故障,是订阅能力不足,换时间重试也无济于事。
+    NoModelSupport,
 }
 
 impl std::fmt::Display for AcquireError {
@@ -186,6 +207,9 @@ impl std::fmt::Display for AcquireError {
             AcquireError::AllDisabled => write!(f, "组内所有账号均已禁用"),
             AcquireError::AllBusy => write!(f, "组内所有账号并发已满"),
             AcquireError::Empty => write!(f, "组内无账号"),
+            AcquireError::NoModelSupport => {
+                write!(f, "组内无支持该模型的账号(订阅等级不足,如 FREE 不支持 opus)")
+            }
         }
     }
 }
@@ -198,11 +222,13 @@ pub struct AccountScheduler {
     entries: Mutex<HashMap<String, CredentialState>>,
     /// 会话亲和映射:session_key → primary。
     affinity: Mutex<HashMap<String, AffinityEntry>>,
+    /// 调度参数(启动注入,运行期不变)。
+    tuning: Tuning,
 }
 
 impl AccountScheduler {
-    /// 用一组账号构造调度器。
-    pub fn new(accounts: Vec<Arc<Account>>) -> Self {
+    /// 用一组账号 + 调度参数构造调度器(参数来自 system.yaml `scheduler` 段)。
+    pub fn new(accounts: Vec<Arc<Account>>, cfg: &SchedulerConfig) -> Self {
         let mut entries = HashMap::with_capacity(accounts.len());
         for acc in accounts {
             entries.insert(acc.account_id.clone(), CredentialState::new(acc));
@@ -210,6 +236,7 @@ impl AccountScheduler {
         Self {
             entries: Mutex::new(entries),
             affinity: Mutex::new(HashMap::new()),
+            tuning: Tuning::from(cfg),
         }
     }
 
@@ -234,14 +261,19 @@ impl AccountScheduler {
         }
     }
 
-    /// 合格账号 id 集:未禁用 + 不在 exclude(busy)内。
+    /// 合格账号 id 集:未禁用 + 不在 exclude(busy)内 + 支持本次模型。
     fn eligible_ids(
         entries: &HashMap<String, CredentialState>,
         exclude: &HashSet<String>,
+        supports: &dyn Fn(&Account) -> bool,
     ) -> Vec<String> {
         entries
             .values()
-            .filter(|e| !e.disabled && !exclude.contains(&e.account.account_id))
+            .filter(|e| {
+                !e.disabled
+                    && !exclude.contains(&e.account.account_id)
+                    && supports(&e.account)
+            })
             .map(|e| e.account.account_id.clone())
             .collect()
     }
@@ -272,15 +304,17 @@ impl AccountScheduler {
 
     /// 按会话亲和选一个账号 id(v52「落在哪个号就认哪个号」),并更新亲和表 + last_selected。
     /// `session_key = None` 时退化为分层 LRU(无亲和记忆)。`exclude` = 本轮已 busy 的号。
+    /// `supports` = 模型能力过滤:primary 不支持本次模型时同样走「改选 + 当场转正」。
     fn select_id(
         &self,
         session_key: Option<&str>,
         exclude: &HashSet<String>,
         now: Instant,
+        supports: &dyn Fn(&Account) -> bool,
     ) -> Option<String> {
         let mut entries = self.entries.lock();
         Self::heal_cooldowns(&mut entries, now);
-        let eligible = Self::eligible_ids(&entries, exclude);
+        let eligible = Self::eligible_ids(&entries, exclude, supports);
         if eligible.is_empty() {
             return None;
         }
@@ -289,7 +323,7 @@ impl AccountScheduler {
             None => Self::tiered_lru(&entries, &eligible),
             Some(key) => {
                 let mut map = self.affinity.lock();
-                map.retain(|_, v| now.duration_since(v.last_access) < AFFINITY_TTL);
+                map.retain(|_, v| now.duration_since(v.last_access) < self.tuning.affinity_ttl);
                 let eligible_set: HashSet<&String> = eligible.iter().collect();
                 match map.get_mut(key) {
                     None => {
@@ -337,19 +371,41 @@ impl AccountScheduler {
         }
     }
 
-    /// 选号 + 取并发许可(v52 亲和)。返回租约;持有期间占并发槽,Drop 释放。
+    /// 选号 + 取并发许可,**无模型过滤**(等价 `acquire_where(_, |_| true)`)。
+    /// 供测试与无能力差异的 provider 使用;worker 主链路走 [`Self::acquire_where`]。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn acquire(&self, session_key: Option<&str>) -> Result<AccountLease, AcquireError> {
+        self.acquire_where(session_key, |_| true).await
+    }
+
+    /// 选号 + 取并发许可(v52 亲和 + 模型能力过滤)。返回租约;持有期间占并发槽,Drop 释放。
+    ///
+    /// `supports` 判定账号能否服务本次模型(来自 `Provider::account_supports_model`,
+    /// 对齐 kiro.rs opus 过滤):不支持的号从合格集剔除,绝不会被选中——否则 FREE 号
+    /// 接 opus 被上游 403 → 误判 TokenInvalid → 永久禁用健康号。
     ///
     /// 流程(对齐 kiro.rs acquire_context_with_session_and_group):
-    /// 1. 冷却 sweep + 分层 LRU 亲和选号;
-    /// 2. 取并发许可,满了把该号记 busy、清亲和重试标记,换下一个号;
+    /// 1. 冷却 sweep + 分层 LRU 亲和选号(合格 = 未禁用 + 非 busy + 支持模型);
+    /// 2. 取并发许可,满了把该号记 busy、换下一个号;
     /// 3. 全 busy 但有可用号 → 短 sleep 等并发释放后重试;
-    /// 4. 全禁用且有 TooManyFailures → 全灭自愈(重置失败计数)再试一轮;否则报错。
-    pub async fn acquire(&self, session_key: Option<&str>) -> Result<AccountLease, AcquireError> {
+    /// 4. 无任何号支持该模型 → NoModelSupport(换时间重试无济于事,与故障区分);
+    /// 5. 全禁用且有 TooManyFailures → 全灭自愈(重置失败计数)再试一轮;否则报错。
+    pub async fn acquire_where<F>(
+        &self,
+        session_key: Option<&str>,
+        supports: F,
+    ) -> Result<AccountLease, AcquireError>
+    where
+        F: Fn(&Account) -> bool,
+    {
         let total = self.total();
         if total == 0 {
             return Err(AcquireError::Empty);
         }
-        let max_attempts = (total * MAX_FAILURES as usize).max(1);
+        // 尝试预算与 max_failures(禁用阈值)**解耦**:复用会让运维把 max_failures
+        // 调到 1 时 busy 几乎不等待、全灭自愈后没机会重选(审查 Architect#6/Minimalist#3)。
+        const ACQUIRE_ATTEMPTS_PER_ACCOUNT: usize = 5;
+        let max_attempts = (total * ACQUIRE_ATTEMPTS_PER_ACCOUNT).max(2);
         let mut attempts = 0;
         let mut busy: HashSet<String> = HashSet::new();
         let mut self_healed = false;
@@ -360,17 +416,33 @@ impl AccountScheduler {
             }
             let now = Instant::now();
 
-            let Some(id) = self.select_id(session_key, &busy, now) else {
-                // 无合格号:区分"全 busy(有可用但占满)" vs "全禁用"。
-                let (avail_total, avail_not_busy) = {
+            let Some(id) = self.select_id(session_key, &busy, now, &supports) else {
+                // 无合格号:区分"没号支持该模型" vs "全 busy(有可用但占满)" vs "全禁用"。
+                // 三类计数都只看**支持该模型**的号——不支持的号既救不了 busy 等待,
+                // 也不该让错误从 NoModelSupport 误报成 AllDisabled。
+                let (supported_any, avail_total, avail_not_busy) = {
                     let entries = self.entries.lock();
-                    let total_avail = entries.values().filter(|e| !e.disabled).count();
-                    let not_busy = entries
-                        .values()
-                        .filter(|e| !e.disabled && !busy.contains(&e.account.account_id))
-                        .count();
-                    (total_avail, not_busy)
+                    let mut any = false;
+                    let mut avail = 0usize;
+                    let mut not_busy = 0usize;
+                    for e in entries.values() {
+                        if !supports(&e.account) {
+                            continue;
+                        }
+                        any = true;
+                        if e.disabled {
+                            continue;
+                        }
+                        avail += 1;
+                        if !busy.contains(&e.account.account_id) {
+                            not_busy += 1;
+                        }
+                    }
+                    (any, avail, not_busy)
                 };
+                if !supported_any {
+                    return Err(AcquireError::NoModelSupport);
+                }
                 if avail_total > 0 && avail_not_busy == 0 && !busy.is_empty() {
                     // 有可用号但全 busy → 等并发释放后重试。
                     busy.clear();
@@ -379,7 +451,9 @@ impl AccountScheduler {
                     continue;
                 }
                 // 全禁用:若有 TooManyFailures,做一次全灭自愈(等价重启)再试。
-                if !self_healed && self.heal_too_many_failures() {
+                // 只复活**支持本次模型**的号:opus 请求不该顺手复活无关 FREE 失败号
+                // (与上方"计数只看支持该模型"同语义,审查②R Skeptic#4)。
+                if !self_healed && self.heal_too_many_failures(&supports) {
                     self_healed = true;
                     attempts += 1;
                     continue;
@@ -399,12 +473,15 @@ impl AccountScheduler {
     }
 
     /// 全灭自愈:若存在 TooManyFailures 禁用的号,清其禁用 + 失败计数(等价重启)。
-    /// 返回是否实际恢复了至少一个号。
-    fn heal_too_many_failures(&self) -> bool {
+    /// 只动 `supports` 通过(支持本次模型)的号。返回是否实际恢复了至少一个号。
+    fn heal_too_many_failures(&self, supports: &dyn Fn(&Account) -> bool) -> bool {
         let mut entries = self.entries.lock();
         let mut healed = false;
         for e in entries.values_mut() {
-            if e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+            if e.disabled
+                && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && supports(&e.account)
+            {
                 e.disabled = false;
                 e.disabled_reason = None;
                 e.failure_count = 0;
@@ -513,6 +590,11 @@ impl AccountScheduler {
         }
     }
 
+    /// 该账号是否有待持久化的脏 extra。
+    pub fn is_extra_dirty(&self, id: &str) -> bool {
+        self.entries.lock().get(id).map(|e| e.extra_dirty).unwrap_or(false)
+    }
+
     /// 全账号运行态快照(worker /status → admin 账号页;id 升序稳定输出)。
     /// 先做冷却自愈 sweep:无流量时快照才不会展示已到期的陈旧冷却态。
     pub fn status_snapshot(&self) -> Vec<AccountStatusSnapshot> {
@@ -559,6 +641,48 @@ impl AccountScheduler {
         }
     }
 
+    /// **原子**替换账号副本并置脏(同一把 entries 锁)。刷新回写专用:
+    /// 「先 update 后 mark_dirty」两步之间,30s sync 看到 dirty=false 会用 DB 旧值
+    /// 覆盖内存,丢掉刚 roll 的 refresh_token(审查 Architect#1)。
+    pub fn update_account_dirty(&self, account: Arc<Account>) {
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.get_mut(&account.account_id) {
+            e.account = account;
+            e.extra_dirty = true;
+        }
+    }
+
+    /// 锁内就地合并**单个** extra 字段(配额回填 subscription_title 等元数据用)。
+    /// 与 [`Self::update_account`] 的整体替换不同:不携带调用方的旧账号快照,
+    /// 不会与并发 token 刷新互相覆盖。值未变化返回 false(调用方可跳过持久化)。
+    pub fn merge_extra(&self, id: &str, key: &str, value: serde_json::Value) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(e) = entries.get_mut(id) else { return false };
+        if e.account.extra.get(key) == Some(&value) {
+            return false;
+        }
+        let mut acc = (*e.account).clone();
+        acc.extra.insert(key.to_string(), value);
+        e.account = Arc::new(acc);
+        true
+    }
+
+    /// 人工救号(admin reset):清运行时禁用/冷却/全部计数,立即回到选号池。
+    /// 配置层禁用(admin 开关 disabled=true)**不**在此解除——那是显式运营意图,
+    /// 走 PATCH disabled=false。返回是否找到该账号。
+    pub fn reset_account(&self, id: &str) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(e) = entries.get_mut(id) else { return false };
+        e.disabled = e.config_disabled;
+        e.disabled_reason = None;
+        e.disabled_until = None;
+        e.failure_count = 0;
+        e.empty_window_start = None;
+        e.empty_count_in_window = 0;
+        tracing::info!(account = %id, "admin reset:清运行时禁用与计数");
+        true
+    }
+
     /// 读当前某账号的凭证副本(单飞刷新的二次检查用:他人可能刚刷新好)。
     pub fn account(&self, id: &str) -> Option<Arc<Account>> {
         self.entries.lock().get(id).map(|e| e.account.clone())
@@ -587,13 +711,14 @@ impl AccountScheduler {
             UpstreamErrorKind::RateLimited | UpstreamErrorKind::TemporarilyBlocked => {
                 e.disabled = true;
                 e.disabled_reason = Some(DisabledReason::RateLimited);
-                e.disabled_until = Some(now + RATE_LIMIT_COOLDOWN);
-                tracing::warn!(account = %id, "命中限流,冷却 {}s", RATE_LIMIT_COOLDOWN.as_secs());
+                e.disabled_until = Some(now + self.tuning.rate_limit_cooldown);
+                tracing::warn!(account = %id, "命中限流,冷却 {}s",
+                    self.tuning.rate_limit_cooldown.as_secs());
             }
             UpstreamErrorKind::EmptyResponse => {
                 // v58 固定窗口阈值:窗口内累计达阈值才冷却,避免误伤偶发 empty 的健康号。
                 match e.empty_window_start {
-                    Some(start) if now.duration_since(start) <= EMPTY_WINDOW => {
+                    Some(start) if now.duration_since(start) <= self.tuning.empty_window => {
                         e.empty_count_in_window += 1;
                     }
                     _ => {
@@ -601,13 +726,14 @@ impl AccountScheduler {
                         e.empty_count_in_window = 1;
                     }
                 }
-                if e.empty_count_in_window >= EMPTY_THRESHOLD {
+                if e.empty_count_in_window >= self.tuning.empty_threshold {
                     e.disabled = true;
                     e.disabled_reason = Some(DisabledReason::EmptyResponse);
-                    e.disabled_until = Some(now + EMPTY_RESPONSE_COOLDOWN);
+                    e.disabled_until = Some(now + self.tuning.empty_cooldown);
                     e.empty_window_start = None;
                     e.empty_count_in_window = 0;
-                    tracing::warn!(account = %id, "空响应达阈值,冷却 {}s", EMPTY_RESPONSE_COOLDOWN.as_secs());
+                    tracing::warn!(account = %id, "空响应达阈值,冷却 {}s",
+                        self.tuning.empty_cooldown.as_secs());
                 }
             }
             UpstreamErrorKind::QuotaExhausted => {
@@ -626,7 +752,7 @@ impl AccountScheduler {
             }
             UpstreamErrorKind::ServerError | UpstreamErrorKind::Network | UpstreamErrorKind::Other => {
                 e.failure_count += 1;
-                if e.failure_count >= MAX_FAILURES {
+                if e.failure_count >= self.tuning.max_failures {
                     e.disabled = true;
                     e.disabled_reason = Some(DisabledReason::TooManyFailures);
                     tracing::warn!(account = %id, "连续失败 {} 次,自动禁用", e.failure_count);
@@ -658,7 +784,12 @@ mod tests {
     }
 
     fn sched(accounts: Vec<Arc<Account>>) -> AccountScheduler {
-        AccountScheduler::new(accounts)
+        AccountScheduler::new(accounts, &SchedulerConfig::default())
+    }
+
+    /// 默认连续失败禁用阈值(配置默认值,测试断言用)。
+    fn max_failures() -> u32 {
+        SchedulerConfig::default().max_failures
     }
 
     #[tokio::test]
@@ -733,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn too_many_failures_then_self_heal() {
         let s = sched(vec![acct("a", 4, None)]);
-        for _ in 0..MAX_FAILURES {
+        for _ in 0..max_failures() {
             s.report_failure("a", UpstreamErrorKind::ServerError);
         }
         assert!(s.acquire(Some("s")).await.is_ok(), "全灭自愈后应恢复");
@@ -742,11 +873,11 @@ mod tests {
     #[tokio::test]
     async fn success_resets_failure_count() {
         let s = sched(vec![acct("a", 4, None)]);
-        for _ in 0..(MAX_FAILURES - 1) {
+        for _ in 0..(max_failures() - 1) {
             s.report_failure("a", UpstreamErrorKind::ServerError);
         }
         s.report_success("a");
-        for _ in 0..(MAX_FAILURES - 1) {
+        for _ in 0..(max_failures() - 1) {
             s.report_failure("a", UpstreamErrorKind::ServerError);
         }
         assert!(s.acquire(Some("s")).await.is_ok(), "成功后失败计数应清零");
@@ -761,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn bad_request_does_not_penalize() {
         let s = sched(vec![acct("a", 4, None)]);
-        for _ in 0..(MAX_FAILURES * 2) {
+        for _ in 0..(max_failures() * 2) {
             s.report_failure("a", UpstreamErrorKind::BadRequest);
         }
         assert!(s.acquire(Some("s")).await.is_ok(), "BadRequest 不应惩罚账号");
@@ -888,6 +1019,173 @@ mod tests {
         assert_eq!(s.account("a").unwrap().extra_str("refresh_token"), Some("rt-stale"));
     }
 
+    // ───────── 模型能力过滤(acquire_where) ─────────
+
+    /// 标了 subscription_title 的账号(模型过滤测试用)。
+    fn acct_sub(id: &str, concurrency: u32, title: &str) -> Arc<Account> {
+        let mut a = (*acct(id, concurrency, None)).clone();
+        a.extra
+            .insert("subscription_title".into(), serde_json::json!(title));
+        Arc::new(a)
+    }
+
+    /// 模拟 KiroProvider::account_supports_model 的 opus 过滤谓词。
+    fn opus_pred(a: &Account) -> bool {
+        a.extra_str("subscription_title")
+            .map(|t| !t.to_uppercase().contains("FREE"))
+            .unwrap_or(true)
+    }
+
+    #[tokio::test]
+    async fn acquire_where_skips_unsupported_accounts() {
+        // FREE 号 id 字典序更靠前(无过滤时会先选中),验证谓词真正生效。
+        let s = sched(vec![acct_sub("a-free", 4, "KIRO FREE"), acct_sub("b-pro", 4, "KIRO PRO")]);
+        for sess in ["s1", "s2", "s3"] {
+            let lease = s.acquire_where(Some(sess), opus_pred).await.unwrap();
+            assert_eq!(lease.account_id(), "b-pro", "FREE 号绝不能被 opus 请求选中");
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_where_no_capable_account_errors_distinctly() {
+        let s = sched(vec![acct_sub("a-free", 4, "KIRO FREE")]);
+        assert_eq!(
+            s.acquire_where(Some("s"), opus_pred).await.err(),
+            Some(AcquireError::NoModelSupport),
+            "全 FREE 请求 opus 应报 NoModelSupport,而非 AllDisabled"
+        );
+        // 非过滤请求(如 sonnet)照常可用。
+        assert!(s.acquire(Some("s")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn affinity_primary_unsupported_promotes_capable() {
+        let s = sched(vec![acct_sub("a-free", 4, "KIRO FREE"), acct_sub("b-pro", 4, "KIRO PRO")]);
+        // 无过滤的请求把会话钉到 FREE 号(字典序先选 a-free)。
+        let first = s.acquire(Some("mix")).await.unwrap().account_id().to_string();
+        assert_eq!(first, "a-free");
+        // 同会话来了 opus 请求:primary 不支持 → 改选 PRO 并当场转正。
+        let second = s
+            .acquire_where(Some("mix"), opus_pred)
+            .await
+            .unwrap()
+            .account_id()
+            .to_string();
+        assert_eq!(second, "b-pro");
+        // 转正后,后续非 opus 请求也钉在新 primary(落在哪认哪)。
+        let third = s.acquire(Some("mix")).await.unwrap().account_id().to_string();
+        assert_eq!(third, "b-pro");
+    }
+
+    #[tokio::test]
+    async fn busy_supported_account_waits_instead_of_falling_to_unsupported() {
+        // PRO 号并发 1 且被占满;FREE 号空闲。opus 请求必须等 PRO 释放,绝不落到 FREE。
+        let s = sched(vec![acct_sub("a-free", 4, "KIRO FREE"), acct_sub("b-pro", 1, "KIRO PRO")]);
+        let hold = s.acquire_where(Some("s1"), opus_pred).await.unwrap();
+        assert_eq!(hold.account_id(), "b-pro");
+        // 占满时 acquire_where 应进入 busy-wait(而非立刻落到 FREE),释放后拿到 PRO。
+        let acquire_fut = s.acquire_where(Some("s2"), opus_pred);
+        tokio::pin!(acquire_fut);
+        // 先让它跑一小会(进入 busy-wait 循环),确认未错误落到 FREE。
+        tokio::select! {
+            r = &mut acquire_fut => {
+                panic!("PRO 占满时不应立刻成功(更不能落 FREE):{:?}", r.map(|l| l.account_id().to_string()));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        drop(hold); // 释放 PRO 并发
+        let got = acquire_fut.await.unwrap();
+        assert_eq!(got.account_id(), "b-pro", "释放后应拿到 PRO,而非 FREE");
+    }
+
+    #[tokio::test]
+    async fn self_heal_respects_model_filter() {
+        // a-free 连续失败禁用,b-pro 额度耗尽:opus 请求不得顺手复活无关的 FREE 失败号。
+        let s = sched(vec![acct_sub("a-free", 2, "KIRO FREE"), acct_sub("b-pro", 2, "KIRO PRO")]);
+        for _ in 0..max_failures() {
+            s.report_failure("a-free", UpstreamErrorKind::ServerError);
+        }
+        s.report_failure("b-pro", UpstreamErrorKind::QuotaExhausted);
+        assert_eq!(
+            s.acquire_where(Some("s"), opus_pred).await.err(),
+            Some(AcquireError::AllDisabled)
+        );
+        let snap = s.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a-free").unwrap();
+        assert!(a.disabled, "opus 请求不应复活不支持 opus 的失败号");
+        // 无过滤(如 sonnet)请求才触发对它的全灭自愈。
+        assert!(s.acquire(Some("s2")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn single_account_low_max_failures_heals_then_acquires() {
+        // max_failures=1 的极端配置:一次失败即禁用;acquire 的尝试预算与其解耦,
+        // 自愈后必须还有机会重选(否则恒报 AllBusy)。
+        let cfg = SchedulerConfig { max_failures: 1, ..SchedulerConfig::default() };
+        let s = AccountScheduler::new(vec![acct("a", 2, None)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::ServerError);
+        let got = s.acquire(None).await;
+        assert!(got.is_ok(), "全灭自愈后应能租到刚恢复的账号: {:?}", got.err());
+    }
+
+    // ───────── reset_account / merge_extra ─────────
+
+    #[tokio::test]
+    async fn reset_account_revives_runtime_disable() {
+        let s = sched(vec![acct("a", 2, None)]);
+        s.report_failure("a", UpstreamErrorKind::QuotaExhausted);
+        assert_eq!(s.acquire(None).await.err(), Some(AcquireError::AllDisabled));
+        assert!(s.reset_account("a"));
+        assert!(s.acquire(None).await.is_ok(), "reset 后应立即回到选号池");
+        assert!(!s.reset_account("ghost"), "不存在的账号返回 false");
+    }
+
+    #[tokio::test]
+    async fn reset_account_keeps_config_disable() {
+        let s = sched(vec![acct_disabled("a", true)]);
+        assert!(s.reset_account("a"));
+        assert_eq!(
+            s.acquire(None).await.err(),
+            Some(AcquireError::AllDisabled),
+            "配置层禁用不被 reset 解除(显式运营意图,走 PATCH disabled=false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_extra_updates_single_field_in_place() {
+        let s = sched(vec![acct("a", 2, None)]);
+        assert!(s.merge_extra("a", "subscription_title", serde_json::json!("KIRO PRO")));
+        assert_eq!(
+            s.account("a").unwrap().extra_str("subscription_title"),
+            Some("KIRO PRO")
+        );
+        // 等值合并返回 false(调用方据此跳过持久化)。
+        assert!(!s.merge_extra("a", "subscription_title", serde_json::json!("KIRO PRO")));
+        // 不影响其它字段与运行态。
+        s.report_failure("a", UpstreamErrorKind::ServerError);
+        assert!(s.merge_extra("a", "subscription_title", serde_json::json!("KIRO POWER")));
+        let snap = s.status_snapshot();
+        assert_eq!(snap[0].failure_count, 1, "merge_extra 不得动运行态");
+        assert!(!s.merge_extra("ghost", "k", serde_json::json!(1)));
+    }
+
+    // ───────── 配置注入(Tuning) ─────────
+
+    #[tokio::test]
+    async fn custom_empty_threshold_from_config() {
+        let cfg = SchedulerConfig {
+            empty_response_threshold: 1,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![acct("a", 2, None)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::EmptyResponse);
+        assert_eq!(
+            s.acquire(None).await.err(),
+            Some(AcquireError::AllDisabled),
+            "阈值 1:首个 empty 即应冷却"
+        );
+    }
+
     // ───────── status_snapshot ─────────
 
     #[tokio::test]
@@ -900,7 +1198,7 @@ mod tests {
         let a = snap.iter().find(|x| x.account_id == "a").unwrap();
         assert!(a.disabled);
         assert_eq!(a.reason, "rate_limited");
-        assert!(a.cooldown_remaining_secs > 0 && a.cooldown_remaining_secs <= 60);
+        assert!(a.cooldown_remaining_secs > 0 && a.cooldown_remaining_secs <= 300);
         let b = snap.iter().find(|x| x.account_id == "b").unwrap();
         assert!(!b.disabled);
         assert_eq!(b.reason, "");

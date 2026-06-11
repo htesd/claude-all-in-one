@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Pencil, Trash2 } from 'lucide-react'
+import { HeartPulse, Pencil, Trash2 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -9,7 +9,7 @@ import { GroupChip } from '@/features/groups/components/GroupChip'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
-import { deriveAccountStatus } from '../lib'
+import { deriveAccountStatus, formatCredits, isQuotaLow } from '../lib'
 import type { AccountRow, AccountRuntimeEntry } from '../types'
 import { AccountStatusBadge } from './AccountStatusBadge'
 
@@ -32,6 +32,7 @@ interface AccountTableRowProps {
   onToggleDisabled: (row: AccountRow) => void
   onEdit: (row: AccountRow) => void
   onDelete: (id: string) => void
+  onReset: (id: string) => void
 }
 
 export function AccountTableRow({
@@ -43,11 +44,19 @@ export function AccountTableRow({
   onToggleDisabled,
   onEdit,
   onDelete,
+  onReset,
 }: AccountTableRowProps) {
   const { t } = useI18n()
   const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   const failureCount = runtime?.status.failure_count ?? 0
+  // 救号按钮：worker 在线且账号处于「运行时」禁用（冷却/封禁,非 admin 配置开关）,
+  // 或攒了失败计数 —— reset 可立即清掉,不必等冷却自然到期。
+  const runtimeReason = runtime?.online === true ? runtime.status.reason : ''
+  const canReset =
+    runtime?.online === true &&
+    ((runtime.status.disabled && runtimeReason !== '' && runtimeReason !== 'config') ||
+      failureCount > 0)
   /** 并发列只在 worker 在线上报时显示「空闲/上限」，否则回落到配置值。 */
   const hasLivePermits = runtimeState === 'ready' && runtime !== undefined && runtime.online
 
@@ -82,6 +91,26 @@ export function AccountTableRow({
         ) : (
           <AccountStatusBadge status={deriveAccountStatus(row, runtime)} />
         )}
+      </TD>
+
+      {/* 积分:剩余/上限(来自 getUsageLimits);null = 后台查询中 */}
+      <TD className="text-right">
+        {(() => {
+          if (runtimeState === 'loading') return <Skeleton className="ml-auto h-4 w-16" />
+          const quota = runtime?.online ? runtime.status.quota : undefined
+          if (quota === undefined || quota === null) {
+            return <span className="text-muted-foreground">—</span>
+          }
+          const low = isQuotaLow(quota.remaining, quota.limit)
+          return (
+            <span className="tabular-nums" title={quota.label ?? undefined}>
+              <span className={cn('font-medium', low && 'text-destructive')}>
+                {formatCredits(quota.remaining)}
+              </span>
+              <span className="text-muted-foreground"> / {formatCredits(quota.limit)}</span>
+            </span>
+          )
+        })()}
       </TD>
 
       {/* 并发：空闲/上限（runtime），无 runtime 数据时显示配置值 */}
@@ -127,6 +156,17 @@ export function AccountTableRow({
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5">
+            {canReset && (
+              <button
+                type="button"
+                onClick={() => onReset(row.account_id)}
+                title={t('accounts.action.reset')}
+                disabled={busy}
+                className={cn(iconButtonClass, 'text-warning hover:text-warning')}
+              >
+                <HeartPulse className="h-3.5 w-3.5" />
+              </button>
+            )}
             <Button
               variant="outline"
               size="sm"

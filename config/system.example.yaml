@@ -3,6 +3,9 @@ cache:
   read_multiplier: 1.0
   cap_ratio: 0.9
   floor_ratio: 0.1
+  # cache_sim 会话表(可选,缺省即下值):TTL 秒数 + LRU 最大会话数。
+  sim_ttl_secs: 300
+  max_sessions: 4096
 
 # admin 控制面:设了非空 token 才启用(router 进程挂 /admin/api)。这是单一管理密钥,
 # 与对外客户 apikey 完全分离;前端登录用它,经 x-api-key / Bearer 传入。留空=不启用 admin。
@@ -11,3 +14,22 @@ admin:
 
 # 空响应无配置:v60 起不做反代侧重试/兜底,固定为记一条 empty_response error +
 # 阈值冷却 + 客户端自重试。
+
+# 账号调度/冷却(可选,缺省即下值;对齐 kiro.rs 生产默认)。
+# 改动需重启 worker 生效(热调控制面在后续版本)。
+scheduler:
+  rate_limit_cooldown_secs: 300     # 429 限流冷却(到期自愈)
+  empty_response_cooldown_secs: 60  # 空响应达阈值后的冷却
+  empty_response_window_secs: 60    # 空响应计数窗口
+  empty_response_threshold: 3       # 窗口内达此次数才冷却
+  max_failures: 5                   # 连续 5xx/网络失败达此数自动禁用(可全灭自愈)
+  affinity_ttl_secs: 1800           # 会话亲和条目 TTL(同会话钉同账号的记忆时长)
+
+# 图像压缩(可选,缺省即下值;🔵 移植 kiro.rs/xkiro,含解码前 OOM 护栏)。
+# 多模态大图按四档阈值等比缩放;失败一律回退原图,绝不丢图。
+image:
+  enabled: true
+  max_long_edge: 4000        # 长边像素上限
+  max_pixels_single: 4000000 # 单图总像素上限
+  max_pixels_multi: 4000000  # 多图档总像素上限(默认与单图相同,需要更严时调小)
+  multi_threshold: 20        # 请求内图片数达此值启用多图档

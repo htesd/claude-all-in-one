@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_id      TEXT PRIMARY KEY,
     group_name      TEXT NOT NULL DEFAULT '',
     provider        TEXT NOT NULL DEFAULT 'kiro',
-    max_concurrency INTEGER NOT NULL DEFAULT 1,
+    max_concurrency INTEGER NOT NULL DEFAULT 2,
     disabled        INTEGER NOT NULL DEFAULT 0,
     extra           TEXT NOT NULL DEFAULT '{}',
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))

@@ -34,6 +34,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 hyper = "1"
 futures = "0.3"
 bytes = "1"
+# 图像压缩(🔵 对齐 kiro.rs:四档缩放 + 解码前 OOM 护栏)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 # 序列化与配置
 serde = { version = "1.0", features = ["derive"] }

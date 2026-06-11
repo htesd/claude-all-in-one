@@ -230,7 +230,7 @@ fn expires_at_rfc3339(expires_in: i64) -> String {
 }
 
 /// Unix 秒 → "YYYY-MM-DDTHH:MM:SSZ"(纯算术,避免 chrono 依赖)。
-fn format_unix_utc(secs: i64) -> String {
+pub(crate) fn format_unix_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);

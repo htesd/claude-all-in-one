@@ -141,6 +141,7 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
 
     let mut app = Router::new()
         .route("/v1/messages", post(forward))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(forward_models))
         .route("/health", get(health))
         .with_state(state);
@@ -195,6 +196,34 @@ async fn health(State(st): State<Arc<RouterState>>) -> impl IntoResponse {
         "role": "router",
         "workers": worker_status,
     }))
+}
+
+/// `POST /v1/messages/count_tokens` —— 本地估算,零上游调用(对齐 kiro.rs 默认路径)。
+///
+/// NewAPI 等上层网关与部分客户端会探测/调用此端点,缺失会 404 影响兼容。
+/// 估算口径 = system + 消息 text 块 + 工具定义;计费**不**依赖它(计费走上游 usage),
+/// 因此在 router 直接处理,不占用 worker/账号。
+async fn count_tokens(
+    State(st): State<Arc<RouterState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    if let Err(resp) = authorize(&st, &headers).await {
+        return resp;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"type":"error","error":{
+                    "type":"invalid_request_error","message": format!("无效 JSON: {e}")}})),
+            )
+                .into_response();
+        }
+    };
+    let tokens = gw_kiro::text_tokens::count_request_tokens(&parsed);
+    Json(serde_json::json!({"input_tokens": tokens})).into_response()
 }
 
 async fn forward(

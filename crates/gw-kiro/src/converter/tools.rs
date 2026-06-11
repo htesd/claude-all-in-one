@@ -98,6 +98,12 @@ pub(super) fn convert_tools(tools: &Option<Vec<crate::anthropic_types::Tool>>, t
                 description.push_str(suffix);
             }
 
+            // 空描述兜底:某些 Kiro 模型版本拒绝空 description 工具规格(400)。
+            // 对齐 static_flow:填 "Client-provided tool '{name}'"。
+            if description.trim().is_empty() {
+                description = format!("Client-provided tool '{}'", t.name);
+            }
+
             // 限制描述长度（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(TOOL_DESCRIPTION_MAX_LEN) {
                 Some((idx, _)) => description[..idx].to_string(),
@@ -113,6 +119,43 @@ pub(super) fn convert_tools(tools: &Option<Vec<crate::anthropic_types::Tool>>, t
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod desc_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn atool(name: &str, desc: &str) -> crate::anthropic_types::Tool {
+        crate::anthropic_types::Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: desc.to_string(),
+            input_schema: HashMap::new(),
+            max_uses: None,
+        }
+    }
+
+    #[test]
+    fn empty_description_is_filled() {
+        let tools = Some(vec![atool("my_tool", "   ")]);
+        let mut map = HashMap::new();
+        let out = convert_tools(&tools, &mut map);
+        assert_eq!(out.len(), 1);
+        // 空/空白描述应兜底为 "Client-provided tool '{name}'",避免 Kiro 400。
+        assert_eq!(
+            out[0].tool_specification.description,
+            "Client-provided tool 'my_tool'"
+        );
+    }
+
+    #[test]
+    fn nonempty_description_preserved() {
+        let tools = Some(vec![atool("t", "real desc")]);
+        let mut map = HashMap::new();
+        let out = convert_tools(&tools, &mut map);
+        assert_eq!(out[0].tool_specification.description, "real desc");
+    }
 }
 
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义

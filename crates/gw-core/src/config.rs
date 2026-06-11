@@ -142,6 +142,10 @@ pub struct SystemConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub image: ImageConfig,
 }
 
 /// admin 控制面配置。`token` 未设(None / 空串)→ admin API 关闭(router 不挂 /admin)。
@@ -164,6 +168,133 @@ pub struct CacheConfig {
     pub read_multiplier: f64,
     pub cap_ratio: f64,
     pub floor_ratio: f64,
+    /// cache_sim 会话条目 TTL(秒);worker 启动时同步到全局 sim store。
+    /// 带 serde 默认,旧 system.yaml(无此字段)仍可解析。
+    #[serde(default = "default_sim_ttl_secs")]
+    pub sim_ttl_secs: u64,
+    /// cache_sim 最大会话数(LRU 容量);worker 启动时同步到全局 sim store。
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+}
+
+fn default_sim_ttl_secs() -> u64 {
+    300
+}
+fn default_max_sessions() -> usize {
+    4096
+}
+
+/// 账号调度/冷却参数(worker 启动时注入 AccountScheduler)。
+///
+/// 默认值对齐 kiro.rs 生产配置(rateLimitCooldownSecs=300 / emptyResponse 60s·3次·60s窗 /
+/// affinityMapTtlSecs=1800)。`max_failures` 例外:kiro.rs 是 3 但其 5xx/网络错误**不计数**
+/// (重试同号);本项目 5xx/网络计入 failure_count 并换号,故默认放宽到 5,避免上游抖动
+/// 误禁健康号(有全灭自愈兜底)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    /// 429 限流冷却秒数(到期自愈)。
+    #[serde(default = "default_rate_limit_cooldown_secs")]
+    pub rate_limit_cooldown_secs: u64,
+    /// 空响应冷却秒数(达阈值后)。
+    #[serde(default = "default_empty_response_cooldown_secs")]
+    pub empty_response_cooldown_secs: u64,
+    /// 空响应计数固定窗口秒数。
+    #[serde(default = "default_empty_response_window_secs")]
+    pub empty_response_window_secs: u64,
+    /// 窗口内空响应达此次数才冷却(避免误伤偶发 empty 的健康号)。
+    #[serde(default = "default_empty_response_threshold")]
+    pub empty_response_threshold: u32,
+    /// 连续失败(5xx/网络)达此次数自动禁用(TooManyFailures,可全灭自愈)。
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// 会话亲和条目 TTL 秒数(超时未访问 = 会话重开,自然再平衡)。
+    #[serde(default = "default_affinity_ttl_secs")]
+    pub affinity_ttl_secs: u64,
+}
+
+fn default_rate_limit_cooldown_secs() -> u64 {
+    300
+}
+fn default_empty_response_cooldown_secs() -> u64 {
+    60
+}
+fn default_empty_response_window_secs() -> u64 {
+    60
+}
+fn default_empty_response_threshold() -> u32 {
+    3
+}
+fn default_max_failures() -> u32 {
+    5
+}
+fn default_affinity_ttl_secs() -> u64 {
+    1800
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
+            empty_response_cooldown_secs: default_empty_response_cooldown_secs(),
+            empty_response_window_secs: default_empty_response_window_secs(),
+            empty_response_threshold: default_empty_response_threshold(),
+            max_failures: default_max_failures(),
+            affinity_ttl_secs: default_affinity_ttl_secs(),
+        }
+    }
+}
+
+/// 图像压缩参数(🔵 移植 kiro.rs/xkiro 的四档阈值;缩放规则对齐 Anthropic 官方建议)。
+///
+/// 多模态请求里 base64 原图会显著撑大请求体(撞上游字节上限/抬高成本),且恶意构造的
+/// 解压炸弹可 OOM 整个 worker——压缩模块自带解码前护栏。`Copy`:压缩在 blocking
+/// 线程池执行,按值携带配置。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ImageConfig {
+    /// 总开关。关闭后所有图片原样透传,不解码不缩放(护栏也随之失效)。
+    #[serde(default = "default_image_enabled")]
+    pub enabled: bool,
+    /// 长边像素上限,超过则等比缩放。
+    #[serde(default = "default_image_max_long_edge")]
+    pub max_long_edge: u32,
+    /// 单图模式总像素上限。
+    #[serde(default = "default_image_max_pixels_single")]
+    pub max_pixels_single: u32,
+    /// 多图模式总像素上限(图片数 ≥ multi_threshold 时生效)。默认与单图相等
+    /// (开箱不产生差异,仅预留;对齐 xkiro 默认)。
+    #[serde(default = "default_image_max_pixels_multi")]
+    pub max_pixels_multi: u32,
+    /// 多图档阈值:请求内图片数达此值即用多图像素上限。
+    #[serde(default = "default_image_multi_threshold")]
+    pub multi_threshold: usize,
+}
+
+fn default_image_enabled() -> bool {
+    true
+}
+fn default_image_max_long_edge() -> u32 {
+    4000
+}
+fn default_image_max_pixels_single() -> u32 {
+    4_000_000
+}
+fn default_image_max_pixels_multi() -> u32 {
+    4_000_000
+}
+fn default_image_multi_threshold() -> usize {
+    20
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_image_enabled(),
+            max_long_edge: default_image_max_long_edge(),
+            max_pixels_single: default_image_max_pixels_single(),
+            max_pixels_multi: default_image_max_pixels_multi(),
+            multi_threshold: default_image_multi_threshold(),
+        }
+    }
 }
 
 impl Default for CacheConfig {
@@ -172,6 +303,8 @@ impl Default for CacheConfig {
             read_multiplier: 1.0,
             cap_ratio: 0.9,
             floor_ratio: 0.1,
+            sim_ttl_secs: default_sim_ttl_secs(),
+            max_sessions: default_max_sessions(),
         }
     }
 }

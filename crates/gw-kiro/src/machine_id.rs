@@ -31,7 +31,7 @@ static FALLBACK_MACHINE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock
 /// - 64 字符十六进制:直接返回
 /// - UUID 格式(去连字符 32 hex):重复一次补齐到 64 字符
 /// - 其他:None
-fn normalize_machine_id(machine_id: &str) -> Option<String> {
+pub(crate) fn normalize_machine_id(machine_id: &str) -> Option<String> {
     let trimmed = machine_id.trim();
 
     if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {

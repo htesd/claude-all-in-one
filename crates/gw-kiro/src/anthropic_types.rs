@@ -118,8 +118,11 @@ where
 /// OutputConfig 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
-    #[serde(default = "default_effort")]
-    pub effort: String,
+    /// 思考强度。`None` = 客户端未指定 → 用 [`OutputConfig::effective_effort`] 的默认。
+    /// 对齐 static_flow:`Option<String>`,缺省回退 "xhigh"(深推理),而非旧的写死 "high"
+    /// (后者只产 ~43 字符的桩推理;xhigh 约 3560 字符)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// 结构化输出格式（`{type:"json_schema", schema:{...}}`）。
     /// 客户端要求模型输出严格符合 schema 的 JSON 时携带。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,11 +146,15 @@ impl OutputConfig {
             .filter(|f| f.format_type == "json_schema")
             .and_then(|f| f.schema.as_ref())
     }
+
+    /// 有效思考强度:客户端显式值优先,否则 "xhigh"(对齐 static_flow `effective_effort`)。
+    pub fn effective_effort(&self) -> &str {
+        self.effort.as_deref().filter(|s| !s.is_empty()).unwrap_or("xhigh")
+    }
 }
 
-fn default_effort() -> String {
-    "high".to_string()
-}
+/// 客户端完全未带 output_config 时的默认思考强度(深推理)。
+pub const DEFAULT_EFFORT: &str = "xhigh";
 
 /// Claude Code 请求中的 metadata
 #[derive(Debug, Clone, Deserialize)]
