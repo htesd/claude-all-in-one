@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   LogOut,
   Moon,
+  Settings,
   Sun,
   Users,
   Zap,
@@ -35,6 +36,7 @@ const navItems: NavItem[] = [
   { to: '/accounts', labelKey: 'nav.accounts', icon: Users },
   { to: '/keys', labelKey: 'nav.apiKeys', icon: KeyRound },
   { to: '/groups', labelKey: 'nav.groups', icon: FolderKanban },
+  { to: '/settings', labelKey: 'nav.settings', icon: Settings },
 ]
 
 function readInitialCollapsed(): boolean {

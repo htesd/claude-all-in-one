@@ -17,9 +17,10 @@ use gw_store::SqliteStore;
 mod accounts;
 mod groups;
 mod keys;
+mod settings;
 mod usage;
 
-/// admin 路由共享态:管理密钥 + 控制面存储(keys / usage / groups / accounts)。
+/// admin 路由共享态:管理密钥 + 控制面存储(keys / usage / groups / accounts / settings)。
 #[derive(Clone)]
 pub struct AdminState {
     pub token: Arc<String>,
@@ -28,6 +29,9 @@ pub struct AdminState {
     pub workers: Arc<Vec<gw_core::config::WorkerConfig>>,
     /// 聚合 worker /health 用的内网客户端(短超时,worker 掉线不拖死页面)。
     pub http: reqwest::Client,
+    /// system.yaml 启动快照(不可变基线)。settings GET/PUT 在它之上叠 DB overlay
+    /// 算"有效值";YAML 本身改动需重启,故快照即足够。
+    pub yaml_config: Arc<gw_core::config::SystemConfig>,
 }
 
 impl AdminState {
@@ -35,6 +39,7 @@ impl AdminState {
         token: Arc<String>,
         store: Arc<SqliteStore>,
         workers: Vec<gw_core::config::WorkerConfig>,
+        yaml_config: gw_core::config::SystemConfig,
     ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -45,6 +50,7 @@ impl AdminState {
             store,
             workers: Arc::new(workers),
             http,
+            yaml_config: Arc::new(yaml_config),
         }
     }
 }
@@ -57,6 +63,7 @@ pub fn admin_api_router(state: AdminState) -> Router {
         .merge(keys::router())
         .merge(groups::router())
         .merge(accounts::router())
+        .merge(settings::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state)
 }
@@ -70,6 +77,42 @@ pub(crate) fn internal_error(e: impl std::fmt::Display) -> axum::response::Respo
         Json(serde_json::json!({"type":"error","error":{"message":"内部错误"}})),
     )
         .into_response()
+}
+
+/// 校验出口代理 URL(写入边界 fail-closed,审查 Skeptic#2/Architect#2):trim 后用
+/// `reqwest::Proxy` 解析;非法或含掩码占位 `***` → `Err(消息)`。空串=清除,调用方先判空跳过。
+/// 返回 trim 后的合法 URL。在写库前校验,避免"配了代理却静默回退裸 IP"的防封语义破坏。
+pub(crate) fn validate_proxy_url(raw: &str) -> Result<String, &'static str> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("代理 URL 为空");
+    }
+    if s.contains("***") {
+        return Err("代理含掩码占位 ***,请输入完整 URL 或留空清除");
+    }
+    reqwest::Proxy::all(s)
+        .map_err(|_| "代理 URL 非法(支持 socks5:// / http:// / https://)")?;
+    Ok(s.to_string())
+}
+
+/// 掩码代理 URL 的密码段(`scheme://user:pass@host` → `scheme://user:***@host`),
+/// 保留 scheme/user/host/port 供识别。无 userinfo 原样返回。GET 响应用,防 user:pass@
+/// 明文经接口/日志泄漏(审查 Architect#3)。真实值仍存库,resolver 用真实值。
+pub(crate) fn redact_proxy_url(s: &str) -> String {
+    let Some(scheme_end) = s.find("://") else {
+        return s.to_string();
+    };
+    let after = &s[scheme_end + 3..];
+    let Some(at) = after.find('@') else {
+        return s.to_string();
+    };
+    let userinfo = &after[..at];
+    let rest = &after[at..]; // 含 '@' 起的 host:port[/path]
+    let masked = match userinfo.find(':') {
+        Some(colon) => format!("{}:***", &userinfo[..colon]),
+        None => userinfo.to_string(), // 只有 user 无 password,无需掩码
+    };
+    format!("{}{}{}", &s[..scheme_end + 3], masked, rest)
 }
 
 /// 连通性探针(需鉴权)。前端登录时用它校验 admin_token 是否正确。
@@ -143,7 +186,12 @@ pub(crate) mod tests_support {
 
     pub fn app() -> (axum::Router, Arc<SqliteStore>) {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let st = AdminState::new(Arc::new(TOKEN.to_string()), store.clone(), vec![]);
+        let st = AdminState::new(
+            Arc::new(TOKEN.to_string()),
+            store.clone(),
+            vec![],
+            gw_core::config::SystemConfig::default(),
+        );
         (admin_api_router(st), store)
     }
 
@@ -218,5 +266,25 @@ mod tests {
         assert_eq!(extract_admin_key(&headers(&[("x-api-key", "")])), None);
         assert_eq!(extract_admin_key(&headers(&[("authorization", "Basic xxx")])), None);
         assert_eq!(extract_admin_key(&headers(&[("authorization", "Bearer ")])), None);
+    }
+
+    #[test]
+    fn validate_proxy_url_accepts_valid_rejects_garbage_and_masked() {
+        assert_eq!(validate_proxy_url("  socks5://u:p@h:1080  ").unwrap(), "socks5://u:p@h:1080");
+        assert!(validate_proxy_url("http://1.2.3.4:8888").is_ok());
+        assert!(validate_proxy_url("").is_err());
+        assert!(validate_proxy_url("   ").is_err());
+        // 含掩码占位的回传值必须拒绝(防把脱敏形态当真值存进库)。
+        assert!(validate_proxy_url("socks5://u:***@h:1080").is_err());
+    }
+
+    #[test]
+    fn redact_proxy_url_masks_only_password() {
+        assert_eq!(redact_proxy_url("socks5://user:secret@host:1080"), "socks5://user:***@host:1080");
+        // 无 password(只有 user)不掩。
+        assert_eq!(redact_proxy_url("socks5://user@host:1080"), "socks5://user@host:1080");
+        // 无 userinfo 原样返回。
+        assert_eq!(redact_proxy_url("http://host:8888"), "http://host:8888");
+        assert_eq!(redact_proxy_url("socks5://1.2.3.4:1080"), "socks5://1.2.3.4:1080");
     }
 }

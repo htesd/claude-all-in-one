@@ -30,6 +30,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
   const [group, setGroup] = useState('')
   const [token, setToken] = useState('')
   const [concurrency, setConcurrency] = useState('2')
+  const [proxy, setProxy] = useState('')
   const [error, setError] = useState<string | null>(null)
 
   // 每次打开都从干净的表单态开始
@@ -39,6 +40,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       setGroup('')
       setToken('')
       setConcurrency('2')
+      setProxy('')
       setError(null)
     }
   }, [open])
@@ -64,10 +66,14 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
     }
     setError(null)
 
+    const extra: Record<string, unknown> = { refresh_token: trimmedToken }
+    const trimmedProxy = proxy.trim()
+    if (trimmedProxy !== '') extra.proxy = trimmedProxy
+
     const payload: CreateAccountPayload = {
       account_id: accountId,
       max_concurrency: parsedConcurrency,
-      extra: { refresh_token: trimmedToken },
+      extra,
     }
     if (group !== '') payload.group = group
 
@@ -156,6 +162,23 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
             step={1}
             value={concurrency}
             onChange={(event) => setConcurrency(event.target.value)}
+            className={inputClass}
+          />
+        </div>
+
+        {/* 出口代理（可选） */}
+        <div className="space-y-1.5">
+          <label htmlFor="account-proxy" className="text-xs font-medium text-muted-foreground">
+            {t('accounts.field.proxy')}
+          </label>
+          <input
+            id="account-proxy"
+            type="text"
+            value={proxy}
+            onChange={(event) => setProxy(event.target.value)}
+            placeholder={t('accounts.field.proxyPlaceholder')}
+            spellCheck={false}
+            autoComplete="off"
             className={inputClass}
           />
         </div>

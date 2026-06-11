@@ -118,6 +118,7 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
             Arc::new(token.to_string()),
             store.clone(),
             instances.workers.clone(),
+            system.clone(),
         )),
         (Some(_), None) => {
             tracing::warn!("配置了 admin_token 但控制面库不可用,admin 未启用");

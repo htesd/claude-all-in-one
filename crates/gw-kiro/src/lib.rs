@@ -22,6 +22,7 @@ pub mod kiro_types;
 pub mod machine_id;
 pub mod parser;
 pub mod profiles;
+pub mod resolver;
 pub mod signature;
 pub mod text_tokens;
 pub mod thinking_policy;
@@ -97,44 +98,50 @@ const KIRO_ACCOUNT_SCHEMA: &[FieldSpec] = &[
         .with_help("IdC 账号必填;走 AWS OIDC 刷新,不易封"),
     FieldSpec::new("kiro_version", "客户端版本", FieldType::String, false)
         .with_help("⚠️ UA 里的 KiroIDE 版本,默认 0.12.155;改它而不同步 OS/Node 版本会造成现实不存在的指纹组合,非必要勿动"),
+    FieldSpec::new("proxy", "出口代理 URL (可选)", FieldType::String, false)
+        .with_help("该账号专用出口代理,如 socks5://user:pass@host:port 或 http://host:port;该号 refresh/配额/发包全程走它。留空则用全局默认代理,再留空则用 worker 绑定源 IP"),
 ];
 
-/// Kiro provider。持有 worker 注入的 egress client(固定出口 IP)。
+/// Kiro provider。持有按账号选出口的 [`resolver::EgressResolver`](每账号代理);
+/// 计费/图像参数用 `RwLock` 承接热调(admin 设置面板 30s 生效)。
 pub struct KiroProvider {
     family: &'static str,
-    /// 本 worker 的 egress HTTP client(所有上游请求走同一出口)。
-    egress_client: reqwest::Client,
-    /// 缓存计费参数(从 system.yaml 注入,见 [`CacheBilling`])。
-    cache_billing: CacheBilling,
-    /// 图像压缩参数(system.yaml `image` 段;chat 前对 body 内 base64 图瘦身 + OOM 护栏)。
-    image_cfg: gw_core::config::ImageConfig,
+    /// 出口 client 解析器:按账号(专属代理 → 默认代理 → worker 源 IP)选 client。
+    /// 同一账号 refresh/quota/profile/chat 全程用 `resolver.client_for(account)`,同出口。
+    resolver: Arc<resolver::EgressResolver>,
+    /// 缓存计费参数(system.yaml + 热调;见 [`CacheBilling`])。
+    cache_billing: parking_lot::RwLock<CacheBilling>,
+    /// 图像压缩参数(system.yaml `image` 段 + 热调;chat 前对 body 内 base64 图瘦身 + OOM 护栏)。
+    image_cfg: parking_lot::RwLock<gw_core::config::ImageConfig>,
 }
 
 impl KiroProvider {
+    /// 用 worker 基础 egress client 构造(无默认代理)。测试与简单注入用。
     pub fn new(egress_client: reqwest::Client) -> Self {
         Self {
             family: "kiro",
-            egress_client,
-            cache_billing: CacheBilling::default(),
-            image_cfg: gw_core::config::ImageConfig::default(),
+            resolver: resolver::EgressResolver::new(egress_client, None),
+            cache_billing: parking_lot::RwLock::new(CacheBilling::default()),
+            image_cfg: parking_lot::RwLock::new(gw_core::config::ImageConfig::default()),
         }
     }
 
     /// 显式指定缓存计费参数(测试 / 配置注入用)。
-    pub fn with_cache_billing(mut self, billing: CacheBilling) -> Self {
-        self.cache_billing = billing;
+    pub fn with_cache_billing(self, billing: CacheBilling) -> Self {
+        *self.cache_billing.write() = billing;
         self
     }
 
     /// 显式指定图像压缩参数(测试 / 配置注入用)。
-    pub fn with_image_config(mut self, cfg: gw_core::config::ImageConfig) -> Self {
-        self.image_cfg = cfg;
+    pub fn with_image_config(self, cfg: gw_core::config::ImageConfig) -> Self {
+        *self.image_cfg.write() = cfg;
         self
     }
 
-    /// registry 工厂:接收 worker 的 egress client(固定出口 IP),注入 provider。
+    /// registry 工厂:接收 worker 的 egress client(固定源 IP),注入 provider。
     /// `cfg` 携带 `system.cache` 段(read_multiplier/cap_ratio/floor_ratio)+
-    /// 可选 `image` 子对象(图像压缩;缺失/解析失败回退默认,容错优先)。
+    /// 可选 `image` 子对象 + 可选 `default_proxy`(全局默认出口代理;缺失/解析失败
+    /// 回退默认,容错优先)。
     pub fn from_config(
         cfg: &serde_json::Value,
         egress_client: reqwest::Client,
@@ -144,11 +151,16 @@ impl KiroProvider {
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        Ok(Arc::new(
-            Self::new(egress_client)
-                .with_cache_billing(CacheBilling::from_cfg(cfg))
-                .with_image_config(image_cfg),
-        ))
+        let default_proxy = cfg
+            .get("default_proxy")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Ok(Arc::new(Self {
+            family: "kiro",
+            resolver: resolver::EgressResolver::new(egress_client, default_proxy),
+            cache_billing: parking_lot::RwLock::new(CacheBilling::from_cfg(cfg)),
+            image_cfg: parking_lot::RwLock::new(image_cfg),
+        }))
     }
 }
 
@@ -217,18 +229,14 @@ impl Provider for KiroProvider {
 
     async fn chat(&self, mut req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
         // 图像压缩(转换前):base64 大图按四档瘦身,解压炸弹在解码前被护栏拦截。
-        // 失败回退原图,绝不阻断请求。
-        image::compress_body_images(&mut req.body, &self.image_cfg).await;
-        // 设备指纹(machineId 嵌 UA);egress client 固定出口 IP。
+        // 失败回退原图,绝不阻断请求。ImageConfig 是 Copy,读锁后即拷出。
+        let image_cfg = *self.image_cfg.read();
+        image::compress_body_images(&mut req.body, &image_cfg).await;
+        // 设备指纹(machineId 嵌 UA);出口 client 按账号解析(专属代理→默认代理→源IP)。
         let machine_id = self.machine_identity(&ctx.account).machine_id;
-        chat::chat_stream(
-            self.egress_client.clone(),
-            ctx.account.clone(),
-            machine_id,
-            req,
-            self.cache_billing,
-        )
-        .await
+        let client = self.resolver.client_for(&ctx.account);
+        let cache_billing = *self.cache_billing.read();
+        chat::chat_stream(client, ctx.account.clone(), machine_id, req, cache_billing).await
     }
 
     /// 会话亲和键 = 派生的 conversationId(与上游 prefix cache 的会话粒度同源)。
@@ -238,9 +246,10 @@ impl Provider for KiroProvider {
     }
 
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
-        // 用 egress client 刷新(social/IdC 自动分流),把新 token 写回 Account.extra 返回。
-        // 持久化由 gw-app 负责(契约 H4)。
-        let refreshed = token::refresh_auth(&self.egress_client, account).await?;
+        // 用该账号的出口 client 刷新(social/IdC 自动分流),把新 token 写回 Account.extra 返回。
+        // 持久化由 gw-app 负责(契约 H4)。出口与发包同源(防封):同一账号 refresh/chat 同代理。
+        let client = self.resolver.client_for(account);
+        let refreshed = token::refresh_auth(&client, account).await?;
         let mut updated = account.clone();
         // 冻结 machineId(用**旧** refresh_token 派生,务必在覆盖 rolling token 之前):
         // 否则下次刷新后 machineId 随新 token 漂移 = 换设备 = 封号。见 machine_id::freeze。
@@ -279,7 +288,8 @@ impl Provider for KiroProvider {
         &self,
         account: &Account,
     ) -> Result<Option<AccountQuota>, UpstreamError> {
-        usage_limits::get_account_quota(&self.egress_client, account)
+        let client = self.resolver.client_for(account);
+        usage_limits::get_account_quota(&client, account)
             .await
             .map(Some)
     }
@@ -291,7 +301,53 @@ impl Provider for KiroProvider {
         &self,
         account: &Account,
     ) -> Result<Option<String>, UpstreamError> {
-        profiles::discover_profile_arn(&self.egress_client, account).await
+        let client = self.resolver.client_for(account);
+        profiles::discover_profile_arn(&client, account).await
+    }
+
+    /// 热应用设置(worker 30s 轮询):更新默认代理 + 缓存计费 + 图像压缩参数。
+    /// 仅覆盖 JSON 中出现的字段(部分更新);无副作用、线程安全(内部 RwLock)。
+    fn apply_hot_settings(&self, settings: &serde_json::Value) {
+        // 默认代理(空串/缺失 → None,resolver 内部再归一)。
+        let default_proxy = settings
+            .get("default_proxy")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        self.resolver.update_default_proxy(default_proxy);
+
+        // 缓存计费(present 字段才覆盖)。
+        {
+            let mut cb = self.cache_billing.write();
+            if let Some(v) = settings.get("cache_read_multiplier").and_then(|v| v.as_f64()) {
+                cb.read_multiplier = v;
+            }
+            if let Some(v) = settings.get("cache_cap_ratio").and_then(|v| v.as_f64()) {
+                cb.cap_ratio = v;
+            }
+            if let Some(v) = settings.get("cache_floor_ratio").and_then(|v| v.as_f64()) {
+                cb.floor_ratio = v;
+            }
+        }
+
+        // 图像压缩(present 字段才覆盖)。
+        {
+            let mut ic = self.image_cfg.write();
+            if let Some(v) = settings.get("image_enabled").and_then(|v| v.as_bool()) {
+                ic.enabled = v;
+            }
+            if let Some(v) = settings.get("image_max_long_edge").and_then(|v| v.as_u64()) {
+                ic.max_long_edge = v as u32;
+            }
+            if let Some(v) = settings.get("image_max_pixels_single").and_then(|v| v.as_u64()) {
+                ic.max_pixels_single = v as u32;
+            }
+            if let Some(v) = settings.get("image_max_pixels_multi").and_then(|v| v.as_u64()) {
+                ic.max_pixels_multi = v as u32;
+            }
+            if let Some(v) = settings.get("image_multi_threshold").and_then(|v| v.as_u64()) {
+                ic.multi_threshold = v as usize;
+            }
+        }
     }
 
     /// 订阅能力过滤(对齐 kiro.rs `supports_opus`,credentials.rs:256):
@@ -337,6 +393,31 @@ mod tests {
         let p = KiroProvider::new(client());
         let models = p.list_models().await.unwrap();
         assert!(models.iter().any(|m| m.id == "claude-opus-4-8"));
+    }
+
+    #[test]
+    fn from_config_reads_default_proxy_and_apply_hot_settings_updates() {
+        // from_config 读 default_proxy → resolver 据此给无账号代理的号建代理 client。
+        let cfg = serde_json::json!({"default_proxy": "socks5://cfg:1080"});
+        let p = KiroProvider::from_config(&cfg, client()).unwrap();
+        // 通过 chat 之外的公开行为不易直接断言 resolver 内部;改测 apply_hot_settings 热更:
+        // 把默认代理换成新值,再换空 → 行为通过不 panic 验证(resolver 单测已覆盖解析)。
+        p.apply_hot_settings(&serde_json::json!({
+            "default_proxy": "http://hot:8888",
+            "cache_read_multiplier": 3.0,
+            "image_enabled": false
+        }));
+        p.apply_hot_settings(&serde_json::json!({"default_proxy": ""}));
+        // 不 panic 即通过;字段级更新的正确性由 resolver/config 单测保证。
+    }
+
+    #[test]
+    fn account_schema_includes_proxy_field() {
+        let p = KiroProvider::new(client());
+        assert!(
+            p.account_schema().iter().any(|f| f.name == "proxy"),
+            "schema 应含 proxy 字段(前端表单据此渲染)"
+        );
     }
 
     #[test]

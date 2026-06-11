@@ -155,8 +155,10 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamItem, UpstreamError
 
 /// 单次调用的上下文(由调度层装配,provider 只读)。
 ///
-/// 携带本次请求选中的账号、会话与缓存亲和 key。account 已由 scheduler 在组内
-/// 选好;出口 IP 由进程(worker)固定,provider 无需关心绑定细节。
+/// 携带本次请求选中的账号、会话与缓存亲和 key。account 已由 scheduler 在组内选好。
+/// **出口策略**:worker 注入一个绑定源 IP 的 base client,但 provider 可按账号再选出口
+/// (如 Kiro 按 `account.extra.proxy` / 全局默认代理解析出专属 client);**同一账号的
+/// 刷新/配额/发包应走同一出口**。账号无专属代理时回退 base(进程源 IP)。
 /// 客户端 key / usage 归属由 gw-app 持有(provider 只产 [`ChatUsage`] token 数)。
 pub struct CallCtx {
     /// 本次选中的账号。
@@ -225,8 +227,16 @@ pub trait Provider: Send + Sync {
     /// **回写契约(H4)**:返回的 `Account` 由 **gw-app 负责写回 store**;provider
     /// 只做刷新计算,不自行持久化。**并发契约**:同一账号同时只允许一个 in-flight
     /// refresh(gw-app 以 per-account 锁/单飞去重保证),避免两请求并发刷新互相
-    /// 覆盖 token。出口 IP 已由进程固定,实现无需关心绑定。
+    /// 覆盖 token。**出口契约**:刷新必须与该账号发包走同一出口(防封铁律)——实现应
+    /// 用与 chat 相同的按账号出口解析(账号专属代理 → 默认代理 → 进程源 IP,见 [`CallCtx`])。
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError>;
+
+    /// 热应用运行时设置(worker 30s 轮询调用),无需重启。`settings` 是有效
+    /// [`crate::config::SystemSettings`] 序列化后的 JSON(扁平字段)。默认 no-op;
+    /// 支持热调的 provider(KiroProvider)覆盖以更新出口代理/计费/图像参数等。
+    /// **必须无副作用、快、线程安全**(实现内部用 RwLock 等承接,Provider 自身仍按
+    /// `&self` 不可变共享语义对外)。
+    fn apply_hot_settings(&self, _settings: &serde_json::Value) {}
 
     /// 查询账号配额(只读;`getUsageLimits` 这类接口)。返回 `Ok(None)` = 该 provider
     /// 不支持配额查询(默认)。**安全契约**:实现只发只读请求(刷新 + GET),绝不触发

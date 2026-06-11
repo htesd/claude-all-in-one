@@ -28,6 +28,7 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
 
   const [group, setGroup] = useState('')
   const [json, setJson] = useState('')
+  const [batchProxy, setBatchProxy] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ImportAccountsResult | null>(null)
 
@@ -35,6 +36,7 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
     if (open) {
       setGroup('')
       setJson('')
+      setBatchProxy('')
       setError(null)
       setResult(null)
     }
@@ -56,8 +58,9 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
       return
     }
     setError(null)
+    const trimmedProxy = batchProxy.trim()
     mutation.mutate(
-      { json, group_name: group || undefined },
+      { json, group_name: group || undefined, batch_proxy: trimmedProxy || undefined },
       {
         onSuccess: (data) => setResult(data),
         onError: (err) => setError(extractErrorMessage(err)),
@@ -134,6 +137,23 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
                 </option>
               ))}
             </Select>
+          </div>
+
+          {/* 批量代理（可选） */}
+          <div className="space-y-1.5">
+            <label htmlFor="import-batch-proxy" className="text-xs font-medium text-muted-foreground">
+              {t('accounts.import.batchProxy')}
+            </label>
+            <input
+              id="import-batch-proxy"
+              type="text"
+              value={batchProxy}
+              onChange={(event) => setBatchProxy(event.target.value)}
+              placeholder={t('accounts.import.batchProxyPlaceholder')}
+              spellCheck={false}
+              autoComplete="off"
+              className={inputClass}
+            />
           </div>
 
           {/* JSON 粘贴 + 文件选择 */}
