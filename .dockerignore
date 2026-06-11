@@ -1,0 +1,14 @@
+# 构建上下文瘦身 + 防泄密(真实凭据/配置永不进镜像层)。
+target/
+.git/
+**/node_modules/
+admin-ui/dist/
+data/
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+config/system.yaml
+config/instances.yaml
+config/accounts.yaml

@@ -1,0 +1,34 @@
+# 多进程部署:router(对外 API + admin)+ worker0(账号组 + 上游)。
+# 两进程共享同一镜像与 SQLite;network_mode host 让 router 经 127.0.0.1 直连 worker,
+# 并使 worker 出口走宿主默认路由(egress: direct)。端口在 config/instances.yaml 配置。
+#
+# 真实 config(system.yaml/instances.yaml/accounts.yaml)与 data/ 由服务器侧提供,不入库。
+# 启动:docker compose up -d --build
+
+services:
+  router:
+    build: .
+    image: claude-all-in-one:local
+    container_name: caio-router
+    command: ["--mode", "router"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+
+  worker0:
+    image: claude-all-in-one:local
+    container_name: caio-worker0
+    command: ["--mode", "worker", "--instance", "0"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - router
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
