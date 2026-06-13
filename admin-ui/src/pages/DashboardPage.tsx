@@ -31,14 +31,17 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-6">
-      {/* Page hero */}
-      <div className="page-hero flex flex-wrap items-center justify-between gap-4 p-6">
+      {/* Page header */}
+      <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t('dashboard.title')}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t('dashboard.subtitle')}</p>
+          <p className="eyebrow">Dashboard</p>
+          <h1 className="mt-2 font-display text-4xl font-black tracking-[-0.04em]">
+            {t('dashboard.title')}
+          </h1>
+          <p className="mt-2 text-sm text-muted-foreground">{t('dashboard.subtitle')}</p>
         </div>
         <RangeSegment value={range} onChange={setRange} />
-      </div>
+      </header>
 
       {summaryQuery.isError && <ErrorNote error={summaryQuery.error} />}
 
@@ -87,7 +90,7 @@ export default function DashboardPage() {
 
       {/* Tables */}
       <div className="grid gap-6 xl:grid-cols-2">
-        <ByModelTable data={byModelQuery.data} loading={byModelQuery.isPending} />
+        <ByModelTable data={byModelQuery.data} loading={byModelQuery.isPending} basis="billed" />
         <ByKeyTable data={byKeyQuery.data} loading={byKeyQuery.isPending} />
       </div>
     </div>

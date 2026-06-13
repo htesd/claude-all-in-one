@@ -24,6 +24,8 @@ export function rangeToFilter(range: TimeRange): UsageFilter {
   return range === 'all' ? { mode: 'all' } : { mode: 'preset', days: range }
 }
 
+export type CostBasis = 'billed' | 'real'
+
 export interface UsageSummary {
   requests: number
   success_requests: number
@@ -31,6 +33,11 @@ export interface UsageSummary {
   output_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
+  real_cache_read_tokens: number
+  metering_credit: number
+  cost_billed_usd: number
+  cost_real_usd: number
+  unpriced_requests: number
 }
 
 export interface ModelUsage {
@@ -40,6 +47,11 @@ export interface ModelUsage {
   output_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
+  real_cache_read_tokens: number
+  metering_credit: number
+  cost_billed_usd: number
+  cost_real_usd: number
+  priced: boolean
 }
 
 export interface KeyUsage {
@@ -51,4 +63,6 @@ export interface KeyUsage {
   output_tokens: number
   cache_read_tokens: number
   cache_creation_tokens: number
+  real_cache_read_tokens: number
+  metering_credit: number
 }

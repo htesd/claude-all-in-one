@@ -12,7 +12,7 @@ interface ErrorNoteProps {
 export function ErrorNote({ error, labelKey = 'common.loadFailed' }: ErrorNoteProps) {
   const { t } = useI18n()
   return (
-    <div className="glass-card flex items-center gap-2 rounded-xl px-4 py-3 text-sm text-destructive">
+    <div className="flex items-center gap-2 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300">
       <AlertTriangle className="h-4 w-4 shrink-0" />
       <span>
         {t(labelKey)}: {extractErrorMessage(error)}

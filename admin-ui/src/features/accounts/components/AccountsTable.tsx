@@ -23,6 +23,7 @@ interface AccountsTableProps {
   onEdit: (row: AccountRow) => void
   onDelete: (id: string) => void
   onReset: (id: string) => void
+  onRefresh: (id: string) => void
 }
 
 /** 账号列表玻璃卡表格：配置行 + worker 运行态的 merge 视图。 */
@@ -37,6 +38,7 @@ export function AccountsTable({
   onEdit,
   onDelete,
   onReset,
+  onRefresh,
 }: AccountsTableProps) {
   const { t } = useI18n()
 
@@ -102,6 +104,7 @@ export function AccountsTable({
                 onEdit={onEdit}
                 onDelete={onDelete}
                 onReset={onReset}
+                onRefresh={onRefresh}
               />
             ))
           )}

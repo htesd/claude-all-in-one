@@ -56,7 +56,7 @@ export interface AccountQuota {
   used: number
   /** 额度上限。 */
   limit: number
-  /** 剩余 = max(limit - used, 0)。 */
+  /** 剩余 = limit - used(可为负:超额账号显示已超出多少)。 */
   remaining: number
   /** 已用百分比(可超 100 = 已进 overage)。 */
   percent_used: number

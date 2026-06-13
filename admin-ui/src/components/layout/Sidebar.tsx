@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   LogOut,
   Moon,
+  ScrollText,
   Settings,
   Sun,
   Users,
@@ -37,6 +38,7 @@ const navItems: NavItem[] = [
   { to: '/keys', labelKey: 'nav.apiKeys', icon: KeyRound },
   { to: '/groups', labelKey: 'nav.groups', icon: FolderKanban },
   { to: '/settings', labelKey: 'nav.settings', icon: Settings },
+  { to: '/logs', labelKey: 'nav.logs', icon: ScrollText },
 ]
 
 function readInitialCollapsed(): boolean {
@@ -61,7 +63,7 @@ function FooterButton({ icon: Icon, label, collapsed, onClick }: FooterButtonPro
       onClick={onClick}
       title={label}
       className={cn(
-        'w-full flex items-center rounded-xl text-xs font-medium text-muted-foreground transition-all hover:bg-white/40 hover:text-foreground dark:hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+        'w-full flex items-center rounded-xl text-xs font-medium text-white/55 transition-all hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-acid/50',
         collapsed ? 'justify-center p-2.5' : 'gap-3 px-3 py-2',
       )}
     >
@@ -101,38 +103,47 @@ export function Sidebar() {
   return (
     <motion.aside
       initial={false}
-      animate={{ width: collapsed ? 64 : 224 }}
+      animate={{ width: collapsed ? 64 : 240 }}
       transition={{ type: 'spring', stiffness: 320, damping: 30 }}
-      className="glass-sidebar flex shrink-0 flex-col overflow-hidden rounded-3xl"
+      className="glass-sidebar flex h-full shrink-0 flex-col overflow-hidden border-r border-white/10"
     >
-      {/* Logo */}
-      <div className="flex h-14 items-center justify-center gap-2 overflow-hidden border-b border-white/10 px-3 dark:border-white/5">
-        <span className="gradient-bg-primary flex h-9 w-9 shrink-0 items-center justify-center rounded-xl shadow-sm">
-          <Zap className="h-5 w-5 text-white" />
-        </span>
-        <AnimatePresence initial={false}>
-          {!collapsed && (
+      {/* Wordmark */}
+      <div
+        className={cn(
+          'flex h-20 items-center overflow-hidden border-b border-white/10',
+          collapsed ? 'justify-center px-2' : 'px-5',
+        )}
+      >
+        {collapsed ? (
+          <span
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-acid"
+            title={t('app.title')}
+          >
+            <Zap className="h-5 w-5 text-ink" />
+          </span>
+        ) : (
+          <AnimatePresence initial={false}>
             <motion.div
-              key="logo-text"
+              key="wordmark"
               initial={{ opacity: 0, x: -10 }}
               animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -10 }}
               transition={{ duration: 0.2 }}
               className="min-w-0"
+              title={t('app.title')}
             >
-              <div className="truncate text-sm font-semibold text-foreground">
-                {t('app.title')}
+              <div className="font-display text-[26px] font-black leading-none tracking-[-0.06em] text-white">
+                CA<span className="text-acid">IO</span>
               </div>
-              <div className="truncate text-[10px] text-muted-foreground">
-                {t('app.subtitle')}
+              <div className="mt-1.5 whitespace-nowrap text-[10px] font-semibold uppercase tracking-[0.28em] text-white/35">
+                Admin Console
               </div>
             </motion.div>
-          )}
-        </AnimatePresence>
+          </AnimatePresence>
+        )}
       </div>
 
       {/* Menu items */}
-      <nav className="flex-1 space-y-1 overflow-y-auto px-2 py-3">
+      <nav className="flex-1 space-y-1.5 overflow-y-auto px-2.5 py-4">
         {navItems.map((item) => {
           const Icon = item.icon
           const active = isActive(item.to)
@@ -143,27 +154,23 @@ export function Sidebar() {
               type="button"
               onClick={() => navigate(item.to)}
               className={cn(
-                'group relative w-full flex items-center overflow-hidden rounded-xl text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50',
+                'group relative w-full flex items-center overflow-hidden rounded-xl text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-acid/50',
                 active
-                  ? 'text-primary-foreground shadow-[0_4px_16px_rgba(91,140,255,0.35)]'
-                  : 'text-muted-foreground hover:bg-white/40 hover:text-foreground dark:hover:bg-white/5',
-                collapsed ? 'justify-center p-2.5' : 'gap-3 px-3 py-2.5',
+                  ? 'text-ink'
+                  : 'text-white/60 hover:bg-white/10 hover:text-white',
+                collapsed ? 'justify-center p-2.5' : 'gap-3 px-4 py-2.5',
               )}
               title={collapsed ? label : undefined}
             >
-              {/* Active pill: gradient background, follows the theme */}
+              {/* Active pill: acid block, the brand signature */}
               {active && (
                 <motion.span
                   layoutId="sidebar-active-pill"
-                  className="absolute inset-0 rounded-xl"
-                  style={{
-                    background:
-                      'linear-gradient(135deg, var(--gradient-from), var(--gradient-to))',
-                  }}
+                  className="absolute inset-0 rounded-xl bg-acid"
                   transition={{ type: 'spring', stiffness: 380, damping: 32 }}
                 />
               )}
-              <Icon className={cn('relative z-10 h-5 w-5 shrink-0', active && 'text-white')} />
+              <Icon className={cn('relative z-10 h-5 w-5 shrink-0', active && 'text-ink')} />
               <AnimatePresence initial={false}>
                 {!collapsed && (
                   <motion.span
@@ -172,7 +179,10 @@ export function Sidebar() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: -8 }}
                     transition={{ duration: 0.15 }}
-                    className={cn('relative z-10 whitespace-nowrap', active && 'text-white')}
+                    className={cn(
+                      'relative z-10 whitespace-nowrap',
+                      active && 'font-semibold text-ink',
+                    )}
                   >
                     {label}
                   </motion.span>
@@ -184,7 +194,7 @@ export function Sidebar() {
       </nav>
 
       {/* Footer: theme / language / logout */}
-      <div className="space-y-1 border-t border-white/10 p-2 dark:border-white/5">
+      <div className="space-y-1 border-t border-white/10 p-2">
         <FooterButton
           icon={dark ? Sun : Moon}
           label={dark ? t('theme.toLight') : t('theme.toDark')}
@@ -206,12 +216,12 @@ export function Sidebar() {
       </div>
 
       {/* Collapse toggle */}
-      <div className="border-t border-white/10 p-2 dark:border-white/5">
+      <div className="border-t border-white/10 p-2">
         <button
           type="button"
           onClick={toggleCollapsed}
           title={collapsed ? t('nav.expand') : t('nav.collapse')}
-          className="group w-full flex items-center justify-center gap-2 overflow-hidden rounded-xl px-3 py-2 text-sm text-muted-foreground transition-all hover:bg-white/40 hover:text-primary dark:hover:bg-white/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+          className="group w-full flex items-center justify-center gap-2 overflow-hidden rounded-xl px-3 py-2 text-sm text-white/55 transition-all hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-acid/50"
         >
           <motion.div
             animate={{ rotate: collapsed ? 0 : 180 }}

@@ -1,3 +1,4 @@
+import type { LogsFilter } from '@/features/logs/types'
 import type { UsageFilter } from '@/features/usage/types'
 
 export const queryKeys = {
@@ -29,5 +30,11 @@ export const queryKeys = {
     /** 系统设置域根 key。 */
     root: ['settings'] as const,
     detail: () => ['settings', 'detail'] as const,
+  },
+  logs: {
+    /** 请求日志域根 key。 */
+    root: ['logs'] as const,
+    list: (filter: LogsFilter, page: number) => ['logs', 'list', filter, page] as const,
+    detail: (id: number) => ['logs', 'detail', id] as const,
   },
 } as const

@@ -166,29 +166,5 @@ pub(super) fn derive_conversation_id_from_messages(
     )
 }
 
-/// 基于 conversationId 派生 agentContinuationId。
-///
-/// 实测证据：5 次完全相同 payload，conversationId 都相同，但每次新生成 agentContinuationId 时
-/// Kiro 后端 prompt cache miss（首次 0.059，其余应低却出现 0.108）。当 agentContinuationId
-/// 在同会话内稳定，metering 立刻降到 0.038（~36% 折扣）。
-///
-/// 跟 conversationId 用同一种哈希派生方式，但加固定盐区分两个 ID，避免相等。
-pub(super) fn derive_agent_continuation_id(conversation_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"agent-continuation:");
-    hasher.update(conversation_id.as_bytes());
-    let digest = hasher.finalize();
-    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 has 32 bytes");
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
-        u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
-        u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
-        u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
-        u64::from_be_bytes({
-            let mut b = [0u8; 8];
-            b[2..].copy_from_slice(&bytes[10..16]);
-            b
-        }) & 0x0000_ffff_ffff_ffff,
-    )
-}
+// 注:agentContinuationId 派生已删除——自造该 ID 上 wire 会让 Kiro 绕过 conversationId 前缀
+// 缓存致全 miss(2026-06-13 实锤),static_flow/kiro.rs 均不发。详见 converter/mod.rs 根因注释。

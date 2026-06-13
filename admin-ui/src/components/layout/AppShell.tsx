@@ -3,7 +3,7 @@ import { useLocation, useOutlet } from 'react-router-dom'
 
 import { Sidebar } from './Sidebar'
 
-/** Authenticated app shell: ambient background + glass sidebar + page transitions. */
+/** Authenticated app shell: dark flush sidebar + light paper content + page transitions. */
 export function AppShell() {
   const location = useLocation()
   // Snapshot the outlet element so the exiting page keeps rendering its own
@@ -11,9 +11,9 @@ export function AppShell() {
   const outlet = useOutlet()
 
   return (
-    <div className="ambient-bg flex h-screen gap-4 overflow-hidden p-4">
+    <div className="flex h-screen overflow-hidden">
       <Sidebar />
-      <main className="page-surface glass-card-subtle flex-1 overflow-y-auto rounded-3xl">
+      <main className="flex-1 overflow-y-auto">
         <AnimatePresence mode="wait" initial={false}>
           <motion.div
             key={location.pathname}
@@ -21,7 +21,7 @@ export function AppShell() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.18, ease: 'easeOut' }}
-            className="min-h-full p-6"
+            className="mx-auto min-h-full w-full max-w-[1440px] p-6 md:p-8"
           >
             {outlet}
           </motion.div>

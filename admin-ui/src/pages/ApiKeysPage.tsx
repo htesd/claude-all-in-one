@@ -67,16 +67,17 @@ export default function ApiKeysPage() {
   return (
     <div className="space-y-6">
       {/* Page hero：标题 + 新建入口 */}
-      <div className="page-hero flex flex-wrap items-center justify-between gap-4 p-6">
+      <header className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">{t('keys.title')}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t('keys.subtitle')}</p>
+          <p className="eyebrow">API Keys</p>
+          <h1 className="mt-2 font-display text-4xl font-black tracking-[-0.04em]">{t('keys.title')}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{t('keys.subtitle')}</p>
         </div>
         <Button onClick={() => setDialogOpen(true)}>
           <Plus className="h-4 w-4" />
           {t('keys.new')}
         </Button>
-      </div>
+      </header>
 
       {keysQuery.isError && <ErrorNote error={keysQuery.error} />}
       {/* 启停/删除失败时的提示（下一次操作发起时自动清除） */}

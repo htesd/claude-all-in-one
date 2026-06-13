@@ -7,6 +7,7 @@ import ApiKeysPage from '@/pages/ApiKeysPage'
 import DashboardPage from '@/pages/DashboardPage'
 import GroupsPage from '@/pages/GroupsPage'
 import LoginPage from '@/pages/LoginPage'
+import RequestLogsPage from '@/pages/RequestLogsPage'
 import SettingsPage from '@/pages/SettingsPage'
 import UsagePage from '@/pages/UsagePage'
 
@@ -28,6 +29,7 @@ export default function App() {
           <Route path="keys" element={<ApiKeysPage />} />
           <Route path="groups" element={<GroupsPage />} />
           <Route path="settings" element={<SettingsPage />} />
+          <Route path="logs" element={<RequestLogsPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

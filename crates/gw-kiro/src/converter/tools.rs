@@ -6,6 +6,56 @@ use super::MessagesRequest;
 use crate::kiro_types::conversation::Message;
 use crate::kiro_types::tool::{InputSchema, Tool, ToolSpecification};
 
+/// 请求含图片时,Kiro 会拒绝带这些 JSON-schema 关键字的工具 schema(返回 400
+/// "Improperly formed request")。🟢 对齐 static_flow `converter/schema.rs`。
+const MULTIMODAL_UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "contains",
+    "dependentSchemas",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "prefixItems",
+    "unevaluatedProperties",
+];
+
+/// 递归判断 schema 是否含多模态下 Kiro 不支持的关键字。
+fn schema_contains_multimodal_unsupported_keywords(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(k, child)| {
+            MULTIMODAL_UNSUPPORTED_SCHEMA_KEYWORDS.contains(&k.as_str())
+                || schema_contains_multimodal_unsupported_keywords(child)
+        }),
+        serde_json::Value::Array(items) => {
+            items.iter().any(schema_contains_multimodal_unsupported_keywords)
+        }
+        _ => false,
+    }
+}
+
+/// 请求含图片时,把带不支持关键字的工具 schema **整体替换**为宽松 object schema,避免 Kiro 因
+/// "多模态 + 复杂 schema" 返回 400。无图片则原样不动。🟢 对齐 static_flow
+/// `apply_multimodal_tool_schema_compatibility`。
+pub(super) fn apply_multimodal_tool_schema_compatibility(tools: &mut [Tool], has_images: bool) {
+    if !has_images {
+        return;
+    }
+    for tool in tools.iter_mut() {
+        if schema_contains_multimodal_unsupported_keywords(
+            &tool.tool_specification.input_schema.json,
+        ) {
+            tool.tool_specification.input_schema = InputSchema::from_json(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": true
+            }));
+        }
+    }
+}
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，

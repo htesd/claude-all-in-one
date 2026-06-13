@@ -60,20 +60,41 @@ pub(super) fn strip_rolling_fingerprints(s: &str) -> String {
 
 // === model identity 规范化 ===
 
-/// 由客户端请求的 model 名给出 (短名, 规范 model_id)。未知模型返回 None(不改写)。
-/// model_id 取去掉 `-thinking` 后缀的规范名(owned,避免借用入参生命周期)。
+/// 由客户端请求的 model 名给出 (短名, 回显 model_id)。未知模型返回 None(不改写)。
+///
+/// 走权威表 [`super::model_map::resolve_base`](统一归一 plain/-thinking/日期/日期-thinking):
+/// - `short` 取该基础行的 `identity_short`(防 Kiro 真实代号 `claude-quince` 泄漏);
+/// - 回显的 model_id 取**去 `-thinking` 后的原请求名**,从而**保留日期名**
+///   (如 `claude-sonnet-4-5-20250929`),让身份行与甲方请求名一致。
+///
+/// 历史 bug:旧实现对去 thinking 后的名字做精确匹配,日期快照名(`...-20250929`)匹配不上
+/// → 返回 None → 身份行不规范化 → claude-quince 泄漏。改走 resolve_base 后日期名也覆盖。
 fn requested_model_identity(model: &str) -> Option<(&'static str, String)> {
-    let id = model.strip_suffix("-thinking").unwrap_or(model);
-    let short = match id {
-        "claude-opus-4-8" => "Opus 4.8",
-        "claude-opus-4-7" => "Opus 4.7",
-        "claude-opus-4-6" => "Opus 4.6",
-        "claude-sonnet-4-6" => "Sonnet 4.6",
-        "claude-sonnet-4-5" => "Sonnet 4.5",
-        "claude-haiku-4-5" => "Haiku 4.5",
-        _ => return None,
-    };
-    Some((short, id.to_string()))
+    // 1. 权威表精确归一(plain/-thinking/日期/日期-thinking):回显去 thinking 的原请求名
+    //    (保留日期段)。去后缀**大小写不敏感**——resolve_base 小写匹配,回显也须一致剥除,
+    //    否则 `...-THINKING` 会把后缀漏在身份行里(审查 Skeptic#3/Minimalist#4)。
+    if let Some(base) = super::model_map::resolve_base(model) {
+        let echo = strip_thinking_suffix_ci(model);
+        return Some((base.identity_short, echo.to_string()));
+    }
+    // 2. 兜底:凡 `map_model` 能路由的名字(子串兜底的异名/未列名)身份保护面也必须覆盖,
+    //    否则上游真实代号 `claude-quince` 仍会从身份行泄漏(审查 Skeptic#1/Minimalist#1 共识 high:
+    //    身份保护面必须 ⊇ chat 路由面)。反查权威表取 identity_short,回显规范裸名。
+    let kiro = super::model_map::map_model(model)?;
+    let base = super::model_map::KIRO_MODELS
+        .iter()
+        .find(|m| m.kiro_model == kiro)?;
+    Some((base.identity_short, base.advertised_id.to_string()))
+}
+
+/// 大小写不敏感地剥掉末尾 `-thinking`(9 字符)。
+fn strip_thinking_suffix_ci(s: &str) -> &str {
+    const SUFFIX: &str = "-thinking";
+    if s.len() >= SUFFIX.len() && s[s.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX) {
+        &s[..s.len() - SUFFIX.len()]
+    } else {
+        s
+    }
 }
 
 /// 规范化 system 文本里的 model identity 行,统一成
@@ -229,4 +250,64 @@ pub(super) fn route_system_role_messages(messages: &[Message]) -> Option<RoutedM
         messages: out,
         promoted_system: promoted,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 不变量:每个**公告**对外名(含 -thinking / 日期 / 日期-thinking)都必须能身份规范化,
+    /// 否则 /v1/models 公告了一个会泄漏 Kiro 真实代号(claude-quince)的模型(审查 Minimalist#4)。
+    #[test]
+    fn every_advertised_model_normalizes_identity() {
+        for am in super::super::model_map::advertised_models() {
+            assert!(
+                requested_model_identity(&am.id).is_some(),
+                "公告模型 {} 无身份规范化 → 真实代号可能泄漏",
+                am.id
+            );
+        }
+    }
+
+    /// 日期快照名必须规范化,且**回显日期名**(身份行与甲方请求名一致、不泄漏 claude-quince)。
+    #[test]
+    fn dated_snapshot_normalizes_and_echoes_dated_id() {
+        let (short, echo) = requested_model_identity("claude-sonnet-4-5-20250929").unwrap();
+        assert_eq!(short, "Sonnet 4.5");
+        assert_eq!(echo, "claude-sonnet-4-5-20250929", "应回显日期名");
+        // 日期 + thinking:去 thinking 后回显日期名。
+        let (_, echo2) = requested_model_identity("claude-sonnet-4-5-20250929-thinking").unwrap();
+        assert_eq!(echo2, "claude-sonnet-4-5-20250929");
+    }
+
+    /// opus-4-5(老客户端)仍能规范化以防代号泄漏(审查 Architect#1 回归保护)。
+    #[test]
+    fn legacy_opus_4_5_normalizes_identity() {
+        assert!(requested_model_identity("claude-opus-4-5").is_some());
+    }
+
+    /// **身份保护面 ⊇ 路由面**:凡 map_model 能路由的名字(含子串兜底异名/反序后缀/大小写),
+    /// requested_model_identity 都必须 Some,否则 claude-quince 泄漏(审查 Skeptic#1/Minimalist#1 high)。
+    #[test]
+    fn substring_routed_models_also_normalize_identity() {
+        for m in [
+            "claude-opus-4.7-beta",
+            "anthropic/claude-3.5-sonnet-4.6",
+            "claude-sonnet-4-5-thinking-20250929", // 反序后缀:子串兜底仍路由
+            "claude-haiku-4-20250514",
+        ] {
+            assert!(
+                super::super::model_map::map_model(m).is_none()
+                    || requested_model_identity(m).is_some(),
+                "{m} 可被路由但身份未规范化 → claude-quince 泄漏"
+            );
+        }
+    }
+
+    /// 大小写:`...-THINKING` 回显须去掉后缀(与小写匹配一致)。
+    #[test]
+    fn thinking_suffix_echo_is_case_insensitive() {
+        let (_, echo) = requested_model_identity("claude-opus-4-8-THINKING").unwrap();
+        assert_eq!(echo, "claude-opus-4-8", "大写 -THINKING 也应从回显剥除");
+    }
 }

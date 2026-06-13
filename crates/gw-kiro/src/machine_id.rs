@@ -98,13 +98,15 @@ pub fn has_explicit_machine_id(account: &Account) -> bool {
         .is_some()
 }
 
-/// 冻结 machineId:若账号无显式 machine_id,把**当前**派生值钉成显式 `machine_id`。
-/// 返回是否发生了冻结。
+/// 冻结 machineId:若账号无显式 machine_id,把当前派生值钉成显式 `machine_id`。
 ///
-/// **防封核心**:social/OAuth 的 machineId 派生自 refresh_token,而 token 是 rolling 的
-/// (每次刷新都换)。不冻结则每次刷新 machineId 漂移 = 上游看到"同账号换设备" = 封号。
-/// 在 token roll **之前**用旧 token 派生并钉死,设备指纹此后恒定。调用方须在覆盖
-/// refresh_token 前调用(否则会用新 token 派生,失去冻结意义)。
+/// ⚠️ **已弃用,刷新路径不再调用(2026-06-12)。请勿重新接线。**
+/// 当初的理论(冻结防"指纹漂移")是**错的**:真实 Kiro 客户端 + kiro.rs 都是每次按
+/// **当前** refresh_token 重新派生 `sha256("KotlinNativeAPI/"+rt)`,rt 滚动时 machineId
+/// 随之滚动、始终与上游一致。冻结反而会在 rt 滚动后发出**陈旧**值(真实客户端不会发)
+/// → 像换设备 → 封号(mrdev3258 实锤)。正解=不冻结,让 `generate_from_account` 每次按
+/// 当前 rt 派生(有真机显式 machine_id 的号自然优先用显式值)。函数保留仅供历史/测试参考。
+#[allow(dead_code)]
 pub fn freeze_machine_id_if_absent(account: &mut Account) -> bool {
     if has_explicit_machine_id(account) {
         return false;

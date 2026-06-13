@@ -73,6 +73,8 @@ pub fn router() -> Router<AdminState> {
         .route("/accounts/runtime", get(runtime))
         .route("/accounts/{id}", patch(update_account).delete(delete_account))
         .route("/accounts/{id}/reset", post(reset_account))
+        .route("/accounts/{id}/refresh", post(refresh_account))
+        .route("/accounts/{id}/quota", post(quota_account))
 }
 
 fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
@@ -252,7 +254,7 @@ async fn import_accounts(
         Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("JSON 解析失败: {e}")),
     };
 
-    let imported = match gw_kiro::import::parse_kiromanager_export(&root) {
+    let imported = match gw_kiro::import::parse_accounts_export(&root) {
         Ok(v) => v,
         Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
     };
@@ -383,6 +385,12 @@ async fn import_accounts(
         }
     }
 
+    // 导入落库后 best-effort 捅所有 worker 立即同步账号集——消除"导入后 30s 内
+    // 按号操作(验活/刷新)报『没有 worker 持有该账号』"的窗口。
+    if created + merged > 0 {
+        poke_workers_sync(&st).await;
+    }
+
     Json(serde_json::json!({
         "created": created, "merged": merged, "skipped": skipped, "items": items
     }))
@@ -484,10 +492,31 @@ async fn delete_account(
     Path(id): Path<String>,
 ) -> axum::response::Response {
     match st.store.delete_account(&id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // 立即让 worker 从内存移除(审查 Skeptic#4/Minimalist#5):否则删除后
+            // 至多 30s 内该账号仍可能被 chat 选中,与"已删除"语义冲突。
+            poke_workers_sync(&st).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "账号不存在"),
         Err(e) => internal_error(e),
     }
+}
+
+/// best-effort 捅所有 worker 立即从 DB 同步账号集(导入/删除后消除 30s 生效窗口)。
+/// 失败仅 debug log:worker 自己的 30s 周期 sync 兜底。
+async fn poke_workers_sync(st: &AdminState) {
+    let fanout = st.workers.iter().map(|w| {
+        let http = st.http.clone();
+        let url = format!("http://{}/sync", w.listen);
+        let instance = w.instance;
+        async move {
+            if let Err(e) = http.post(&url).send().await {
+                tracing::debug!(instance, "sync 扇出失败(worker 离线?): {e}");
+            }
+        }
+    });
+    futures::future::join_all(fanout).await;
 }
 
 /// 运行态聚合:并发拉各 worker 的 `/health`(单个 2s 超时),离线 worker 标 `online:false`。
@@ -567,6 +596,121 @@ async fn reset_account(
         );
     }
     Json(serde_json::json!({"reset": true, "account_id": id, "workers": hits})).into_response()
+}
+
+/// `POST /accounts/{id}/refresh` —— 人工**强制刷新该账号 token**(rt→at 换一次,仅刷新,
+/// **不**发 chat → 不触发风控,见 no-chat-test-on-real-accounts 记忆)。
+///
+/// 与 reset 不同,refresh 有副作用(滚动 refresh_token),故**顺序**询问各 worker。
+/// 各 worker 三种回应:
+/// - 2xx:持有方刷新成功 → **立即**返回(成功才滚 token,故绝不会刷到第二个 worker);
+/// - 404:不持有此账号 → 问下一个 worker;
+/// - 其他(502/400):持有方尝试了但上游刷新失败(失败不滚 token,安全)→ 记下首个错误,
+///   继续问后面的 worker,看重复持有窗口里是否有别的 worker 能成功(审查 Skeptic#3/Architect#4)。
+///
+/// 扫完仍无成功:有错误则透出首个错误(而非误报“无人持有”),否则全 404 → 404。
+async fn refresh_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let mut first_error: Option<(u16, String)> = None;
+    for w in st.workers.iter() {
+        let url = format!("http://{}/accounts/{}/refresh", w.listen, id);
+        let resp = match st.http.post(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(instance = w.instance, "refresh 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status == 404 {
+            continue; // 该 worker 不持有此账号。
+        }
+        let body = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            return Json(
+                body.unwrap_or_else(|| serde_json::json!({"refreshed": true, "account_id": id})),
+            )
+            .into_response();
+        }
+        // 持有方尝试了但失败(未滚 token):记下首个错误,继续看后面是否有 worker 能成功。
+        if first_error.is_none() {
+            let msg = body
+                .as_ref()
+                .and_then(|b| b.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("刷新失败")
+                .to_string();
+            first_error = Some((status, msg));
+        }
+    }
+    if let Some((status, msg)) = first_error {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return api_error(code, &msg);
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+    )
+}
+
+/// `POST /accounts/{id}/quota` —— 按需验活:让持有方 worker 确保 token 有效(必要时
+/// 刷新,只读)并查一次配额(getUsageLimits)。导入对话框逐账号验活用,**绝不发 chat**。
+///
+/// 与 refresh 同款**顺序**扇出(虽只读,但保持同一语义最简单):
+/// - 2xx:持有方查到结果 → 立即返回;
+/// - 404:不持有 → 问下一个;
+/// - 其他:持有方查询失败(死号/网络)→ 记首个错误继续,扫完透出(而非误报"无人持有")。
+async fn quota_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let mut first_error: Option<(u16, String)> = None;
+    for w in st.workers.iter() {
+        let url = format!("http://{}/accounts/{}/quota", w.listen, id);
+        let resp = match st.http.post(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(instance = w.instance, "quota 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status == 404 {
+            continue; // 该 worker 不持有此账号。
+        }
+        let body = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            return Json(
+                body.unwrap_or_else(|| serde_json::json!({"verified": false, "account_id": id})),
+            )
+            .into_response();
+        }
+        if first_error.is_none() {
+            let msg = body
+                .as_ref()
+                .and_then(|b| b.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("配额查询失败")
+                .to_string();
+            first_error = Some((status, msg));
+        }
+    }
+    if let Some((status, msg)) = first_error {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return api_error(code, &msg);
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+    )
 }
 
 #[cfg(test)]
@@ -968,6 +1112,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn refresh_validates_id_and_404s_without_workers() {
+        let (app, _) = app();
+        // 非法 id → 400(不发起任何扇出)。
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/bad%2Fid/refresh", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 无 worker 在线 → 404(token 刷新发生在 worker 内存的选号池,无人持有即无可刷新)。
+        let resp = app
+            .oneshot(req("POST", "/accounts/k1/refresh", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn refresh_requires_admin_token() {
+        let (app, _) = app();
+        let r = Request::builder()
+            .method("POST")
+            .uri("/accounts/k1/refresh")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(r).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn quota_validates_id_and_404s_without_workers() {
+        let (app, _) = app();
+        // 非法 id → 400(不发起任何扇出)。
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/bad%2Fid/quota", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 无 worker 在线 → 404(配额查询发生在持有方 worker,无人持有即无可验)。
+        let resp = app
+            .oneshot(req("POST", "/accounts/k1/quota", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn quota_requires_admin_token() {
+        let (app, _) = app();
+        let r = Request::builder()
+            .method("POST")
+            .uri("/accounts/k1/quota")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(r).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

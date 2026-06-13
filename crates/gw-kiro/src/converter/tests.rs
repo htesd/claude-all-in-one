@@ -287,6 +287,91 @@ fn test_tool_name_mapping_in_convert_request() {
 }
 
 #[test]
+fn convert_request_does_not_send_agent_continuation_metadata() {
+    // 【真实缓存命中的命门】(2026-06-13 线上 caio 全 miss 实锤,对齐 static_flow 金标准):
+    // 绝不把自造的 agentContinuationId 上 wire——Kiro 会当成"续接它没签发的 agent 上下文"而绕过
+    // conversationId 前缀缓存致每轮冷 miss。agentTaskType 同样不发(vibe 走 header)。只发
+    // chat_trigger_type=MANUAL。这条测试锁死该 wire 形状,谁加回 with_agent_continuation_id 即红。
+    use crate::anthropic_types::Message as AnthropicMessage;
+    let req = MessagesRequest {
+        model: "claude-opus-4-8".to_string(),
+        max_tokens: 1024,
+        messages: vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Hello"),
+        }],
+        system: None,
+        stream: false,
+        tools: None,
+        thinking: None,
+        tool_choice: None,
+        output_config: None,
+        metadata: None,
+        context_management: None,
+    };
+    let cs = convert_request(&req).unwrap().conversation_state;
+    assert_eq!(cs.chat_trigger_type.as_deref(), Some("MANUAL"), "应发 chat_trigger_type=MANUAL");
+    assert!(cs.agent_continuation_id.is_none(), "绝不发 agentContinuationId(Kiro 缓存命门)");
+    assert!(cs.agent_task_type.is_none(), "不发 agentTaskType(vibe 走 header)");
+}
+
+#[test]
+fn multimodal_request_downgrades_complex_tool_schema() {
+    // 🟢 static_flow:请求含图片时,带 anyOf/$defs 等关键字的工具 schema 会被 Kiro 400。
+    // 含图 → 整体降级为宽松 object schema;不含图 → 原样保留。
+    use crate::anthropic_types::{Message as AnthropicMessage, Tool as AnthropicTool};
+    let complex_tool = || {
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert(
+            "properties".to_string(),
+            serde_json::json!({"x": {"anyOf": [{"type": "string"}, {"type": "number"}]}}),
+        );
+        AnthropicTool {
+            name: "Complex".to_string(),
+            description: "c".to_string(),
+            input_schema: schema,
+            tool_type: None,
+            max_uses: None,
+        }
+    };
+    let mk = |with_image: bool| MessagesRequest {
+        model: "claude-opus-4-8".to_string(),
+        max_tokens: 1024,
+        messages: vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: if with_image {
+                serde_json::json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aaaa"}},
+                    {"type": "text", "text": "what is this"}
+                ])
+            } else {
+                serde_json::json!("what is this")
+            },
+        }],
+        system: None,
+        stream: false,
+        tools: Some(vec![complex_tool()]),
+        thinking: None,
+        tool_choice: None,
+        output_config: None,
+        metadata: None,
+        context_management: None,
+    };
+    let tools_json = |req: &MessagesRequest| {
+        let cs = convert_request(req).unwrap().conversation_state;
+        serde_json::to_string(
+            &cs.current_message.user_input_message.user_input_message_context.tools,
+        )
+        .unwrap()
+    };
+    // 含图:anyOf 应被剥除(降级为宽松 schema)。
+    assert!(!tools_json(&mk(true)).contains("anyOf"), "含图请求的复杂 schema 应降级");
+    // 不含图:anyOf 保留(不误伤纯文本请求的工具定义)。
+    assert!(tools_json(&mk(false)).contains("anyOf"), "纯文本请求不应改工具 schema");
+}
+
+#[test]
 fn test_tool_name_mapping_in_history() {
     use crate::anthropic_types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
@@ -353,6 +438,48 @@ fn test_tool_name_mapping_in_history() {
         }
     }
     assert!(found, "应该在历史中找到 tool_use");
+}
+
+#[test]
+fn dup_tool_use_id_rewrite_does_not_perturb_conversation_id() {
+    // 对抗审查 Architect#3:身份链同源不变量回归守卫。
+    // convert_request 在 conversationId 派生【之后】才做 dup-id 改写,故其 conversationId
+    // 必须与 affinity_key_from_body(走原始 body、不改写)逐字一致。这里早轮用并行重复 id,
+    // 使第二个 tool_result 在改写后变成 `dup__caiodup2`,且它落在【前 2 条 user 消息】里
+    // (参与 conversationId 内容哈希)。若有人把改写挪到派生之前,convert_request 会按改写后
+    // 的 msg 派生 → 与 affinity(原始)不等 → 本测试失败。无 metadata.user_id 以强制走内容哈希。
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "dup", "name": "a", "input": {}},
+                {"type": "tool_use", "id": "dup", "name": "b", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "dup", "content": "r1"},
+                {"type": "tool_result", "tool_use_id": "dup", "content": "r2"}
+            ]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "continue"}
+        ]
+    });
+    let req: MessagesRequest = serde_json::from_value(body.clone()).unwrap();
+    // 先证改写确实被触发(否则本测试退化为空守卫):转换产物里应出现改写后缀。
+    let result = convert_request(&req).unwrap();
+    let renamed_present = result.conversation_state.history.iter().any(|m| {
+        matches!(m, Message::Assistant(a)
+            if a.assistant_response_message.tool_uses.iter().flatten()
+                .any(|tu| tu.tool_use_id == "dup__caiodup2"))
+    });
+    assert!(renamed_present, "用例应触发 dup-id 改写(history 里应有 dup__caiodup2)");
+
+    let cid_affinity = affinity_key_from_body(&body).expect("affinity key 应可派生");
+    assert_eq!(
+        result.conversation_state.conversation_id, cid_affinity,
+        "convert_request 的 conversationId 必须与 affinity_key_from_body 同源(派生须在改写之前)"
+    );
 }
 
 #[test]

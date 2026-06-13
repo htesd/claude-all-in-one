@@ -14,6 +14,8 @@ tracing.workspace = true
 parking_lot.workspace = true
 # accounts.extra(provider 专属字段)与 yaml 导入的 JSON 编解码。
 serde_json.workspace = true
+# 请求日志报文 gzip 压缩存储(全文不截断,文本压 5-10 倍)。
+flate2 = "1"
 
 [dev-dependencies]
 tokio.workspace = true

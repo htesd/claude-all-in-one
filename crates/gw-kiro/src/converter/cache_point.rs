@@ -1,25 +1,58 @@
-//! cachePoint / tools-in-prefix 实验开关(dormant,默认关,见各 fn 注释)。
+//! cachePoint / tools-in-prefix 实验开关(默认关,见各 fn 注释)。
+//!
+//! `tools_in_prefix` / `cache_point` 两个 on/off 开关可经**设置面板热控**(DB overlay →
+//! 30s settings 轮询 → [`crate::KiroProvider::apply_hot_settings`] → [`set_experimental_flags`]);
+//! env(`KIRO_TOOLS_IN_PREFIX` / `KIRO_CACHE_POINT`)仍作启动默认(后向兼容)。其余子参数
+//! (cachePoint type/place/config)是 dormant 实验的高级旋钮,保持 env-only。
 #![allow(clippy::doc_lazy_continuation)] // 迁移注释原样保留,不重排
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
-/// 实验开关：把 tools 放进 history[0] 前缀（可被 Kiro prefix cache 缓存），
-/// 而非每轮全价重发的 currentMessage。由环境变量 `KIRO_TOOLS_IN_PREFIX=1` 启用。
-///
-/// 背景：tools(数万 token)放在 currentMessage 时排在增长的 history 之后，
-/// 永远落在"缓存分歧点之后"被全价重算。挪到 history[0] 理论上能进稳定前缀。
-/// **未验证 Kiro 后端是否仍会向当前轮提供这些工具**，故先做成开关、实测后再决定。
-pub(super) fn tools_in_prefix_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("KIRO_TOOLS_IN_PREFIX")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+/// 可热控的实验开关快照。
+#[derive(Clone, Copy)]
+struct ExperimentalFlags {
+    tools_in_prefix: bool,
+    cache_point: bool,
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 进程级实验开关(默认从 env 取,settings 热应用经 [`set_experimental_flags`] 覆盖)。
+fn experimental() -> &'static RwLock<ExperimentalFlags> {
+    static G: OnceLock<RwLock<ExperimentalFlags>> = OnceLock::new();
+    G.get_or_init(|| {
+        RwLock::new(ExperimentalFlags {
+            tools_in_prefix: env_flag("KIRO_TOOLS_IN_PREFIX"),
+            cache_point: env_flag("KIRO_CACHE_POINT"),
+        })
     })
 }
 
+/// 热应用实验开关(worker 30s settings 轮询经 apply_hot_settings 调用)。
+pub(crate) fn set_experimental_flags(tools_in_prefix: bool, cache_point: bool) {
+    if let Ok(mut g) = experimental().write() {
+        g.tools_in_prefix = tools_in_prefix;
+        g.cache_point = cache_point;
+    }
+}
+
+/// 实验开关：把 tools 放进 history[0] 前缀（可被 Kiro prefix cache 缓存），
+/// 而非每轮全价重发的 currentMessage。默认关(env `KIRO_TOOLS_IN_PREFIX=1` 或设置面板启用)。
+///
+/// 背景：tools(数万 token)放在 currentMessage 时排在增长的 history 之后，
+/// 永远落在"缓存分歧点之后"被全价重算。挪到 history[0] 理论上能进稳定前缀。
+/// **未验证 Kiro 后端是否仍会向当前轮提供这些工具**——实测会让部分客户端工具调用失效,
+/// 金标准 static_flow 亦不用此招,默认保持关闭。
+pub(super) fn tools_in_prefix_enabled() -> bool {
+    experimental().read().map(|g| g.tools_in_prefix).unwrap_or(false)
+}
+
 /// 实验开关：将 Anthropic `cache_control` 翻译为 Kiro `cachePoint`。
-/// 由环境变量 `KIRO_CACHE_POINT=1` 启用。
+/// 默认关(env `KIRO_CACHE_POINT=1` 或设置面板启用)。
 ///
 /// 【2026-05-24 实测结论 —— 已证实是 no-op，默认保持关闭】
 /// 用独立可写 DB 做 A/B（多轮对话 + 唯一 nonce 冷启动，每配置连发 3 次）：
@@ -31,12 +64,7 @@ pub(super) fn tools_in_prefix_enabled() -> bool {
 /// 真正降低输入的杠杆是「稳定 conversationId」（见本文件 derive_conversation_id_*），
 /// 不是 cachePoint。代码保留为 dormant 实验，供 Python 迁移参考，勿在 prod 开启。
 pub(super) fn cache_point_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("KIRO_CACHE_POINT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    experimental().read().map(|g| g.cache_point).unwrap_or(false)
 }
 
 /// 实验参数：cachePoint 的 type 值。默认 EPHEMERAL。

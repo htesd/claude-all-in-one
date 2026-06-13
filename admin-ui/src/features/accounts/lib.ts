@@ -84,13 +84,14 @@ export function parseConcurrency(input: string): number | null {
   return Number.isInteger(value) && value >= 1 ? value : null
 }
 
-/** 积分展示格式化:整数千分位;< 0 当 0。 */
+/** 积分展示格式化:整数千分位。允许负值(超额账号的 remaining=已超出多少)。 */
 export function formatCredits(n: number): string {
-  return Math.round(Math.max(n, 0)).toLocaleString()
+  return Math.round(n).toLocaleString()
 }
 
-/** 剩余是否吃紧(< 上限 10% 或为 0)—— 用于标红提示该换号。 */
+/** 剩余是否吃紧(超额/为 0/< 上限 10%）—— 用于标红提示该换号。 */
 export function isQuotaLow(remaining: number, limit: number): boolean {
-  if (limit <= 0) return false
+  if (remaining < 0) return true // 超额一定标红(即使上限未知)
+  if (limit <= 0) return false // 上限未知且未超额:不误报
   return remaining <= 0 || remaining / limit < 0.1
 }

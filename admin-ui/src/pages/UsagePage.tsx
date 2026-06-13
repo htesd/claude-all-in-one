@@ -3,10 +3,11 @@ import { useMemo, useState } from 'react'
 import { ErrorNote } from '@/components/ui/error-note'
 import { ByKeyTable } from '@/features/usage/components/ByKeyTable'
 import { ByModelTable } from '@/features/usage/components/ByModelTable'
+import { CostStatsCard } from '@/features/usage/components/CostStatsCard'
 import { SummaryStrip } from '@/features/usage/components/SummaryStrip'
 import { UsageFilterBar } from '@/features/usage/components/UsageFilterBar'
 import { useUsageByKey, useUsageByModel, useUsageSummary } from '@/features/usage/hooks'
-import type { TimeRange, UsageFilter } from '@/features/usage/types'
+import type { CostBasis, TimeRange, UsageFilter } from '@/features/usage/types'
 import { useI18n } from '@/lib/i18n'
 
 /**
@@ -34,6 +35,7 @@ export default function UsagePage() {
   const [toDate, setToDate] = useState('')
   /** undefined = all keys, '' = unattributed bucket, otherwise a client key id. */
   const [keyFilter, setKeyFilter] = useState<string | undefined>(undefined)
+  const [basis, setBasis] = useState<CostBasis>('billed')
 
   const customRange = useMemo(() => toUnixRange(fromDate, toDate), [fromDate, toDate])
 
@@ -74,10 +76,13 @@ export default function UsagePage() {
   return (
     <div className="space-y-6">
       {/* Page hero */}
-      <div className="page-hero p-6">
-        <h1 className="text-2xl font-bold tracking-tight">{t('usage.title')}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{t('usage.subtitle')}</p>
-      </div>
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="eyebrow">Usage</p>
+          <h1 className="mt-2 font-display text-4xl font-black tracking-[-0.04em]">{t('usage.title')}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{t('usage.subtitle')}</p>
+        </div>
+      </header>
 
       {/* Filters: time presets / custom date range / key */}
       <UsageFilterBar
@@ -95,11 +100,19 @@ export default function UsagePage() {
 
       {queryError !== null && <ErrorNote error={queryError} />}
 
+      {/* Cumulative cost & usage (hero card with billed/real toggle) */}
+      <CostStatsCard
+        data={summaryQuery.data}
+        loading={summaryQuery.isPending}
+        basis={basis}
+        onBasisChange={setBasis}
+      />
+
       {/* Filtered summary */}
       <SummaryStrip data={summaryQuery.data} loading={summaryQuery.isPending} />
 
       {/* Per-model usage (compact table with inline proportion bars) */}
-      <ByModelTable data={byModelQuery.data} loading={byModelQuery.isPending} />
+      <ByModelTable data={byModelQuery.data} loading={byModelQuery.isPending} basis={basis} />
 
       {/* Per-key usage (always all keys; time-filtered only) */}
       <ByKeyTable data={byKeyQuery.data} loading={byKeyQuery.isPending} showCacheColumns />

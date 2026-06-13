@@ -24,6 +24,8 @@ export interface SystemSettings {
   affinity_ttl_secs: number
   /** 连续失败上限（整数）。 */
   max_failures: number
+  /** 是否启用后台配额轮询（防封 ambient 流量；关掉则仅 /health 被打时刷配额）。 */
+  quota_poll_enabled: boolean
   /** 是否启用图像压缩。 */
   image_enabled: boolean
   /** 图像最大长边（像素，整数）。 */
@@ -34,6 +36,10 @@ export interface SystemSettings {
   image_max_pixels_multi: number
   /** 触发多图模式的阈值（整数）。 */
   image_multi_threshold: number
+  /** 实验：把工具定义放进 history[0] 前缀（蹭缓存）。⚠️ 部分客户端工具调用会失效，默认关。 */
+  tools_in_prefix: boolean
+  /** 实验：cache_control→cachePoint（实测 no-op，dormant）。 */
+  cache_point: boolean
 }
 
 /**

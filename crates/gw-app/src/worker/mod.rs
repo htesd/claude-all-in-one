@@ -23,7 +23,7 @@ use gw_core::error::{UpstreamError, UpstreamErrorKind};
 use gw_core::provider::{
     AccountQuota, CallCtx, ChatRequest, ChatUsage, Provider, SseEvent, StreamItem,
 };
-use gw_core::store::{UsageRecord, UsageSink};
+use gw_core::store::{RequestLog, UsageRecord, UsageSink};
 use gw_store::SqliteStore;
 
 use crate::egress;
@@ -58,6 +58,10 @@ struct WorkerState {
     /// 配额刷新并发上限信号量:防 /health 一次性给上百个账号同时刷新造成 stampede
     /// (审查 Architect#4)。后台任务先抢 permit 再打上游。
     quota_sem: Arc<tokio::sync::Semaphore>,
+    /// 账号集同步串行锁(审查 Skeptic#1/Architect#1):30s 周期循环与 `/sync` 端点
+    /// 并发跑 `sync_accounts_from_db` 时,若不串行"读 DB 快照 → 应用 scheduler",
+    /// 旧快照可能最后应用,把刚导入的账号从内存移掉(等下轮才回来)。
+    sync_lock: tokio::sync::Mutex<()>,
     /// worker 的 egress client(provider 已持有同一个;此处保留供诊断)。
     _client: reqwest::Client,
 }
@@ -66,6 +70,31 @@ struct WorkerState {
 const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// 配额刷新最大并发(stampede 护栏):上百账号同时被查看也只 N 个在打上游。
 const QUOTA_MAX_CONCURRENCY: usize = 3;
+
+/// 后台配额轮询一轮间隔下/上限(秒)。🟢 对齐 static_flow(240–300s + 抖动)。
+/// worker 自身每轮兜底刷新一遍账号配额,不依赖 /health 被打。
+/// ⚠️ 与 [`QUOTA_TTL`](=60s)耦合:轮询用 `QUOTA_POLL_MIN_SECS` 作 stale floor,必须 **>
+/// `QUOTA_TTL`**,否则会和 /health 路径重复打点(被 /health 在 floor 内刷过的账号本轮才会跳过)。
+/// 调整任一常量时检查二者关系(对抗审查 Architect#7)。
+const QUOTA_POLL_MIN_SECS: u64 = 240;
+const QUOTA_POLL_MAX_SECS: u64 = 300;
+/// 启动后首轮配额 sweep 的短延迟:让启动握手/warm 先跑,但远早于 240s,避免"重启后无人看
+/// dashboard 时前几分钟配额全空"的冷启动窗口(对抗审查 Skeptic#5)。
+const QUOTA_POLL_WARMUP_SECS: u64 = 20;
+
+/// 在 `[min, max]` 内取一个秒数。用 `SystemTime` 亚秒纳秒做熵,免引入 `rand` 依赖——
+/// 抖动只为打散轮询时刻、避免精确固定间隔成为可识别指纹(防封),不需密码学强度随机。
+fn jittered_secs(min: u64, max: u64) -> u64 {
+    if min >= max {
+        return min;
+    }
+    let span = max - min + 1;
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    min + (entropy % span)
+}
 
 impl WorkerState {
     /// 取该账号的 per-account 刷新锁(单飞:同账号同时只一个刷新;
@@ -93,13 +122,50 @@ impl WorkerState {
         self.refresh_locked(account).await
     }
 
-    /// 强制刷新该账号一次(用于 chat 返回 TokenInvalid 时的同号 refresh-then-retry):
-    /// 即便当前 token 看似"新",也走单飞锁刷新(上游已判定其失效)。
+    /// 强制刷新该账号一次:**无条件**走单飞锁 + 上游 refresh_auth,忽略 token 新鲜度。
+    ///
+    /// 人工“刷新 token”按钮用——操作者要真正向上游换一次,以验证 refresh_token 可用 /
+    /// 轮换 rt 后立即拿到新 access_token。锁内取 scheduler 最新副本作基底(拿当前 rolling
+    /// refresh_token、不抹并发 merge 字段),不因 fresh 提前返回。
     async fn force_refresh(
         &self,
         account: Arc<Account>,
     ) -> Result<Arc<Account>, gw_core::error::UpstreamError> {
-        self.refresh_locked(account).await
+        let lock = self.refresh_lock(&account.account_id);
+        let _guard = lock.lock().await;
+        let base = self
+            .scheduler
+            .account(&account.account_id)
+            .unwrap_or(account);
+        self.do_refresh_and_persist(base).await
+    }
+
+    /// chat 收 403 TokenInvalid 后的同号刷新:**仅当** scheduler 现存 access_token 仍是
+    /// 这枚被拒 token(并发请求尚未替我刷过)才真打上游;否则直接返回最新副本。
+    ///
+    /// 判据是 **token 是否被换掉**,而非 expires_at 新鲜度——被拒 token 常仍“看似新”
+    /// (吊销/时钟漂移),旧 `refresh_locked` 的 fresh 早返回会把它当好 token 返回、retry
+    /// 必再失败。改用 CAS 后:同账号 N 个并发 403,第一个刷新换掉 token,其余进锁后发现
+    /// token 已变 → 直接用新的、不再各自重刷,避免放大 token 交换 / rolling refresh_token
+    /// (审查 Skeptic#2 / Architect#3)。
+    async fn refresh_after_rejection(
+        &self,
+        account: Arc<Account>,
+        rejected_token: Option<&str>,
+    ) -> Result<Arc<Account>, gw_core::error::UpstreamError> {
+        let lock = self.refresh_lock(&account.account_id);
+        let _guard = lock.lock().await;
+        let base = match self.scheduler.account(&account.account_id) {
+            Some(fresh) => {
+                // 他人已把 token 换成别的(不再是被拒的那枚)→ 用新的,别再刷。
+                if fresh.extra_str("access_token") != rejected_token {
+                    return Ok(fresh);
+                }
+                fresh
+            }
+            None => account,
+        };
+        self.do_refresh_and_persist(base).await
     }
 
     /// 单飞锁内刷新:锁内二次检查(他人可能刚刷好)→ 仍需则 refresh_auth → 回写 scheduler。
@@ -122,6 +188,16 @@ impl WorkerState {
             }
             None => account,
         };
+        self.do_refresh_and_persist(base).await
+    }
+
+    /// 刷新 + 回写 + 持久化的共享尾段(`refresh_locked` / `force_refresh` 复用)。
+    ///
+    /// 调用方必须**已持有**该账号的 per-account 刷新锁,并已选定 `base`(scheduler 最新副本)。
+    async fn do_refresh_and_persist(
+        &self,
+        base: Arc<Account>,
+    ) -> Result<Arc<Account>, gw_core::error::UpstreamError> {
         let refreshed = Arc::new(self.provider.refresh_auth(&base).await?);
         // 回写 scheduler:带新 token 的副本进入选号池(单一事实来源)。
         // **原子**「替换 + 置脏」(同一把 entries 锁):分两步的话,30s sync 会在
@@ -311,24 +387,86 @@ impl WorkerState {
         }
     }
 
+    /// 后台配额轮询的单轮(在轮询任务内**顺序内联**执行,不再 per-account spawn——避免上万
+    /// 账号周期性创建上万个仅挂在 semaphore 上的 task,对抗审查 Architect#1)。
+    ///
+    /// 对**未禁用**且**距上次尝试 ≥ `QUOTA_POLL_MIN_SECS`** 的账号顺序刷新一次 getUsageLimits
+    /// (只读,安全):
+    /// - **跳过 disabled 账号**(人工隔离 / invalid_refresh_token / quota_exhausted / 配置禁用):
+    ///   禁用即"不再使用",不该对其周期性打上游/试刷 token(对抗审查 Skeptic#4 / Architect#2 /
+    ///   Minimalist#2)。
+    /// - 与 /health 路径经 `quota_inflight` 去重(同账号同时只一个在途);被 /health
+    ///   (TTL=[`QUOTA_TTL`]=60s)在 floor 内刷过的账号本轮自然跳过 → 不双倍打点。
+    /// - 顺序处理:后台 sweep 不赶时间;`quota_sem` 仍护 /health 侧并发。
+    async fn sweep_stale_quotas(self: &Arc<Self>) {
+        let floor = std::time::Duration::from_secs(QUOTA_POLL_MIN_SECS);
+        let now = std::time::Instant::now();
+        let due: Vec<String> = self
+            .scheduler
+            .status_snapshot()
+            .into_iter()
+            .filter(|s| !s.disabled)
+            .map(|s| s.account_id)
+            .filter(|id| match self.quota_cache.lock().get(id) {
+                Some((_, at)) => now.duration_since(*at) >= floor,
+                None => true, // 从未查过 → 该刷。
+            })
+            .collect();
+        for id in due {
+            // 与 /health 触发去重:已在途则跳过,否则同账号并发两次 getUsageLimits。
+            if !self.quota_inflight.lock().insert(id.clone()) {
+                continue;
+            }
+            self.refresh_quota_once(&id).await;
+            self.quota_inflight.lock().remove(&id);
+        }
+    }
+
     /// 拉一次配额(可能触发 token 刷新)。Ok(None) = 账号已不在/上游无配额。
+    /// 错误保留 [`UpstreamError`](而非 anyhow 包装):按需验活端点要透出可分类的
+    /// 状态码/kind(invalid_grant vs 网络抖动),后台轮询调用方只 log 不受影响。
     async fn try_fetch_quota(
         self: &Arc<Self>,
         account_id: &str,
-    ) -> anyhow::Result<Option<AccountQuota>> {
+    ) -> Result<Option<AccountQuota>, UpstreamError> {
         let Some(account) = self.scheduler.account(account_id) else {
             return Ok(None);
         };
-        let account = self
-            .ensure_credentialed(account)
-            .await
-            .map_err(|e| anyhow::anyhow!("ensure token: {e}"))?;
+        let account = self.ensure_credentialed(account).await?;
         // 企业/IdC 号 getUsageLimits 同样要求 profileArn:缺则先发现+持久化。
         let account = self.ensure_profile_arn(account).await;
-        self.provider
-            .account_quota(&account)
-            .await
-            .map_err(|e| anyhow::anyhow!("getUsageLimits: {e}"))
+        self.provider.account_quota(&account).await
+    }
+
+    /// 从 DB 重读组内账号集并同步进 scheduler —— 30s 周期循环与 `/sync` 立即同步
+    /// **共用本实现**(勿另写一份,语义漂移=同步行为分叉)。先冲刷上轮回写失败的
+    /// 脏 extra,再差量同步账号集。返回 (added, removed);无库/读库失败 → None。
+    /// 全程持 `sync_lock`:保证"读快照→应用"原子,后读的快照必然后应用。
+    async fn sync_accounts_from_db(self: &Arc<Self>) -> Option<(usize, usize)> {
+        let store = self.store.clone()?;
+        let _serialized = self.sync_lock.lock().await;
+        // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
+        flush_dirty_extras(&self.scheduler, &store, &self.refresh_locks, "sync 重试").await;
+        match store.load_group_accounts(&self.group) {
+            Ok(accs) => {
+                let accs = filter_by_provider(
+                    accs.into_iter().map(Arc::new).collect(),
+                    self.provider.family(),
+                );
+                let out = self.scheduler.sync_accounts(accs);
+                if out.added + out.removed > 0 {
+                    tracing::info!(added = out.added, removed = out.removed,
+                        "账号集已按 DB 同步");
+                    // 新进账号若缺订阅档位,预热配额查询补齐(模型过滤数据源)。
+                    self.warm_subscription_titles();
+                }
+                Some((out.added, out.removed))
+            }
+            Err(e) => {
+                tracing::warn!("账号 sync 读库失败,跳过本轮: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -544,6 +682,7 @@ pub async fn run(
         quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
         quota_sem: Arc::new(tokio::sync::Semaphore::new(QUOTA_MAX_CONCURRENCY)),
+        sync_lock: tokio::sync::Mutex::new(()),
         _client: client,
     });
 
@@ -559,24 +698,8 @@ pub async fn run(
             tick.tick().await; // 首跳立即触发,跳过(启动时刚加载过)。
             loop {
                 tick.tick().await;
-                // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
-                flush_dirty_extras(&st.scheduler, &store, &st.refresh_locks, "sync 重试").await;
-                match store.load_group_accounts(&st.group) {
-                    Ok(accs) => {
-                        let accs = filter_by_provider(
-                            accs.into_iter().map(Arc::new).collect(),
-                            st.provider.family(),
-                        );
-                        let out = st.scheduler.sync_accounts(accs);
-                        if out.added + out.removed > 0 {
-                            tracing::info!(added = out.added, removed = out.removed,
-                                "账号集已按 DB 同步");
-                            // 新进账号若缺订阅档位,预热配额查询补齐(模型过滤数据源)。
-                            st.warm_subscription_titles();
-                        }
-                    }
-                    Err(e) => tracing::warn!("账号 sync 读库失败,跳过本轮: {e}"),
-                }
+                // 账号集同步(含脏 extra 冲刷)—— 与 /sync 立即同步共用实现。
+                st.sync_accounts_from_db().await;
                 // 热应用 DB 设置 overlay:代理/计费/图像(provider)+ 调度参数 + cache_sim。
                 // 用**有效全量**(YAML 基线叠 overlay,再回灌 from_effective)喂给 provider,
                 // 这样 overlay 删某字段时能正确恢复到 YAML 默认(而非停留在上次热值)。
@@ -606,6 +729,38 @@ pub async fn run(
         });
     }
 
+    // static_flow 式后台配额轮询:worker 自身每 240–300s(带抖动)兜底刷新一遍账号配额,
+    // **不依赖 /health 被打**。目的:① 复刻真实 Kiro IDE 每 ~5min 一次 getUsageLimits 的
+    // ambient 流量(防封——纯反代账号在两次聊天间对上游静默是最易被审计的指纹);② 让配额
+    // 面板在无人看 dashboard 时也保持新鲜。被 /health(60s TTL)刚刷过的账号本轮自动跳过,
+    // 不产生双倍流量;上游并发仍受 quota_sem(3)节流。
+    //
+    // 启停:**始终 spawn**,每轮读 `scheduler.quota_poll_enabled()` 热开关(经 SchedulerConfig
+    // + 30s settings overlay 热生效——设置面板可即时启停,无需重启;对抗审查 Architect#5/
+    // Minimalist#4 取代了原 env 开关)。冷启动:首轮只等 QUOTA_POLL_WARMUP_SECS 就 sweep 一遍
+    // (对抗审查 Skeptic#5),之后进入抖动节律。
+    // shutdown:本任务是 daemon(同既有 30s sync loop,无独立 shutdown 协调)。安全性依据:
+    // refresh_locked 刷新 token 后**同步落库**(merge_account_extra),故停机中途被 drop 也不丢
+    // rolling token;sweep 唯一外部副作用是只读 getUsageLimits,被 drop 无损(对抗审查 Architect#6)。
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(QUOTA_POLL_WARMUP_SECS)).await;
+            loop {
+                if st.scheduler.quota_poll_enabled() {
+                    st.sweep_stale_quotas().await;
+                }
+                let secs = jittered_secs(QUOTA_POLL_MIN_SECS, QUOTA_POLL_MAX_SECS);
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+        });
+        tracing::info!(
+            min = QUOTA_POLL_MIN_SECS,
+            max = QUOTA_POLL_MAX_SECS,
+            "后台配额轮询已就绪(static_flow 式 ambient getUsageLimits;启停经设置面板热控)"
+        );
+    }
+
     // 启动预热:缺订阅档位的账号后台拉一次配额(getUsageLimits 只读,安全),
     // 让模型能力过滤(FREE 不给 opus)冷启动即有数据源,而非等 /health 被动触发。
     state.warm_subscription_titles();
@@ -619,9 +774,14 @@ pub async fn run(
     // 否则客户端可直连 worker 绕过 router 鉴权并伪造用量归属(审查 #2)。
     let loopback = is_loopback_listen(&wcfg.listen);
     if loopback {
-        // 内网管理端点(无鉴权,信任同机 router):人工救号。**仅 loopback 才挂载**——
-        // 非 loopback 误配下暴露它等于把"清禁用保护"开给整个网络(审查②R 共识 high)。
-        app = app.route("/accounts/{id}/reset", post(reset_account));
+        // 内网管理端点(无鉴权,信任同机 router):人工救号 + 人工强制刷新 token。
+        // **仅 loopback 才挂载**——非 loopback 误配下暴露它等于把"清禁用保护/强制刷新"
+        // 开给整个网络(审查②R 共识 high)。
+        app = app
+            .route("/accounts/{id}/reset", post(reset_account))
+            .route("/accounts/{id}/refresh", post(refresh_account))
+            .route("/accounts/{id}/quota", post(quota_account))
+            .route("/sync", post(sync_now));
     } else {
         tracing::warn!(
             listen = %wcfg.listen,
@@ -838,6 +998,138 @@ async fn reset_account(
     }
 }
 
+/// `POST /accounts/{id}/refresh` —— 人工**强制刷新该账号 token**(rt→at 换一次)。
+///
+/// 安全性:这就是后台配额轮询 / 按需刷新本来就在做的 OIDC token 交换,**不是** chat,
+/// 不触发风控(见 no-chat-test-on-real-accounts 记忆)。操作者可借此验证 refresh_token
+/// 仍可用、或在轮换 rt 后立刻换到新 access_token。
+///
+/// 仅本组持有该账号的 worker 命中;账号不在本组 → 404(admin 据此向其余 worker 续问)。
+/// 上游刷新失败(invalid_grant / 网络 / 5xx)→ 经 `upstream_error_response` 透出错误,
+/// admin 层据状态码区分"无人持有(404)"与"持有方刷新失败(502/400)"。
+async fn refresh_account(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(account) = st.scheduler.account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"refreshed": false, "account_id": id})),
+        )
+            .into_response();
+    };
+    match st.force_refresh(account).await {
+        Ok(refreshed) => {
+            // 绝不回传 token 明文;只给 expires_at 让操作者确认新 token 的有效期窗口。
+            let expires_at = refreshed.extra_str("expires_at").map(|s| s.to_string());
+            Json(serde_json::json!({
+                "refreshed": true,
+                "account_id": id,
+                "expires_at": expires_at,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            // 反映真实状态(审查 Skeptic#1):与 chat 路径一致地 report_failure——
+            // rt 永久失效(TokenInvalid)→ 立即标 invalid_refresh_token 禁用,仪表盘即时
+            // 见死号、不再被路由到;transient(网络/5xx)→ 仅计失败数(救号一键清)。
+            // 不在此换号/重试(人工动作就是要看这一次结果)。
+            st.scheduler.report_failure(&id, e.kind);
+            upstream_error_response(&e)
+        }
+    }
+}
+
+/// `POST /accounts/{id}/quota` —— 按需验活:确保 token 有效(必要时刷新,只读 OIDC
+/// 交换)→ getUsageLimits 查配额。导入对话框逐账号验活用。**全程只读,绝不发 chat**
+/// (见 no-chat-test-on-real-accounts 记忆)。
+///
+/// 仅本组持有该账号的 worker 命中;不在本组 → 404(admin 据此向其余 worker 续问)。
+/// 上游失败 → report_failure(与 refresh 同理:死号立即标禁用,导入即见)+ 透出错误。
+async fn quota_account(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if st.scheduler.account(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"verified": false, "account_id": id})),
+        )
+            .into_response();
+    }
+    // 与后台轮询/预热同走 quota_sem(审查 Architect#2/Minimalist#1):并发验活
+    // 不突破 QUOTA_MAX_CONCURRENCY,不绕开既有上游压力边界。
+    let _permit = match st.quota_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"verified": false, "account_id": id})),
+            )
+                .into_response();
+        }
+    };
+    match st.try_fetch_quota(&id).await {
+        Ok(q) => {
+            // 预检与取数之间账号可能被并发 /sync 移除(审查 Skeptic#3):try_fetch_quota
+            // 对"不在本组"也回 Ok(None),与"上游无配额数据"撞语义——复查持有,不在则
+            // 404 让 admin 继续问真正的持有方,而非误报 200"无配额"。
+            if st.scheduler.account(&id).is_none() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"verified": false, "account_id": id})),
+                )
+                    .into_response();
+            }
+            // 写共享配额缓存:表格积分列(/health runtime)立刻反映,且按 TTL
+            // 节流后台轮询(刚验过的号本轮 sweep 自动跳过,不产生双倍流量)。
+            st.quota_cache
+                .lock()
+                .insert(id.clone(), (q.clone(), std::time::Instant::now()));
+            // verified=false + 200:账号可刷新但上游无配额数据(非硬失败,前端显示"—")。
+            Json(serde_json::json!({
+                "verified": q.is_some(),
+                "account_id": id,
+                "quota": quota_to_json(q),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            // 只读探测失败**只对真死号惩罚**(审查三人共识):TokenInvalid(invalid_grant/
+            // 403)→ report_failure 标 invalid_refresh_token,死号导入即现形;瞬时错误
+            // (网络/5xx/429)只透传给前端展示,不计入与 chat 共用的失败池/冷却——
+            // 否则上游抖动期间批量验活会把好号验成 too_many_failures。
+            if matches!(e.kind, UpstreamErrorKind::TokenInvalid) {
+                st.scheduler.report_failure(&id, e.kind);
+            }
+            // 失败也写"尝试时刻"(None),与后台轮询同一节流口径。
+            st.quota_cache
+                .lock()
+                .insert(id.clone(), (None, std::time::Instant::now()));
+            upstream_error_response(&e)
+        }
+    }
+}
+
+/// `POST /sync` —— 立即从 DB 同步组内账号集(与 30s 周期循环共用实现)。
+/// admin 导入账号后主动捅一下,消除"导入后 30s 内按号操作报无人持有"的窗口。
+/// 无库(降级模式)/读库失败 → 503,调用方按 best-effort 忽略。
+async fn sync_now(State(st): State<Arc<WorkerState>>) -> axum::response::Response {
+    match st.sync_accounts_from_db().await {
+        Some((added, removed)) => Json(serde_json::json!({
+            "synced": true,
+            "added": added,
+            "removed": removed,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"synced": false})),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/models` —— 暴露 provider 的模型目录(Anthropic 线缆格式)。
 /// provider 一处实现 `list_models`,框架在此映射成对外响应(写一次,各 provider 共享)。
 async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response {
@@ -878,6 +1170,9 @@ async fn messages(
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     let req = ChatRequest::from_anthropic_body(body);
+    // 请求日志(#③)采集:进入即计时。报文序列化(client/kiro)推迟到收尾的 blocking 任务里做,
+    // 不在热路径(handler 入口)同步跑(审查 Skeptic#1)。
+    let started_at = std::time::Instant::now();
     // 客户 key 归属:router 鉴权后经内网头透传(对外 Authorization 不到 worker)。
     let client_key = headers
         .get(crate::CLIENT_KEY_HEADER)
@@ -953,11 +1248,26 @@ async fn messages(
         //    - 其他可重试错误:上报失败、换号重试。
         match st.provider.chat(req.clone(), &ctx).await {
             Ok(stream) => {
-                return finish_response(st.clone(), lease, stream, &req, &client_key).await
+                return finish_response(
+                    st.clone(),
+                    lease,
+                    stream,
+                    &req,
+                    &client_key,
+                    ctx.account.clone(),
+                    started_at,
+                )
+                .await
             }
             Err(e) if e.kind == UpstreamErrorKind::TokenInvalid => {
                 tracing::info!(account = %account_id, "chat 403 token 失效,尝试同号刷新后重试");
-                match st.force_refresh(ctx.account.clone()).await {
+                // 传入这枚被拒的 access_token:并发 403 时,只有第一个进锁者真刷,
+                // 其余发现 token 已被换掉即复用,避免 N 次重复上游刷新(审查 Skeptic#2)。
+                let rejected = ctx.account.extra_str("access_token").map(|s| s.to_string());
+                match st
+                    .refresh_after_rejection(ctx.account.clone(), rejected.as_deref())
+                    .await
+                {
                     Ok(refreshed) => {
                         let retry_ctx = CallCtx {
                             account: refreshed,
@@ -966,8 +1276,16 @@ async fn messages(
                         };
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
-                                return finish_response(st.clone(), lease, stream, &req, &client_key)
-                                    .await
+                                return finish_response(
+                                    st.clone(),
+                                    lease,
+                                    stream,
+                                    &req,
+                                    &client_key,
+                                    retry_ctx.account.clone(),
+                                    started_at,
+                                )
+                                .await
                             }
                             Err(e2) => {
                                 // 刷新后仍失败:这次才上报失败 + 换号。
@@ -999,6 +1317,26 @@ async fn messages(
                 st.scheduler.report_failure(&account_id, kind);
                 drop(lease);
                 if kind == UpstreamErrorKind::BadRequest || attempts >= total {
+                    // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
+                    // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
+                    let status = if kind == UpstreamErrorKind::BadRequest {
+                        Some(400)
+                    } else {
+                        Some(502)
+                    };
+                    spawn_request_log_blocking(
+                        &st,
+                        req.clone(),
+                        Some(ctx.account.clone()),
+                        client_key.clone(),
+                        req.stream,
+                        false,
+                        status,
+                        Some(format!("{kind:?}")),
+                        Some(started_at.elapsed().as_millis() as i64),
+                        None,
+                        None,
+                    );
                     return upstream_error_response(&e);
                 }
                 continue;
@@ -1045,6 +1383,8 @@ async fn finalize_usage(
         output_tokens: u.output_tokens,
         cache_read_tokens: u.cache_read_tokens,
         cache_creation_tokens: u.cache_creation_tokens,
+        real_cache_read_tokens: u.real_cache_read_tokens,
+        metering_credit: u.metering_credit,
         success,
     };
     if let Err(e) = sink.record(rec).await {
@@ -1055,25 +1395,178 @@ async fn finalize_usage(
 /// 按客户端 `stream` 标志分发:provider 一律产流,这里决定回 SSE 还是折叠成单个
 /// 非流式 Messages 响应(折叠逻辑写一次,见 [`gw_core::fold`])。两条路径都做同一套
 /// 收尾(账号生命周期上报 + usage 落库)。
+/// 请求日志环形保留条数(最新 N 条;`insert_request_log` 按此裁旧)。用户口径"最新 2000 条"。
+const REQUEST_LOG_CAP: u64 = 2000;
+/// 单条报文(client/kiro)入库前的**文本**体积上限(截断兜底)。报文经 gzip 压缩入库
+/// (`gw-store`,文本压 5-10 倍),且图片/文档已抽到去重 blob 表,故**全文存储不再截断**;
+/// 此上限抬到 16MiB 仅作防御性护栏——Kiro 报文体积硬上限 ~6.3MB(`DEFAULT_MAX_BODY_BYTES`),
+/// 真实报文绝不触顶,只挡住非常规超大输入(防单行无界内存/库占用)。
+const MAX_LOG_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// 报文入库前处理:**按字段把图片/文档 base64 抽到 blob 列表**(`data`/`bytes` 键的长值,
+/// 替换为 `blob:<hash>` 引用;对话正文走 `text` 键,绝不误抽),**再**按字符边界截断文本兜底。
+/// 返回(处理后报文文本, 抽出的 blob)。非 JSON(如转换错误串)原样截断、无 blob。
+fn prepare_log_payload(raw: String) -> (String, Vec<gw_core::store::LogBlob>) {
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(mut v) => {
+            let blobs = gw_core::store::extract_log_blobs(&mut v);
+            let text = serde_json::to_string(&v).unwrap_or(raw);
+            (truncate_log_payload(text), blobs)
+        }
+        Err(_) => (truncate_log_payload(raw), Vec::new()),
+    }
+}
+
+/// 按 UTF-8 字符边界安全截断报文(超 [`MAX_LOG_PAYLOAD_BYTES`] 时)。
+fn truncate_log_payload(s: String) -> String {
+    if s.len() <= MAX_LOG_PAYLOAD_BYTES {
+        return s;
+    }
+    let mut end = MAX_LOG_PAYLOAD_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…<已截断,原 {} 字节>", &s[..end], s.len())
+}
+
+/// 同步构造并落一条请求日志(环形保留最新 [`REQUEST_LOG_CAP`] 条)。**两份报文都在此序列化**
+/// (用户原始 `client_payload` = req.body;发 Kiro 前 `kiro_payload` = gw-kiro 纯渲染助手重渲染,
+/// 不跑 cache_sim/体积护栏,无副作用)——故必须经 [`spawn_request_log_blocking`] 丢到 blocking
+/// 线程池跑,**绝不在收入热路径**(handler 入口 / SSE async poll)同步执行(审查 Skeptic#1/#3)。
+/// `account=None`(选号前即失败)→ account_id/kiro_payload 留空。落库失败仅告警。
+#[allow(clippy::too_many_arguments)]
+fn write_request_log(
+    store: Arc<SqliteStore>,
+    req: ChatRequest,
+    account: Option<Arc<Account>>,
+    client_key: String,
+    is_stream: bool,
+    success: bool,
+    status_code: Option<i64>,
+    error_kind: Option<String>,
+    duration_ms: Option<i64>,
+    ttfb_ms: Option<i64>,
+    usage: Option<ChatUsage>,
+) {
+    let (input, output, cache_read, cache_creation, real_cache_read, metering_credit) = usage
+        .as_ref()
+        .map(|u| {
+            (
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_tokens,
+                u.cache_creation_tokens,
+                u.real_cache_read_tokens,
+                u.metering_credit,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0, 0.0));
+    // 抽出两份报文里的媒体 blob(图片/文档);合并后入库按 hash 去重(同图复用一行)。
+    let (client_payload, mut blobs) =
+        prepare_log_payload(serde_json::to_string(&req.body).unwrap_or_default());
+    let (account_id, kiro_payload) = match &account {
+        Some(a) => {
+            let (kp, kb) = prepare_log_payload(gw_kiro::chat::render_kiro_payload(&req, a));
+            blobs.extend(kb);
+            (a.account_id.clone(), kp)
+        }
+        None => (String::new(), String::new()),
+    };
+    let log = RequestLog {
+        client_key_id: client_key,
+        account_id,
+        model: req.model.clone(),
+        stream: is_stream,
+        success,
+        status_code,
+        error_kind,
+        duration_ms,
+        ttfb_ms,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
+        // "报"口径本次上报总 token(input 已含放大后的 cache_read);前端展示"报 N"。
+        reported_tokens: input.saturating_add(output),
+        // "真":上游真实命中;"credit":Kiro 原生计费。诊断/优化用,不参与计费。
+        real_cache_read_tokens: real_cache_read,
+        metering_credit,
+        client_payload,
+        kiro_payload,
+        blobs,
+    };
+    if let Err(e) = store.insert_request_log(&log, REQUEST_LOG_CAP) {
+        tracing::warn!(error = %e, account = %log.account_id, "请求日志落库失败");
+    }
+}
+
+/// 把请求日志落库 detach 到 **blocking 线程池**(两份报文序列化 + 同步 SQLite 写均为阻塞工作),
+/// 不占用 async worker 线程、不拖慢活跃 SSE poll(审查 Skeptic#3)。store=None(库降级)或无
+/// 运行时上下文则跳过。guard 跟随任务存活:停机排空经 pending_writes.wait_idle 等这批收尾。
+#[allow(clippy::too_many_arguments)]
+fn spawn_request_log_blocking(
+    st: &Arc<WorkerState>,
+    req: ChatRequest,
+    account: Option<Arc<Account>>,
+    client_key: String,
+    is_stream: bool,
+    success: bool,
+    status_code: Option<i64>,
+    error_kind: Option<String>,
+    duration_ms: Option<i64>,
+    ttfb_ms: Option<i64>,
+    usage: Option<ChatUsage>,
+) {
+    let Some(store) = st.store.clone() else {
+        return;
+    };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let guard = st.pending_writes.enter();
+    handle.spawn_blocking(move || {
+        let _guard = guard;
+        write_request_log(
+            store, req, account, client_key, is_stream, success, status_code, error_kind,
+            duration_ms, ttfb_ms, usage,
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finish_response(
     st: Arc<WorkerState>,
     lease: scheduler::AccountLease,
     stream: gw_core::provider::ChatStream,
     req: &ChatRequest,
     client_key: &str,
+    account: Arc<Account>,
+    started_at: std::time::Instant,
 ) -> axum::response::Response {
     if req.stream {
-        // 流式:返回惰性 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库)。
-        stream_response(st, lease, stream, req.model.clone(), client_key.to_string())
+        // 流式:返回惰性 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库 usage+请求日志)。
+        stream_response(
+            st,
+            lease,
+            stream,
+            req.clone(),
+            client_key.to_string(),
+            account,
+            started_at,
+        )
     } else {
         // 非流式:此处即时抽干流、折叠成单个 Messages JSON。
         collect_response(
             &st.scheduler,
             st.usage_sink.as_ref(),
+            st.store.clone(),
+            Some(st.pending_writes.clone()),
             lease,
             stream,
-            req.model.clone(),
+            req.clone(),
             client_key.to_string(),
+            account,
+            started_at,
         )
         .await
     }
@@ -1086,13 +1579,18 @@ async fn finish_response(
 /// 错误响应(不重试:已开始消费流,符合 v60 不放大错误契约)。
 ///
 /// 取显式依赖(scheduler / usage_sink)而非整个 WorkerState,便于单测。
+#[allow(clippy::too_many_arguments)]
 async fn collect_response(
     scheduler: &AccountScheduler,
     usage_sink: Option<&Arc<dyn UsageSink>>,
+    store: Option<Arc<SqliteStore>>,
+    pending_writes: Option<Arc<PendingWrites>>,
     lease: scheduler::AccountLease,
     mut stream: gw_core::provider::ChatStream,
-    model: String,
+    req: ChatRequest,
     client_key: String,
+    account: Arc<Account>,
+    started_at: std::time::Instant,
 ) -> axum::response::Response {
     /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
     /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
@@ -1141,6 +1639,20 @@ async fn collect_response(
     };
 
     let success = matches!(outcome, Outcome::Ok(_));
+    // 非流式状态码:成功 200;上游错误经 upstream_error_response 对外 502(BadRequest 除外,
+    // 但折叠失败已落到 Bad/Upstream 两类),折叠失败 502。详情据此回显,不留空(审查 low#7)。
+    let (status_code, error_kind): (Option<i64>, Option<String>) = match &outcome {
+        Outcome::Ok(_) => (Some(200), None),
+        Outcome::Upstream(e) => (
+            Some(if e.kind == UpstreamErrorKind::BadRequest {
+                400
+            } else {
+                502
+            }),
+            Some(format!("{:?}", e.kind)),
+        ),
+        Outcome::Bad(_) => (Some(502), Some("bad_gateway".to_string())),
+    };
     if success {
         scheduler.report_success(&account_id);
     } else {
@@ -1153,13 +1665,39 @@ async fn collect_response(
     finalize_usage(
         usage_sink,
         &account_id,
-        &model,
+        &req.model,
         &client_key,
         last_usage.as_ref(),
         success,
     )
     .await;
-    drop(lease); // 释放并发槽(响应已抽干)。
+    drop(lease); // 释放并发槽(响应已抽干);请求日志在其后 detach,不再占槽(审查 medium#4)。
+    // 请求日志落库:detach 到 blocking 线程池(序列化两份报文 + 写库),不延迟非流式响应、
+    // 不占用 async worker 线程。store/pending_writes 缺失(测试/降级)→ 跳过。
+    if let (Some(store), Some(pw), Ok(handle)) = (
+        store,
+        pending_writes,
+        tokio::runtime::Handle::try_current(),
+    ) {
+        let guard = pw.enter();
+        let duration_ms = Some(started_at.elapsed().as_millis() as i64);
+        handle.spawn_blocking(move || {
+            let _guard = guard;
+            write_request_log(
+                store,
+                req,
+                Some(account),
+                client_key,
+                false,
+                success,
+                status_code,
+                error_kind,
+                duration_ms,
+                None,
+                last_usage,
+            );
+        });
+    }
 
     match outcome {
         Outcome::Ok(msg) => (StatusCode::OK, Json(msg)).into_response(),
@@ -1174,12 +1712,15 @@ async fn collect_response(
 /// 关键:`lease`(并发许可)被 move 进流的状态,持有到流耗尽才 Drop → 整个响应期间
 /// 占用该账号一个并发槽,符合 v52 并发语义。流内出现 error 事件 / Err → 上报失败;
 /// 干净结束 → 上报成功。usage 事件不转发客户端(缓存到 `last_usage`,流终态统一落库)。
+#[allow(clippy::too_many_arguments)]
 fn stream_response(
     st: Arc<WorkerState>,
     lease: scheduler::AccountLease,
     stream: gw_core::provider::ChatStream,
-    model: String,
+    req: ChatRequest,
     client_key: String,
+    account: Arc<Account>,
+    started_at: std::time::Instant,
 ) -> axum::response::Response {
     /// unfold 累积态:lease 持有到流结束;reported 防重复上报;last_usage 缓存终结用量。
     struct StreamCtx {
@@ -1192,6 +1733,13 @@ fn stream_response(
         saw_error: bool,
         reported: bool,
         last_usage: Option<ChatUsage>,
+        // 请求日志(#③)采集态(client_payload 在 detach 的 blocking 任务里从 req.body 序列化,
+        // 不在此持有,避免热路径成本):
+        req: ChatRequest,
+        account: Arc<Account>,
+        started_at: std::time::Instant,
+        first_byte_at: Option<std::time::Instant>,
+        error_kind: Option<String>,
     }
 
     // 收尾(账号生命周期上报 + usage 落库)统一放 Drop:无论流跑到 None 正常结束,
@@ -1212,36 +1760,60 @@ fn stream_response(
                     self.st.scheduler.report_success(&self.account_id);
                 }
             }
-            // usage 落库(Drop 仅执行一次,无需额外去重标记)。
-            let (Some(sink), Some(usage)) = (self.st.usage_sink.clone(), self.last_usage.take())
-            else {
-                return;
-            };
-            let account_id = self.account_id.clone();
-            let model = self.model.clone();
-            let client_key = self.client_key.clone();
+            // detach 到当前运行时,做 usage 落库(#130)+ 请求日志落库(#③)。
+            // 请求日志**总是**尝试(失败请求也要记),故不像 #130 那样门控 usage/sink;
+            // finalize_usage / finalize_request_log 各自对 None 降级。无运行时上下文
+            // (理论上不会:SSE body 总在 tokio 内 drop)则跳过。guard 跟随任务存活:
+            // 停机排空经 pending_writes.wait_idle 等这批落库收尾(审查 Skeptic#1/Architect#1)。
             let success = !self.saw_error;
-            // detach 到当前运行时;无运行时上下文(理论上不会:SSE body 总在 tokio 内 drop)则跳过。
-            // guard 跟随任务存活:停机排空经 pending_writes.wait_idle 等这批落库收尾。
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let guard = self.st.pending_writes.enter();
-                handle.spawn(async move {
-                    let _guard = guard;
-                    finalize_usage(
-                        Some(&sink),
-                        &account_id,
-                        &model,
-                        &client_key,
-                        Some(&usage),
-                        success,
-                    )
-                    .await;
-                });
+            let duration_ms = Some(self.started_at.elapsed().as_millis() as i64);
+            let ttfb_ms = self
+                .first_byte_at
+                .map(|t| t.duration_since(self.started_at).as_millis() as i64);
+            let status_code: Option<i64> = if success { Some(200) } else { None };
+            let usage = self.last_usage.take();
+            let error_kind = self.error_kind.take();
+            // usage 落库(#130):async,detach 到运行时(sink.record 是 async)。
+            if let (Some(sink), Some(u)) = (self.st.usage_sink.clone(), usage.clone()) {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let guard = self.st.pending_writes.enter();
+                    let account_id = self.account_id.clone();
+                    let model = self.model.clone();
+                    let client_key = self.client_key.clone();
+                    handle.spawn(async move {
+                        let _guard = guard;
+                        finalize_usage(
+                            Some(&sink),
+                            &account_id,
+                            &model,
+                            &client_key,
+                            Some(&u),
+                            success,
+                        )
+                        .await;
+                    });
+                }
             }
+            // 请求日志落库(#③):detach 到 blocking 线程池(序列化两份报文 + 写库)。失败请求也记,
+            // 故不门控 usage/sink;client_payload 在 blocking 任务里从 req.body 序列化(离开热路径)。
+            spawn_request_log_blocking(
+                &self.st,
+                self.req.clone(),
+                Some(self.account.clone()),
+                self.client_key.clone(),
+                true,
+                success,
+                status_code,
+                error_kind,
+                duration_ms,
+                ttfb_ms,
+                usage,
+            );
         }
     }
 
     let account_id = lease.account_id().to_string();
+    let model = req.model.clone();
     let init = StreamCtx {
         st,
         account_id,
@@ -1252,6 +1824,11 @@ fn stream_response(
         saw_error: false,
         reported: false,
         last_usage: None,
+        req,
+        account,
+        started_at,
+        first_byte_at: None,
+        error_kind: None,
     };
 
     let sse = futures::stream::unfold(init, |mut ctx| async move {
@@ -1259,8 +1836,15 @@ fn stream_response(
         loop {
             match ctx.inner.next().await {
                 Some(Ok(StreamItem::Sse(ev))) => {
+                    // 首个转发事件时刻 = TTFB(请求日志 #③)。
+                    if ctx.first_byte_at.is_none() {
+                        ctx.first_byte_at = Some(std::time::Instant::now());
+                    }
                     if ev.event == "error" {
                         ctx.saw_error = true;
+                        if ctx.error_kind.is_none() {
+                            ctx.error_kind = Some("stream_error".to_string());
+                        }
                     }
                     let out = match ev.to_wire() {
                         Ok(_) => Event::default().event(ev.event).data(ev.data.to_string()),
@@ -1289,6 +1873,9 @@ fn stream_response(
                 }
                 Some(Err(e)) => {
                     ctx.saw_error = true; // 硬错误 → 本次响应失败(usage success=false)。
+                    if ctx.error_kind.is_none() {
+                        ctx.error_kind = Some(format!("{:?}", e.kind));
+                    }
                     if !ctx.reported {
                         ctx.reported = true;
                         ctx.st.scheduler.report_failure(&ctx.account_id, e.kind);
@@ -1323,6 +1910,21 @@ mod tests {
     use gw_core::provider::ChatUsage;
     use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn jittered_secs_within_bounds_and_degenerate() {
+        // 退化区间(min>=max)恒返回 min。
+        assert_eq!(jittered_secs(300, 300), 300);
+        assert_eq!(jittered_secs(300, 200), 300);
+        // 正常区间:多次采样都落在 [min, max] 内。
+        for _ in 0..256 {
+            let s = jittered_secs(QUOTA_POLL_MIN_SECS, QUOTA_POLL_MAX_SECS);
+            assert!(
+                (QUOTA_POLL_MIN_SECS..=QUOTA_POLL_MAX_SECS).contains(&s),
+                "{s} 越界 [{QUOTA_POLL_MIN_SECS}, {QUOTA_POLL_MAX_SECS}]"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn pending_writes_wait_idle_tracks_guards() {
@@ -1425,6 +2027,7 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 50,
             cache_creation_tokens: 7,
+            ..Default::default()
         };
         finalize_usage(Some(&dyn_sink), "acct-1", "claude-x", "sk-cust", Some(&usage), true).await;
         let rows = sink.rows.lock().unwrap();
@@ -1478,6 +2081,11 @@ mod tests {
         Box::pin(futures::stream::iter(items))
     }
 
+    /// 请求日志捕获参数下的最小 ChatRequest(model="m";store=None 时不会被实际使用)。
+    fn req_model_m() -> ChatRequest {
+        ChatRequest::from_anthropic_body(serde_json::json!({"model":"m","messages":[]}))
+    }
+
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1515,10 +2123,11 @@ mod tests {
                 output_tokens: 2,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                ..Default::default()
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into(), String::new()).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
@@ -1544,7 +2153,7 @@ mod tests {
                 serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
             ))),
         ];
-        let resp = collect_response(&sched, None, lease, chat_stream(items), "m".into(), String::new()).await;
+        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "overloaded_error");
@@ -1565,10 +2174,11 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                ..Default::default()
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), lease, chat_stream(items), "m".into(), String::new()).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -1639,5 +2249,36 @@ mod tests {
             ("access_token", "t"),
             ("expires_at", "2099-01-01T00:00:00Z"),
         ])));
+    }
+
+    #[test]
+    fn prepare_extracts_image_blob_keeps_text() {
+        // Anthropic 图片块:source.data 抽到 blob,报文里换 blob 引用;text 正文原样保留。
+        let big = "A".repeat(2048);
+        let raw = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "看这张图,顺便说下 a+b/c=d 是什么"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big}}
+                ]
+            }]
+        })
+        .to_string();
+        let (out, blobs) = prepare_log_payload(raw);
+        assert_eq!(blobs.len(), 1, "应抽出 1 个图片 blob");
+        assert_eq!(blobs[0].media_type, "image/png");
+        assert!(out.contains("看这张图") && out.contains("a+b/c=d"), "正文完整保留");
+        assert!(out.contains(&format!("blob:{}", blobs[0].hash)), "data 换成 blob 引用");
+        assert!(!out.contains(&"A".repeat(2048)), "原始 base64 不入报文");
+    }
+
+    #[test]
+    fn prepare_passes_through_non_json() {
+        // 非 JSON(如转换错误串)原样保留、无 blob(短串不触顶截断)。
+        let raw = "<转换失败: bad request>".to_string();
+        let (out, blobs) = prepare_log_payload(raw.clone());
+        assert_eq!(out, raw);
+        assert!(blobs.is_empty());
     }
 }

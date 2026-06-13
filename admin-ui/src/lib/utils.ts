@@ -34,3 +34,14 @@ export function formatPercent(numerator: number, denominator: number): string {
 export function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
+
+export function formatUsd(value: number): string {
+  if (Math.abs(value) >= 1000) {
+    return '$' + Math.round(value).toLocaleString('en-US')
+  }
+  return '$' + value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+export function formatMillions(value: number): string {
+  return `${(value / 1e6).toFixed(2)}M`
+}

@@ -15,7 +15,7 @@ interface SegmentProps<T extends string | number> {
   className?: string
 }
 
-/** Segmented control with a spring-animated active pill (framer-motion layoutId). */
+/** Segmented control with a spring-animated acid active pill (framer-motion layoutId). */
 export function Segment<T extends string | number>({
   options,
   value,
@@ -27,7 +27,7 @@ export function Segment<T extends string | number>({
   return (
     <div
       className={cn(
-        'glass-card-subtle inline-flex items-center gap-1 rounded-xl p-1',
+        'inline-flex items-center gap-1 rounded-full bg-black/5 p-1 dark:bg-white/10',
         className,
       )}
       role="tablist"
@@ -42,18 +42,14 @@ export function Segment<T extends string | number>({
             aria-selected={active}
             onClick={() => onChange(option.value)}
             className={cn(
-              'relative rounded-lg px-3 py-1.5 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
-              active ? 'text-white' : 'text-muted-foreground hover:text-foreground',
+              'relative rounded-full px-3.5 py-1.5 text-xs font-semibold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
+              active ? 'text-ink' : 'text-muted-foreground hover:text-foreground',
             )}
           >
             {active && (
               <motion.span
                 layoutId={layoutId}
-                className="absolute inset-0 rounded-lg"
-                style={{
-                  background:
-                    'linear-gradient(135deg, var(--gradient-from), var(--gradient-to))',
-                }}
+                className="absolute inset-0 rounded-full bg-acid"
                 transition={{ type: 'spring', stiffness: 380, damping: 32 }}
               />
             )}

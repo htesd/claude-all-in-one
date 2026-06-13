@@ -9,7 +9,7 @@ import type { SystemSettings, SystemSettingsPatch } from '@/features/settings/ty
 import { useI18n } from '@/lib/i18n'
 
 const inputClass =
-  'w-full rounded-xl border bg-input px-3 py-2 text-sm text-foreground transition-colors placeholder:text-muted-foreground focus:outline-none'
+  'w-full rounded-2xl border bg-input px-4 py-2.5 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground'
 
 /** 表单内部状态：数字字段均以字符串存储，提交时解析。 */
 interface FormState {
@@ -25,11 +25,14 @@ interface FormState {
   empty_response_threshold: string
   affinity_ttl_secs: string
   max_failures: string
+  quota_poll_enabled: boolean
   image_enabled: boolean
   image_max_long_edge: string
   image_max_pixels_single: string
   image_max_pixels_multi: string
   image_multi_threshold: string
+  tools_in_prefix: boolean
+  cache_point: boolean
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -46,11 +49,14 @@ function settingsToForm(s: SystemSettings): FormState {
     empty_response_threshold: String(s.empty_response_threshold),
     affinity_ttl_secs: String(s.affinity_ttl_secs),
     max_failures: String(s.max_failures),
+    quota_poll_enabled: s.quota_poll_enabled,
     image_enabled: s.image_enabled,
     image_max_long_edge: String(s.image_max_long_edge),
     image_max_pixels_single: String(s.image_max_pixels_single),
     image_max_pixels_multi: String(s.image_max_pixels_multi),
     image_multi_threshold: String(s.image_multi_threshold),
+    tools_in_prefix: s.tools_in_prefix,
+    cache_point: s.cache_point,
   }
 }
 
@@ -101,8 +107,16 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
   }
 
   // 布尔字段
-  if (form.image_enabled !== original.image_enabled) {
-    patch.image_enabled = form.image_enabled
+  const boolFields: Array<keyof SystemSettings & keyof FormState> = [
+    'quota_poll_enabled',
+    'image_enabled',
+    'tools_in_prefix',
+    'cache_point',
+  ]
+  for (const k of boolFields) {
+    if (form[k] !== original[k]) {
+      ;(patch as Record<string, unknown>)[k] = form[k]
+    }
   }
 
   return patch
@@ -150,12 +164,15 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       {/* 页头 */}
-      <div className="page-hero">
-        <h1 className="text-2xl font-bold">{t('settings.title')}</h1>
-        <p className="text-sm text-muted-foreground">{t('settings.subtitle')}</p>
-      </div>
+      <header className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="eyebrow">Settings</p>
+          <h1 className="mt-2 font-display text-4xl font-black tracking-[-0.04em]">{t('settings.title')}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{t('settings.subtitle')}</p>
+        </div>
+      </header>
 
       {/* 静态提示：进程拓扑需重启 */}
       <div className="flex items-start gap-2 rounded-xl bg-muted/50 px-4 py-3 text-xs text-muted-foreground">
@@ -170,7 +187,7 @@ export default function SettingsPage() {
         {/* ── 代理 ── */}
         <Card>
           <CardHeader>
-            <CardTitle>{t('settings.section.proxy')}</CardTitle>
+            <CardTitle className="text-base">{t('settings.section.proxy')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-1.5">
@@ -194,7 +211,7 @@ export default function SettingsPage() {
         {/* ── 缓存 ── */}
         <Card>
           <CardHeader>
-            <CardTitle>{t('settings.section.cache')}</CardTitle>
+            <CardTitle className="text-base">{t('settings.section.cache')}</CardTitle>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <div className="space-y-1.5">
@@ -273,7 +290,7 @@ export default function SettingsPage() {
         {/* ── 调度 ── */}
         <Card>
           <CardHeader>
-            <CardTitle>{t('settings.section.scheduler')}</CardTitle>
+            <CardTitle className="text-base">{t('settings.section.scheduler')}</CardTitle>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <div className="space-y-1.5">
@@ -360,13 +377,23 @@ export default function SettingsPage() {
                 className={inputClass}
               />
             </div>
+            <label className="flex cursor-pointer items-center gap-3 sm:col-span-2 lg:col-span-3">
+              <input
+                type="checkbox"
+                checked={form?.quota_poll_enabled ?? false}
+                onChange={(e) => set('quota_poll_enabled', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="h-4 w-4 rounded"
+              />
+              <span className="text-sm font-medium">{t('settings.field.quotaPollEnabled')}</span>
+            </label>
           </CardContent>
         </Card>
 
         {/* ── 图像压缩 ── */}
         <Card>
           <CardHeader>
-            <CardTitle>{t('settings.section.image')}</CardTitle>
+            <CardTitle className="text-base">{t('settings.section.image')}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             {/* 启用开关 */}
@@ -442,6 +469,49 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
+        {/* ── 实验性 ── */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">{t('settings.section.experimental')}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.tools_in_prefix ?? false}
+                onChange={(e) => set('tools_in_prefix', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.toolsInPrefix')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.toolsInPrefixHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.cache_point ?? false}
+                onChange={(e) => set('cache_point', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.cachePoint')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.cachePointHint')}
+                </span>
+              </span>
+            </label>
+          </CardContent>
+        </Card>
+
         {/* 保存区 */}
         {mutation.isError && (
           <ErrorNote error={mutation.error} labelKey="common.actionFailed" />
@@ -449,7 +519,7 @@ export default function SettingsPage() {
 
         <div className="flex items-center justify-end gap-3">
           {saved && (
-            <span className="text-sm text-success">{t('settings.saved')}</span>
+            <span className="text-sm text-emerald-700 dark:text-emerald-300">{t('settings.saved')}</span>
           )}
           <Button type="submit" disabled={isLoading || form === null || mutation.isPending}>
             {mutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}

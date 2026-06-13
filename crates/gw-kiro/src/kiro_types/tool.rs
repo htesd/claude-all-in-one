@@ -68,13 +68,12 @@ pub struct ToolResult {
     /// 执行状态（"success" 或 "error"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// 是否为错误
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// 是否为错误。**永不序列化上 wire**(🟢 对齐 static_flow `wire.rs:362` `skip_serializing`):
+    /// 真 Kiro 客户端不发 `isError` 字段,错误信号只走 `status:"error"`。保留本字段仅供内部
+    /// 按需派生 status(见 content.rs)。曾用 `skip_serializing_if=is_false` 会在出错时多发
+    /// `"isError":true`——真客户端没有的字段,既是检测面也与金标准报文不一致。
+    #[serde(default, skip_serializing)]
     pub is_error: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 impl ToolResult {
@@ -171,6 +170,15 @@ mod tests {
         assert!(json.contains("\"status\":\"success\""));
         // is_error = false 应该被跳过
         assert!(!json.contains("isError"));
+    }
+
+    #[test]
+    fn test_tool_result_error_does_not_serialize_is_error() {
+        // 🟢 对齐 static_flow:即使 is_error=true 也绝不上 wire,错误只走 status:"error"。
+        let result = ToolResult::error("tool-err", "boom");
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"status\":\"error\""), "错误信号应走 status");
+        assert!(!json.contains("isError"), "isError 字段绝不序列化(真客户端没有)");
     }
 
     #[test]

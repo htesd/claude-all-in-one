@@ -27,6 +27,42 @@ use crate::error_map::classify_chat_error;
 use crate::kiro_types::request::KiroRequest;
 use crate::parser::decoder::EventStreamDecoder;
 
+/// 出站体积护栏:序列化体积超 `max_body_bytes` 时,从 history 剔最老媒体瘦身后重序列化;
+/// 仍超限或无媒体可剔则 `Err(BadRequest)`(不发上游、不惩罚账号)。返回最终请求体字符串。
+///
+/// 🔵 对齐 kiro.rs v63 `enforce_upstream_body_limit`。无 headroom:caio 序列化的 body 即
+/// 最终出站字节(profileArn 已在序列化前注入,发包路径只加 header 不改 body)。
+fn enforce_body_limit(
+    kiro_req: &mut KiroRequest,
+    body: String,
+    max_body_bytes: usize,
+) -> Result<String, UpstreamError> {
+    if body.len() <= max_body_bytes {
+        return Ok(body);
+    }
+    let need = body.len() - max_body_bytes;
+    let shed = converter::shed_history_media(&mut kiro_req.conversation_state.history, need);
+    if shed.dropped_documents + shed.dropped_images == 0 {
+        // 没有可剔的历史媒体(超大的是文本/工具/当前消息),无法自动修复
+        return Err(UpstreamError::bad_request(format!(
+            "请求体 {} 字节超出上游体积上限 {} 字节,且无历史媒体可剔除以瘦身;请减少附件或对话历史",
+            body.len(),
+            max_body_bytes
+        )));
+    }
+    let reshrunk = serde_json::to_string(kiro_req).map_err(|e| {
+        UpstreamError::new(UpstreamErrorKind::Other, format!("体积护栏重序列化失败: {e}"))
+    })?;
+    if reshrunk.len() > max_body_bytes {
+        return Err(UpstreamError::bad_request(format!(
+            "请求体剔除历史媒体后仍 {} 字节,超出上游体积上限 {} 字节;请减少当前消息附件",
+            reshrunk.len(),
+            max_body_bytes
+        )));
+    }
+    Ok(reshrunk)
+}
+
 /// api 区域:`api_region` > `region` > us-east-1。
 fn api_region(account: &Account) -> String {
     account
@@ -35,6 +71,29 @@ fn api_region(account: &Account) -> String {
         .or_else(|| account.extra_str("region").filter(|s| !s.is_empty()))
         .unwrap_or("us-east-1")
         .to_string()
+}
+
+/// 渲染"发往 Kiro 前"的完整请求体 JSON,仅用于请求日志(调试)展示。
+///
+/// 纯函数:复刻 [`chat_stream`] 的转换 + thinking 覆写 + profileArn 注入,但**不跑 cache_sim、
+/// 不做体积护栏、不发送上游**——无副作用,可在落库的 detach 异步任务里安全调用,绝不碰热路径。
+/// 任何阶段失败都返回带说明的占位串(绝不 panic、不阻断日志落库)。
+pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
+    let mut messages_req: crate::anthropic_types::MessagesRequest =
+        match serde_json::from_value(req.body.clone()) {
+            Ok(m) => m,
+            Err(e) => return format!("<解析 Anthropic 请求体失败: {e}>"),
+        };
+    crate::thinking_policy::override_thinking_from_model_name(&mut messages_req);
+    let conversion = match converter::convert_request(&messages_req) {
+        Ok(c) => c,
+        Err(e) => return format!("<转换失败: {e}>"),
+    };
+    let kiro_req = KiroRequest {
+        conversation_state: conversion.conversation_state,
+        profile_arn: crate::headers::resolve_profile_arn(account),
+    };
+    serde_json::to_string_pretty(&kiro_req).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
 }
 
 /// 发起一次 generateAssistantResponse,返回 Anthropic SSE 事件流。
@@ -47,6 +106,7 @@ pub async fn chat_stream(
     machine_id: String,
     req: ChatRequest,
     cache_billing: crate::CacheBilling,
+    max_body_bytes: usize,
 ) -> Result<ChatStream, UpstreamError> {
     // 1. 解析 Anthropic body → 强类型 MessagesRequest
     let mut messages_req: crate::anthropic_types::MessagesRequest =
@@ -63,30 +123,46 @@ pub async fn chat_stream(
         UpstreamError::bad_request(format!("转换失败: {e}"))
     })?;
 
-    // 2.5 Prefix 缓存命中模拟(v53:billing 唯一路径)。🔵 对齐 kiro.rs handlers.rs:1558——
-    // 在把 conversation_state move 进 KiroRequest 前算一次。
+    // 3. 组装顶层 KiroRequest(注入 profileArn:显式值 > 按 idp 固定兜底,对齐 static_flow)
+    let profile_arn = crate::headers::resolve_profile_arn(&account);
+    let mut kiro_req = KiroRequest {
+        conversation_state: conversion.conversation_state,
+        profile_arn: profile_arn.clone(),
+    };
+    let mut body = serde_json::to_string(&kiro_req)
+        .map_err(|e| UpstreamError::new(UpstreamErrorKind::Other, format!("序列化 KiroRequest 失败: {e}")))?;
+
+    // 3.5 出站体积护栏(🔵 kiro.rs v63):超上游报文上限 → 先从 history 剔最老媒体瘦身,
+    // 仍超限则本地 BadRequest(不发上游、不惩罚账号)。整个会话从"超限即每轮必 400 毒化"
+    // 变为"自动瘦身续命"。剔除会就地改 kiro_req.conversation_state.history,故后续 cache_sim
+    // 观测到的是真正发出的 state(见 3.6)。
+    body = enforce_body_limit(&mut kiro_req, body, max_body_bytes)?;
+
+    // 3.6 Prefix 缓存命中模拟(v53:billing 唯一路径)。🔵 对齐 kiro.rs。
+    // **必须在体积护栏之后**观测(审查 Architect#2):护栏剔除历史媒体后,这里观测的是
+    // **真正发给上游的** conversation_state,否则会按未剔除口径高估 input/cache_read tokens
+    // 落库计费,且把从未发出的前缀写进模拟缓存状态污染后续轮。
     //
-    // session_key 必须按**账号**隔离(审查 Architect#1):kiro.rs 是单进程单账号池,
-    // 仅用 conversationId 即可;claude-all-in-one 一个 worker 固定一组多账号,真实 Kiro prefix cache
-    // 是 per-account 后端会话隔离的。若两账号撞同一派生 conversationId(同 system+前2条 user),
-    // 仅用 convId 作键会让 A 账号的前缀污染 B 账号的命中估算 → 误报缓存折扣/串号计费。
+    // session_key 必须按**账号**隔离:claude-all-in-one 一个 worker 固定一组多账号,真实 Kiro
+    // prefix cache 是 per-account 后端会话隔离的。若两账号撞同一派生 conversationId(同 system+
+    // 前2条 user),仅用 convId 作键会让 A 账号前缀污染 B 账号命中估算 → 误报折扣/串号计费。
     // 故 key = account_id + '\x1f' + conversationId,与上游缓存粒度对齐。
     let sim_cache: (i32, i32) = {
-        let cs = &conversion.conversation_state;
+        let cs = &kiro_req.conversation_state;
         let session_key = format!("{}\x1f{}", account.account_id, cs.conversation_id);
         let fps = crate::cache_sim::fingerprints_from_state(cs);
         let sim = crate::cache_sim::observe(&session_key, &req.model, fps);
         (sim.cache_read_tokens as i32, sim.total_tokens as i32)
     };
 
-    // 3. 组装顶层 KiroRequest(注入 profileArn:显式值 > 按 idp 固定兜底,对齐 static_flow)
-    let profile_arn = crate::headers::resolve_profile_arn(&account);
-    let kiro_req = KiroRequest {
-        conversation_state: conversion.conversation_state,
-        profile_arn: profile_arn.clone(),
-    };
-    let body = serde_json::to_string(&kiro_req)
-        .map_err(|e| UpstreamError::new(UpstreamErrorKind::Other, format!("序列化 KiroRequest 失败: {e}")))?;
+    // 3.7 毒报文备忘录(🔵 kiro.rs v63):同字节级 payload 近期已被上游确定性 400 过 →
+    // 本地 BadRequest 拦截,不再打上游。兜住无视 400 仍重试的客户端(本次事故上游即此类)。
+    let poison_fp = crate::poison_memo::fingerprint(&body);
+    if crate::poison_memo::is_poisoned(&poison_fp) {
+        return Err(UpstreamError::bad_request(
+            "该请求体近期已被上游判为非法(HTTP 400)并被本地缓存拦截;重试相同请求不会成功,请修改请求(如减少附件或历史)后重试",
+        ));
+    }
 
     // 4. access_token(P1:要求账号已持有有效 token;刷新/重试由 scheduler 层负责)
     let access_token = account
@@ -121,7 +197,18 @@ pub async fn chat_stream(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(classify_chat_error(status.as_u16(), &body_text));
+        let err = classify_chat_error(status.as_u16(), &body_text);
+        // 只记**报文格式/体积类**的确定性 400("Improperly formed request"),不记所有
+        // BadRequest(审查 Minimalist#1):后者可能含账号/profile/entitlement 相关 400,
+        // 换号或修 profile 后同 body 本可成功,记毒会跨账号误伤 600s。格式/体积类才是
+        // 与账号无关、同 body 重试必败的真确定性失败 —— 对齐 kiro.rs v63 的短语门。
+        if status.as_u16() == 400
+            && err.kind == UpstreamErrorKind::BadRequest
+            && body_text.contains("Improperly formed")
+        {
+            crate::poison_memo::remember(poison_fp);
+        }
+        return Err(err);
     }
 
     // 6. 流式读响应字节 → eventstream 解码 → Anthropic SSE StreamItem
@@ -568,6 +655,12 @@ fn async_stream_like(
         // report_total:计费基准 token。优先 tokenUsageEvent 真值(uncached+cacheRead),
         // 退而 contextUsageEvent(pct×窗口),再退模拟器 sim_total。
         let mut report_total: Option<i32> = None;
+        // 诊断/优化信号(不参与计费):真实上游命中 + Kiro 原生计费。
+        // real_cache_read = tokenUsageEvent.cacheReadInputTokens(真号在 Kiro 服务端的真实
+        // prefix cache 命中);metering_credit = meteringEvent.usage(真号本次真实积分消耗)。
+        // 二者落进请求日志的"真 / credit"列,供前端看每条请求的真实命中与真实成本来优化缓存。
+        let mut real_cache_read: i64 = 0;
+        let mut metering_credit: f64 = 0.0;
         let window = crate::converter::get_context_window_size(&model);
         futures::pin_mut!(byte_stream);
 
@@ -691,6 +784,8 @@ fn async_stream_like(
                                     if total_input > 0 {
                                         report_total = Some(total_input.min(i32::MAX as i64) as i32);
                                     }
+                                    // 留住真实命中(诊断/优化用,不进计费)。
+                                    real_cache_read = cr.max(0);
                                 }
                             }
                             Some("contextUsageEvent") => {
@@ -713,7 +808,14 @@ fn async_stream_like(
                                 }
                             }
                             Some("meteringEvent") => {
-                                // v53 已不靠 metering 反推缓存;此处仅吞掉(留兼容)。
+                                // Kiro 原生计费(真号本次真实积分消耗,单位通常 "credit")。v53 不靠它
+                                // 反推缓存,但留作请求日志的"真实 credit"信号——判断 Kiro 服务端有没有
+                                // 应用缓存折扣、每条请求真号到底烧了多少。仅记录,不参与上报计费。
+                                if let Ok(v) = frame.payload_as_json::<serde_json::Value>() {
+                                    if let Some(u) = v.get("usage").and_then(|x| x.as_f64()) {
+                                        metering_credit = u;
+                                    }
+                                }
                             }
                             // event-type 异常名兜底(:message-type=event 但 event-type 是异常名
                             // 的奇异帧;常规异常帧已在上方按 :message-type 路由)。
@@ -833,6 +935,8 @@ fn async_stream_like(
                 output_tokens: output_tokens.max(0) as u64,
                 cache_read_tokens: cache_read.max(0) as u64,
                 cache_creation_tokens: cache_creation.max(0) as u64,
+                real_cache_read_tokens: real_cache_read.max(0) as u64,
+                metering_credit,
             })))
             .await;
     });
@@ -844,6 +948,73 @@ fn async_stream_like(
 mod tests {
     use super::*;
     use base64::Engine;
+
+    // ===== 出站体积护栏 enforce_body_limit(🔵 kiro.rs v63 移植)=====
+    mod body_limit {
+        use super::super::enforce_body_limit;
+        use crate::kiro_types::conversation::{
+            ConversationState, CurrentMessage, HistoryUserMessage, KiroDocument, Message,
+            UserInputMessage, UserMessage,
+        };
+        use crate::kiro_types::request::KiroRequest;
+        use gw_core::error::UpstreamErrorKind;
+
+        fn req_with_history_doc(b64_len: usize) -> KiroRequest {
+            let mut hist = UserMessage::new("analyze this", "claude-opus-4.8");
+            hist.documents
+                .push(KiroDocument::from_base64("doc", "pdf", "A".repeat(b64_len)));
+            let cs = ConversationState::new("conv")
+                .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                    "hello",
+                    "claude-opus-4.8",
+                )))
+                .with_history(vec![Message::User(HistoryUserMessage { user_input_message: hist })]);
+            KiroRequest { conversation_state: cs, profile_arn: None }
+        }
+
+        #[test]
+        fn under_limit_passthrough_unchanged() {
+            let mut req = req_with_history_doc(100);
+            let body = serde_json::to_string(&req).unwrap();
+            let original = body.clone();
+            let out = enforce_body_limit(&mut req, body, 1_000_000).unwrap();
+            assert_eq!(out, original, "未超限不应改动请求体");
+            // 历史媒体应原样保留
+            if let Message::User(u) = &req.conversation_state.history[0] {
+                assert_eq!(u.user_input_message.documents.len(), 1);
+            }
+        }
+
+        #[test]
+        fn over_limit_sheds_history_media_and_passes() {
+            let mut req = req_with_history_doc(50_000);
+            let body = serde_json::to_string(&req).unwrap();
+            assert!(body.len() > 10_000);
+            let out = enforce_body_limit(&mut req, body, 10_000).unwrap();
+            assert!(out.len() <= 10_000, "剔除后应低于上限,实际 {}", out.len());
+            assert!(out.contains("attachment omitted"), "剔除回合应带占位说明");
+            if let Message::User(u) = &req.conversation_state.history[0] {
+                assert!(u.user_input_message.documents.is_empty());
+            }
+        }
+
+        #[test]
+        fn over_limit_no_sheddable_media_rejects_bad_request() {
+            // 超大的是当前消息文本(history 无媒体可剔)→ BadRequest
+            let mut hist = UserMessage::new("x".repeat(50_000), "claude-opus-4.8");
+            hist.documents.clear();
+            let cs = ConversationState::new("conv")
+                .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                    "hi",
+                    "claude-opus-4.8",
+                )))
+                .with_history(vec![Message::User(HistoryUserMessage { user_input_message: hist })]);
+            let mut req = KiroRequest { conversation_state: cs, profile_arn: None };
+            let body = serde_json::to_string(&req).unwrap();
+            let err = enforce_body_limit(&mut req, body, 10_000).unwrap_err();
+            assert_eq!(err.kind, UpstreamErrorKind::BadRequest, "无媒体可剔应 BadRequest");
+        }
+    }
 
     // 收集事件的 (event名, delta类型 或 block类型) 便于断言时序。
     fn tag(ev: &SseEvent) -> String {

@@ -14,7 +14,7 @@ import { CUSTOM_KEY_PATTERN, type CreateKeyPayload } from '../types'
 import { CopyKeyButton } from './CopyKeyButton'
 
 const inputClass =
-  'w-full rounded-xl border bg-input px-3 py-2 text-sm text-foreground transition-colors placeholder:text-muted-foreground focus:outline-none'
+  'w-full rounded-2xl border bg-input px-4 py-2.5 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground'
 
 interface CreateKeyDialogProps {
   open: boolean
@@ -91,7 +91,7 @@ export function CreateKeyDialog({ open, onClose }: CreateKeyDialogProps) {
       {createdKey !== null ? (
         /* 成功确认态：展示完整 key + 复制 */
         <div className="mt-4 space-y-4">
-          <div className="flex items-start gap-2 rounded-xl border bg-input px-3 py-2.5">
+          <div className="flex items-start gap-2 rounded-2xl border border-acid/60 bg-acid/10 px-3 py-2.5">
             <code className="min-w-0 flex-1 break-all font-mono text-xs leading-5">
               {createdKey}
             </code>

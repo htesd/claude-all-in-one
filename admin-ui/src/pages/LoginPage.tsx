@@ -1,9 +1,7 @@
 import { useState, type FormEvent } from 'react'
-import { KeyRound, Loader2, LogIn, ShieldCheck } from 'lucide-react'
+import { KeyRound, Loader2, LogIn } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
-import { Button } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
 import {
   clearToken,
   extractErrorMessage,
@@ -13,6 +11,7 @@ import {
 } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 
+/** 登录页是品牌时刻:无论明暗模式,恒为 ink 暗色画布 + acid 强调。 */
 export default function LoginPage() {
   const { t } = useI18n()
   const navigate = useNavigate()
@@ -48,18 +47,20 @@ export default function LoginPage() {
 
   return (
     <div className="ambient-bg flex min-h-screen items-center justify-center p-4">
-      <Card variant="glass-strong" className="acrylic-noise w-full max-w-sm p-8">
-        <div className="flex flex-col items-center text-center">
-          <div className="gradient-bg-primary breathe-glow flex h-14 w-14 items-center justify-center rounded-2xl shadow-lg">
-            <ShieldCheck className="h-7 w-7 text-white" />
-          </div>
-          <h1 className="mt-4 text-xl font-bold tracking-tight">{t('login.title')}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{t('login.subtitle')}</p>
+      <div className="w-full max-w-sm rounded-[2.5rem] border border-white/10 bg-white/[0.08] p-8 shadow-2xl shadow-black/35 backdrop-blur-xl">
+        <div className="text-center">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.32em] text-white/35">
+            Admin Console
+          </p>
+          <h1 className="mt-3 font-display text-5xl font-black leading-none tracking-[-0.06em] text-white">
+            CA<span className="text-acid">IO</span>
+          </h1>
+          <p className="mt-3 text-sm text-white/55">{t('login.subtitle')}</p>
         </div>
 
-        <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+        <form onSubmit={handleSubmit} className="mt-8 space-y-4">
           <div className="relative">
-            <KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <KeyRound className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-white/30" />
             <input
               type="password"
               value={tokenInput}
@@ -70,22 +71,26 @@ export default function LoginPage() {
               placeholder={t('login.placeholder')}
               autoFocus
               autoComplete="current-password"
-              className="w-full rounded-xl border bg-input py-2.5 pl-10 pr-4 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground"
+              className="w-full rounded-2xl border bg-black/35 py-3 pl-11 pr-4 text-sm text-white outline-none transition-colors placeholder:text-white/25 !border-white/10 focus:!border-acid"
             />
           </div>
 
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {error && <p className="text-sm text-rose-300">{error}</p>}
 
-          <Button type="submit" className="w-full" disabled={!tokenInput.trim() || loading}>
+          <button
+            type="submit"
+            disabled={!tokenInput.trim() || loading}
+            className="inline-flex w-full items-center justify-center gap-2 rounded-full bg-acid py-3 text-sm font-semibold text-ink transition hover:bg-white disabled:pointer-events-none disabled:opacity-50"
+          >
             {loading ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
               <LogIn className="h-4 w-4" />
             )}
             {loading ? t('login.checking') : t('login.submit')}
-          </Button>
+          </button>
         </form>
-      </Card>
+      </div>
     </div>
   )
 }

@@ -16,7 +16,7 @@ import { CopyKeyButton } from './CopyKeyButton'
 
 /** 行内小图标按钮的统一样式（备注铅笔 / 删除等）。 */
 const iconButtonClass =
-  'inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10'
+  'inline-flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10'
 
 interface KeyRowProps {
   row: ApiKeyRow
@@ -97,7 +97,7 @@ export function KeyRow({
               onKeyDown={handleLabelKeyDown}
               placeholder={t('keys.label.placeholder')}
               autoFocus
-              className="h-7 w-36 rounded-lg border bg-input px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              className="h-7 w-36 rounded-xl border bg-input px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             />
             <button
               type="button"
@@ -234,7 +234,7 @@ export function KeyRow({
               onClick={() => setConfirmingDelete(true)}
               title={t('keys.action.delete')}
               disabled={busy}
-              className={cn(iconButtonClass, 'hover:text-destructive')}
+              className={cn(iconButtonClass, 'hover:text-rose-600 dark:hover:text-rose-300')}
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
