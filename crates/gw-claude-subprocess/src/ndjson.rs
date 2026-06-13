@@ -56,6 +56,8 @@ pub fn parse_result_usage(value: &serde_json::Value) -> Option<ChatUsage> {
             usage,
             &[&["cache_creation_input_tokens"], &["cache_creation", "input_tokens"]],
         ),
+        // 真实命中/Kiro 原生计费是 Kiro provider 专有信号,subprocess(Claude Code 直通)无,置 0。
+        ..Default::default()
     })
 }
 

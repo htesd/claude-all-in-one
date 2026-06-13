@@ -60,11 +60,11 @@ export function SummaryStrip({ data, loading }: SummaryStripProps) {
           ))
         : items.map((item) => (
             <div key={item.label}>
-              <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              <div className="eyebrow text-muted-foreground">
                 {item.label}
               </div>
               <div
-                className="mt-1 text-lg font-semibold tabular-nums tracking-tight"
+                className="mt-1 font-display text-2xl font-black tracking-[-0.04em] tabular-nums"
                 title={item.title}
               >
                 {item.value}

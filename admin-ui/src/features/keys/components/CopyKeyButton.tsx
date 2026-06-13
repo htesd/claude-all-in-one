@@ -43,7 +43,7 @@ export function CopyKeyButton({ value, className }: { value: string; className?:
       title={title}
       aria-label={title}
       className={cn(
-        'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 dark:hover:bg-white/10',
+        'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 dark:hover:bg-white/10',
         state === 'copied' && 'text-success hover:text-success',
         state === 'failed' && 'text-destructive hover:text-destructive',
         className,

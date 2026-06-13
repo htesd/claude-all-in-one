@@ -22,15 +22,21 @@ mod model_map;
 mod normalize;
 mod pairing;
 mod session;
+mod shed;
+mod tool_id;
 mod tools;
 
 // 重导出子模块项,使本文件(及测试)无需逐一限定路径即可调用。
-pub use model_map::{get_context_window_size, map_model};
+pub use model_map::{advertised_models, get_context_window_size, map_model, AdvertisedModel};
+pub use shed::{shed_history_media, MediaShed};
+/// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
+pub(crate) use cache_point::set_experimental_flags;
 use cache_point::*;
 use content::*;
 use history::*;
 use pairing::*;
 use session::*;
+use tool_id::rewrite_duplicate_tool_use_ids;
 use tools::*;
 // normalize 的项在本文件以显式路径调用;glob 仅给测试模块用(避免非测试构建 unused 警告)。
 #[cfg(test)]
@@ -144,10 +150,21 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 3. 生成会话 ID 和代理 ID。conversationId 派生逻辑抽到 [`derive_conversation_id`]
     //    (worker 会话亲和也复用它,保证 router/sim/亲和三处身份链同源)。
     let conversation_id = derive_conversation_id(req, messages);
-    // agentContinuationId 也必须稳定 —— 实测证据：同 conversationId 但每次新生成
-    // agentContinuationId 时 Kiro 后端 prompt cache miss、metering ~3 倍。
-    // 用 conversationId 派生（不同 UUID 但跟着对话走，让 Kiro 后端能稳定识别同一会话）。
-    let agent_continuation_id = derive_agent_continuation_id(&conversation_id);
+    // 【根因·真实缓存全 miss】(2026-06-13 线上 caio 实锤,真号 真=miss/全冷)：
+    // 旧实现自造一个稳定的 agentContinuationId 上 wire。Kiro 收到 agentContinuationId 会把请求
+    // 当成「续接一个它从未签发的 agent 上下文」,于是**绕过 conversationId 前缀缓存** → 同一对话
+    // 连续轮也每轮冷 miss、真号真实额度暴烧。static_flow(金标准)与 kiro.rs(生产)都**完全不发**
+    // 这个字段;static_flow 还专门有测试 does_not_send_random_agent_continuation_metadata 锁死。
+    // 旧注释"agentContinuationId 必须稳定/否则 3 倍计费"实为误判(对比的是「稳定发」vs「随机发」
+    // 两个都错的配置;正解是**根本不发**)。故此处不再派生、不再上 wire。见 [[real-cache-hit]] 修正。
+
+    // 3.1 跨轮重复 tool_use_id 重写(🟢 static_flow)。客户端反复 auto-compact 后,同一
+    // tool_use_id 可能在两个各自已完成的 assistant 轮里各出现一次,直发会让 Kiro 400。
+    // **必须在 conversationId 派生之后**:身份哈希走原始 messages,与 worker 的
+    // `affinity_key_from_body`(同样基于原始 body)同源;改写只作用于发往 Kiro 的 wire 报文。
+    // 无重复时返回 None,继续用原 borrowed slice(零拷贝)。畸形输入不报错,交 pairing 兜底。
+    let deduped = rewrite_duplicate_tool_use_ids(messages);
+    let messages: &[_] = deduped.as_deref().unwrap_or(messages);
 
     // 3.5 块1a:处理 messages 数组里 role=="system" 的消息(代理链中段注入)。
     // 三级分流:稳定前缀提升进 promoted_system / 动态噪声丢弃 / interrupted-user 与未知转 user。
@@ -213,6 +230,17 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
             tools.push(create_placeholder_tool(&tool_name));
         }
     }
+
+    // 10.5 多模态 schema 兼容(🟢 static_flow):请求(当前轮或历史)含图片时,Kiro 会拒绝带
+    // anyOf/oneOf/$defs 等复杂关键字的工具 schema(400 Improperly formed request)。把这类 schema
+    // 整体降级为宽松 object schema;无图片则原样不动。在工具放置前做,current/history 放置都覆盖。
+    // 用**转换后**的图判定(caio 丢弃 url/file 图、只留 base64 上 wire):current=已转 `images`,
+    // history=已转 KiroImage。避免按原始报文误判(带 url 图但 wire 无图却误降级,审查 Skeptic#2)。
+    let has_images = !images.is_empty()
+        || history
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if !u.user_input_message.images.is_empty()));
+    apply_multimodal_tool_schema_compatibility(&mut tools, has_images);
 
     // 11. 构建 UserInputMessageContext
     // 记录是否有工具结果（validated_tool_results 随后会被移动进 context，这里先存一份布尔量
@@ -321,9 +349,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     }
 
     // 13. 构建 ConversationState
+    // 【只发 chat_trigger_type=MANUAL,不发 agentContinuationId / agentTaskType】——逐字对齐
+    // static_flow 金标准(测试 does_not_send_random_agent_continuation_metadata 断言这俩为 None)
+    // 与 kiro.rs 生产(二者均不发)。详见下方根因注释。
     let conversation_state = ConversationState::new(conversation_id)
-        .with_agent_continuation_id(agent_continuation_id)
-        .with_agent_task_type("vibe")
         .with_chat_trigger_type(chat_trigger_type)
         .with_current_message(current_message)
         .with_history(history);
@@ -346,6 +375,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
 }
+
 
 #[cfg(test)]
 mod tests;

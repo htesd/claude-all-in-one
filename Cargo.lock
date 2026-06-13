@@ -711,6 +711,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "flate2",
  "gw-core",
  "parking_lot",
  "rusqlite",

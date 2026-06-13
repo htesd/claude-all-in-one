@@ -31,7 +31,7 @@ export function TR({ className, ...props }: HTMLAttributes<HTMLTableRowElement>)
   return (
     <tr
       className={cn(
-        'border-b border-black/5 transition-colors last:border-0 hover:bg-white/30 dark:border-white/5 dark:hover:bg-white/5',
+        'border-b border-black/5 transition-colors last:border-0 hover:bg-black/[0.025] dark:border-white/5 dark:hover:bg-white/[0.04]',
         className,
       )}
       {...props}
@@ -43,7 +43,7 @@ export function TH({ className, ...props }: ThHTMLAttributes<HTMLTableCellElemen
   return (
     <th
       className={cn(
-        'h-10 whitespace-nowrap px-4 text-left align-middle text-xs font-medium uppercase tracking-wider text-muted-foreground',
+        'h-10 whitespace-nowrap px-4 text-left align-middle text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground',
         className,
       )}
       {...props}

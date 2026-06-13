@@ -48,6 +48,8 @@ struct Tuning {
     empty_threshold: u32,
     /// 连续 API 失败达此次数 → 自动禁用(TooManyFailures,可被全灭自愈)。
     max_failures: u32,
+    /// worker 后台配额轮询开关(热生效:设置面板改后 30s 内经 update_tuning 替换)。
+    quota_poll_enabled: bool,
 }
 
 impl From<&SchedulerConfig> for Tuning {
@@ -59,6 +61,7 @@ impl From<&SchedulerConfig> for Tuning {
             empty_window: Duration::from_secs(c.empty_response_window_secs.max(1)),
             empty_threshold: c.empty_response_threshold.max(1),
             max_failures: c.max_failures.max(1),
+            quota_poll_enabled: c.quota_poll_enabled,
         }
     }
 }
@@ -247,6 +250,11 @@ impl AccountScheduler {
     /// 不动任何账号运行态(已生效冷却/失败计数保留),只影响其后的判定。
     pub fn update_tuning(&self, cfg: &SchedulerConfig) {
         *self.tuning.write() = Tuning::from(cfg);
+    }
+
+    /// 后台配额轮询当前是否启用(热值;worker 轮询每轮读它,设置面板改后 30s 内生效)。
+    pub fn quota_poll_enabled(&self) -> bool {
+        self.tuning.read().quota_poll_enabled
     }
 
     /// 组内账号总数。

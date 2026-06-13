@@ -72,8 +72,7 @@ export function UsageFilterBar({
 
   return (
     <Card
-      variant="glass-subtle"
-      className="flex flex-wrap items-center gap-x-5 gap-y-3 rounded-2xl px-4 py-3"
+      className="flex flex-wrap items-center gap-x-5 gap-y-3 rounded-2xl border border-border bg-card px-4 py-3 shadow-sm"
     >
       {/* Time: quick presets (dimmed while a custom range is active) */}
       <div className="flex items-center gap-2">

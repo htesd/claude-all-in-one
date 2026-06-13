@@ -21,6 +21,7 @@ pub mod inline_thinking;
 pub mod kiro_types;
 pub mod machine_id;
 pub mod parser;
+pub mod poison_memo;
 pub mod profiles;
 pub mod resolver;
 pub mod signature;
@@ -113,7 +114,18 @@ pub struct KiroProvider {
     cache_billing: parking_lot::RwLock<CacheBilling>,
     /// 图像压缩参数(system.yaml `image` 段 + 热调;chat 前对 body 内 base64 图瘦身 + OOM 护栏)。
     image_cfg: parking_lot::RwLock<gw_core::config::ImageConfig>,
+    /// 出站请求体体积上限(字节)。序列化后的 KiroRequest 超此值时,先从 history
+    /// 剔最老媒体瘦身;仍超限则本地 BadRequest(不发上游)。🔵 搬运自 kiro.rs v63
+    /// (实测 Kiro 报文体积硬上限在 (6.34, 7.34]MB,默认取 6,300,000)。
+    ///
+    /// 目前固定为 [`DEFAULT_MAX_BODY_BYTES`]:不经 admin 热调(caio 的 SystemConfig 分节
+    /// 结构暂无此项干净归属;接入 admin 面板时再一并加 SystemSettings 字段与归属节)。
+    /// 测试用 [`with_max_body_bytes`](Self::with_max_body_bytes) 注入小值验证护栏。
+    max_body_bytes: usize,
 }
+
+/// 出站请求体体积上限默认值(字节)。已知成功最大值 6,341,854 之下,方向安全。
+pub const DEFAULT_MAX_BODY_BYTES: usize = 6_300_000;
 
 impl KiroProvider {
     /// 用 worker 基础 egress client 构造(无默认代理)。测试与简单注入用。
@@ -123,12 +135,19 @@ impl KiroProvider {
             resolver: resolver::EgressResolver::new(egress_client, None),
             cache_billing: parking_lot::RwLock::new(CacheBilling::default()),
             image_cfg: parking_lot::RwLock::new(gw_core::config::ImageConfig::default()),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 
     /// 显式指定缓存计费参数(测试 / 配置注入用)。
     pub fn with_cache_billing(self, billing: CacheBilling) -> Self {
         *self.cache_billing.write() = billing;
+        self
+    }
+
+    /// 显式指定出站体积上限(测试用:注入小值即可在不构造 MB 级 body 下验证护栏)。
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
         self
     }
 
@@ -160,6 +179,7 @@ impl KiroProvider {
             resolver: resolver::EgressResolver::new(egress_client, default_proxy),
             cache_billing: parking_lot::RwLock::new(CacheBilling::from_cfg(cfg)),
             image_cfg: parking_lot::RwLock::new(image_cfg),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }))
     }
 }
@@ -212,19 +232,23 @@ impl Provider for KiroProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, UpstreamError> {
-        // P1:返回 converter 已支持映射的模型集合(对外名)。真实 ListAvailableModels 留 P2。
-        let mk = |id: &str, thinking: bool| {
-            let mut m = ModelInfo::new(id);
-            m.supports_thinking = thinking;
-            m.supports_tools = true;
-            m.supports_vision = true;
-            m
-        };
-        Ok(vec![
-            mk("claude-opus-4-8", true),
-            mk("claude-sonnet-4-5", true),
-            mk("claude-haiku-4-5", false),
-        ])
+        // 目录由 converter 权威表 `KIRO_MODELS` **生成**(`advertised_models`):每个基础模型
+        // 展开 plain / -thinking / 日期快照 / 日期-thinking,与 chat 实际可服务(map_model)+
+        // 身份规范化(requested_model_identity)同源、不漂移。context_length 由
+        // get_context_window_size 统一推导。真实 ListAvailableModels(逐账号上游查询)留 P2。
+        let models = converter::advertised_models()
+            .into_iter()
+            .map(|am| {
+                let mut m = ModelInfo::new(am.id.clone());
+                m.display_name = Some(am.display_name);
+                m.context_length = Some(converter::get_context_window_size(&am.id).max(0) as u32);
+                m.supports_thinking = am.supports_thinking;
+                m.supports_tools = true;
+                m.supports_vision = true;
+                m
+            })
+            .collect();
+        Ok(models)
     }
 
     async fn chat(&self, mut req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
@@ -236,7 +260,7 @@ impl Provider for KiroProvider {
         let machine_id = self.machine_identity(&ctx.account).machine_id;
         let client = self.resolver.client_for(&ctx.account);
         let cache_billing = *self.cache_billing.read();
-        chat::chat_stream(client, ctx.account.clone(), machine_id, req, cache_billing).await
+        chat::chat_stream(client, ctx.account.clone(), machine_id, req, cache_billing, self.max_body_bytes).await
     }
 
     /// 会话亲和键 = 派生的 conversationId(与上游 prefix cache 的会话粒度同源)。
@@ -251,15 +275,13 @@ impl Provider for KiroProvider {
         let client = self.resolver.client_for(account);
         let refreshed = token::refresh_auth(&client, account).await?;
         let mut updated = account.clone();
-        // 冻结 machineId(用**旧** refresh_token 派生,务必在覆盖 rolling token 之前):
-        // 否则下次刷新后 machineId 随新 token 漂移 = 换设备 = 封号。见 machine_id::freeze。
-        if machine_id::freeze_machine_id_if_absent(&mut updated) {
-            tracing::info!(
-                account_id = %updated.account_id,
-                "已冻结派生 machineId 防 rolling token 漂移;若该号由 Kiro IDE/KiroManager 导出,\
-                 建议在账号里填真机 machine_id 以彻底规避风控"
-            );
-        }
+        // **不冻结 machineId**(对齐 kiro.rs `generate_from_credentials` + 真实 Kiro 客户端):
+        // 无显式 machine_id 的号,每次按**当前** refresh_token 派生 sha256("KotlinNativeAPI/"+rt)。
+        // 真实客户端正是这么算的——rt 滚动时 machineId 随之滚动、始终与上游对得上。
+        // 早先的"冻结"(钉死首个 rt 的派生值)反而会在 rt 滚动后发出**陈旧** machineId
+        // (真实客户端不会发的值)→ 在风控看来像换了设备 → 封号(mrdev3258 即此:被我
+        // 反复刷新滚了 rt,却仍发陈旧冻结值)。kiro.rs 从不冻结、长期不封,故对齐之。
+        // 有**真机** machine_id 的号(import 带入):generate_from_account 仍优先用显式值,不受影响。
         updated.extra.insert(
             "access_token".into(),
             serde_json::Value::String(refreshed.access_token),
@@ -348,6 +370,20 @@ impl Provider for KiroProvider {
                 ic.multi_threshold = v as usize;
             }
         }
+
+        // 实验开关(tools_in_prefix / cache_point)。from_effective 总会带这两个字段;
+        // 缺失时退回 false(不覆盖到危险开启)。改写进程级实验全局,converter 下轮即读到。
+        {
+            let tools_in_prefix = settings
+                .get("tools_in_prefix")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let cache_point = settings
+                .get("cache_point")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            crate::converter::set_experimental_flags(tools_in_prefix, cache_point);
+        }
     }
 
     /// 订阅能力过滤(对齐 kiro.rs `supports_opus`,credentials.rs:256):
@@ -392,7 +428,47 @@ mod tests {
     async fn list_models_returns_known_models() {
         let p = KiroProvider::new(client());
         let models = p.list_models().await.unwrap();
-        assert!(models.iter().any(|m| m.id == "claude-opus-4-8"));
+        // 目录不再是 3 个 stub:opus-4-6/4-7 与 sonnet-4-6 必须公告(漏报会让客户端误判不支持)。
+        for id in [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ] {
+            let m = models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("目录缺少 {id}"));
+            assert!(m.supports_tools && m.supports_vision, "{id} 工具/视觉能力缺失");
+            assert!(m.context_length.unwrap_or(0) >= 200_000, "{id} 上下文窗口异常");
+            assert!(m.display_name.is_some(), "{id} 缺展示名");
+        }
+        // opus-4.6+ / sonnet-4.6 是 1M 窗口,目录应如实反映。
+        let opus48 = models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+        assert_eq!(opus48.context_length, Some(1_000_000));
+        let sonnet45 = models.iter().find(|m| m.id == "claude-sonnet-4-5").unwrap();
+        assert_eq!(sonnet45.context_length, Some(200_000));
+        // 新:thinking 变体与日期快照名也要公告(NewAPI 渠道按这些名拉取)。
+        for id in [
+            "claude-opus-4-8-thinking",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5-20250929-thinking",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let m = models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("目录缺少 {id}"));
+            assert!(m.context_length.unwrap_or(0) >= 200_000, "{id} 窗口异常");
+        }
+        // 日期快照窗口对齐其基础模型(sonnet-4.5=200k)。
+        let dated = models.iter().find(|m| m.id == "claude-sonnet-4-5-20250929").unwrap();
+        assert_eq!(dated.context_length, Some(200_000));
+        // -thinking 变体 supports_thinking 恒 true。
+        let opus48t = models.iter().find(|m| m.id == "claude-opus-4-8-thinking").unwrap();
+        assert!(opus48t.supports_thinking);
     }
 
     #[test]

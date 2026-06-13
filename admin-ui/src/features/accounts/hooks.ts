@@ -8,6 +8,7 @@ import {
   fetchAccounts,
   fetchAccountsRuntime,
   importAccounts,
+  refreshAccount,
   resetAccount,
   updateAccount,
 } from './api'
@@ -77,6 +78,15 @@ export function useResetAccount() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => resetAccount(id),
+    onSuccess: () => invalidateAccountDomains(queryClient),
+  })
+}
+
+/** 人工强制刷新 token（rt→at）；成功后刷新 runtime（新 token 有效期 / 配额可能随之回正）。 */
+export function useRefreshAccount() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => refreshAccount(id),
     onSuccess: () => invalidateAccountDomains(queryClient),
   })
 }

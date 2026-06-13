@@ -14,7 +14,7 @@ import { parseTokenAmount } from '../quota'
 import type { ApiKeyRow, UpdateKeyPayload } from '../types'
 
 const inputClass =
-  'w-full rounded-xl border bg-input px-3 py-2 text-sm text-foreground transition-colors placeholder:text-muted-foreground focus:outline-none'
+  'w-full rounded-2xl border bg-input px-4 py-2.5 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground'
 
 interface KeyManageDialogProps {
   open: boolean

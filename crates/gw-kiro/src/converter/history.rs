@@ -1,11 +1,12 @@
 //! 历史构建、user/assistant 合并、thinking 前缀与结构化输出指令。
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use super::{ContentBlock, ConversionError, MessagesRequest, EMPTY_CONTENT_PLACEHOLDER, MEDIA_ONLY_PLACEHOLDER};
 // 跨子模块调用(经 mod.rs 的 `use <sub>::*` 提升到 converter 根,故走 super::)
 use super::{normalized_client_system, request_has_chunked_tools, process_message_content, map_tool_name};
 use crate::kiro_types::conversation::{AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserInputMessageContext, UserMessage};
-use crate::kiro_types::tool::ToolUseEntry;
+use crate::kiro_types::tool::{ToolResult, ToolUseEntry};
 
 /// 生成thinking标签前缀
 pub(super) fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
@@ -16,11 +17,18 @@ pub(super) fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> 
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effective_effort())
-                .unwrap_or("xhigh");
+            // wire 注入唯一出口:把客户端原始 effort 归一到白名单档位,非法值回退 xhigh 并告警,
+            // 避免脏 effort 串打到 Kiro 触发 400(见 anthropic_types::normalize_effort)。
+            let raw = req.output_config.as_ref().and_then(|c| c.effort.as_deref());
+            let (effort, fell_back) = crate::anthropic_types::normalize_effort(raw);
+            if fell_back {
+                tracing::warn!(
+                    requested = ?raw,
+                    valid = ?crate::anthropic_types::VALID_EFFORTS,
+                    fallback = effort,
+                    "非法 thinking effort，已回退默认档位"
+                );
+            }
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -35,6 +43,112 @@ pub(super) fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>")
         || content.contains("<max_thinking_length>")
         || content.contains("<thinking_effort>")
+}
+
+/// 历史 user 文本里需剥离的「临时提醒块」标签名。
+///
+/// Claude Code 等客户端把这些块注入 user 轮,再随对话推进**逐轮增删**(把旧轮的提醒删掉)。
+/// 原样透传给 Kiro,则同一条历史消息跨轮从"带提醒"变"不带",**内容字节抖动 → 打断 Kiro
+/// prefix cache → 该点之后全部命中失效**(与历史 thinking 丢弃同理,见 `convert_assistant_message`;
+/// 实测 opus-4-8 因此每请求多烧 ~42% 积分)。默认剥 `system-reminder` / `internal_reminder`
+/// (实测真凶);可经 `KIRO_STRIP_HISTORY_TAGS`(逗号分隔)追加更多漂移标签。
+fn ephemeral_history_tags() -> &'static [String] {
+    static V: OnceLock<Vec<String>> = OnceLock::new();
+    V.get_or_init(|| {
+        let mut tags = vec![
+            "system-reminder".to_string(),
+            "internal_reminder".to_string(),
+        ];
+        if let Ok(extra) = std::env::var("KIRO_STRIP_HISTORY_TAGS") {
+            for t in extra.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if !tags.iter().any(|x| x == t) {
+                    tags.push(t.to_string());
+                }
+            }
+        }
+        tags
+    })
+}
+
+/// 从**历史** user 文本剥离所有临时提醒块,稳定跨轮前缀字节。**纯手写扫描(无 regex 依赖)**,
+/// 确定性:同输入恒同输出。只用于历史(`merge_user_messages`),当前轮原样保留(模型仍看得到本轮提醒)。
+pub(super) fn strip_ephemeral_blocks(text: &str) -> String {
+    let mut s = text.to_string();
+    let mut changed = false;
+    for tag in ephemeral_history_tags() {
+        let stripped = strip_one_tag(&s, tag);
+        if stripped != s {
+            changed = true;
+            s = stripped;
+        }
+    }
+    // 仅当确有剥离时才 trim:抹平提醒被删后残留的首尾空白(如 `正文\n` → `正文`),使
+    // "带提醒"与"不带提醒"两版同一轮逐字节相等。无提醒的历史**原样返回**(零改动,不引入
+    // cold-start;它本就跨轮稳定)。
+    if changed {
+        s.trim().to_string()
+    } else {
+        s
+    }
+}
+
+/// 历史 **tool_result** 内容也剥临时提醒块。实测(线上 log 2099)Claude Code 把
+/// `<internal_reminder>` 追加在工具输出后面,落在
+/// `toolResults[].content[].text`,且同样逐轮增删 → 前缀抖动打断缓存(主文本之外的第二个真凶)。
+/// 就地修改每个 tool_result 的 content 数组里的 `text` 字段。**仅历史**(`merge_user_messages` 调)。
+pub(super) fn strip_ephemeral_from_tool_results(results: &mut [ToolResult]) {
+    for tr in results.iter_mut() {
+        for block in tr.content.iter_mut() {
+            if let Some(serde_json::Value::String(t)) = block.get_mut("text") {
+                let stripped = strip_ephemeral_blocks(t);
+                if stripped != *t {
+                    *t = stripped;
+                }
+            }
+        }
+    }
+}
+
+/// 剥离单个标签的所有 `<tag ...>...</tag>` 块(不嵌套;无闭合则整段保留,绝不破坏正文)。
+fn strip_one_tag(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(pos) = rest.find(&open) else {
+            out.push_str(rest);
+            break;
+        };
+        // 边界:标签名后必须是 '>' / 空白 / '/',否则是误匹配(如 `<system-reminderX>`),
+        // 原样保留到该位置之后再继续找。
+        let after = rest[pos + open.len()..].chars().next();
+        let boundary_ok = matches!(
+            after,
+            Some('>') | Some(' ') | Some('\t') | Some('\n') | Some('\r') | Some('/')
+        );
+        if !boundary_ok {
+            let keep = pos + open.len();
+            out.push_str(&rest[..keep]);
+            rest = &rest[keep..];
+            continue;
+        }
+        // 从开标签处向后找闭合标签;无闭合 → 整段原样保留(宁可不剥,不破坏内容)。
+        let Some(close_rel) = rest[pos..].find(&close) else {
+            out.push_str(rest);
+            break;
+        };
+        let close_end = pos + close_rel + close.len();
+        out.push_str(&rest[..pos]);
+        rest = &rest[close_end..];
+        // 顺带吃掉块后紧跟的一个换行,避免留下空行(确定性、更干净)。
+        if let Some(stripped) = rest.strip_prefix("\r\n") {
+            rest = stripped;
+        } else if let Some(stripped) = rest.strip_prefix('\n') {
+            rest = stripped;
+        }
+    }
+    out
 }
 
 /// 块2b:把 thinking 前缀注入**当前轮** user content 前面(不进 system/history)。
@@ -199,7 +313,10 @@ pub(super) fn merge_user_messages(
 
     for msg in messages {
         let (text, images, documents, tool_results) = process_message_content(&msg.content)?;
-        if !text.is_empty() {
+        // 历史专用:剥掉客户端逐轮增删的临时提醒块(system-reminder/internal_reminder),
+        // 让历史前缀跨轮字节恒定 → Kiro prefix cache 命中(降积分)。当前轮不经本函数,保留提醒。
+        let text = strip_ephemeral_blocks(&text);
+        if !text.trim().is_empty() {
             content_parts.push(text);
         }
         all_images.extend(images);
@@ -236,6 +353,8 @@ pub(super) fn merge_user_messages(
     }
 
     if !all_tool_results.is_empty() {
+        // 历史 tool_result 内容也剥临时提醒(主文本外的第二处漂移源,见上)。
+        strip_ephemeral_from_tool_results(&mut all_tool_results);
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(all_tool_results);
         user_msg = user_msg.with_context(ctx);
@@ -419,5 +538,156 @@ fn append_line(base: String, line: &str) -> String {
         line.to_string()
     } else {
         format!("{base}\n{line}")
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::strip_ephemeral_blocks;
+
+    #[test]
+    fn removes_system_and_internal_reminder() {
+        let t = "hello\n<system-reminder>\nephemeral context here\n</system-reminder>\nworld";
+        assert_eq!(strip_ephemeral_blocks(t), "hello\nworld");
+        let t2 = "do it<internal_reminder>!IMPORTANT! rules</internal_reminder>";
+        assert_eq!(strip_ephemeral_blocks(t2), "do it");
+    }
+
+    #[test]
+    fn handles_attributes_on_open_tag() {
+        let t = "a<system-reminder foo=\"bar\" x=1>junk</system-reminder>b";
+        assert_eq!(strip_ephemeral_blocks(t), "ab");
+    }
+
+    #[test]
+    fn removes_multiple_blocks() {
+        let t = "<system-reminder>one</system-reminder>keep<system-reminder>two</system-reminder>end";
+        assert_eq!(strip_ephemeral_blocks(t), "keepend");
+    }
+
+    #[test]
+    fn boundary_does_not_match_similar_tag() {
+        // `<system-reminderish>` 不是真标签,必须原样保留。
+        let t = "<system-reminderish>not a reminder</system-reminderish>";
+        assert_eq!(strip_ephemeral_blocks(t), t);
+    }
+
+    #[test]
+    fn unclosed_tag_left_intact() {
+        // 无闭合 → 宁可不剥,绝不吞掉后文。
+        let t = "text <system-reminder> oops no close, rest of message";
+        assert_eq!(strip_ephemeral_blocks(t), t);
+    }
+
+    #[test]
+    fn non_reminder_text_untouched() {
+        let t = "再看方兴师兄怎么做的";
+        assert_eq!(strip_ephemeral_blocks(t), t);
+    }
+
+    #[test]
+    fn cache_stability_same_turn_with_and_without_reminder_match() {
+        // 复刻线上真凶(conv 1dc6d7de history[28]):同一历史轮,早期快照带 internal_reminder、
+        // 后期快照被客户端删掉。剥离后两者必须**逐字节相同** → Kiro prefix cache 才能命中。
+        let with_reminder =
+            "再看方兴师兄怎么做的\n<internal_reminder>!IMPORTANT! Recall the workflow rules:\nUnderstand → choose the best path</internal_reminder>";
+        let without_reminder = "再看方兴师兄怎么做的";
+        assert_eq!(
+            strip_ephemeral_blocks(with_reminder),
+            strip_ephemeral_blocks(without_reminder),
+            "带提醒与不带提醒的同一轮,剥离后必须相同(否则前缀仍抖动)"
+        );
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let t = "x<system-reminder>a</system-reminder>y<internal_reminder>b</internal_reminder>z";
+        let once = strip_ephemeral_blocks(t);
+        assert_eq!(strip_ephemeral_blocks(&once), once, "二次剥离应稳定不变");
+        assert_eq!(once, "xyz");
+    }
+
+    #[test]
+    fn empty_when_only_reminder() {
+        assert_eq!(strip_ephemeral_blocks("<system-reminder>all of it</system-reminder>"), "");
+    }
+
+    #[test]
+    fn strips_reminder_inside_tool_result_content() {
+        // 复刻线上 log 2099:reminder 在 tool_result 的 content[].text 里(主文本之外)。
+        use crate::kiro_types::tool::ToolResult;
+        let mut trs = vec![ToolResult::success(
+            "tu_1",
+            "- total 89 lines)\n</content>\n\n<internal_reminder>\n!IMPORTANT! rules\n</internal_reminder>",
+        )];
+        super::strip_ephemeral_from_tool_results(&mut trs);
+        let txt = trs[0].content[0].get("text").and_then(|v| v.as_str()).unwrap();
+        assert!(!txt.contains("internal_reminder"), "tool_result 里的提醒必须剥掉: {txt:?}");
+        assert_eq!(txt, "- total 89 lines)\n</content>");
+    }
+
+    #[test]
+    fn tool_result_cache_stability_with_and_without_reminder() {
+        use crate::kiro_types::tool::ToolResult;
+        let body = "- total 89 lines)\n</content>";
+        let mut with = vec![ToolResult::success(
+            "tu_1",
+            &format!("{body}\n\n<internal_reminder>\nrules\n</internal_reminder>"),
+        )];
+        let mut without = vec![ToolResult::success("tu_1", body)];
+        super::strip_ephemeral_from_tool_results(&mut with);
+        super::strip_ephemeral_from_tool_results(&mut without);
+        let a = with[0].content[0].get("text").and_then(|v| v.as_str()).unwrap();
+        let b = without[0].content[0].get("text").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(a, b, "带提醒/不带提醒的同一 tool_result,剥离后必须逐字节相同");
+    }
+}
+
+#[cfg(test)]
+mod thinking_prefix_tests {
+    use super::generate_thinking_prefix;
+    use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking};
+
+    fn adaptive_req(effort: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                display: None,
+                budget_tokens: 20000,
+            }),
+            output_config: Some(OutputConfig {
+                effort: effort.map(|s| s.to_string()),
+                format: None,
+            }),
+            metadata: None,
+            context_management: None,
+        }
+    }
+
+    #[test]
+    fn valid_effort_passes_through_to_wire() {
+        let p = generate_thinking_prefix(&adaptive_req(Some("low"))).unwrap();
+        assert!(p.contains("<thinking_effort>low</thinking_effort>"), "实际={p}");
+    }
+
+    #[test]
+    fn illegal_effort_falls_back_to_xhigh_on_wire() {
+        // 脏 effort 串不得透传到 Kiro,统一回退 xhigh(防 400)。
+        let p = generate_thinking_prefix(&adaptive_req(Some("ultra-mega"))).unwrap();
+        assert!(p.contains("<thinking_effort>xhigh</thinking_effort>"), "实际={p}");
+        assert!(!p.contains("ultra-mega"), "非法 effort 不应出现在 wire 上:{p}");
+    }
+
+    #[test]
+    fn absent_effort_defaults_to_xhigh() {
+        let p = generate_thinking_prefix(&adaptive_req(None)).unwrap();
+        assert!(p.contains("<thinking_effort>xhigh</thinking_effort>"), "实际={p}");
     }
 }

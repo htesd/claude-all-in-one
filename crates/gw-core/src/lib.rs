@@ -18,6 +18,7 @@ pub mod config;
 pub mod error;
 pub mod fold;
 pub mod model;
+pub mod pricing;
 pub mod provider;
 pub mod routing;
 pub mod store;

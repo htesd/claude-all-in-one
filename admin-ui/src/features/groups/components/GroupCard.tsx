@@ -10,7 +10,7 @@ import { DEFAULT_GROUP_COLOR, type GroupRow } from '../types'
 
 /** 卡片右上角小图标按钮的统一样式（与 Key 行内按钮一致）。 */
 const iconButtonClass =
-  'inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10'
+  'inline-flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10'
 
 interface GroupCardProps {
   group: GroupRow
@@ -35,7 +35,7 @@ export function GroupCard({ group, busy, onEdit, onDelete }: GroupCardProps) {
             className="h-2.5 w-2.5 shrink-0 rounded-full"
             style={{ backgroundColor: color }}
           />
-          <h3 className="truncate text-sm font-semibold" title={group.name}>
+          <h3 className="truncate text-sm font-black tracking-[-0.01em]" title={group.name}>
             {group.name}
           </h3>
         </div>
@@ -54,7 +54,7 @@ export function GroupCard({ group, busy, onEdit, onDelete }: GroupCardProps) {
             onClick={() => setConfirmingDelete(true)}
             title={t('groups.action.delete')}
             disabled={busy}
-            className={cn(iconButtonClass, 'hover:text-destructive')}
+            className={cn(iconButtonClass, 'hover:text-rose-600 dark:hover:text-rose-300')}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>

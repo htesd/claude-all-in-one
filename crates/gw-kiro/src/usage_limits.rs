@@ -232,7 +232,7 @@ mod tests {
         let q = resp.into_account_quota();
         assert_eq!(q.used, 10236.75);
         assert_eq!(q.limit, 1000.0);
-        assert_eq!(q.remaining, 0.0, "超额 remaining clamp 到 0");
+        assert_eq!(q.remaining, -9236.75, "超额 remaining 为负=已超出多少(不再 clamp 到 0)");
         assert!(q.percent_used > 1000.0, "已用 1023%");
         assert_eq!(q.currency.as_deref(), Some("KIRO PRO"));
     }

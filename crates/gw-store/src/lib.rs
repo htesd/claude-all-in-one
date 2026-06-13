@@ -4,15 +4,20 @@
 //! 多进程(router + 多 worker)并发读、控制面写少。
 //! usage / 状态机 / request_cache 在 P2/P4 按 IMPROVEMENTS.md 补。
 
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use gw_core::account::Account;
 use gw_core::config::AccountsConfig;
 use gw_core::store::{
     AccountPatch, AccountRow, ApiKeyPatch, ApiKeyRow, AuthenticatedKey, ControlStore, GroupRow,
-    UsageByKey, UsageByModel, UsageFilter, UsageRecord, UsageSink, UsageSummary,
+    LogBlob, RequestLog, RequestLogDetail, RequestLogFilter, RequestLogRow, UsageByKey,
+    UsageByModel, UsageFilter, UsageRecord, UsageSink, UsageSummary,
 };
 use rusqlite::types::Value;
 use parking_lot::Mutex;
@@ -38,6 +43,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
     output_tokens         INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    real_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    metering_credit        REAL    NOT NULL DEFAULT 0,
     success       INTEGER NOT NULL DEFAULT 1,
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
@@ -75,7 +82,87 @@ CREATE TABLE IF NOT EXISTS settings (
     value      TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+-- 请求日志(调试用):每次上游调用结束追加一行,保存【发 Kiro 前的完整报文】+【用户原始
+-- 报文】+ 用量/耗时元数据。**环形保留最新 N 条**(insert_request_log 按 cap 裁旧),不无限增长。
+CREATE TABLE IF NOT EXISTS request_logs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    client_key_id TEXT    NOT NULL DEFAULT '',
+    account_id    TEXT    NOT NULL DEFAULT '',
+    model         TEXT    NOT NULL DEFAULT '',
+    stream        INTEGER NOT NULL DEFAULT 0,
+    success       INTEGER NOT NULL DEFAULT 1,
+    status_code   INTEGER,
+    error_kind    TEXT,
+    duration_ms   INTEGER,
+    ttfb_ms       INTEGER,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    reported_tokens       INTEGER NOT NULL DEFAULT 0,
+    real_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    metering_credit       REAL    NOT NULL DEFAULT 0,
+    client_payload TEXT   NOT NULL DEFAULT '',
+    kiro_payload   TEXT   NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_reqlog_created ON request_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_reqlog_account ON request_logs(account_id, created_at);
+
+-- 媒体 blob:用户上传的图片/文档,内容寻址(hash=sha256(base64))去重存储。
+-- 同一张图在一个会话里每轮都发,只存一份;报文里以 "blob:<hash>" 引用。
+CREATE TABLE IF NOT EXISTS log_blobs (
+    hash       TEXT    PRIMARY KEY,
+    media_type TEXT    NOT NULL DEFAULT '',
+    data       TEXT    NOT NULL,
+    bytes      INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+-- 日志↔blob 多对多引用。日志环形裁剪时连带删本表行,再清无引用的 log_blobs(GC)。
+CREATE TABLE IF NOT EXISTS log_blob_refs (
+    log_id INTEGER NOT NULL,
+    hash   TEXT    NOT NULL,
+    PRIMARY KEY (log_id, hash)
+);
+CREATE INDEX IF NOT EXISTS idx_blobref_hash ON log_blob_refs(hash);
 "#;
+
+/// 请求日志报文 gzip 压缩后入库(BLOB)——全文不截断,文本压 5-10 倍。压缩失败极罕见
+/// (内存),退回原文 UTF-8 字节(读侧按 gzip magic 区分,兼容)。
+fn gzip_text(s: &str) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    if enc.write_all(s.as_bytes()).is_ok() {
+        if let Ok(buf) = enc.finish() {
+            return buf;
+        }
+    }
+    s.as_bytes().to_vec()
+}
+
+/// 读侧还原报文:gzip(magic `1f 8b`)→ 解压;否则按**旧明文行**(本特性前存的 TEXT)
+/// 当 UTF-8 处理。解压失败兜底 lossy,绝不 panic。
+fn ungzip_text(bytes: Vec<u8>) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        let mut out = String::new();
+        if GzDecoder::new(&bytes[..]).read_to_string(&mut out).is_ok() {
+            return out;
+        }
+        // 解压失败(损坏)→ lossy 兜底。
+        return String::from_utf8_lossy(&bytes).into_owned();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// 报文列读取:新行是 gzip BLOB、旧行是明文 TEXT,故按动态 `Value` 取再还原
+/// (rusqlite 的 `Vec<u8>` FromSql 只认 BLOB,不能直接读旧 TEXT 行)。
+fn value_to_payload(v: Value) -> String {
+    match v {
+        Value::Blob(b) => ungzip_text(b),
+        Value::Text(s) => s, // 旧明文行,直接用
+        _ => String::new(),
+    }
+}
 
 /// SQLite 控制面存储。
 ///
@@ -131,10 +218,41 @@ impl SqliteStore {
         Self::ensure_column(conn, "api_keys", "group_name", "group_name TEXT NOT NULL DEFAULT ''")?;
         Self::ensure_column(conn, "api_keys", "quota_tokens", "quota_tokens INTEGER")?;
         Self::ensure_column(conn, "api_keys", "used_tokens", "used_tokens INTEGER NOT NULL DEFAULT 0")?;
+        // request_logs 真实命中/原生计费列(存量库热升级:旧表无此列则补)。
+        Self::ensure_column(
+            conn,
+            "request_logs",
+            "real_cache_read_tokens",
+            "real_cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            conn,
+            "request_logs",
+            "metering_credit",
+            "metering_credit REAL NOT NULL DEFAULT 0",
+        )?;
+        // usage_records 成本看板列(存量库热升级:旧表无此列则补,历史行回填为 0)。
+        Self::ensure_column(
+            conn,
+            "usage_records",
+            "real_cache_read_tokens",
+            "real_cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            conn,
+            "usage_records",
+            "metering_credit",
+            "metering_credit REAL NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
     /// 列不存在则 ADD COLUMN(表名/DDL 为代码常量,无注入面)。
+    ///
+    /// **跨进程幂等**(审查 Skeptic#1):router 与多个 worker 进程升级后会并发 `open` 同一库,
+    /// `pragma_table_info` 探测与 `ALTER TABLE` 之间非原子——两进程都可能先看到列缺失,一个 ADD
+    /// 成功、另一个等锁后再 ADD 撞 `duplicate column name`。把该错误视为成功(列已就位即达成目的),
+    /// 否则 `open` 失败会让 worker 不落库 / router 控制面降级。
     fn ensure_column(conn: &Connection, table: &str, col: &str, ddl: &str) -> anyhow::Result<()> {
         let exists: bool = conn
             .prepare(&format!(
@@ -142,7 +260,13 @@ impl SqliteStore {
             ))?
             .exists([col])?;
         if !exists {
-            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"), [])?;
+            match conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"), []) {
+                Ok(_) => {}
+                // 另一进程抢先 ADD 了同名列(竞态)→ 目的已达成,当成功。
+                Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -523,6 +647,209 @@ impl SqliteStore {
         Ok(())
     }
 
+    // === 请求日志(调试用,环形保留最新 N 条)===
+
+    /// request_logs 列表列(不含大 payload)。`Self::REQLOG_ROW_COLS` 顺序与
+    /// [`Self::row_to_reqlog_row`] 一一对应。
+    const REQLOG_ROW_COLS: &'static str = "id, created_at, client_key_id, account_id, model, \
+         stream, success, status_code, error_kind, duration_ms, ttfb_ms, input_tokens, \
+         output_tokens, cache_read_tokens, cache_creation_tokens, reported_tokens, \
+         real_cache_read_tokens, metering_credit";
+
+    /// 追加一条请求日志,并把表裁到**最新 `cap` 条**(cap=0 → 不裁,谨慎)。
+    /// id 单调自增(AUTOINCREMENT 不复用),故 `id <= max_id - cap` 即"除最新 cap 条外全删"。
+    pub fn insert_request_log(&self, log: &RequestLog, cap: u64) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO request_logs \
+             (client_key_id, account_id, model, stream, success, status_code, error_kind, \
+              duration_ms, ttfb_ms, input_tokens, output_tokens, cache_read_tokens, \
+              cache_creation_tokens, reported_tokens, real_cache_read_tokens, metering_credit, \
+              client_payload, kiro_payload) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            rusqlite::params![
+                log.client_key_id,
+                log.account_id,
+                log.model,
+                log.stream as i64,
+                log.success as i64,
+                log.status_code,
+                log.error_kind,
+                log.duration_ms,
+                log.ttfb_ms,
+                clamp_i64(log.input_tokens),
+                clamp_i64(log.output_tokens),
+                clamp_i64(log.cache_read_tokens),
+                clamp_i64(log.cache_creation_tokens),
+                clamp_i64(log.reported_tokens),
+                clamp_i64(log.real_cache_read_tokens),
+                log.metering_credit,
+                gzip_text(&log.client_payload),
+                gzip_text(&log.kiro_payload),
+            ],
+        )?;
+        let max_id = tx.last_insert_rowid();
+        // 媒体 blob 去重入库:INSERT OR IGNORE 按 hash 去重(同图复用一行),refs 记本条引用。
+        for b in &log.blobs {
+            tx.execute(
+                "INSERT OR IGNORE INTO log_blobs (hash, media_type, data, bytes) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![b.hash, b.media_type, b.data, b.bytes],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO log_blob_refs (log_id, hash) VALUES (?1,?2)",
+                rusqlite::params![max_id, b.hash],
+            )?;
+        }
+        if cap > 0 {
+            let cutoff = max_id - cap as i64;
+            if cutoff > 0 {
+                // 环形裁剪:删旧日志 + 其 blob 引用,再清掉已无任何引用的 blob(GC,防无限膨胀)。
+                tx.execute("DELETE FROM request_logs WHERE id <= ?1", [cutoff])?;
+                tx.execute("DELETE FROM log_blob_refs WHERE log_id <= ?1", [cutoff])?;
+                tx.execute(
+                    "DELETE FROM log_blobs WHERE hash NOT IN (SELECT hash FROM log_blob_refs)",
+                    [],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 列表查询(按筛选,id 降序;不含 payload)。`limit<=0` 时用 `default_limit`;
+    /// `filter.offset>0` 时跳过前 N 条(分页)。
+    pub fn list_request_logs(
+        &self,
+        filter: &RequestLogFilter,
+        default_limit: i64,
+    ) -> anyhow::Result<Vec<RequestLogRow>> {
+        let (where_, mut params) = Self::reqlog_filter_where(filter);
+        let limit = if filter.limit > 0 {
+            filter.limit
+        } else {
+            default_limit
+        };
+        params.push(Value::Integer(limit));
+        let limit_ph = params.len();
+        params.push(Value::Integer(filter.offset.max(0)));
+        let sql = format!(
+            "SELECT {} FROM request_logs WHERE {} ORDER BY id DESC LIMIT ?{} OFFSET ?{}",
+            Self::REQLOG_ROW_COLS,
+            where_,
+            limit_ph,
+            params.len()
+        );
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), Self::row_to_reqlog_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 同筛选下的总条数(分页用,不受 limit/offset 影响)。
+    pub fn count_request_logs(&self, filter: &RequestLogFilter) -> anyhow::Result<i64> {
+        let (where_, params) = Self::reqlog_filter_where(filter);
+        let sql = format!("SELECT COUNT(*) FROM request_logs WHERE {where_}");
+        let conn = self.stats_conn.lock();
+        let n = conn.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// 取单条详情(含完整 client/kiro payload)。无此 id → `None`。
+    pub fn get_request_log(&self, id: i64) -> anyhow::Result<Option<RequestLogDetail>> {
+        let sql = format!(
+            "SELECT {}, client_payload, kiro_payload FROM request_logs WHERE id = ?1",
+            Self::REQLOG_ROW_COLS
+        );
+        let conn = self.stats_conn.lock();
+        let mut detail = match conn.query_row(&sql, [id], |r| {
+            // 报文以 gzip BLOB 入库(旧明文行兼容),读时按动态 Value 还原。
+            Ok(RequestLogDetail {
+                row: Self::row_to_reqlog_row(r)?,
+                client_payload: value_to_payload(r.get::<_, Value>(18)?),
+                kiro_payload: value_to_payload(r.get::<_, Value>(19)?),
+                blobs: Vec::new(),
+            })
+        }) {
+            Ok(d) => d,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // 本条日志报文里 blob:<hash> 引用到的去重媒体(图片/文档)。
+        let mut stmt = conn.prepare(
+            "SELECT b.hash, b.media_type, b.data, b.bytes \
+             FROM log_blob_refs r JOIN log_blobs b ON b.hash = r.hash \
+             WHERE r.log_id = ?1",
+        )?;
+        detail.blobs = stmt
+            .query_map([id], |r| {
+                Ok(LogBlob {
+                    hash: r.get(0)?,
+                    media_type: r.get(1)?,
+                    data: r.get(2)?,
+                    bytes: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(detail))
+    }
+
+    /// 测试用:当前去重媒体 blob 行数(校验去重/GC)。
+    #[cfg(test)]
+    fn count_log_blobs(&self) -> i64 {
+        self.stats_conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM log_blobs", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// 把一行(`REQLOG_ROW_COLS` 顺序)映射为 [`RequestLogRow`]。
+    fn row_to_reqlog_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogRow> {
+        Ok(RequestLogRow {
+            id: r.get(0)?,
+            created_at: r.get(1)?,
+            client_key_id: r.get(2)?,
+            account_id: r.get(3)?,
+            model: r.get(4)?,
+            stream: r.get::<_, i64>(5)? != 0,
+            success: r.get::<_, i64>(6)? != 0,
+            status_code: r.get(7)?,
+            error_kind: r.get(8)?,
+            duration_ms: r.get(9)?,
+            ttfb_ms: r.get(10)?,
+            input_tokens: r.get(11)?,
+            output_tokens: r.get(12)?,
+            cache_read_tokens: r.get(13)?,
+            cache_creation_tokens: r.get(14)?,
+            reported_tokens: r.get(15)?,
+            real_cache_read_tokens: r.get(16)?,
+            metering_credit: r.get(17)?,
+        })
+    }
+
+    /// request_logs 的 WHERE 子句 + 参数(占位符从 ?1 起;调用方可继续 push LIMIT)。
+    fn reqlog_filter_where(f: &RequestLogFilter) -> (String, Vec<Value>) {
+        let since = f.since_unix.unwrap_or(0);
+        let until = f.until_unix.unwrap_or(i64::MAX);
+        let mut clause = String::from("created_at >= ?1 AND created_at < ?2");
+        let mut params = vec![Value::Integer(since), Value::Integer(until)];
+        if let Some(a) = &f.account_id {
+            params.push(Value::Text(a.clone()));
+            clause.push_str(&format!(" AND account_id = ?{}", params.len()));
+        }
+        if let Some(m) = &f.model {
+            params.push(Value::Text(m.clone()));
+            clause.push_str(&format!(" AND model = ?{}", params.len()));
+        }
+        if let Some(s) = f.success {
+            params.push(Value::Integer(s as i64));
+            clause.push_str(&format!(" AND success = ?{}", params.len()));
+        }
+        (clause, params)
+    }
+
     /// 分组是否存在(admin 写入 group_name 前的存在性校验,防"幽灵分组")。
     pub fn group_exists(&self, name: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
@@ -624,7 +951,8 @@ impl SqliteStore {
         let sql = format!(
             "SELECT COUNT(*), COALESCE(SUM(success),0), COALESCE(SUM(input_tokens),0), \
              COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
-             COALESCE(SUM(cache_creation_tokens),0) FROM usage_records WHERE {where_}"
+             COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(real_cache_read_tokens),0), \
+             COALESCE(SUM(CASE WHEN metering_credit > 0 THEN metering_credit ELSE 0 END),0) FROM usage_records WHERE {where_}"
         );
         let conn = self.stats_conn.lock();
         let s = conn.query_row(&sql, rusqlite::params_from_iter(params), |r| {
@@ -635,6 +963,8 @@ impl SqliteStore {
                 output_tokens: r.get::<_, i64>(3)? as u64,
                 cache_read_tokens: r.get::<_, i64>(4)? as u64,
                 cache_creation_tokens: r.get::<_, i64>(5)? as u64,
+                real_cache_read_tokens: r.get::<_, i64>(6)? as u64,
+                metering_credit: r.get::<_, f64>(7)?,
             })
         })?;
         Ok(s)
@@ -645,7 +975,8 @@ impl SqliteStore {
         let (where_, params) = Self::filter_where(filter);
         let sql = format!(
             "SELECT model, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
-             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
+             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), \
+             COALESCE(SUM(real_cache_read_tokens),0), COALESCE(SUM(CASE WHEN metering_credit > 0 THEN metering_credit ELSE 0 END),0) \
              FROM usage_records WHERE {where_} GROUP BY model ORDER BY COUNT(*) DESC"
         );
         let conn = self.stats_conn.lock();
@@ -659,6 +990,8 @@ impl SqliteStore {
                     output_tokens: r.get::<_, i64>(3)? as u64,
                     cache_read_tokens: r.get::<_, i64>(4)? as u64,
                     cache_creation_tokens: r.get::<_, i64>(5)? as u64,
+                    real_cache_read_tokens: r.get::<_, i64>(6)? as u64,
+                    metering_credit: r.get::<_, f64>(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -671,7 +1004,8 @@ impl SqliteStore {
         let sql = format!(
             "SELECT client_key_id, COUNT(*), COALESCE(SUM(success),0), \
              COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), \
-             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0) \
+             COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_creation_tokens),0), \
+             COALESCE(SUM(real_cache_read_tokens),0), COALESCE(SUM(CASE WHEN metering_credit > 0 THEN metering_credit ELSE 0 END),0) \
              FROM usage_records WHERE {where_} GROUP BY client_key_id ORDER BY COUNT(*) DESC"
         );
         let conn = self.stats_conn.lock();
@@ -686,6 +1020,8 @@ impl SqliteStore {
                     output_tokens: r.get::<_, i64>(4)? as u64,
                     cache_read_tokens: r.get::<_, i64>(5)? as u64,
                     cache_creation_tokens: r.get::<_, i64>(6)? as u64,
+                    real_cache_read_tokens: r.get::<_, i64>(7)? as u64,
+                    metering_credit: r.get::<_, f64>(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -730,8 +1066,9 @@ impl UsageSink for SqliteStore {
         conn.execute(
             "INSERT INTO usage_records \
              (client_key_id, account_id, model, input_tokens, output_tokens, \
-              cache_read_tokens, cache_creation_tokens, success) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              cache_read_tokens, cache_creation_tokens, real_cache_read_tokens, \
+              metering_credit, success) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 usage.client_key_id,
                 usage.account_id,
@@ -740,6 +1077,9 @@ impl UsageSink for SqliteStore {
                 clamp_i64(usage.output_tokens),
                 clamp_i64(usage.cache_read_tokens),
                 clamp_i64(usage.cache_creation_tokens),
+                clamp_i64(usage.real_cache_read_tokens),
+                // credit 非负兜底:异常负值不污染"每积分成本"分母。
+                usage.metering_credit.max(0.0),
                 usage.success as i64,
             ],
         )?;
@@ -820,6 +1160,8 @@ mod tests {
                 output_tokens: 345,
                 cache_read_tokens: 900,
                 cache_creation_tokens: 64,
+                real_cache_read_tokens: 0,
+                metering_credit: 0.0,
                 success: true,
             })
             .await
@@ -863,6 +1205,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_credit_and_real_cache_persist_and_aggregate() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (cr, rcr, credit) in [(900u64, 100u64, 1.5f64), (300, 50, 0.5)] {
+            store
+                .record(UsageRecord {
+                    client_key_id: "sk-cust".into(),
+                    account_id: "a".into(),
+                    model: "claude-opus-4-8".into(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: cr,
+                    cache_creation_tokens: 0,
+                    real_cache_read_tokens: rcr,
+                    metering_credit: credit,
+                    success: true,
+                })
+                .await
+                .unwrap();
+        }
+        let f = UsageFilter::default();
+        let s = store.usage_summary(&f).unwrap();
+        assert_eq!(s.cache_read_tokens, 1200);
+        assert_eq!(s.real_cache_read_tokens, 150, "真实口径缓存读须独立累计");
+        assert!((s.metering_credit - 2.0).abs() < 1e-9, "积分须求和: {}", s.metering_credit);
+
+        let by_model = store.usage_by_model(&f).unwrap();
+        assert_eq!(by_model.len(), 1);
+        assert!((by_model[0].metering_credit - 2.0).abs() < 1e-9);
+        assert_eq!(by_model[0].real_cache_read_tokens, 150);
+
+        let by_key = store.usage_by_key(&f).unwrap();
+        assert_eq!(by_key[0].real_cache_read_tokens, 150);
+        assert!((by_key[0].metering_credit - 2.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn usage_negative_credit_clamped_to_zero() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .record(UsageRecord {
+                client_key_id: String::new(),
+                account_id: "a".into(),
+                model: "m".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                real_cache_read_tokens: 0,
+                metering_credit: -3.0,
+                success: true,
+            })
+            .await
+            .unwrap();
+        let s = store.usage_summary(&UsageFilter::default()).unwrap();
+        assert_eq!(s.metering_credit, 0.0, "负 credit 须兜底为 0,不污染分母");
+    }
+
+    #[tokio::test]
     async fn usage_record_persists_failure_flag() {
         let store = SqliteStore::open_in_memory().unwrap();
         store
@@ -874,6 +1274,8 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                real_cache_read_tokens: 0,
+                metering_credit: 0.0,
                 success: false,
             })
             .await
@@ -900,6 +1302,8 @@ mod tests {
                 output_tokens: out,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                real_cache_read_tokens: 0,
+                metering_credit: 0.0,
                 success: ok,
             })
             .await
@@ -1351,6 +1755,8 @@ groups:
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                real_cache_read_tokens: 0,
+                metering_credit: 0.0,
                 success: true,
             })
             .await
@@ -1364,5 +1770,221 @@ groups:
             )
             .unwrap();
         assert_eq!(in_t, i64::MAX, "超 i64 的 token 数应饱和而非回绕成负数");
+    }
+
+    fn mk_log(account: &str, model: &str, success: bool) -> RequestLog {
+        RequestLog {
+            client_key_id: "k1".into(),
+            account_id: account.into(),
+            model: model.into(),
+            stream: true,
+            success,
+            status_code: Some(if success { 200 } else { 429 }),
+            error_kind: if success { None } else { Some("rate_limited".into()) },
+            duration_ms: Some(1234),
+            ttfb_ms: Some(200),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 0,
+            reported_tokens: 999,
+            real_cache_read_tokens: 3,
+            metering_credit: 0.4321,
+            client_payload: format!(r#"{{"model":"{model}","orig":true}}"#),
+            kiro_payload: format!(r#"{{"conversationState":"for-{account}"}}"#),
+            blobs: Vec::new(),
+        }
+    }
+
+    fn mk_blob(hash: &str) -> LogBlob {
+        LogBlob {
+            hash: hash.into(),
+            media_type: "image/png".into(),
+            data: format!("data-of-{hash}"),
+            bytes: 10,
+        }
+    }
+
+    #[test]
+    fn request_log_roundtrip_and_detail() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.insert_request_log(&mk_log("kiro-1", "claude-opus-4-8", true), 2000).unwrap();
+
+        let rows = store
+            .list_request_logs(&RequestLogFilter::default(), 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.account_id, "kiro-1");
+        assert_eq!(row.model, "claude-opus-4-8");
+        assert!(row.stream && row.success);
+        assert_eq!(row.reported_tokens, 999);
+        // 真/credit 列往返:真实命中 + Kiro 原生计费(f64)正确存读。
+        assert_eq!(row.real_cache_read_tokens, 3);
+        assert!((row.metering_credit - 0.4321).abs() < 1e-9);
+
+        // 详情含完整 payload。
+        let detail = store.get_request_log(row.id).unwrap().expect("应存在");
+        assert!(detail.kiro_payload.contains("for-kiro-1"));
+        assert!(detail.client_payload.contains("\"orig\":true"));
+        // 不存在的 id → None。
+        assert!(store.get_request_log(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn request_log_blobs_dedup_and_returned_in_detail() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // 两条日志各引用同一张图(同 hash)→ log_blobs 只存一份(去重)。
+        let mut l1 = mk_log("a", "opus", true);
+        l1.blobs = vec![mk_blob("hashX"), mk_blob("hashY")];
+        store.insert_request_log(&l1, 2000).unwrap();
+        let mut l2 = mk_log("b", "opus", true);
+        l2.blobs = vec![mk_blob("hashX")]; // 与 l1 共享 hashX
+        store.insert_request_log(&l2, 2000).unwrap();
+
+        assert_eq!(store.count_log_blobs(), 2, "hashX 去重 → 共 2 个唯一 blob");
+        // 详情按 log 取回各自引用的 blob。
+        let rows = store
+            .list_request_logs(&RequestLogFilter::default(), 100)
+            .unwrap();
+        let id_l2 = rows[0].id; // 最新
+        let id_l1 = rows[1].id;
+        let d1 = store.get_request_log(id_l1).unwrap().unwrap();
+        let mut hashes1: Vec<_> = d1.blobs.iter().map(|b| b.hash.clone()).collect();
+        hashes1.sort();
+        assert_eq!(hashes1, vec!["hashX", "hashY"]);
+        let d2 = store.get_request_log(id_l2).unwrap().unwrap();
+        assert_eq!(d2.blobs.len(), 1);
+        assert_eq!(d2.blobs[0].hash, "hashX");
+    }
+
+    #[test]
+    fn request_log_blob_gc_removes_orphans_on_trim() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // cap=1:每插一条就把更早的全裁掉,其独有 blob 应被 GC。
+        let mut l1 = mk_log("a", "opus", true);
+        l1.blobs = vec![mk_blob("only-in-1")];
+        store.insert_request_log(&l1, 1).unwrap();
+        assert_eq!(store.count_log_blobs(), 1);
+
+        let mut l2 = mk_log("b", "opus", true);
+        l2.blobs = vec![mk_blob("only-in-2")];
+        store.insert_request_log(&l2, 1).unwrap(); // l1 被裁,only-in-1 应被 GC
+        assert_eq!(store.count_log_blobs(), 1, "孤儿 blob 应随裁剪清掉");
+        let rows = store
+            .list_request_logs(&RequestLogFilter::default(), 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let d = store.get_request_log(rows[0].id).unwrap().unwrap();
+        assert_eq!(d.blobs.len(), 1);
+        assert_eq!(d.blobs[0].hash, "only-in-2");
+    }
+
+    #[test]
+    fn request_log_payload_gzip_roundtrip_full_text() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // 超过旧 512KiB 截断阈值的大报文:gzip 全文存储,详情应原样取回(不截断)。
+        let big_text = "中文长正文 abc ".repeat(60_000); // ~ 数百 KB
+        let mut log = mk_log("a", "opus", true);
+        log.client_payload = format!(r#"{{"messages":[{{"role":"user","content":"{big_text}"}}]}}"#);
+        store.insert_request_log(&log, 2000).unwrap();
+        let rows = store.list_request_logs(&RequestLogFilter::default(), 50).unwrap();
+        let d = store.get_request_log(rows[0].id).unwrap().unwrap();
+        assert_eq!(d.client_payload, log.client_payload, "大报文应 gzip 全文无损取回");
+        assert!(d.client_payload.len() > 512 * 1024, "确实超过旧截断阈值");
+    }
+
+    #[test]
+    fn ungzip_handles_legacy_plaintext_and_gzip() {
+        // 旧明文(无 gzip magic)原样返回;gzip 字节正确解压。
+        assert_eq!(ungzip_text(b"{\"plain\":true}".to_vec()), "{\"plain\":true}");
+        let gz = gzip_text("hello gzip");
+        assert!(gz.len() >= 2 && gz[0] == 0x1f && gz[1] == 0x8b, "应是 gzip 字节");
+        assert_eq!(ungzip_text(gz), "hello gzip");
+    }
+
+    #[test]
+    fn request_log_pagination_offset_and_count() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .insert_request_log(&mk_log(&format!("acc{i}"), "m", true), 2000)
+                .unwrap();
+        }
+        // 总数不受 limit/offset 影响。
+        assert_eq!(store.count_request_logs(&RequestLogFilter::default()).unwrap(), 5);
+        // 第一页(limit 2, offset 0):最新两条 acc4/acc3(id 降序)。
+        let p1 = store
+            .list_request_logs(&RequestLogFilter { limit: 2, offset: 0, ..Default::default() }, 50)
+            .unwrap();
+        assert_eq!(p1.iter().map(|r| r.account_id.as_str()).collect::<Vec<_>>(), vec!["acc4", "acc3"]);
+        // 第二页(offset 2):acc2/acc1。
+        let p2 = store
+            .list_request_logs(&RequestLogFilter { limit: 2, offset: 2, ..Default::default() }, 50)
+            .unwrap();
+        assert_eq!(p2.iter().map(|r| r.account_id.as_str()).collect::<Vec<_>>(), vec!["acc2", "acc1"]);
+        // 末页越界(offset 4, limit 2):仅 acc0 一条。
+        let p3 = store
+            .list_request_logs(&RequestLogFilter { limit: 2, offset: 4, ..Default::default() }, 50)
+            .unwrap();
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3[0].account_id, "acc0");
+    }
+
+    #[test]
+    fn request_log_ring_trim_keeps_latest_cap() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .insert_request_log(&mk_log(&format!("acc{i}"), "m", true), 3)
+                .unwrap();
+        }
+        let rows = store
+            .list_request_logs(&RequestLogFilter::default(), 100)
+            .unwrap();
+        // 只保留最新 3 条(acc2/acc3/acc4),id 降序。
+        assert_eq!(rows.len(), 3);
+        let accounts: Vec<_> = rows.iter().map(|r| r.account_id.as_str()).collect();
+        assert_eq!(accounts, vec!["acc4", "acc3", "acc2"]);
+    }
+
+    #[test]
+    fn request_log_filters_by_account_model_success() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.insert_request_log(&mk_log("a", "opus", true), 2000).unwrap();
+        store.insert_request_log(&mk_log("a", "sonnet", false), 2000).unwrap();
+        store.insert_request_log(&mk_log("b", "opus", true), 2000).unwrap();
+
+        let by_account = store
+            .list_request_logs(
+                &RequestLogFilter { account_id: Some("a".into()), ..Default::default() },
+                100,
+            )
+            .unwrap();
+        assert_eq!(by_account.len(), 2);
+
+        let by_model = store
+            .list_request_logs(
+                &RequestLogFilter { model: Some("opus".into()), ..Default::default() },
+                100,
+            )
+            .unwrap();
+        assert_eq!(by_model.len(), 2);
+
+        let failures = store
+            .list_request_logs(
+                &RequestLogFilter { success: Some(false), ..Default::default() },
+                100,
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].model, "sonnet");
+        assert_eq!(failures[0].error_kind.as_deref(), Some("rate_limited"));
+
+        // limit 生效。
+        let limited = store
+            .list_request_logs(&RequestLogFilter { limit: 1, ..Default::default() }, 100)
+            .unwrap();
+        assert_eq!(limited.len(), 1);
     }
 }

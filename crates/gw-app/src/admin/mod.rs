@@ -17,6 +17,7 @@ use gw_store::SqliteStore;
 mod accounts;
 mod groups;
 mod keys;
+mod logs;
 mod settings;
 mod usage;
 
@@ -64,6 +65,7 @@ pub fn admin_api_router(state: AdminState) -> Router {
         .merge(groups::router())
         .merge(accounts::router())
         .merge(settings::router())
+        .merge(logs::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state)
 }

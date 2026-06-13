@@ -372,7 +372,7 @@ async fn authorize(
                 Err((StatusCode::INTERNAL_SERVER_ERROR, "鉴权失败").into_response())
             }
         },
-        None => Err(unauthorized("缺少 Authorization")),
+        None => Err(unauthorized("缺少 API key(x-api-key 或 Authorization: Bearer)")),
     }
 }
 
@@ -491,18 +491,31 @@ fn parse_session_id(body: &Bytes) -> Option<String> {
     gw_kiro::converter::affinity_key_from_body(&v)
 }
 
+/// 提取客户端 API key。**两种鉴权头都认**:
+/// 1. `x-api-key: <key>` —— **Anthropic 标准头**(真 Anthropic API 用它)。NewAPI 的
+///    Claude/Anthropic 渠道、Anthropic SDK、Claude Code 指到本网关都发这个;旧版只认
+///    `Authorization` → 这些客户端一律 401,上游(如 NewAPI)再包装成 500。
+/// 2. `Authorization: Bearer <key>`(或直接把 key 放进 Authorization)—— OpenAI 风格。
+///
+/// 两者都在时优先 `x-api-key`(本网关对外是 Anthropic 线缆)。空白值跳过、回退下一种。
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        let k = k.trim();
+        if !k.is_empty() {
+            return Some(k.to_string());
+        }
+    }
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
-        .ok()?;
-    raw.strip_prefix("Bearer ")
+        .ok()?
+        .trim();
+    let key = raw
+        .strip_prefix("Bearer ")
         .or_else(|| raw.strip_prefix("bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // 兼容 x-api-key 风格直接放 key。
-            Some(raw.to_string())
-        })
+        .unwrap_or(raw) // 兼容把 key 直接放进 Authorization(无 Bearer 前缀)。
+        .trim();
+    (!key.is_empty()).then(|| key.to_string())
 }
 
 fn unauthorized(msg: &str) -> axum::response::Response {
@@ -603,6 +616,50 @@ mod embedded_ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn extract_bearer_accepts_x_api_key_and_authorization() {
+        // Anthropic 标准头(NewAPI Claude 渠道 / Anthropic SDK / Claude Code 都发这个)。
+        assert_eq!(
+            extract_bearer(&hdr(&[("x-api-key", "sk-abc")])).as_deref(),
+            Some("sk-abc")
+        );
+        // OpenAI 风格 Bearer。
+        assert_eq!(
+            extract_bearer(&hdr(&[("authorization", "Bearer sk-def")])).as_deref(),
+            Some("sk-def")
+        );
+        // 直接把 key 放进 Authorization(无 Bearer 前缀)。
+        assert_eq!(
+            extract_bearer(&hdr(&[("authorization", "sk-ghi")])).as_deref(),
+            Some("sk-ghi")
+        );
+        // 两者都在 → 优先 x-api-key(本网关对外是 Anthropic 线缆)。
+        assert_eq!(
+            extract_bearer(&hdr(&[("x-api-key", "sk-xak"), ("authorization", "Bearer sk-auth")]))
+                .as_deref(),
+            Some("sk-xak")
+        );
+        // 空 x-api-key 回退到 Authorization。
+        assert_eq!(
+            extract_bearer(&hdr(&[("x-api-key", "  "), ("authorization", "Bearer sk-fallback")]))
+                .as_deref(),
+            Some("sk-fallback")
+        );
+        // 都没有 → None。
+        assert_eq!(extract_bearer(&hdr(&[("accept", "application/json")])), None);
+    }
 
     #[test]
     fn parse_session_from_body() {

@@ -96,26 +96,33 @@ impl SseEvent {
 /// provider 在解析上游流时产出(Kiro 的权威 usage 在末个事件;subprocess 在
 /// `result` 事件;dario 在 message_delta)。gw-app 据此组装 store 的 UsageRecord,
 /// 无需重新解析已转好的 Anthropic SSE JSON。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// 注:含 f64(metering_credit)故不能 derive Eq;PartialEq 足够(assert_eq/比较用)。
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// 真:上游 `tokenUsageEvent.cacheReadInputTokens`——真号在 Kiro 服务端的**真实** prefix
+    /// cache 命中(诊断/优化用,**不参与上报计费**;非 Kiro provider 恒 0)。
+    pub real_cache_read_tokens: u64,
+    /// credit:Kiro `meteringEvent.usage`——本次请求真号的**真实积分消耗**(诊断/优化用,
+    /// 反映 Kiro 服务端有没有应用缓存折扣;非 Kiro provider 恒 0.0)。
+    pub metering_credit: f64,
 }
 
 /// 账号配额(积分/额度)只读快照。`getUsageLimits` 这类接口产出,admin 账号页展示
 /// "已用 / 上限 / 剩余"。非 Kiro provider 可不实现(默认 `None`)。
 ///
 /// `used`/`limit` 用浮点:Kiro 的 Credit 配额带小数(如 10236.75)。`remaining`
-/// 由实现保证 `= (limit - used).max(0.0)`(超额 clamp 到 0,不为负)。
+/// `= limit - used`,**可为负**(账号允许超额,负值=已超出多少 Credits,不再 clamp)。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccountQuota {
     /// 已用额度(Credits)。
     pub used: f64,
     /// 额度上限(base limit)。
     pub limit: f64,
-    /// 剩余额度 = (limit - used).max(0)。
+    /// 剩余额度 = limit - used(**可为负**:账号允许超额,负值=已超出多少 Credits)。
     pub remaining: f64,
     /// 已用百分比(0–100+,可超 100 表示已进入 overage)。
     pub percent_used: f64,
@@ -124,9 +131,9 @@ pub struct AccountQuota {
 }
 
 impl AccountQuota {
-    /// 由已用/上限构造,自动算 remaining(clamp 0)与 percent。
+    /// 由已用/上限构造,自动算 remaining(**不 clamp**:超额时为负,反映已超出多少)与 percent。
     pub fn from_used_limit(used: f64, limit: f64) -> Self {
-        let remaining = (limit - used).max(0.0);
+        let remaining = limit - used;
         let percent_used = if limit > 0.0 { used / limit * 100.0 } else { 0.0 };
         Self {
             used,

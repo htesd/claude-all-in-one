@@ -6,10 +6,11 @@ export type CardVariant = 'glass' | 'glass-strong' | 'glass-subtle' | 'solid'
 
 interface CardProps extends HTMLAttributes<HTMLDivElement> {
   /**
-   * - glass        : 默认玻璃态（半透明 + blur）
-   * - glass-strong : 更不透明的玻璃（适合需要更高可读性的内容）
-   * - glass-subtle : 轻玻璃（适合二级容器、工具栏）
-   * - solid        : 不透明实色 Card
+   * 变体名沿用旧 API(glass-*),视觉已切换为实色纸面卡片:
+   * - glass        : 默认白卡(实色 + 轻边框 + 微阴影)
+   * - glass-strong : 弹窗级卡片(实色 + 远投影)
+   * - glass-subtle : 二级容器(米白面板)
+   * - solid        : 同 glass(兼容保留)
    */
   variant?: CardVariant
   /** 是否启用 hover 浮起动画 */
@@ -20,7 +21,7 @@ const variantClass: Record<CardVariant, string> = {
   glass: 'glass-card text-card-foreground',
   'glass-strong': 'glass-card-strong text-card-foreground',
   'glass-subtle': 'glass-card-subtle text-card-foreground',
-  solid: 'bg-card text-card-foreground border shadow',
+  solid: 'glass-card text-card-foreground',
 }
 
 export const Card = forwardRef<HTMLDivElement, CardProps>(
@@ -50,7 +51,7 @@ export const CardTitle = forwardRef<HTMLDivElement, HTMLAttributes<HTMLDivElemen
   ({ className, ...props }, ref) => (
     <div
       ref={ref}
-      className={cn('font-semibold leading-none tracking-tight', className)}
+      className={cn('font-black leading-none tracking-[-0.02em]', className)}
       {...props}
     />
   ),

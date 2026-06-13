@@ -146,6 +146,42 @@ pub struct SystemConfig {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub image: ImageConfig,
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
+}
+
+/// 实验性开关(默认关)。两个 on/off 可经设置面板热控;env(`KIRO_TOOLS_IN_PREFIX` /
+/// `KIRO_CACHE_POINT`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    /// 把工具定义放进 history[0] 前缀(蹭 Kiro 缓存)。⚠️ 实测会让部分客户端工具调用失效,
+    /// 默认关。
+    #[serde(default = "default_tools_in_prefix")]
+    pub tools_in_prefix: bool,
+    /// 把 Anthropic `cache_control` 翻成 Kiro `cachePoint`(实测 no-op,dormant)。
+    #[serde(default = "default_cache_point")]
+    pub cache_point: bool,
+}
+
+fn env_experimental_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+fn default_tools_in_prefix() -> bool {
+    env_experimental_flag("KIRO_TOOLS_IN_PREFIX")
+}
+fn default_cache_point() -> bool {
+    env_experimental_flag("KIRO_CACHE_POINT")
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            tools_in_prefix: default_tools_in_prefix(),
+            cache_point: default_cache_point(),
+        }
+    }
 }
 
 /// admin 控制面配置。`token` 未设(None / 空串)→ admin API 关闭(router 不挂 /admin)。
@@ -210,6 +246,11 @@ pub struct SchedulerConfig {
     /// 会话亲和条目 TTL 秒数(超时未访问 = 会话重开,自然再平衡)。
     #[serde(default = "default_affinity_ttl_secs")]
     pub affinity_ttl_secs: u64,
+    /// worker 后台配额轮询开关(默认开)。复刻真实 Kiro IDE 每 ~5min 一次 getUsageLimits 的
+    /// ambient 流量(防封)+ 让配额面板无人看 dashboard 时也新鲜。与冷却阈值同放 SchedulerConfig
+    /// 是为复用既有 30s 热应用路径——admin 设置面板可即时启停轮询,无需重启(对抗审查 Architect#5)。
+    #[serde(default = "default_quota_poll_enabled")]
+    pub quota_poll_enabled: bool,
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
@@ -227,6 +268,9 @@ fn default_empty_response_threshold() -> u32 {
 fn default_max_failures() -> u32 {
     5
 }
+fn default_quota_poll_enabled() -> bool {
+    true
+}
 fn default_affinity_ttl_secs() -> u64 {
     1800
 }
@@ -240,6 +284,7 @@ impl Default for SchedulerConfig {
             empty_response_threshold: default_empty_response_threshold(),
             max_failures: default_max_failures(),
             affinity_ttl_secs: default_affinity_ttl_secs(),
+            quota_poll_enabled: default_quota_poll_enabled(),
         }
     }
 }
@@ -351,6 +396,9 @@ pub struct SystemSettings {
     pub max_failures: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_ttl_secs: Option<u64>,
+    /// worker 后台配额轮询热开关(None = 用 yaml 基线默认 true)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_poll_enabled: Option<bool>,
     // —— image ——
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_enabled: Option<bool>,
@@ -362,6 +410,13 @@ pub struct SystemSettings {
     pub image_max_pixels_multi: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_multi_threshold: Option<usize>,
+    // —— experimental ——
+    /// 工具放 history[0] 前缀实验(默认关;⚠️ 部分客户端工具调用会失效)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_in_prefix: Option<bool>,
+    /// cache_control→cachePoint 实验(实测 no-op,dormant)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<bool>,
 }
 
 impl SystemSettings {
@@ -378,11 +433,14 @@ impl SystemSettings {
         if let Some(v) = self.empty_response_threshold { base.scheduler.empty_response_threshold = v; }
         if let Some(v) = self.max_failures { base.scheduler.max_failures = v; }
         if let Some(v) = self.affinity_ttl_secs { base.scheduler.affinity_ttl_secs = v; }
+        if let Some(v) = self.quota_poll_enabled { base.scheduler.quota_poll_enabled = v; }
         if let Some(v) = self.image_enabled { base.image.enabled = v; }
         if let Some(v) = self.image_max_long_edge { base.image.max_long_edge = v; }
         if let Some(v) = self.image_max_pixels_single { base.image.max_pixels_single = v; }
         if let Some(v) = self.image_max_pixels_multi { base.image.max_pixels_multi = v; }
         if let Some(v) = self.image_multi_threshold { base.image.multi_threshold = v; }
+        if let Some(v) = self.tools_in_prefix { base.experimental.tools_in_prefix = v; }
+        if let Some(v) = self.cache_point { base.experimental.cache_point = v; }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -401,11 +459,14 @@ impl SystemSettings {
             empty_response_threshold: Some(cfg.scheduler.empty_response_threshold),
             max_failures: Some(cfg.scheduler.max_failures),
             affinity_ttl_secs: Some(cfg.scheduler.affinity_ttl_secs),
+            quota_poll_enabled: Some(cfg.scheduler.quota_poll_enabled),
             image_enabled: Some(cfg.image.enabled),
             image_max_long_edge: Some(cfg.image.max_long_edge),
             image_max_pixels_single: Some(cfg.image.max_pixels_single),
             image_max_pixels_multi: Some(cfg.image.max_pixels_multi),
             image_multi_threshold: Some(cfg.image.multi_threshold),
+            tools_in_prefix: Some(cfg.experimental.tools_in_prefix),
+            cache_point: Some(cfg.experimental.cache_point),
         }
     }
 }

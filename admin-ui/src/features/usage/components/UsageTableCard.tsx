@@ -33,8 +33,8 @@ export function UsageTableCard({
     <Card className="overflow-hidden">
       <div className="flex items-center justify-between border-b border-black/5 px-5 py-4 dark:border-white/5">
         <div className="flex items-center gap-2">
-          <Icon className="h-4 w-4 text-primary" />
-          <h2 className="text-sm font-semibold">{title}</h2>
+          <Icon className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-sm font-black tracking-[-0.01em]">{title}</h2>
         </div>
         {!loading && count !== undefined && <Badge variant="muted">{count}</Badge>}
       </div>

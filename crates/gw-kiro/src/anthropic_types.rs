@@ -147,14 +147,36 @@ impl OutputConfig {
             .and_then(|f| f.schema.as_ref())
     }
 
-    /// 有效思考强度:客户端显式值优先,否则 "xhigh"(对齐 static_flow `effective_effort`)。
-    pub fn effective_effort(&self) -> &str {
-        self.effort.as_deref().filter(|s| !s.is_empty()).unwrap_or("xhigh")
+    /// 有效思考强度:客户端显式值经白名单归一后返回(非法值回退 [`DEFAULT_EFFORT`])。
+    /// 对齐 static_flow `effective_effort`,但叠加合法化(见 [`normalize_effort`])。
+    pub fn effective_effort(&self) -> &'static str {
+        normalize_effort(self.effort.as_deref()).0
     }
 }
 
 /// 客户端完全未带 output_config 时的默认思考强度(深推理)。
 pub const DEFAULT_EFFORT: &str = "xhigh";
+
+/// Kiro 原生支持的 thinking effort 档位(由低到高)。客户端传入须命中其一(大小写不敏感)
+/// 才透传上游;非空但非法的值会被回退到 [`DEFAULT_EFFORT`],避免脏 effort 串打到 Kiro 触发 400。
+pub const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// 归一客户端 effort 到合法档位。返回 `(归一后的 &'static str, 是否因非法而回退)`:
+/// - `None` / 纯空白:未指定 → `(DEFAULT_EFFORT, false)`(默认,非告警情形);
+/// - 命中白名单(大小写不敏感):`(该档, false)`;
+/// - 非空但不在白名单:`(DEFAULT_EFFORT, true)`(调用方据 bool 决定是否告警)。
+pub fn normalize_effort(raw: Option<&str>) -> (&'static str, bool) {
+    let s = match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return (DEFAULT_EFFORT, false),
+    };
+    for v in VALID_EFFORTS {
+        if v.eq_ignore_ascii_case(s) {
+            return (*v, false);
+        }
+    }
+    (DEFAULT_EFFORT, true)
+}
 
 /// Claude Code 请求中的 metadata
 #[derive(Debug, Clone, Deserialize)]
@@ -354,4 +376,52 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn none_is_default_no_fallback_flag() {
+        assert_eq!(normalize_effort(None), ("xhigh", false));
+    }
+
+    #[test]
+    fn blank_is_default_no_fallback_flag() {
+        // 纯空白视为未指定:默认 xhigh,不算"非法回退"(不告警)。
+        assert_eq!(normalize_effort(Some("")), ("xhigh", false));
+        assert_eq!(normalize_effort(Some("   ")), ("xhigh", false));
+    }
+
+    #[test]
+    fn valid_levels_pass_through() {
+        assert_eq!(normalize_effort(Some("low")), ("low", false));
+        assert_eq!(normalize_effort(Some("medium")), ("medium", false));
+        assert_eq!(normalize_effort(Some("high")), ("high", false));
+        assert_eq!(normalize_effort(Some("xhigh")), ("xhigh", false));
+    }
+
+    #[test]
+    fn valid_levels_case_and_whitespace_insensitive() {
+        // 大小写不敏感 + 去前后空白后命中,归一为白名单里的标准小写形态(透传 wire 干净)。
+        assert_eq!(normalize_effort(Some("HIGH")), ("high", false));
+        assert_eq!(normalize_effort(Some("  XHigh ")), ("xhigh", false));
+    }
+
+    #[test]
+    fn illegal_value_falls_back_with_flag() {
+        // 非空但不在白名单 → 回退 xhigh 且标记 true(调用方据此告警)。
+        assert_eq!(normalize_effort(Some("ultra")), ("xhigh", true));
+        assert_eq!(normalize_effort(Some("999")), ("xhigh", true));
+        assert_eq!(normalize_effort(Some("high; drop")), ("xhigh", true));
+    }
+
+    #[test]
+    fn effective_effort_delegates_to_normalize() {
+        let oc = OutputConfig { effort: Some("garbage".to_string()), format: None };
+        assert_eq!(oc.effective_effort(), "xhigh");
+        let oc2 = OutputConfig { effort: Some("low".to_string()), format: None };
+        assert_eq!(oc2.effective_effort(), "low");
+    }
 }

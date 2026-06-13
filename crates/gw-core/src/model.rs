@@ -48,11 +48,11 @@ impl ModelInfo {
 /// (`KiroIDE-{version}-{machine_id}`)。**同一账号的 machine_id 必须
 /// 跨"激活/刷新/发包"始终一致**,否则触发风控(¥900 封号根因)。
 ///
-/// 一致性保证(审查 Architect#5):理想是账号**显式持有** machine_id。但 Social/OAuth
-/// 号常无显式值,此时 Kiro provider 按 `sha256("KotlinNativeAPI/"+refresh_token)` 派生
-/// (对齐上游客户端派生公式),并在**首次刷新**时把该值冻结为显式 `machine_id` 持久化
-/// (见 `gw_kiro::machine_id::freeze_machine_id_if_absent`),避免随 rolling token 漂移。
-/// 即"显式优先,缺失则派生一次后即冻结",而非每次发包重新派生。
+/// 一致性保证:理想是账号**显式持有**真机 machine_id(import 带入)。但 Social/OAuth
+/// 号常无显式值,此时 Kiro provider 按 `sha256("KotlinNativeAPI/"+refresh_token)` 用
+/// **当前** rt 派生(对齐上游客户端 + kiro.rs 的派生公式)。即"显式优先,缺失则**每次**
+/// 用当前 rt 派生"——**不冻结**(2026-06-12 撤销旧冻结):真实客户端 rt 滚动时 machineId
+/// 随之滚动,冻结会发陈旧值反而像换设备 → 封号(见 machine_id::freeze 的弃用说明)。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineIdentity {
     /// 64 字符小写 hex 机器码。

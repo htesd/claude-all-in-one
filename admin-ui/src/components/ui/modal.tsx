@@ -15,7 +15,7 @@ interface ModalProps {
   className?: string
 }
 
-/** 通用玻璃对话框：统一遮罩点击 / Esc 关闭、标题栏与进出场动画。 */
+/** 通用对话框：统一遮罩点击 / Esc 关闭、标题栏与进出场动画。 */
 export function Modal({ open, onClose, title, children, className }: ModalProps) {
   const { t } = useI18n()
 
@@ -41,7 +41,7 @@ export function Modal({ open, onClose, title, children, className }: ModalProps)
           className="fixed inset-0 z-50 flex items-center justify-center p-4"
         >
           {/* 遮罩：点击关闭 */}
-          <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+          <div className="absolute inset-0 bg-black/55" onClick={onClose} />
 
           <motion.div
             initial={{ scale: 0.96, y: 8 }}
@@ -50,14 +50,19 @@ export function Modal({ open, onClose, title, children, className }: ModalProps)
             transition={{ duration: 0.18, ease: [0.4, 0, 0.2, 1] }}
             className={cn('relative w-full max-w-md', className)}
           >
-            <Card variant="glass-strong" className="p-6" role="dialog" aria-modal="true">
+            <Card
+              variant="glass-strong"
+              className="rounded-3xl p-6"
+              role="dialog"
+              aria-modal="true"
+            >
               <div className="flex items-center justify-between">
-                <h2 className="text-base font-semibold">{title}</h2>
+                <h2 className="text-lg font-black tracking-[-0.02em]">{title}</h2>
                 <button
                   type="button"
                   onClick={onClose}
                   title={t('common.cancel')}
-                  className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 dark:hover:bg-white/10"
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 dark:hover:bg-white/10"
                 >
                   <X className="h-4 w-4" />
                 </button>

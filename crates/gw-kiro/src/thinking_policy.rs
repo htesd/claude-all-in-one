@@ -45,10 +45,12 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
             return;
         }
         // effort 客户端传入优先,缺省 xhigh(深推理;旧 high 仅产桩推理)。
+        // 此处保留客户端**原始**串(不归一/不告警):合法化与回退统一在
+        // `generate_thinking_prefix`(wire 注入唯一出口)做,避免双重告警 + 双重归一。
         let effort = req
             .output_config
             .as_ref()
-            .map(|c| c.effective_effort().to_string())
+            .and_then(|c| c.effort.clone())
             .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
 
         tracing::info!(

@@ -1,12 +1,18 @@
-//! KiroManager 导出 JSON → 账号字段映射(完整导入)。
+//! 账号导出 JSON → 账号字段映射(完整导入)。支持**两种**输入格式:
 //!
-//! **为什么存在**:KiroManager 导出的每个账号顶层带真机 `machineId`(激活时绑定的
-//! 设备指纹)。只导 refreshToken 会丢掉它,服务器据 rt 重新派生一个不同的 machineId
-//! → 上游看到"激活设备 A、发包设备 B" = 双指纹 = 封号。完整导入把 machineId 及
-//! clientId/secret/profileArn 等**原样**搬进账号 extra,消除这一根因。
+//! 1. **KiroManager 导出**:`{ version, accounts: [{ email, machineId,
+//!    credentials: { refreshToken, accessToken, clientId, ... }, subscription }] }`
+//!    (嵌套 + camelCase)。每账号顶层带真机 `machineId`(激活时的设备指纹),
+//!    只导 refreshToken 会丢它 → 服务器据 rt 派生不同 machineId → 双指纹封号;
+//!    完整导入把 machineId/clientId/secret/profileArn **原样**搬进 extra 消除根因。
+//! 2. **扁平账号数组**:`[{ refresh_token, access_token, client_id, client_secret,
+//!    profile_arn, region, auth_method, email, expires_at }, ...]`(顶层 + snake_case)。
+//!    字段名已是内部 extra 约定,近乎恒等映射;这类导出通常**不带** machineId
+//!    (留空 → 按 rt 派生,封号风险见上,建议尽量用带 machineId 的来源)。
 //!
-//! 本模块只做**纯映射**(KiroManager JSON → `extra` map),不碰库;智能合并(已存在
-//! 账号只补缺失字段、不覆盖服务器已 roll 的 token)由 gw-app admin 处理。
+//! 顶层是**数组** → 按扁平解析;是**对象且含 `accounts`** → 逐账号按"有无 `credentials`
+//! 子对象"分流到嵌套/扁平映射。本模块只做**纯映射**(JSON → `extra` map),不碰库;
+//! 智能合并(已存在账号只补缺失字段、不覆盖服务器已 roll 的 token)由 gw-app admin 处理。
 
 use serde_json::{json, Map, Value};
 
@@ -27,18 +33,22 @@ impl ImportedAccount {
     }
 }
 
-/// 解析 KiroManager 导出根对象(`{ version, accounts: [...] }`)。
+/// 解析账号导出(顶层数组 = 扁平;`{ accounts: [...] }` = KiroManager/混合)。
 /// 跳过无 refreshToken 的条目(social/IdC 都需要它)。全部无效返回 `Err`。
-pub fn parse_kiromanager_export(root: &Value) -> Result<Vec<ImportedAccount>, String> {
-    let accounts = root
-        .get("accounts")
-        .and_then(|a| a.as_array())
-        .ok_or("JSON 缺少 accounts 数组(不是 KiroManager 导出格式?)")?;
+pub fn parse_accounts_export(root: &Value) -> Result<Vec<ImportedAccount>, String> {
+    let accounts: &[Value] = match root.as_array() {
+        Some(arr) => arr.as_slice(),
+        None => root
+            .get("accounts")
+            .and_then(|a| a.as_array())
+            .map(Vec::as_slice)
+            .ok_or("JSON 既不是账号数组,也不含 accounts 数组(不是支持的导出格式?)")?,
+    };
 
     let mut out = Vec::new();
     let mut skipped_no_rt = 0;
     for acc in accounts {
-        match map_one(acc) {
+        match map_account(acc) {
             Some(m) => out.push(m),
             None => skipped_no_rt += 1,
         }
@@ -50,6 +60,16 @@ pub fn parse_kiromanager_export(root: &Value) -> Result<Vec<ImportedAccount>, St
         ));
     }
     Ok(out)
+}
+
+/// 单账号分流:含 `credentials` 子对象 → KiroManager 嵌套([`map_one`]);
+/// 否则 → 扁平 snake_case([`map_flat`])。
+fn map_account(acc: &Value) -> Option<ImportedAccount> {
+    if acc.get("credentials").is_some() {
+        map_one(acc)
+    } else {
+        map_flat(acc)
+    }
 }
 
 fn map_one(acc: &Value) -> Option<ImportedAccount> {
@@ -134,6 +154,142 @@ fn map_one(acc: &Value) -> Option<ImportedAccount> {
     Some(ImportedAccount { account_id, extra })
 }
 
+/// 扁平 snake_case 账号(字段即 extra,顶层无 `credentials`)→ [`ImportedAccount`]。
+/// refresh_token 必需。字段名已是内部约定,近乎恒等映射。machineId 不在则留空(派生)。
+///
+/// 与嵌套路径的差别:这里 `auth_method` 是我方 snake_case 约定值(`idc`/`social`/
+/// `external_idp`),**按原值搬运**(权威);嵌套路径来自 KiroManager 的 `authMethod="IdC"`
+/// 自有约定,故刻意不映射。`external_idp` 才会触发 TokenType 头,`idc` 安全。
+fn map_flat(acc: &Value) -> Option<ImportedAccount> {
+    // refresh_token 必需。flat_str 已 snake→camel 回退,故 refreshToken 也认。
+    let refresh = flat_str(acc, "refresh_token").filter(|s| !s.is_empty())?;
+
+    let mut extra = Map::new();
+    extra.insert("refresh_token".into(), json!(refresh));
+
+    // 凭据/配置字段(非空才写)。flat_str: snake_case 优先,回退 camelCase——
+    // 兼容 kiro.rs 风格的 camelCase 导出(clientId/clientSecret/accessToken/profileArn/
+    // authMethod),否则这些字段静默丢失 → BuilderId 号丢 client 凭据、刷新分流判错。
+    // 以**内部 snake_case key** 存(运行时只认 snake_case)。
+    for key in [
+        "access_token",
+        "client_id",
+        "client_secret",
+        "region",
+        "profile_arn",
+        "auth_method",
+    ] {
+        if let Some(v) = flat_str(acc, key).filter(|s| !s.is_empty()) {
+            extra.insert(key.into(), json!(v));
+        }
+    }
+
+    // machineId(若带:校验/归一,非法不写——与嵌套路径同规则)。
+    if let Some(mid) = acc
+        .get("machine_id")
+        .or_else(|| acc.get("machineId"))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(n) = crate::machine_id::normalize_machine_id(mid) {
+            extra.insert("machine_id".into(), json!(n));
+        }
+    }
+
+    // kiro_provider(若带:kiro_provider / provider / idp 归一)。
+    let idp = flat_str(acc, "kiro_provider")
+        .or_else(|| flat_str(acc, "provider"))
+        .or_else(|| flat_str(acc, "idp"))
+        .map(normalize_kiro_provider);
+    if let Some(p) = idp.filter(|s| !s.is_empty()) {
+        extra.insert("kiro_provider".into(), json!(p));
+    }
+
+    // expires_at:字符串(RFC3339)原样;数字(epoch s/ms,>1e12 视为毫秒)转 RFC3339。
+    // snake/camel 都认(expires_at / expiresAt)。
+    if let Some(v) = acc.get("expires_at").or_else(|| acc.get("expiresAt")) {
+        if let Some(s) = v.as_str().filter(|s| !s.is_empty()) {
+            extra.insert("expires_at".into(), json!(s));
+        } else if let Some(n) = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)) {
+            let secs = if n > 1_000_000_000_000 { n / 1000 } else { n };
+            extra.insert("expires_at".into(), json!(crate::token::format_unix_utc(secs)));
+        }
+    }
+
+    // 展示/对账字段。
+    let email = flat_str(acc, "email").filter(|s| !s.is_empty());
+    if let Some(e) = email {
+        extra.insert("email".into(), json!(e));
+    }
+    if let Some(uid) = flat_str(acc, "user_id")
+        .or_else(|| flat_str(acc, "userId"))
+        .filter(|s| !s.is_empty())
+    {
+        extra.insert("user_id".into(), json!(uid));
+    }
+    if let Some(nick) = flat_str(acc, "nickname").filter(|s| !s.is_empty()) {
+        extra.insert("nickname".into(), json!(nick));
+    }
+    if let Some(title) = flat_str(acc, "subscription_title")
+        .or_else(|| {
+            acc.get("subscription")
+                .and_then(|s| s.get("title").or_else(|| s.get("type")))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.is_empty())
+    {
+        extra.insert("subscription_title".into(), json!(title));
+    }
+
+    // account_id:email → user_id → id,清洗成合法路径段。
+    let raw_id = email
+        .or_else(|| flat_str(acc, "user_id"))
+        .or_else(|| flat_str(acc, "userId"))
+        .or_else(|| flat_str(acc, "id"))
+        .unwrap_or("kiro-account");
+    let account_id = sanitize_account_id(raw_id);
+
+    Some(ImportedAccount { account_id, extra })
+}
+
+/// 取顶层字符串字段(扁平格式用)。
+fn top_str<'a>(acc: &'a Value, field: &str) -> Option<&'a str> {
+    acc.get(field).and_then(|v| v.as_str())
+}
+
+/// 取顶层字符串:**snake_case 优先,回退 camelCase**。
+///
+/// 对齐 kiro.rs 的 `#[serde(rename_all = "camelCase")]` 行为——它的导出/导入用 camelCase
+/// (`refreshToken`/`clientId`/`clientSecret`/`machineId`...),而我方内部约定是 snake_case。
+/// 扁平导入两种风格都要吃,否则用户在 kiro.rs 用的 camelCase 文件导进来会丢字段。
+fn flat_str<'a>(acc: &'a Value, snake: &str) -> Option<&'a str> {
+    top_str(acc, snake).or_else(|| {
+        let camel = snake_to_camel(snake);
+        // camel == snake(无下划线,如 "region"/"email"/"provider")时不重复查,直接 None。
+        if camel == snake {
+            None
+        } else {
+            acc.get(&camel).and_then(|v| v.as_str())
+        }
+    })
+}
+
+/// `client_secret` → `clientSecret`。仅用于导入字段名兼容(纯 ASCII)。
+fn snake_to_camel(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    let mut upper_next = false;
+    for c in snake.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.push(c.to_ascii_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// KiroManager 的 provider/idp 值 → 本项目 kiro_provider 取值(小写归一)。
 /// 已知:Enterprise / BuilderId / GitHub / Google / Social;其余原样小写。
 fn normalize_kiro_provider(v: &str) -> String {
@@ -190,6 +346,134 @@ fn num_at(obj: Option<&Value>, field: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// 扁平 snake_case 数组(顶层无 accounts 包裹、字段即 extra)——用户实际格式。
+    fn flat_export() -> Value {
+        json!([{
+            "access_token": "aoa_flat_access",
+            "auth_method": "idc",
+            "client_id": "NHPEspwEz8-hGjN_yUO2anVzLWVhc3QtMQ",
+            "client_secret": "eyJraW_flat_secret",
+            "email": "mrdev3258",
+            "expires_at": "2026-06-10T10:53:33.000Z",
+            "expires_in": 3600,
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:207377045753:profile/P7CDKWEEXXCG",
+            "refresh_token": "aor_flat_refresh",
+            "region": "us-east-1",
+            "type": "kiro"
+        }])
+    }
+
+    #[test]
+    fn flat_array_maps_snake_case_fields() {
+        let out = parse_accounts_export(&flat_export()).unwrap();
+        assert_eq!(out.len(), 1);
+        let a = &out[0];
+        // account_id 由 email 清洗(已是合法字符,原样)。
+        assert_eq!(a.account_id, "mrdev3258");
+        assert_eq!(a.extra["refresh_token"], json!("aor_flat_refresh"));
+        assert_eq!(a.extra["access_token"], json!("aoa_flat_access"));
+        assert_eq!(a.extra["client_id"], json!("NHPEspwEz8-hGjN_yUO2anVzLWVhc3QtMQ"));
+        assert_eq!(a.extra["client_secret"], json!("eyJraW_flat_secret"));
+        assert_eq!(a.extra["region"], json!("us-east-1"));
+        assert_eq!(a.extra["profile_arn"].as_str().unwrap(), "arn:aws:codewhisperer:us-east-1:207377045753:profile/P7CDKWEEXXCG");
+        assert_eq!(a.extra["email"], json!("mrdev3258"));
+        // auth_method 扁平格式按原值搬运(snake_case 是我方约定;idc 安全,非 external_idp)。
+        assert_eq!(a.extra["auth_method"], json!("idc"));
+        // expires_at 已是 RFC3339 字符串,原样保留。
+        assert_eq!(a.extra["expires_at"], json!("2026-06-10T10:53:33.000Z"));
+        // 无 machineId → 不写(留空按 rt 派生)。
+        assert!(!a.has_machine_id());
+        // type/expires_in 不进 extra(非账号字段)。
+        assert!(!a.extra.contains_key("type"));
+        assert!(!a.extra.contains_key("expires_in"));
+    }
+
+    #[test]
+    fn flat_skips_entries_without_refresh_token() {
+        let v = json!([
+            {"email": "a", "access_token": "at"},
+            {"email": "b", "refresh_token": "rt"}
+        ]);
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(out.len(), 1, "无 refresh_token 的扁平条目应跳过");
+        assert_eq!(out[0].account_id, "b");
+    }
+
+    #[test]
+    fn flat_epoch_ms_number_converts_to_rfc3339() {
+        let v = json!([{"refresh_token": "rt", "expires_at": 1781121312584i64}]);
+        let out = parse_accounts_export(&v).unwrap();
+        let exp = out[0].extra["expires_at"].as_str().unwrap();
+        assert!(exp.ends_with('Z') && exp.contains('T'), "数字 epoch 应转 RFC3339: {exp}");
+    }
+
+    #[test]
+    fn accounts_wrapped_flat_objects_also_parse() {
+        // { accounts: [ <扁平对象> ] } —— 无 credentials 子对象也按扁平分流。
+        let v = json!({"accounts": [{"refresh_token": "rt", "email": "x", "client_id": "c", "client_secret": "s"}]});
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].extra["client_id"], json!("c"));
+    }
+
+    /// 用户在 kiro.rs 用的 **camelCase BuilderId** 导出(不封号的格式)。扁平、无
+    /// `credentials` 子对象、字段 camelCase。核心回归:clientId/clientSecret 必须导进来,
+    /// 否则刷新分流(看 client_id+secret 在不在)判错 → BuilderId 号坏。
+    #[test]
+    fn flat_camelcase_builderid_keeps_client_credentials() {
+        let v = json!([{
+            "email": "natalie.raymond.walker@example.com",
+            "refreshToken": "aor_builderid_refresh",
+            "provider": "BuilderId",
+            "password": "ignored-pw",
+            "clientId": "sb16AvMRqYSnm6f4-G40bHVzLWVhc3QtMQ",
+            "clientSecret": "eyJraW_builderid_secret"
+        }]);
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(out.len(), 1);
+        let a = &out[0];
+        // camelCase 全部读到并以内部 snake_case 落库。
+        assert_eq!(a.extra["refresh_token"], json!("aor_builderid_refresh"));
+        assert_eq!(
+            a.extra["client_id"], json!("sb16AvMRqYSnm6f4-G40bHVzLWVhc3QtMQ"),
+            "clientId 必须导入,否则刷新分流判成 social"
+        );
+        assert_eq!(a.extra["client_secret"], json!("eyJraW_builderid_secret"));
+        // provider: BuilderId → kiro_provider 归一为 builderid。
+        assert_eq!(a.extra["kiro_provider"], json!("builderid"));
+        assert_eq!(a.extra["email"], json!("natalie.raymond.walker@example.com"));
+        // password 非账号字段,不进 extra。
+        assert!(!a.extra.contains_key("password"));
+    }
+
+    /// camelCase 的 accessToken/profileArn/expiresAt/machineId 也要认。
+    #[test]
+    fn flat_camelcase_extra_fields_recognized() {
+        let mid = "a".repeat(64);
+        let v = json!([{
+            "refreshToken": "rt",
+            "accessToken": "at-camel",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X",
+            "expiresAt": "2026-06-12T00:00:00Z",
+            "machineId": mid,
+            "userId": "uid-9"
+        }]);
+        let a = &parse_accounts_export(&v).unwrap()[0];
+        assert_eq!(a.extra["access_token"], json!("at-camel"));
+        assert_eq!(a.extra["profile_arn"].as_str().unwrap(), "arn:aws:codewhisperer:us-east-1:1:profile/X");
+        assert_eq!(a.extra["expires_at"], json!("2026-06-12T00:00:00Z"));
+        assert!(a.has_machine_id(), "camelCase machineId 应导入");
+        assert_eq!(a.extra["user_id"], json!("uid-9"));
+    }
+
+    #[test]
+    fn snake_to_camel_basic() {
+        assert_eq!(snake_to_camel("client_secret"), "clientSecret");
+        assert_eq!(snake_to_camel("refresh_token"), "refreshToken");
+        assert_eq!(snake_to_camel("profile_arn"), "profileArn");
+        assert_eq!(snake_to_camel("region"), "region"); // 无下划线原样
+    }
+
     fn enterprise_export() -> Value {
         json!({
             "version": "1.7.5",
@@ -218,7 +502,7 @@ mod tests {
 
     #[test]
     fn maps_all_critical_fields() {
-        let out = parse_kiromanager_export(&enterprise_export()).unwrap();
+        let out = parse_accounts_export(&enterprise_export()).unwrap();
         assert_eq!(out.len(), 1);
         let a = &out[0];
         // account_id 由 email 清洗(@ 和 + 变 -)。
@@ -253,7 +537,7 @@ mod tests {
                 "region": "us-east-1", "provider": "BuilderId"
             }
         }]});
-        let out = parse_kiromanager_export(&v).unwrap();
+        let out = parse_accounts_export(&v).unwrap();
         assert_eq!(out[0].extra["kiro_provider"], json!("builderid"));
         // BuilderId 无 profileArn —— 不臆造,留空靠 kiro_provider 兜底 BUILDER_ID ARN。
         assert!(!out[0].extra.contains_key("profile_arn"));
@@ -265,7 +549,7 @@ mod tests {
             {"email": "a@x.com", "credentials": {"accessToken": "at"}},
             {"email": "b@x.com", "credentials": {"refreshToken": "rt"}}
         ]});
-        let out = parse_kiromanager_export(&v).unwrap();
+        let out = parse_accounts_export(&v).unwrap();
         assert_eq!(out.len(), 1, "无 refreshToken 的条目应跳过");
         assert_eq!(out[0].account_id, "b-x.com");
     }
@@ -279,7 +563,7 @@ mod tests {
             "machineId": "abc",
             "credentials": {"refreshToken": "rt"}
         }]});
-        let out = parse_kiromanager_export(&v).unwrap();
+        let out = parse_accounts_export(&v).unwrap();
         assert!(!out[0].has_machine_id(), "非法 machineId 不应被当成已设置");
         assert!(!out[0].extra.contains_key("machine_id"));
     }
@@ -290,15 +574,15 @@ mod tests {
             "email": "x@y.com",
             "credentials": {"refreshToken": "rt", "accessToken": "at", "expiresAt": "1781121312584"}
         }]});
-        let out = parse_kiromanager_export(&v).unwrap();
+        let out = parse_accounts_export(&v).unwrap();
         let exp = out[0].extra["expires_at"].as_str().unwrap();
         assert!(exp.ends_with('Z') && exp.contains('T'), "字符串 epoch 也应转 RFC3339: {exp}");
     }
 
     #[test]
     fn errors_when_no_accounts_array() {
-        assert!(parse_kiromanager_export(&json!({"version": "1.7.5"})).is_err());
-        assert!(parse_kiromanager_export(&json!({"accounts": []})).is_err());
+        assert!(parse_accounts_export(&json!({"version": "1.7.5"})).is_err());
+        assert!(parse_accounts_export(&json!({"accounts": []})).is_err());
     }
 
     #[test]

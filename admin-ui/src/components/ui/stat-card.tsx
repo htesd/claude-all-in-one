@@ -14,11 +14,9 @@ interface StatCardProps {
 export function StatCard({ icon: Icon, label, value, sub, loading = false }: StatCardProps) {
   return (
     <Card className="hover-lift p-5">
-      <div className="flex items-center gap-2.5 text-muted-foreground">
-        <span className="gradient-bg-primary flex h-8 w-8 shrink-0 items-center justify-center rounded-lg shadow-sm">
-          <Icon className="h-4 w-4 text-white" />
-        </span>
-        <span className="truncate text-xs font-medium">{label}</span>
+      <div className="flex items-center justify-between gap-2 text-muted-foreground">
+        <span className="truncate text-sm">{label}</span>
+        <Icon className="h-4 w-4 shrink-0 opacity-60" />
       </div>
       <div className="mt-3">
         {loading ? (
@@ -28,7 +26,7 @@ export function StatCard({ icon: Icon, label, value, sub, loading = false }: Sta
           </>
         ) : (
           <>
-            <div className="text-2xl font-bold tracking-tight">{value}</div>
+            <div className="font-display text-3xl font-black tracking-[-0.04em]">{value}</div>
             {sub !== undefined && (
               <div className="mt-1 truncate text-xs text-muted-foreground">{sub}</div>
             )}

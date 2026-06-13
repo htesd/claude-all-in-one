@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { HeartPulse, Pencil, Trash2 } from 'lucide-react'
+import { HeartPulse, Pencil, RefreshCw, Trash2 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,7 @@ import { AccountStatusBadge } from './AccountStatusBadge'
 
 /** 行内小图标按钮的统一样式（编辑铅笔 / 删除等）。 */
 const iconButtonClass =
-  'inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10'
+  'inline-flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-black/5 hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50 dark:hover:bg-white/10'
 
 /** runtime 查询的三态：初载 / 失败（无数据可用）/ 就绪。 */
 export type RuntimeQueryState = 'loading' | 'error' | 'ready'
@@ -33,6 +33,7 @@ interface AccountTableRowProps {
   onEdit: (row: AccountRow) => void
   onDelete: (id: string) => void
   onReset: (id: string) => void
+  onRefresh: (id: string) => void
 }
 
 export function AccountTableRow({
@@ -45,6 +46,7 @@ export function AccountTableRow({
   onEdit,
   onDelete,
   onReset,
+  onRefresh,
 }: AccountTableRowProps) {
   const { t } = useI18n()
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -113,13 +115,18 @@ export function AccountTableRow({
         })()}
       </TD>
 
-      {/* 并发：空闲/上限（runtime），无 runtime 数据时显示配置值 */}
+      {/* 并发：在用/上限（runtime）。available_permits 是空闲槽，在用 = 上限 - 空闲，
+          故空闲账号显示 0/N(而非反直觉的 N/N)。无 runtime 数据时只显示配置上限。 */}
       <TD className="text-right">
         {runtimeState === 'loading' ? (
           <Skeleton className="ml-auto h-4 w-10" />
         ) : hasLivePermits ? (
-          <span className="tabular-nums">
-            {runtime.status.available_permits}/{runtime.status.max_concurrency}
+          <span
+            className="tabular-nums"
+            title={t('table.concurrencyHint')}
+          >
+            {runtime.status.max_concurrency - runtime.status.available_permits}/
+            {runtime.status.max_concurrency}
           </span>
         ) : (
           <span className="tabular-nums text-muted-foreground">{row.max_concurrency}</span>
@@ -156,6 +163,17 @@ export function AccountTableRow({
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5">
+            {/* 刷新 token 始终可用(与编辑/删除一致)：不依赖 runtime.online——runtime 降级时
+                仍要能手动刷新,后端会顺序扇出并回成功/失败/无人持有(审查 Skeptic#5/Minimalist#2)。 */}
+            <button
+              type="button"
+              onClick={() => onRefresh(row.account_id)}
+              title={t('accounts.action.refresh')}
+              disabled={busy}
+              className={cn(iconButtonClass, 'text-primary hover:text-primary')}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
             {canReset && (
               <button
                 type="button"
@@ -189,7 +207,7 @@ export function AccountTableRow({
               onClick={() => setConfirmingDelete(true)}
               title={t('accounts.action.delete')}
               disabled={busy}
-              className={cn(iconButtonClass, 'hover:text-destructive')}
+              className={cn(iconButtonClass, 'hover:text-rose-600 dark:hover:text-rose-300')}
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
