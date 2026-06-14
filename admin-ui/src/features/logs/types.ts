@@ -54,6 +54,8 @@ export interface LogBlob {
 export interface RequestLogDetail extends RequestLogRow {
   client_payload: string
   kiro_payload: string
+  /** 模型回复(折叠后的 Anthropic Messages 响应 JSON;旧日志/失败请求为空串)。 */
+  response_payload: string
   /** 本条日志报文引用到的去重媒体 blob。 */
   blobs: LogBlob[]
 }
