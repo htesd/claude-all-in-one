@@ -205,6 +205,24 @@ function parseAnthropic(obj: Record<string, unknown>): Conversation | null {
   return { meta, turns }
 }
 
+/** 解析单条 Anthropic Messages **响应**(我方折叠的模型回复:`{type:"message",role,content,…}`)。
+ *  非该结构返回 null。与请求体不同——响应是单条 assistant message,没有 `messages` 数组。 */
+function parseAnthropicResponse(obj: Record<string, unknown>): Conversation | null {
+  if (obj.type !== 'message' || !Array.isArray(obj.content)) return null
+  const turns: Turn[] = [
+    { role: asText(obj.role) || 'assistant', blocks: anthropicBlocks(obj.content) },
+  ]
+  const meta: Conversation['meta'] = []
+  if (typeof obj.model === 'string') meta.push({ label: 'model', value: obj.model })
+  if (typeof obj.stop_reason === 'string') meta.push({ label: 'stop_reason', value: obj.stop_reason })
+  const usage = obj.usage as Record<string, unknown> | undefined
+  if (usage && typeof usage === 'object') {
+    const out = usage.output_tokens
+    if (typeof out === 'number') meta.push({ label: 'output_tokens', value: String(out) })
+  }
+  return { meta, turns }
+}
+
 /** Kiro userInputMessage / assistantResponseMessage → 归一化 Turn。 */
 function kiroMessageToTurn(node: unknown): Turn | null {
   if (!node || typeof node !== 'object') return null
@@ -275,7 +293,11 @@ function parseConversation(raw: string): Conversation | null {
   try {
     const obj: unknown = JSON.parse(raw)
     if (!obj || typeof obj !== 'object') return null
-    return parseAnthropic(obj as Record<string, unknown>) ?? parseKiro(obj as Record<string, unknown>)
+    return (
+      parseAnthropic(obj as Record<string, unknown>) ??
+      parseAnthropicResponse(obj as Record<string, unknown>) ??
+      parseKiro(obj as Record<string, unknown>)
+    )
   } catch {
     return null
   }

@@ -296,6 +296,9 @@ pub struct RequestLog {
     pub client_payload: String,
     /// 转换后、发往 Kiro 前的请求体(JSON 文本,媒体已替换为 `blob:<hash>` 引用)。
     pub kiro_payload: String,
+    /// 模型回复(我方把上游 SSE 折叠成的单条 Anthropic Messages 响应 JSON;失败/无回复=空串)。
+    /// 便于复盘"用户问了什么→模型答了什么";正文为纯文本/思考/工具调用,不含媒体 blob。
+    pub response_payload: String,
     /// 从两份报文抽出的媒体 blob(图片/文档),入库按 hash 去重。
     pub blobs: Vec<LogBlob>,
 }
@@ -332,6 +335,8 @@ pub struct RequestLogDetail {
     pub row: RequestLogRow,
     pub client_payload: String,
     pub kiro_payload: String,
+    /// 模型回复(折叠后的 Anthropic Messages 响应 JSON;旧日志/失败请求=空串)。
+    pub response_payload: String,
     /// 本条日志报文里 `blob:<hash>` 引用到的媒体(图片/文档),前端据此渲染。
     pub blobs: Vec<LogBlob>,
 }

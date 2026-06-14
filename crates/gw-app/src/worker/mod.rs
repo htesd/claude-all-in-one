@@ -1336,6 +1336,7 @@ async fn messages(
                         Some(started_at.elapsed().as_millis() as i64),
                         None,
                         None,
+                        ResponseLog::None, // 首包前失败:无模型回复。
                     );
                     return upstream_error_response(&e);
                 }
@@ -1403,6 +1404,22 @@ const REQUEST_LOG_CAP: u64 = 2000;
 /// 真实报文绝不触顶,只挡住非常规超大输入(防单行无界内存/库占用)。
 const MAX_LOG_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
+/// 流式模型回复采集的**累计字节**上限(真正的内存护栏:按 SSE data 序列化字节计,而非按条数——
+/// 单个 `input_json_delta`/工具增量可能很大,按条数封顶无法挡住"少量超大事件"撑爆内存)。
+/// 与入库截断阈值同量级:缓存超过最终会被截断的体量没有意义。触顶后停止累积(已采集部分仍折叠)。
+const RESPONSE_LOG_MAX_BYTES: usize = MAX_LOG_PAYLOAD_BYTES;
+
+/// 一次请求"模型回复"的采集结果,交给落库任务(blocking)折叠/序列化——把重活留在 blocking,
+/// 且让非流式路径**复用已折叠的响应体**(不二次折叠,避免与下发客户端的响应产生分歧)。
+enum ResponseLog {
+    /// 无回复(选号前失败 / 无 message_start)。
+    None,
+    /// 非流式:已折叠好的 Anthropic Messages(下发客户端的同一份),直接序列化入库。
+    Folded(serde_json::Value),
+    /// 流式:转发期间按字节预算采集的 SSE 事件,落库任务里折叠成 Messages。
+    Events(Vec<SseEvent>),
+}
+
 /// 报文入库前处理:**按字段把图片/文档 base64 抽到 blob 列表**(`data`/`bytes` 键的长值,
 /// 替换为 `blob:<hash>` 引用;对话正文走 `text` 键,绝不误抽),**再**按字符边界截断文本兜底。
 /// 返回(处理后报文文本, 抽出的 blob)。非 JSON(如转换错误串)原样截断、无 blob。
@@ -1415,6 +1432,26 @@ fn prepare_log_payload(raw: String) -> (String, Vec<gw_core::store::LogBlob>) {
         }
         Err(_) => (truncate_log_payload(raw), Vec::new()),
     }
+}
+
+/// 把折叠后的模型回复(Anthropic Messages)序列化入库。超 [`MAX_LOG_PAYLOAD_BYTES`] 时**不**像
+/// 普通报文那样硬截成半截非法 JSON(会让详情页"格式化"视图解析失败),而是替换成一条**合法**的
+/// 占位 Messages(保留 formatted 渲染 + 明确标注截断,见 `_truncated`)。
+fn serialize_response_capped(msg: &serde_json::Value) -> String {
+    let s = serde_json::to_string(msg).unwrap_or_default();
+    if s.len() <= MAX_LOG_PAYLOAD_BYTES {
+        return s;
+    }
+    serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "text",
+            "text": format!("<模型回复过大(约 {} 字节),已省略未入库>", s.len()),
+        }],
+        "_truncated": true,
+    })
+    .to_string()
 }
 
 /// 按 UTF-8 字符边界安全截断报文(超 [`MAX_LOG_PAYLOAD_BYTES`] 时)。
@@ -1447,6 +1484,7 @@ fn write_request_log(
     duration_ms: Option<i64>,
     ttfb_ms: Option<i64>,
     usage: Option<ChatUsage>,
+    response: ResponseLog,
 ) {
     let (input, output, cache_read, cache_creation, real_cache_read, metering_credit) = usage
         .as_ref()
@@ -1472,6 +1510,24 @@ fn write_request_log(
         }
         None => (String::new(), String::new()),
     };
+    // 模型回复:折叠/序列化都在此 blocking 任务内做,不占热路径。失败请求/无回复 → 空串(详情页不展示)。
+    let response_payload = match response {
+        ResponseLog::None => String::new(),
+        // 非流式:复用下发客户端的同一份折叠结果,不二次折叠(避免与客户端响应分歧)。
+        ResponseLog::Folded(msg) => serialize_response_capped(&msg),
+        ResponseLog::Events(events) if events.is_empty() => String::new(),
+        ResponseLog::Events(events) => match gw_core::fold::fold_sse_to_message(&events) {
+            Ok(msg) => serialize_response_capped(&msg),
+            Err(_) => {
+                // 折叠失败(协议违例 / 缺 message_start / 提前断流):无合法回复可存。
+                // success 请求却折叠失败值得一条诊断(上游格式变更会在此先冒头)。
+                if success {
+                    tracing::debug!(account = %account_id, "模型回复折叠失败,response_payload 留空");
+                }
+                String::new()
+            }
+        },
+    };
     let log = RequestLog {
         client_key_id: client_key,
         account_id,
@@ -1493,6 +1549,7 @@ fn write_request_log(
         metering_credit,
         client_payload,
         kiro_payload,
+        response_payload,
         blobs,
     };
     if let Err(e) = store.insert_request_log(&log, REQUEST_LOG_CAP) {
@@ -1516,6 +1573,7 @@ fn spawn_request_log_blocking(
     duration_ms: Option<i64>,
     ttfb_ms: Option<i64>,
     usage: Option<ChatUsage>,
+    response: ResponseLog,
 ) {
     let Some(store) = st.store.clone() else {
         return;
@@ -1528,7 +1586,7 @@ fn spawn_request_log_blocking(
         let _guard = guard;
         write_request_log(
             store, req, account, client_key, is_stream, success, status_code, error_kind,
-            duration_ms, ttfb_ms, usage,
+            duration_ms, ttfb_ms, usage, response,
         );
     });
 }
@@ -1681,6 +1739,12 @@ async fn collect_response(
     ) {
         let guard = pw.enter();
         let duration_ms = Some(started_at.elapsed().as_millis() as i64);
+        // 非流式:复用上面已折叠、即将下发客户端的同一份响应体(成功才有),不二次折叠——
+        // 保证入库的 response_payload 与客户端实际收到的响应严格一致。失败 → 无回复。
+        let response = match &outcome {
+            Outcome::Ok(msg) => ResponseLog::Folded(msg.clone()),
+            _ => ResponseLog::None,
+        };
         handle.spawn_blocking(move || {
             let _guard = guard;
             write_request_log(
@@ -1695,6 +1759,7 @@ async fn collect_response(
                 duration_ms,
                 None,
                 last_usage,
+                response,
             );
         });
     }
@@ -1740,6 +1805,11 @@ fn stream_response(
         started_at: std::time::Instant,
         first_byte_at: Option<std::time::Instant>,
         error_kind: Option<String>,
+        // 模型回复采集(#③):流过期间累积转发给客户端的 SSE 事件(克隆一份),收尾时折叠成
+        // Anthropic Messages 写入 response_payload。按**累计字节**(resp_bytes)封顶 RESPONSE_LOG_MAX_BYTES
+        // 防超长/超大回复无界占内存(触顶后停止累积,折叠仍尽力而为;正常回复远低于此)。
+        resp_events: Vec<SseEvent>,
+        resp_bytes: usize,
     }
 
     // 收尾(账号生命周期上报 + usage 落库)统一放 Drop:无论流跑到 None 正常结束,
@@ -1808,6 +1878,7 @@ fn stream_response(
                 duration_ms,
                 ttfb_ms,
                 usage,
+                ResponseLog::Events(std::mem::take(&mut self.resp_events)),
             );
         }
     }
@@ -1829,6 +1900,8 @@ fn stream_response(
         started_at,
         first_byte_at: None,
         error_kind: None,
+        resp_events: Vec::new(),
+        resp_bytes: 0,
     };
 
     let sse = futures::stream::unfold(init, |mut ctx| async move {
@@ -1847,7 +1920,17 @@ fn stream_response(
                         }
                     }
                     let out = match ev.to_wire() {
-                        Ok(_) => Event::default().event(ev.event).data(ev.data.to_string()),
+                        Ok(_) => {
+                            // 转发本就要把 data 序列化成字符串,这里复用它:既当字节预算度量,又喂给下游,
+                            // 避免二次 to_string。模型回复采集(#③):error 不入(非回复内容);
+                            // 按累计字节封顶(真正的内存护栏,挡少量超大事件),触顶停采。
+                            let data = ev.data.to_string();
+                            if ev.event != "error" && ctx.resp_bytes < RESPONSE_LOG_MAX_BYTES {
+                                ctx.resp_bytes = ctx.resp_bytes.saturating_add(data.len());
+                                ctx.resp_events.push(ev.clone());
+                            }
+                            Event::default().event(ev.event).data(data)
+                        }
                         Err(e) => {
                             // 序列化失败也算本次响应损坏 → 收尾按失败上报(审查 Architect#9)。
                             ctx.saw_error = true;
@@ -1910,6 +1993,34 @@ mod tests {
     use gw_core::provider::ChatUsage;
     use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn serialize_response_small_is_passthrough_json() {
+        let msg = serde_json::json!({
+            "type":"message","role":"assistant",
+            "content":[{"type":"text","text":"hi"}]
+        });
+        let s = serialize_response_capped(&msg);
+        // 正常体量:原样序列化,可被重新解析(详情页"格式化"视图据此渲染)。
+        let v: serde_json::Value = serde_json::from_str(&s).expect("应是合法 JSON");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn serialize_response_oversized_yields_valid_truncation_marker() {
+        // 超 MAX_LOG_PAYLOAD_BYTES:不能存半截非法 JSON,必须是合法占位 + _truncated 标记。
+        let huge = "x".repeat(MAX_LOG_PAYLOAD_BYTES + 1024);
+        let msg = serde_json::json!({
+            "type":"message","role":"assistant",
+            "content":[{"type":"text","text": huge}]
+        });
+        let s = serialize_response_capped(&msg);
+        assert!(s.len() <= MAX_LOG_PAYLOAD_BYTES, "占位体量应远小于上限");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("占位必须是合法 JSON");
+        assert_eq!(v["_truncated"], true);
+        assert_eq!(v["role"], "assistant");
+    }
 
     #[test]
     fn jittered_secs_within_bounds_and_degenerate() {

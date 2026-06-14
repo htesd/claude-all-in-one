@@ -1,5 +1,33 @@
 # Changelog
 
+## [request-log-response + modal-layout] - 2026-06-14
+
+### Feature —— 请求日志新增「模型回复」保存 + 详情弹窗布局修复
+
+**背景**:请求日志已存「用户原始报文 / 发 Kiro 前报文」,但缺模型的实际回复,不便复盘"问了什么→
+答了什么"。同时详情弹窗内容过长会撑出浏览器可视范围。
+
+- **后端·模型回复入库**:`request_logs` 新增 `response_payload` 列(gzip 入库,旧库 `ensure_column`
+  热升级回填空串)。回复 = 把本次响应折叠成的单条 Anthropic Messages JSON(与下发客户端同形):
+  - 非流式:**复用**已折叠、即将下发客户端的同一份响应体(`ResponseLog::Folded`),**不二次折叠**——
+    入库与客户端实收严格一致;
+  - 流式:转发期间按**累计字节**预算(`RESPONSE_LOG_MAX_BYTES`,与入库截断同量级)采集 SSE 事件
+    (`ResponseLog::Events`),收尾在 blocking 任务里折叠。复用转发时的 `data.to_string()` 既当字节
+    度量又喂下游,避免二次序列化;
+  - 折叠/序列化全在 detach 的 blocking 线程池,**绝不碰收入热路径**;失败请求/无 message_start → 空串
+    (详情页不展示该区块)。
+- **前端·展示**:详情弹窗第三块「模型回复」,沿用 PayloadView 的 formatted/raw 双视图(新增
+  `parseAnthropicResponse` 识别单条 Messages 响应)+ 下载按钮;`response_payload` 为空则隐藏。
+- **前端·弹窗布局**:共享 `Modal` 卡片限高 `max-h-[88vh]`、标题栏固定、内容区超出自身滚动,
+  彻底解决长报文撑出视口。
+- **设计取舍 / 对抗审查(Codex×3,1 high + 数 medium 已修)**:
+  - 流式封顶从"按条数"改为**按字节**——单个超大 `input_json_delta` 也挡得住(原 high 共识);
+  - 回复序列化超限时存**合法**占位 JSON(`_truncated:true`)而非半截非法 JSON,保住 formatted 渲染;
+  - 非流式去掉二次折叠,消除入库与客户端响应分歧风险;`ResponseLog` 具名枚举替代裸 `Vec<SseEvent>`
+    参数;弹窗滚动条改 `pr-1` 不用负 margin,避免其它弹窗水平溢出/焦点环裁切。
+- **测试**:新增 `serialize_response_capped` 2 个(常规直通 / 超限合法占位)+ store 往返断言;
+  workspace 全绿(557 测试)、admin-ui tsc+build 通过。
+
 ## [thinking-effort-validation] - 2026-06-14
 
 ### Feature —— thinking effort 白名单校验 + 非法值回退告警

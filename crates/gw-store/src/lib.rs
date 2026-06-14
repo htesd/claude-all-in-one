@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
     real_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     metering_credit       REAL    NOT NULL DEFAULT 0,
     client_payload TEXT   NOT NULL DEFAULT '',
-    kiro_payload   TEXT   NOT NULL DEFAULT ''
+    kiro_payload   TEXT   NOT NULL DEFAULT '',
+    response_payload TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_reqlog_created ON request_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_reqlog_account ON request_logs(account_id, created_at);
@@ -230,6 +231,13 @@ impl SqliteStore {
             "request_logs",
             "metering_credit",
             "metering_credit REAL NOT NULL DEFAULT 0",
+        )?;
+        // request_logs 模型回复列(存量库热升级:旧表无此列则补,历史行回填为空)。
+        Self::ensure_column(
+            conn,
+            "request_logs",
+            "response_payload",
+            "response_payload TEXT NOT NULL DEFAULT ''",
         )?;
         // usage_records 成本看板列(存量库热升级:旧表无此列则补,历史行回填为 0)。
         Self::ensure_column(
@@ -666,8 +674,8 @@ impl SqliteStore {
              (client_key_id, account_id, model, stream, success, status_code, error_kind, \
               duration_ms, ttfb_ms, input_tokens, output_tokens, cache_read_tokens, \
               cache_creation_tokens, reported_tokens, real_cache_read_tokens, metering_credit, \
-              client_payload, kiro_payload) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+              client_payload, kiro_payload, response_payload) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             rusqlite::params![
                 log.client_key_id,
                 log.account_id,
@@ -687,6 +695,7 @@ impl SqliteStore {
                 log.metering_credit,
                 gzip_text(&log.client_payload),
                 gzip_text(&log.kiro_payload),
+                gzip_text(&log.response_payload),
             ],
         )?;
         let max_id = tx.last_insert_rowid();
@@ -760,7 +769,7 @@ impl SqliteStore {
     /// 取单条详情(含完整 client/kiro payload)。无此 id → `None`。
     pub fn get_request_log(&self, id: i64) -> anyhow::Result<Option<RequestLogDetail>> {
         let sql = format!(
-            "SELECT {}, client_payload, kiro_payload FROM request_logs WHERE id = ?1",
+            "SELECT {}, client_payload, kiro_payload, response_payload FROM request_logs WHERE id = ?1",
             Self::REQLOG_ROW_COLS
         );
         let conn = self.stats_conn.lock();
@@ -770,6 +779,7 @@ impl SqliteStore {
                 row: Self::row_to_reqlog_row(r)?,
                 client_payload: value_to_payload(r.get::<_, Value>(18)?),
                 kiro_payload: value_to_payload(r.get::<_, Value>(19)?),
+                response_payload: value_to_payload(r.get::<_, Value>(20)?),
                 blobs: Vec::new(),
             })
         }) {
@@ -1792,6 +1802,7 @@ groups:
             metering_credit: 0.4321,
             client_payload: format!(r#"{{"model":"{model}","orig":true}}"#),
             kiro_payload: format!(r#"{{"conversationState":"for-{account}"}}"#),
+            response_payload: format!(r#"{{"type":"message","role":"assistant","model":"{model}"}}"#),
             blobs: Vec::new(),
         }
     }
@@ -1827,6 +1838,8 @@ groups:
         let detail = store.get_request_log(row.id).unwrap().expect("应存在");
         assert!(detail.kiro_payload.contains("for-kiro-1"));
         assert!(detail.client_payload.contains("\"orig\":true"));
+        // 模型回复(response_payload)gzip 往返无损。
+        assert!(detail.response_payload.contains("\"role\":\"assistant\""));
         // 不存在的 id → None。
         assert!(store.get_request_log(999_999).unwrap().is_none());
     }

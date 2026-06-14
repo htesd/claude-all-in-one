@@ -50,13 +50,15 @@ export function Modal({ open, onClose, title, children, className }: ModalProps)
             transition={{ duration: 0.18, ease: [0.4, 0, 0.2, 1] }}
             className={cn('relative w-full max-w-md', className)}
           >
+            {/* 卡片限高到视口内(max-h-[88vh])并改为纵向 flex:标题栏固定、内容区超出时自身滚动,
+                避免高报文详情等长内容把弹窗撑出浏览器可视范围。 */}
             <Card
               variant="glass-strong"
-              className="rounded-3xl p-6"
+              className="flex max-h-[88vh] flex-col rounded-3xl p-6"
               role="dialog"
               aria-modal="true"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex shrink-0 items-center justify-between">
                 <h2 className="text-lg font-black tracking-[-0.02em]">{title}</h2>
                 <button
                   type="button"
@@ -67,7 +69,9 @@ export function Modal({ open, onClose, title, children, className }: ModalProps)
                   <X className="h-4 w-4" />
                 </button>
               </div>
-              {children}
+              {/* min-h-0 让 flex 子项可收缩从而触发滚动;pr-1 给滚动条一点内边距(不用负 margin,
+                  避免在其它弹窗里把正文挤进卡片 padding 造成水平溢出/焦点环裁切)。 */}
+              <div className="min-h-0 flex-1 overflow-y-auto pr-1">{children}</div>
             </Card>
           </motion.div>
         </motion.div>

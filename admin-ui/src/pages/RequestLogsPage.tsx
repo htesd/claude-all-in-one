@@ -225,6 +225,25 @@ function LogDetailModal({ id, onClose }: LogDetailModalProps) {
               </div>
               <PayloadView raw={data.kiro_payload} mode={payloadMode} blobs={data.blobs} />
             </div>
+            {/* 模型回复:仅成功且采集到时展示(旧日志/失败请求无此字段) */}
+            {data.response_payload && (
+              <div>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <p className="text-xs font-semibold text-muted-foreground">
+                    {t('logs.detail.responsePayload')}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => downloadText(`response-${data.id}.json`, data.response_payload)}
+                    className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-muted-foreground hover:bg-black/5 dark:hover:bg-white/5"
+                  >
+                    <Download className="h-3 w-3" />
+                    {t('logs.detail.download')}
+                  </button>
+                </div>
+                <PayloadView raw={data.response_payload} mode={payloadMode} blobs={data.blobs} />
+              </div>
+            )}
           </div>
         </div>
       )}
