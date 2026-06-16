@@ -615,7 +615,7 @@ pub async fn run(
     tracing::debug!(providers = ?registry.families(), "已注册 provider");
     // 先按本 worker 的固定出口构造 egress client,注入 provider——
     // 保证该 provider 所有上游请求走同一出口 IP(防关联封号)。
-    let client = egress::build_client(&wcfg.egress)?;
+    let client = egress::build_client(&wcfg.egress, system.upstream_timeout_secs)?;
     let egress_desc = egress::describe(&wcfg.egress);
     // DB 设置 overlay:叠在 system.yaml 基线上得"有效配置"(热调首启即生效)。
     // default_proxy 单独取出注入 provider(出口选择,不属运行开关)。
