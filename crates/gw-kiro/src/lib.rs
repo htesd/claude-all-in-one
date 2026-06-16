@@ -27,6 +27,7 @@ pub mod resolver;
 pub mod signature;
 pub mod text_tokens;
 pub mod thinking_policy;
+pub mod tool_repair;
 pub mod import;
 pub mod token;
 pub mod usage;

@@ -1,5 +1,34 @@
 # Changelog
 
+## [tool-repair] - 2026-06-16
+
+### Fix —— 工具参数双重编码防御性修复（tool_repair）
+
+**线上取证**：部分上游模型（Kiro 上的 Opus）偶发把本应是 JSON array 的工具参数序列化成 JSON
+**字符串**——1027 次 `AskUserQuestion` 调用中 223 次把 `questions` 编码成字符串，客户端按
+`input_schema` 校验拒收：`The parameter questions type is expected as array but provided as string`。
+反代逐字透传模型产出的 tool input，本身无 bug，但这是唯一可控点。
+
+- **新增 `crates/gw-kiro/src/tool_repair.rs`**：转换请求时从每个工具 `input_schema` 提取「顶层
+  type 为 array/object 的字段名集合」建表（`tool_repair_fields: 工具短名 → 字段集合`，键与上游回显的
+  wire 短名同源）；收尾组装 tool input 时，若字段当前为字符串且能解析成 array/object 就解包替换。
+- **流式（chat.rs）**：命中字段的工具走「缓冲不发 → `close_open_tool` 在 `content_block_stop` 前
+  只发一条 `repair_str` 修复后完整 `input_json_delta`」（无双发）；`finish()` 兜未显式 stop 的截断。
+  非修复工具逐帧透传。非流式经同一 BlockTracker 后 `fold_sse_to_message` 折叠，天然覆盖。
+
+### Design Rationale
+
+- 安全边界（绝不破坏正常输入）：仅 schema 声明 array/object 的顶层字段、当前值为字符串、且可解析成
+  对应类型时才替换；标量字符串、非 JSON 串、已是数组、半截 JSON 一律原样保留（11 项单测锁定）。
+- `array_object_fields` 读**原始** `input_schema`（在 normalize/多模态降级之前），故 schema 降级只改
+  发往上游的副本、不影响修复表——按客户端真实期望解包。
+
+### Notes & Caveats
+
+- 缓冲对所有含顶层 array/object 字段的工具生效（input 不再增量流式、整段缓冲到 stop；协议正确性无损）。
+- 仅解顶层一层；nullable/$ref/anyOf 包裹的 array、嵌套双编码不识别（漏修不误伤）。
+- 既有缺陷（与本修复无关、不受影响）：响应侧未消费 tool_name_map，名长 >63B 的工具向客户端泄露短哈希名。
+
 ## [agent-continuation-cache-ab] - 2026-06-15
 
 ### Fix(实验开关) —— 恢复稳定 agentContinuationId,修复真实缓存全 miss

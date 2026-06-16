@@ -56,6 +56,10 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 工具防御性修复字段表：发往上游的工具短名 → 该工具 input_schema 中 type 为
+    /// array/object 的顶层字段集合。供流式收尾解包被模型双重编码成字符串的参数
+    /// （如 AskUserQuestion.questions）。无 array/object 字段的工具不入表。
+    pub tool_repair_fields: HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// 转换错误
@@ -193,9 +197,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let (text_content, images, documents, tool_results) =
         merge_current_message_content(current_messages)?;
 
-    // 6. 转换工具定义（超长名称自动缩短并记录映射）
+    // 6. 转换工具定义（超长名称自动缩短并记录映射；同时按 schema 收集需修复的 array/object 字段）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let mut tool_repair_fields: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut tools = convert_tools(&req.tools, &mut tool_name_map, &mut tool_repair_fields);
 
     // 7. 构建历史消息（当前轮之前的所有消息;需要先构建,以便收集历史中使用的工具）
     // promoted_system: 块1a 从 messages 数组提升上来的稳定 system 文本,折叠进 history[0]。
