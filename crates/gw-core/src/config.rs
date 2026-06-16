@@ -176,6 +176,10 @@ pub struct ExperimentalConfig {
     /// 把 Anthropic `cache_control` 翻成 Kiro `cachePoint`(实测 no-op,dormant)。
     #[serde(default = "default_cache_point")]
     pub cache_point: bool,
+    /// 发**稳定** agentContinuationId(+agentTaskType="vibe")进 conversationState。默认关。
+    /// 用于复刻 kiro.rs proven 配置做真实缓存命中的生产 A/B(见 gw-kiro converter/cache_point.rs)。
+    #[serde(default = "default_agent_continuation")]
+    pub agent_continuation: bool,
 }
 
 fn env_experimental_flag(name: &str) -> bool {
@@ -189,12 +193,16 @@ fn default_tools_in_prefix() -> bool {
 fn default_cache_point() -> bool {
     env_experimental_flag("KIRO_CACHE_POINT")
 }
+fn default_agent_continuation() -> bool {
+    env_experimental_flag("KIRO_AGENT_CONTINUATION")
+}
 
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             tools_in_prefix: default_tools_in_prefix(),
             cache_point: default_cache_point(),
+            agent_continuation: default_agent_continuation(),
         }
     }
 }
@@ -432,6 +440,9 @@ pub struct SystemSettings {
     /// cache_control→cachePoint 实验(实测 no-op,dormant)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_point: Option<bool>,
+    /// 稳定 agentContinuationId+vibe 实验(真实缓存命中 A/B,默认关)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_continuation: Option<bool>,
 }
 
 impl SystemSettings {
@@ -456,6 +467,7 @@ impl SystemSettings {
         if let Some(v) = self.image_multi_threshold { base.image.multi_threshold = v; }
         if let Some(v) = self.tools_in_prefix { base.experimental.tools_in_prefix = v; }
         if let Some(v) = self.cache_point { base.experimental.cache_point = v; }
+        if let Some(v) = self.agent_continuation { base.experimental.agent_continuation = v; }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -482,6 +494,7 @@ impl SystemSettings {
             image_multi_threshold: Some(cfg.image.multi_threshold),
             tools_in_prefix: Some(cfg.experimental.tools_in_prefix),
             cache_point: Some(cfg.experimental.cache_point),
+            agent_continuation: Some(cfg.experimental.agent_continuation),
         }
     }
 }

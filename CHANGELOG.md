@@ -1,5 +1,31 @@
 # Changelog
 
+## [agent-continuation-cache-ab] - 2026-06-15
+
+### Fix(实验开关) —— 恢复稳定 agentContinuationId,修复真实缓存全 miss
+
+**背景/根因(线上取证)**:caio 真实 Kiro 前缀缓存命中 **0%**(1985/1985 success),credit **+49% vs
+kiro.rs**(opus-4-8 1.37 vs 0.92/req);而 kiro.rs 同上游同期 **~43%** 命中。逐层对比两套源码:caio
+发的 wire 看似完美可缓存(稳定 conversationId、history 前缀逐字节相同、reminder 已剥),唯一差异是
+2026-06-13 caio **删掉了** `agentContinuationId` + `agentTaskType="vibe"`,理由"kiro.rs/static_flow
+都不发"——经核对**证伪**:kiro.rs 生产一直在发稳定值(其代码实测注释:稳定 → metering 降 ~36%),
+caio 自身 2026-05-24 命中 A/B 基线也含此字段(6-13 才删)。删除疑为当时 reminder-leak bug 混淆的误判。
+
+- **恢复** `derive_agent_continuation_id`(= `SHA256("agent-continuation:"+conversationId)` 前 16 字节
+  排 UUID,**逐字节对齐 kiro.rs**;golden-vector `621628ff-…` 锁死)。
+- **新实验开关 `agent_continuation`**(默认**关**):走与 tools_in_prefix/cache_point 同款 RwLock 热控
+  (config.rs→cache_point.rs→apply_hot_settings),可经**设置面板/API 热翻**——生产做**可逆 A/B**:
+  默认关 = 部署零 wire 变化(`Option` 字段 `skip_serializing_if` 完全省略),开启 = 复刻 kiro.rs proven
+  配置(稳定 conversationId + 稳定 agentContinuationId + vibe)。
+- 附挂逻辑抽成纯函数 `with_agent_continuation_metadata(state, enabled)`,便于直接测两分支。
+- 前端设置面板加该开关 + 中英文案(指向请求日志「真」命中列)。
+- **设计取舍**:做成默认关的可逆开关(而非直接改默认)——历史测量多次被混淆,用真实流量 A/B 定论;
+  必须配稳定 conversationId(本 crate 已保证),否则每轮新值反而 miss(kiro.rs 实测)。
+- **对抗审查(Codex×2)**:修 4 项 medium——补 enabled-path 测试(纯函数双分支 + 序列化边界双向
+  断言:关→JSON 省略两 key、开→含两 key 且 = golden vector)、golden-vector 锁死、OnceLock→RwLock
+  热控(消除"重启才能翻、不可热回滚")。1 项 high 为误报(glob import,编译已过)。
+- **测试**:gw-kiro 357 + workspace 560 全绿;admin-ui tsc+build 通过;clippy 净。
+
 ## [request-log-response + modal-layout] - 2026-06-14
 
 ### Feature —— 请求日志新增「模型回复」保存 + 详情弹窗布局修复

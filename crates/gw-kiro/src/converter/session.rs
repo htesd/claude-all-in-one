@@ -166,5 +166,32 @@ pub(super) fn derive_conversation_id_from_messages(
     )
 }
 
-// 注:agentContinuationId 派生已删除——自造该 ID 上 wire 会让 Kiro 绕过 conversationId 前缀
-// 缓存致全 miss(2026-06-13 实锤),static_flow/kiro.rs 均不发。详见 converter/mod.rs 根因注释。
+/// 基于 conversationId 派生 **稳定** 的 agentContinuationId(同一对话恒等)。
+///
+/// 与 `derive_conversation_id_from_messages` 同款哈希,但加固定盐 `agent-continuation:` 区分
+/// 两个 ID(避免相等)。逐字节对齐 kiro.rs `converter.rs::derive_agent_continuation_id`。
+///
+/// 【2026-06-15 修正】此前(2026-06-13)误判"发 agentContinuationId 即破缓存"而删除,理由是
+/// "kiro.rs/static_flow 都不发"——**经核对 kiro.rs 生产明确在发**(且其代码实测注释:稳定的
+/// agentContinuationId 让 metering 降 ~36%,fresh/不稳定才 miss)。caio 自身 2026-05-24 A/B 命中
+/// 时该字段也**在发**(基线含它,6-13 才删)。删除后线上实测 0% 真实命中、credit +49% vs kiro.rs。
+/// 故此处恢复派生,经 [`super::agent_continuation_enabled`] 开关上 wire(默认关,A/B 灰度)。
+pub(super) fn derive_agent_continuation_id(conversation_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent-continuation:");
+    hasher.update(conversation_id.as_bytes());
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 has 32 bytes");
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+        u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
+        u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+        u64::from_be_bytes({
+            let mut b = [0u8; 8];
+            b[2..].copy_from_slice(&bytes[10..16]);
+            b
+        }) & 0x0000_ffff_ffff_ffff,
+    )
+}

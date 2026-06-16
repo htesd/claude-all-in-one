@@ -150,13 +150,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 3. 生成会话 ID 和代理 ID。conversationId 派生逻辑抽到 [`derive_conversation_id`]
     //    (worker 会话亲和也复用它,保证 router/sim/亲和三处身份链同源)。
     let conversation_id = derive_conversation_id(req, messages);
-    // 【根因·真实缓存全 miss】(2026-06-13 线上 caio 实锤,真号 真=miss/全冷)：
-    // 旧实现自造一个稳定的 agentContinuationId 上 wire。Kiro 收到 agentContinuationId 会把请求
-    // 当成「续接一个它从未签发的 agent 上下文」,于是**绕过 conversationId 前缀缓存** → 同一对话
-    // 连续轮也每轮冷 miss、真号真实额度暴烧。static_flow(金标准)与 kiro.rs(生产)都**完全不发**
-    // 这个字段;static_flow 还专门有测试 does_not_send_random_agent_continuation_metadata 锁死。
-    // 旧注释"agentContinuationId 必须稳定/否则 3 倍计费"实为误判(对比的是「稳定发」vs「随机发」
-    // 两个都错的配置;正解是**根本不发**)。故此处不再派生、不再上 wire。见 [[real-cache-hit]] 修正。
+    // 【2026-06-15 修正·真实缓存全 miss 根因再定位】
+    // 2026-06-13 曾删除 agentContinuationId,理由"kiro.rs/static_flow 都不发、发了破缓存"。
+    // 复核证伪:kiro.rs **生产一直在发**稳定的 agentContinuationId(converter.rs:670,实测注释
+    // 稳定值 → metering 降 ~36%),且 caio 自身 2026-05-24 命中 A/B 基线**也含**此字段(6-13 才删)。
+    // 删除后线上实测 caio 真实命中 **0%**、credit **+49% vs kiro.rs**(后者同上游 ~43% 命中)。
+    // 故恢复**稳定**派生,经 `agent_continuation_enabled()` 开关上 wire(默认关,生产做可逆 A/B):
+    // 稳定 conversationId(本 crate 已保证)+ 稳定 agentContinuationId = kiro.rs proven 配置。
+    // 实际附挂在 `with_agent_continuation_metadata`(纯函数,便于直接测两个分支)。
 
     // 3.1 跨轮重复 tool_use_id 重写(🟢 static_flow)。客户端反复 auto-compact 后,同一
     // tool_use_id 可能在两个各自已完成的 assistant 轮里各出现一次,直发会让 Kiro 400。
@@ -348,14 +349,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 13. 构建 ConversationState
-    // 【只发 chat_trigger_type=MANUAL,不发 agentContinuationId / agentTaskType】——逐字对齐
-    // static_flow 金标准(测试 does_not_send_random_agent_continuation_metadata 断言这俩为 None)
-    // 与 kiro.rs 生产(二者均不发)。详见下方根因注释。
-    let conversation_state = ConversationState::new(conversation_id)
-        .with_chat_trigger_type(chat_trigger_type)
-        .with_current_message(current_message)
-        .with_history(history);
+    // 13. 构建 ConversationState。chat_trigger_type=MANUAL 恒发;agentContinuationId + agentTaskType
+    // 仅在开关启用时上 wire(默认关,见上方根因注释 + `agent_continuation_enabled`)。
+    let conversation_state = with_agent_continuation_metadata(
+        ConversationState::new(conversation_id)
+            .with_chat_trigger_type(chat_trigger_type)
+            .with_current_message(current_message)
+            .with_history(history),
+        agent_continuation_enabled(),
+    );
 
     if !tool_name_map.is_empty() {
         tracing::info!(
@@ -367,7 +369,24 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        tool_repair_fields,
     })
+}
+
+/// 按开关把**稳定** agentContinuationId(从 `state.conversation_id` 派生,与 conversationId 同源)
+/// + agentTaskType="vibe" 附到 conversationState —— 复刻 kiro.rs proven 配置(见根因注释)。
+///
+/// **纯函数**(开关值由调用方传入,便于直接测两个分支,不依赖进程级实验全局):
+/// - `enabled=false`(默认):原样返回,两字段保持 None → 序列化时 **完全省略**(零 wire 变化);
+/// - `enabled=true`:附 agentContinuationId(稳定)+ agentTaskType="vibe"。
+fn with_agent_continuation_metadata(state: ConversationState, enabled: bool) -> ConversationState {
+    if !enabled {
+        return state;
+    }
+    let acid = derive_agent_continuation_id(&state.conversation_id);
+    state
+        .with_agent_continuation_id(acid)
+        .with_agent_task_type("vibe")
 }
 
 /// 确定聊天触发类型
