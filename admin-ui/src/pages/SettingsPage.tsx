@@ -33,6 +33,7 @@ interface FormState {
   image_multi_threshold: string
   tools_in_prefix: boolean
   cache_point: boolean
+  agent_continuation: boolean
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -57,6 +58,7 @@ function settingsToForm(s: SystemSettings): FormState {
     image_multi_threshold: String(s.image_multi_threshold),
     tools_in_prefix: s.tools_in_prefix,
     cache_point: s.cache_point,
+    agent_continuation: s.agent_continuation,
   }
 }
 
@@ -112,6 +114,7 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     'image_enabled',
     'tools_in_prefix',
     'cache_point',
+    'agent_continuation',
   ]
   for (const k of boolFields) {
     if (form[k] !== original[k]) {
@@ -506,6 +509,23 @@ export default function SettingsPage() {
                 </span>
                 <span className="block text-xs text-muted-foreground">
                   {t('settings.field.cachePointHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.agent_continuation ?? false}
+                onChange={(e) => set('agent_continuation', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.agentContinuation')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.agentContinuationHint')}
                 </span>
               </span>
             </label>

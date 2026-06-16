@@ -13,6 +13,8 @@ use std::sync::{OnceLock, RwLock};
 struct ExperimentalFlags {
     tools_in_prefix: bool,
     cache_point: bool,
+    /// 发稳定 agentContinuationId+vibe(真实缓存命中 A/B)。
+    agent_continuation: bool,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -28,15 +30,17 @@ fn experimental() -> &'static RwLock<ExperimentalFlags> {
         RwLock::new(ExperimentalFlags {
             tools_in_prefix: env_flag("KIRO_TOOLS_IN_PREFIX"),
             cache_point: env_flag("KIRO_CACHE_POINT"),
+            agent_continuation: env_flag("KIRO_AGENT_CONTINUATION"),
         })
     })
 }
 
 /// 热应用实验开关(worker 30s settings 轮询经 apply_hot_settings 调用)。
-pub(crate) fn set_experimental_flags(tools_in_prefix: bool, cache_point: bool) {
+pub(crate) fn set_experimental_flags(tools_in_prefix: bool, cache_point: bool, agent_continuation: bool) {
     if let Ok(mut g) = experimental().write() {
         g.tools_in_prefix = tools_in_prefix;
         g.cache_point = cache_point;
+        g.agent_continuation = agent_continuation;
     }
 }
 
@@ -65,6 +69,20 @@ pub(super) fn tools_in_prefix_enabled() -> bool {
 /// 不是 cachePoint。代码保留为 dormant 实验，供 Python 迁移参考，勿在 prod 开启。
 pub(super) fn cache_point_enabled() -> bool {
     experimental().read().map(|g| g.cache_point).unwrap_or(false)
+}
+
+/// 实验开关：把**稳定的** agentContinuationId(+ agentTaskType="vibe")发进 conversationState。
+/// 默认关(env `KIRO_AGENT_CONTINUATION=1` 启用)。
+///
+/// 【为什么是开关、为什么默认关】2026-06-13 caio 误判"发此字段即破缓存"删除,线上随后实测
+/// 真实缓存命中 **0%**、credit **+49% vs kiro.rs**;而 kiro.rs 生产**一直在发**稳定值并拿到
+/// ~43% 命中(其代码实测注释:稳定 agentContinuationId → metering 降 ~36%)。本开关用于在生产做
+/// 可逆 A/B:默认关(部署零行为变化),灰度时置 1 复刻 kiro.rs proven 配置、对比 real-hit。
+/// 注:必须配 **稳定** conversationId(本 crate 已保证),否则每轮新值反而 miss(kiro.rs 实测)。
+/// 走 RwLock 实验全局(与 tools_in_prefix/cache_point 同款),可经设置面板/API **热控**——
+/// A/B 期间零重启、零丢请求即可翻开关回滚(env `KIRO_AGENT_CONTINUATION` 作启动默认)。
+pub(super) fn agent_continuation_enabled() -> bool {
+    experimental().read().map(|g| g.agent_continuation).unwrap_or(false)
 }
 
 /// 实验参数：cachePoint 的 type 值。默认 EPHEMERAL。

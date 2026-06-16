@@ -40,6 +40,8 @@ export interface SystemSettings {
   tools_in_prefix: boolean
   /** 实验：cache_control→cachePoint（实测 no-op，dormant）。 */
   cache_point: boolean
+  /** 实验：发稳定 agentContinuationId+vibe（复刻 kiro.rs，真实缓存命中 A/B，默认关）。 */
+  agent_continuation: boolean
 }
 
 /**

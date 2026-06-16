@@ -371,8 +371,8 @@ impl Provider for KiroProvider {
             }
         }
 
-        // 实验开关(tools_in_prefix / cache_point)。from_effective 总会带这两个字段;
-        // 缺失时退回 false(不覆盖到危险开启)。改写进程级实验全局,converter 下轮即读到。
+        // 实验开关(tools_in_prefix / cache_point / agent_continuation)。from_effective 总会带这些
+        // 字段;缺失时退回 false(不覆盖到危险开启)。改写进程级实验全局,converter 下轮即读到。
         {
             let tools_in_prefix = settings
                 .get("tools_in_prefix")
@@ -382,7 +382,11 @@ impl Provider for KiroProvider {
                 .get("cache_point")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            crate::converter::set_experimental_flags(tools_in_prefix, cache_point);
+            let agent_continuation = settings
+                .get("agent_continuation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            crate::converter::set_experimental_flags(tools_in_prefix, cache_point, agent_continuation);
         }
     }
 
