@@ -136,6 +136,17 @@ impl AccountsConfig {
 /// 注:空响应不设配置——v60 起不做任何反代侧重试/兜底(实战证明换 ID 重发救不回
 /// 且 error 放大触发封号),行为固定为:provider 终态 Err(EmptyResponse) →
 /// worker report_failure 阈值冷却 → 终态 SSE error → 客户端自重试。
+/// 上游流式请求总超时(秒)的默认值。reqwest `.timeout()` 覆盖**整请求**含读完整个
+/// 流式 body;Opus 大上下文常跑 300~700s,旧硬编码 300s 会被 reqwest 在 body 读取期
+/// 腰斩,表现为 502「读取上游流失败: error decoding response body」(2026-06-16 实测:
+/// caio 当天 33 次 stream_io 失败几乎全卡 `duration_ms≈300003`)。对齐 kiro.rs
+/// `api_timeout_secs=720`(其在同上游同模型下基本不触顶)。0 视为未设,回落本默认。
+pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
+
+fn default_upstream_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_TIMEOUT_SECS
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
@@ -148,6 +159,10 @@ pub struct SystemConfig {
     pub image: ImageConfig,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    /// 上游流式请求总超时(秒)。详见 [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]。
+    /// `#[derive(Default)]` 会给 0——build_client 内把 0 视为未设回落默认,故 0 安全。
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
 }
 
 /// 实验性开关(默认关)。两个 on/off 可经设置面板热控;env(`KIRO_TOOLS_IN_PREFIX` /
