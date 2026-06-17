@@ -98,10 +98,14 @@ impl Provider for DarioProvider {
         ])
     }
 
-    /// 会话亲和:dario pool 关闭,其内置 stickiness 不触发 → 必须由 caio 调度提供亲和,
-    /// 否则同会话在多号间跳 → Anthropic 每号独立 prompt cache 反复 create,烧 5h/7d 窗口。
-    fn affinity_key(&self, req: &ChatRequest) -> Option<String> {
-        chat::affinity_from_body(&req.body)
+    /// 会话亲和:MVP 阶段返回 `None`(无亲和)。
+    ///
+    /// `affinity_from_body` 基于**首条用户消息文本**哈希——但同一会话后续轮次首条
+    /// 文本不变,而 dario 是 OAuth 直连(多账号池尚未稳定),基于首条文本的 key
+    /// 与 Anthropic prompt cache 的会话粒度并不对齐。多号阶段再启用时,应以
+    /// 真实 session_id(由调度层下发到 `CallCtx::session_id`)为 key,而非文本哈希。
+    fn affinity_key(&self, _req: &ChatRequest) -> Option<String> {
+        None
     }
 
     async fn chat(&self, req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
