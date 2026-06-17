@@ -1,0 +1,14 @@
+# dario 独立通道拓扑(router-dario + worker-dario)。
+# 与 config/instances.yaml(kiro 主通道)完全分离:router 按会话亲和/负载在
+# 所属 worker 间分发、不跨 instances 文件,所以 dario 必须自带 router 实例,
+# 否则 kiro 流量会被发给无 kiro 账号的 dario worker。
+# egress: direct = 宿主默认路由(139 主 IP 139.180.152.158),与该 Max 号在 139
+# 登录授权的来源 IP 一致。严禁改成美国代理或 kiro 的次 IP 45.32.106.167。
+router:
+  listen: "127.0.0.1:38992"
+workers:
+  - instance: 1
+    listen: "127.0.0.1:39001"
+    egress:
+      mode: direct
+    account_group: "DARIO"

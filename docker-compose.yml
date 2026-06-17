@@ -32,3 +32,54 @@ services:
       - ./data:/app/data
     environment:
       - RUST_LOG=info
+
+  # ── dario(Claude OAuth sidecar)独立通道 ────────────────────────────────
+  # 与 kiro 通道完全隔离:独立 instances-dario.yaml(router 不跨组路由),独立
+  # router-dario(对外 :38992)+ worker-dario(组 DARIO,egress=direct=宿主主 IP)。
+  # 二者 front 一个 dario-on-Bun sidecar(报文指纹+BoringSSL TLS+转发到 Anthropic)。
+  # DARIO_API_KEY 经 config/dario.env 注入(config/ 不入库、不随 rsync 覆盖)。
+  # 出口铁律:OAuth 号出口必须==其登录授权来源 IP。139 登录的 Max 号=direct(主 IP),
+  #   严禁套美国代理或复用 kiro 的次 IP。
+  dario-sidecar:
+    image: oven/bun:1-slim
+    container_name: caio-dario-sidecar
+    working_dir: /root/dario
+    command: ["bun", "dist/cli.js", "proxy", "--port=8788", "--no-live-capture"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /root/dario:/root/dario
+    env_file:
+      - ./config/dario.env
+    environment:
+      - DARIO_INJECTED_ONLY=1
+      - DARIO_NO_LIVE_CAPTURE=1
+      - DARIO_MAX_BODY_MB=16
+
+  router-dario:
+    image: claude-all-in-one:local
+    container_name: caio-router-dario
+    command: ["--mode", "router", "--instances", "config/instances-dario.yaml"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - dario-sidecar
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+
+  worker-dario:
+    image: claude-all-in-one:local
+    container_name: caio-worker-dario
+    command: ["--mode", "worker", "--instance", "1", "--instances", "config/instances-dario.yaml"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - router-dario
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
