@@ -252,6 +252,103 @@ pub(crate) fn format_unix_utc(secs: i64) -> String {
     format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// RFC3339 时刻字符串 → Unix 秒(纯算术,无 chrono;`format_unix_utc` 的逆)。
+/// 支持 `YYYY-MM-DDTHH:MM:SS[.fff]` 后接 `Z` 或 `±HH:MM` / `±HHMM` / `±HH`。
+/// 用于把 kirogo 的 `timestamp`(令牌签发时刻)转成基准,再加 `expiresIn` 得绝对过期。
+///
+/// **严格 + 安全**(对抗审查加固):脏/恶意输入一律返回 None(调用方退回"无 expires_at,
+/// 按需刷新"),绝不 panic、绝不把错误时刻静默写进 extra。具体:① 非 ASCII 直接拒(RFC3339
+/// 纯 ASCII;同时杜绝字节切片越界 panic);② 年限 1970..=9999(防 days*86400 溢出);
+/// ③ 按月/闰年校验日;④ 时/分/秒、时区时/分范围校验;⑤ 多余冒号段 / 非数字小数秒拒绝。
+pub(crate) fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if !s.is_ascii() {
+        return None;
+    }
+    let (datetime, offset_secs) = split_tz_offset(s)?;
+    let t = datetime.find(['T', 't'])?;
+    let (date, time) = (&datetime[..t], &datetime[t + 1..]);
+    // 日期 YYYY-MM-DD(恰好三段)。
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: i64 = dp.next()?.parse().ok()?;
+    let d: i64 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() || !(1970..=9999).contains(&y) || !(1..=12).contains(&mo) {
+        return None;
+    }
+    if d < 1 || d > days_in_month(y, mo) {
+        return None;
+    }
+    // 时间 HH:MM:SS[.fff](恰好三段冒号;小数秒可选、必须全数字、忽略其值)。
+    let mut tp = time.split(':');
+    let h: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    let sec_part = tp.next()?;
+    if tp.next().is_some() {
+        return None;
+    }
+    let (sec_str, frac) = match sec_part.split_once('.') {
+        Some((s, f)) => (s, Some(f)),
+        None => (sec_part, None),
+    };
+    if let Some(f) = frac {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let se: i64 = sec_str.parse().ok()?;
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=60).contains(&se) {
+        return None;
+    }
+    // y ≤ 9999 → days_from_civil*86400 ≤ ~2.6e11,不溢出;offset 已限幅。
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se - offset_secs)
+}
+
+/// 拆时区偏移:返回(去掉偏移的 datetime 部分, 偏移秒数)。`Z`/`z` = 0。
+/// 调用方已保证 `s` 全 ASCII,故 `off[..2]` 等字节切片在字符边界上安全。
+fn split_tz_offset(s: &str) -> Option<(&str, i64)> {
+    if let Some(stripped) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        return Some((stripped, 0));
+    }
+    let t = s.find(['T', 't'])?;
+    // 偏移符号必在 'T' 之后的时间部分(否则会误匹配日期里的 '-')。
+    let rel = s[t + 1..].rfind(['+', '-'])?;
+    let sign_idx = t + 1 + rel;
+    let sign: i64 = if s.as_bytes()[sign_idx] == b'+' { 1 } else { -1 };
+    let off = &s[sign_idx + 1..];
+    let (oh, om) = match off.split_once(':') {
+        Some((a, b)) => (a.parse::<i64>().ok()?, b.parse::<i64>().ok()?),
+        None if off.len() == 4 => (off[..2].parse().ok()?, off[2..].parse().ok()?),
+        None if off.len() == 2 => (off.parse::<i64>().ok()?, 0),
+        None => return None,
+    };
+    if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+        return None;
+    }
+    Some((&s[..sign_idx], sign * (oh * 3600 + om * 60)))
+}
+
+/// 某年某月的天数(含闰年)。非法月返回 0(令日校验失败)。
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// 1970-01-01 起的天数(Howard-Hinnant days_from_civil;`format_unix_utc` 内联算法的逆)。
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +416,55 @@ mod tests {
         assert_eq!(format_unix_utc(1_780_531_200), "2026-06-04T00:00:00Z");
         // epoch
         assert_eq!(format_unix_utc(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn parse_rfc3339_to_unix_roundtrip_and_offsets() {
+        // epoch + 往返
+        assert_eq!(parse_rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_to_unix("2026-06-04T00:00:00Z"), Some(1_780_531_200));
+        // round-trip 任意时刻
+        let t = 1_780_531_200 + 66_046;
+        assert_eq!(parse_rfc3339_to_unix(&format_unix_utc(t)), Some(t));
+        // 时区偏移:+08:00 比 UTC 早 8h(同墙钟 → unix 小 28800)
+        let z = parse_rfc3339_to_unix("2026-06-07T10:20:46Z").unwrap();
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T18:20:46+08:00"), Some(z));
+        // 负偏移 + 紧凑写法 + 小数秒
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-06-07T05:20:46-05:00"),
+            parse_rfc3339_to_unix("2026-06-07T10:20:46Z")
+        );
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-06-07T18:20:46+0800"),
+            parse_rfc3339_to_unix("2026-06-07T18:20:46+08:00")
+        );
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-06-07T18:20:46.958+08:00"),
+            parse_rfc3339_to_unix("2026-06-07T18:20:46+08:00")
+        );
+        // 非法
+        assert_eq!(parse_rfc3339_to_unix("not a date"), None);
+        assert_eq!(parse_rfc3339_to_unix("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn parse_rfc3339_to_unix_rejects_garbage() {
+        // 非法日(按月/闰年校验)
+        assert_eq!(parse_rfc3339_to_unix("2026-02-31T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_to_unix("2026-02-29T00:00:00Z"), None, "2026 非闰年");
+        assert!(parse_rfc3339_to_unix("2024-02-29T00:00:00Z").is_some(), "2024 闰年合法");
+        assert_eq!(parse_rfc3339_to_unix("2026-04-31T00:00:00Z"), None, "4 月只有 30 天");
+        // 时区越界
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T18:20:46+24:00"), None);
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T18:20:46+08:99"), None);
+        // 多余冒号段 / 非数字小数秒
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T18:20:46:999Z"), None);
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T18:20:46.fooZ"), None);
+        // 时分秒越界
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T24:00:00Z"), None);
+        // 非 ASCII offset:返回 None,**绝不 panic**(对抗审查 #1 字节切片越界)。
+        assert_eq!(parse_rfc3339_to_unix("2026-06-07T18:20:46+€a"), None);
+        // 年限外(防 days*86400 溢出)
+        assert_eq!(parse_rfc3339_to_unix("0001-01-01T00:00:00Z"), None);
     }
 }

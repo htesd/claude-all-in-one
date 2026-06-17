@@ -215,6 +215,27 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
         }
     }
 
+    // kirogo 风格:无绝对 expires_at,但有 expiresIn(相对秒) + timestamp(令牌签发时刻)。
+    // 绝对值优先(上面已设则跳过);否则按【签发时刻】+ expiresIn 算 expires_at。
+    // 关键:必须以签发 timestamp 为基准,不能用 now —— 否则早已过期的导入 token 会被
+    // 当成新鲜,首次请求拿陈旧 access_token 吃 403。timestamp 解析失败则留空(按需刷新兜底)。
+    if !extra.contains_key("expires_at") {
+        let rel = acc
+            .get("expires_in")
+            .or_else(|| acc.get("expiresIn"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+            .filter(|&r| r >= 0); // 负 expiresIn = 脏数据 → 留空,按需刷新兜底
+        let ts = acc.get("timestamp").and_then(|v| v.as_str());
+        if let (Some(rel), Some(ts)) = (rel, ts) {
+            // checked_add 防极端 expiresIn 溢出(溢出 → 留空,不写错误时刻也不 panic)。
+            if let Some(exp) =
+                crate::token::parse_rfc3339_to_unix(ts).and_then(|issued| issued.checked_add(rel))
+            {
+                extra.insert("expires_at".into(), json!(crate::token::format_unix_utc(exp)));
+            }
+        }
+    }
+
     // 展示/对账字段。
     let email = flat_str(acc, "email").filter(|s| !s.is_empty());
     if let Some(e) = email {
@@ -590,5 +611,56 @@ mod tests {
         assert_eq!(sanitize_account_id("a@b+c.com"), "a-b-c.com");
         assert_eq!(sanitize_account_id(""), "kiro-account");
         assert_eq!(sanitize_account_id(&"x".repeat(100)).len(), 64);
+    }
+
+    #[test]
+    fn kirogo_flat_camelcase_with_computed_expires_at() {
+        // kirogo 导出:顶层数组 + camelCase 字段 + expiresIn/timestamp(无 credentials、无 machineId)。
+        let root = json!([{
+            "email": "lucas17@amazon.lalicy.com",
+            "accessToken": "at-xyz",
+            "refreshToken": "rt-xyz",
+            "idp": "BuilderId",
+            "clientId": "cid",
+            "clientSecret": "csecret",
+            "expiresIn": 3600,
+            "timestamp": "2026-06-07T18:20:46+08:00",
+            "subscriptionTitle": "Pro",
+            "fingerprintProfileId": "gen-1280x800-8afbf2e3"
+        }]);
+        let out = parse_accounts_export(&root).expect("kirogo 扁平格式应被解析");
+        assert_eq!(out.len(), 1);
+        let a = &out[0];
+        assert_eq!(a.account_id, "lucas17-amazon.lalicy.com");
+        assert_eq!(a.extra["refresh_token"], json!("rt-xyz"));
+        assert_eq!(a.extra["access_token"], json!("at-xyz"));
+        assert_eq!(a.extra["client_id"], json!("cid"));
+        assert_eq!(a.extra["client_secret"], json!("csecret"));
+        assert_eq!(a.extra["kiro_provider"], json!("builderid"));
+        assert_eq!(a.extra["subscription_title"], json!("Pro"));
+        // expires_at = 签发时刻(18:20:46+08:00 = 10:20:46Z)+ expiresIn(1h)= 11:20:46Z。
+        assert_eq!(a.extra["expires_at"], json!("2026-06-07T11:20:46Z"));
+        // 无 machineId → 不写(运行时按当前 rt 派生 = 与真实 Kiro 客户端一致,见 machine_id.rs)。
+        assert!(!a.has_machine_id());
+        // fingerprintProfileId 非内部字段 → 不入 extra(machineId 走 rt 派生,不需要它)。
+        assert!(!a.extra.contains_key("fingerprintProfileId"));
+    }
+
+    #[test]
+    fn kirogo_bad_expiry_leaves_expires_at_unset() {
+        // 负 expiresIn / 无法解析的 timestamp → 不写 expires_at(留空按需刷新),账号仍正常导入。
+        for (ei, ts) in [
+            (json!(-3600), "2026-06-07T18:20:46+08:00"),
+            (json!(3600), "garbage-timestamp"),
+        ] {
+            let root = json!([{ "refreshToken": "rt", "expiresIn": ei, "timestamp": ts }]);
+            let out = parse_accounts_export(&root).expect("账号仍应导入");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].extra["refresh_token"], json!("rt"));
+            assert!(
+                !out[0].extra.contains_key("expires_at"),
+                "脏 expiry(ei={ei}, ts={ts})不应写 expires_at"
+            );
+        }
     }
 }
