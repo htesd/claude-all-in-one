@@ -50,7 +50,7 @@ Expected: `dist/index.js` 存在。
 - [ ] **Step 2: 起 server(pool 关 + 跳 live-capture),确认日志显示 pool-off/单账号**
 ```bash
 DARIO_API_KEY=local-smoke DARIO_NO_LIVE_CAPTURE=1 \
-bun dist/index.js proxy --port=39100 --host=127.0.0.1 --no-live-capture --upstream-proxy=<USPROXY> &
+bun dist/cli.js proxy --port=39100 --host=127.0.0.1 --no-live-capture --upstream-proxy=<USPROXY> &
 ```
 Expected 日志含:listening 127.0.0.1:39100;**确认未加载 ≥2 账号(pool===null)** —— 不放任何 `~/.dario/accounts/`。
 
@@ -137,7 +137,7 @@ Expected: 合法 SSE。记录响应头 **`anthropic-ratelimit-unified-representa
 - [ ] **Step 3: 构建 + 手动验证注入不被覆盖**
 ```bash
 bun run build
-DARIO_API_KEY=local-smoke bun dist/index.js proxy --port=39100 --host=127.0.0.1 --no-live-capture --upstream-proxy=<USPROXY> &
+DARIO_API_KEY=local-smoke bun dist/cli.js proxy --port=39100 --host=127.0.0.1 --no-live-capture --upstream-proxy=<USPROXY> &
 curl -sS http://127.0.0.1:39100/v1/messages \
   -H 'x-api-key: local-smoke' \
   -H 'x-dario-upstream-token: <REAL_ACCESS_TOKEN>' \
@@ -607,6 +607,7 @@ pub(crate) async fn chat_via_sidecar(
         let kind = match code {
             400 => UpstreamErrorKind::BadRequest,
             401 => UpstreamErrorKind::TokenInvalid,
+            402 => UpstreamErrorKind::QuotaExhausted,   // 月度额度耗尽:须冷却,否则调度器立刻重选耗尽号
             403 if text.to_lowercase().contains("suspend") => UpstreamErrorKind::TemporarilyBlocked,
             403 => UpstreamErrorKind::TokenInvalid,
             429 => UpstreamErrorKind::RateLimited,
@@ -953,9 +954,10 @@ git commit -m "feat(admin): create claude-dario account from .credentials.json +
     environment:
       DARIO_API_KEY: "${DARIO_API_KEY}"
       DARIO_NO_LIVE_CAPTURE: "1"
+      DARIO_INJECTED_ONLY: "1"           # fail-closed:禁 pool、无 x-dario-upstream-token 即 400(防静默回落本地 pool)
       DARIO_MAX_BODY_MB: "16"            # 对齐 caio 16MB 入站上限
     command: >
-      bun dist/index.js proxy
+      bun dist/cli.js proxy
       --port=39100 --host=127.0.0.1 --no-live-capture
       --upstream-proxy=${DARIO_US1_UPSTREAM_PROXY}
 ```
