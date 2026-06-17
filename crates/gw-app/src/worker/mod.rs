@@ -711,7 +711,7 @@ pub async fn run(
     if provider_family == "claude-dario" {
         tracing::warn!(
             worker_egress = %egress_desc,
-            "dario 组:请确保本 worker 的 egress 与所连 dario sidecar 的 --upstream-proxy 为同一美国 HTTPS 代理(否则刷新 IP≠发包 IP,关联封号风险)"
+            "dario 组:本 worker 的 egress 必须与所连 dario sidecar 的出口为同一 IP,且等于该账号登录授权的来源 IP(二者均 direct 或同一代理皆可;不一致=刷新 IP≠发包 IP,关联封号风险)"
         );
     }
 
