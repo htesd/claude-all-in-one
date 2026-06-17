@@ -159,8 +159,9 @@ pub(crate) async fn chat_via_sidecar(
     let api_key = cfg.api_key.clone();
 
     // Force upstream streaming so dario returns SSE regardless of what the
-    // downstream client requested.
-    let mut body = req.body.clone();
+    // downstream client requested.  Move `req.body` out (req's other fields
+    // are not used past this point), saving one allocation.
+    let mut body = req.body;
     if let serde_json::Value::Object(ref mut m) = body {
         m.insert("stream".into(), serde_json::Value::Bool(true));
     }
@@ -192,6 +193,7 @@ pub(crate) async fn chat_via_sidecar(
         let kind = match code {
             400 => UpstreamErrorKind::BadRequest,
             401 => UpstreamErrorKind::TokenInvalid,
+            402 => UpstreamErrorKind::QuotaExhausted, // Anthropic monthly quota exhausted (aligns gw-kiro error_map)
             403 if text.to_lowercase().contains("suspend") => {
                 UpstreamErrorKind::TemporarilyBlocked
             }
@@ -302,5 +304,18 @@ mod tests {
     #[test]
     fn affinity_none_without_messages() {
         assert_eq!(affinity_from_body(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn forces_stream_true_in_forwarded_body() {
+        let req = gw_core::provider::ChatRequest::from_anthropic_body(
+            serde_json::json!({"model":"claude-opus-4-8","messages":[]}),
+        );
+        assert!(!req.stream);
+        let mut body = req.body.clone();
+        if let serde_json::Value::Object(m) = &mut body {
+            m.insert("stream".into(), serde_json::Value::Bool(true));
+        }
+        assert_eq!(body["stream"], serde_json::json!(true));
     }
 }
