@@ -160,6 +160,21 @@ fn default_max_request_body_bytes() -> usize {
     DEFAULT_MAX_REQUEST_BODY_BYTES
 }
 
+/// dario sidecar 连接配置(claude-dario provider 用)。
+///
+/// 空 `sidecar_url`/`api_key` 是合法默认值——provider 工厂收到后:
+/// - `sidecar_url` 空 → 回落 `http://127.0.0.1:39100`;
+/// - `api_key` 空 → dario 只在 loopback 放行(无 `DARIO_API_KEY` 时安全;
+///   生产部署必须与 dario `DARIO_API_KEY` env 保持一致)。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DarioSidecarConfig {
+    /// 本机 dario-on-Bun 监听地址,如 `http://127.0.0.1:39100`。
+    pub sidecar_url: String,
+    /// dario 入站鉴权 key(对应 sidecar `DARIO_API_KEY` env)。
+    pub api_key: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
@@ -182,6 +197,10 @@ pub struct SystemConfig {
     /// 经 [`effective_max_request_body_bytes`](Self::effective_max_request_body_bytes) 回落默认。
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
+    /// dario sidecar(claude-dario provider)连接参数。
+    /// **启动期参数**:worker 启动时一次性注入 provider 工厂;改后需重启相关 worker。
+    #[serde(default)]
+    pub dario: DarioSidecarConfig,
 }
 
 impl SystemConfig {
@@ -569,6 +588,25 @@ impl SystemSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dario_config_defaults_and_parse() {
+        // 缺省:两字段均为空串。
+        let d = DarioSidecarConfig::default();
+        assert_eq!(d.sidecar_url, "");
+        assert_eq!(d.api_key, "");
+
+        // SystemConfig 缺 dario 段 → 用默认(空串)。
+        let cfg: SystemConfig = serde_yaml::from_str("upstream_timeout_secs: 600\n").unwrap();
+        assert_eq!(cfg.dario.sidecar_url, "");
+        assert_eq!(cfg.dario.api_key, "");
+
+        // 解析 dario 段。
+        let yaml = "dario:\n  sidecar_url: \"http://127.0.0.1:39100\"\n  api_key: \"local-key\"\n";
+        let cfg2: SystemConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg2.dario.sidecar_url, "http://127.0.0.1:39100");
+        assert_eq!(cfg2.dario.api_key, "local-key");
+    }
 
     #[test]
     fn parse_instances_with_local_ip_and_proxy() {
