@@ -21,6 +21,8 @@ export interface CreateAccountPayload {
   provider?: string
   max_concurrency?: number
   extra?: Record<string, unknown>
+  /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
+  egress?: string
 }
 
 /** PATCH /accounts/{id}：extra 传了就是整体替换（凭据轮换），不传不动。 */
@@ -82,8 +84,10 @@ export interface ImportAccountsPayload {
   group_name?: string
   /** KiroManager 导出内容(原文字符串或已解析对象均可)。 */
   json: string
-  /** 批量出口代理：非空时应用到本次导入的所有账号。 */
+  /** 批量出口代理：非空时应用到本次导入的所有账号(API 直连用;UI 走 egress)。 */
   batch_proxy?: string
+  /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
+  egress?: string
 }
 
 /** POST /accounts/import 响应。 */

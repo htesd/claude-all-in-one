@@ -789,7 +789,19 @@ pub async fn run(
              reset 管理端点已禁用。请改绑 127.0.0.1,或为 router→worker 内网跳加共享密钥。"
         );
     }
-    let app = app.with_state(state.clone());
+    // 入站体积上限:messages 用 Json<Value> 全量缓冲,axum 默认 2MB 会在 handler 前 413。
+    // 提到 effective_system.max_request_body_bytes(默认 16MB)。这是第二道入站咽喉——
+    // router 放开后此处不放开仍会再 413(两处缺一不可)。管理端点无 body,层对其无害。
+    // 启动日志打印有效值:与 router 日志对照即可发现两进程配置漂移(只重启一侧时原 bug
+    // 会在 worker 侧复现——Architect 审查)。
+    let max_body = effective_system.effective_max_request_body_bytes();
+    tracing::info!(
+        max_request_body_bytes = max_body,
+        "worker 入站体积上限(应与 router 一致;不一致=配置漂移,大请求仍会在此 413)"
+    );
+    let app = app
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&wcfg.listen).await?;
     axum::serve(listener, app)
@@ -1185,6 +1197,11 @@ async fn messages(
     // 选号 + 发起 chat 的重试循环:token 失效(403/401)时刷新该号并对账号生命周期上报,
     // 换号重试;首包前的可重试错误最多走 total 个账号。committed(首包已出)后不重试。
     let total = st.scheduler.total().max(1);
+    // 换号重试硬上限:一个失败请求最多波及 max_switch_attempts 个号(默认 2),而非走遍全组。
+    // 2026-06 大面积封号雪崩根因正是 `attempts < total` 让一个「毒请求/高频重试」逐个打爆全池;
+    // 内容/封禁类错误(EmptyResponse/TemporarilyBlocked)更靠 worth_switching_account()=false
+    // 命中首个号即止,不扩散。
+    let max_attempts = st.scheduler.max_switch_attempts().min(total).max(1);
     let mut attempts = 0;
 
     loop {
@@ -1224,7 +1241,7 @@ async fn messages(
                 tracing::warn!(account = %account_id, kind = ?e.kind, "凭证刷新失败: {e}");
                 st.scheduler.report_failure(&account_id, e.kind);
                 drop(lease);
-                if attempts >= total {
+                if !e.kind.worth_switching_account() || attempts >= max_attempts {
                     return upstream_error_response(&e);
                 }
                 continue;
@@ -1292,7 +1309,7 @@ async fn messages(
                                 tracing::warn!(account = %account_id, kind = ?e2.kind, "刷新后重试仍失败: {e2}");
                                 st.scheduler.report_failure(&account_id, e2.kind);
                                 drop(lease);
-                                if e2.kind == UpstreamErrorKind::BadRequest || attempts >= total {
+                                if !e2.kind.worth_switching_account() || attempts >= max_attempts {
                                     return upstream_error_response(&e2);
                                 }
                                 continue;
@@ -1304,7 +1321,7 @@ async fn messages(
                         tracing::warn!(account = %account_id, kind = ?re.kind, "同号刷新失败: {re}");
                         st.scheduler.report_failure(&account_id, re.kind);
                         drop(lease);
-                        if attempts >= total {
+                        if !re.kind.worth_switching_account() || attempts >= max_attempts {
                             return upstream_error_response(&re);
                         }
                         continue;
@@ -1316,7 +1333,7 @@ async fn messages(
                 tracing::warn!(account = %account_id, kind = ?kind, "chat 失败: {e}");
                 st.scheduler.report_failure(&account_id, kind);
                 drop(lease);
-                if kind == UpstreamErrorKind::BadRequest || attempts >= total {
+                if !kind.worth_switching_account() || attempts >= max_attempts {
                     // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
                     // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
                     let status = if kind == UpstreamErrorKind::BadRequest {

@@ -14,10 +14,115 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use gw_core::config::SystemSettings;
 use gw_core::store::{AccountPatch, AccountRow};
 use serde::Deserialize;
 
 use super::{internal_error, redact_proxy_url, validate_proxy_url, AdminState};
+
+/// 从设置 overlay 读 `egress_pool`(trim、去空);解析失败/未配置 → 空 Vec。
+fn read_egress_pool(st: &AdminState) -> Vec<String> {
+    let overlay: SystemSettings = match st.store.get_settings() {
+        Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_default(),
+        _ => SystemSettings::default(),
+    };
+    overlay
+        .egress_pool
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 取账号 extra JSON 里非空的 `proxy`;无/空 → None。
+fn account_proxy(extra_json: &str) -> Option<String> {
+    let extra: serde_json::Map<String, serde_json::Value> = serde_json::from_str(extra_json).ok()?;
+    extra
+        .get("proxy")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// 出口池「最少使用」分配器:把新号粘到当前分配最少的池 URL,使账号均衡铺满 N 个出口 IP
+/// (每号固定一个,粘性)。计数初值 = 现有账号已分配到各池 URL 的数量;每分配一次本地计数 +1,
+/// 保证同一批导入内也均匀(而非全堆到第一个)。
+struct EgressAssigner {
+    /// (池 URL, 当前已分配账号数)。
+    counts: Vec<(String, usize)>,
+}
+
+impl EgressAssigner {
+    /// 从设置 `egress_pool` + 现有账号分布构造;池为空/未配置 → None(不自动分配)。
+    fn from_settings(st: &AdminState) -> Option<Self> {
+        let pool = read_egress_pool(st);
+        if pool.is_empty() {
+            return None;
+        }
+        let mut counts: Vec<(String, usize)> = pool.into_iter().map(|u| (u, 0usize)).collect();
+        if let Ok(rows) = st.store.list_accounts() {
+            for row in &rows {
+                if let Some(p) = account_proxy(&row.extra) {
+                    if let Some(c) = counts.iter_mut().find(|(u, _)| *u == p) {
+                        c.1 += 1;
+                    }
+                }
+            }
+        }
+        Some(Self { counts })
+    }
+
+    /// 取当前分配最少的池 URL,并把其本地计数 +1(下一个号即感知)。
+    fn next(&mut self) -> Option<String> {
+        let idx = self
+            .counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, c))| *c)
+            .map(|(i, _)| i)?;
+        self.counts[idx].1 += 1;
+        Some(self.counts[idx].0.clone())
+    }
+}
+
+/// 上号(导入/新建)时选择的出口网关解析。前端下拉回传 `egress`:
+/// - `None`/`""`/`"direct"` → 直连(不设 proxy);
+/// - `"auto"` → 最少使用自动分配(`EgressAssigner`,把号均衡铺满各网关);
+/// - 数字索引 → `egress_pool[i]`(选定网关,本批所有新号都用它)。
+enum EgressPicker {
+    Direct,
+    Fixed(String),
+    Auto(EgressAssigner),
+}
+
+impl EgressPicker {
+    fn build(st: &AdminState, sel: Option<&str>) -> Self {
+        let pool = read_egress_pool(st);
+        match sel.map(str::trim) {
+            None | Some("") | Some("direct") => EgressPicker::Direct,
+            Some("auto") => match EgressAssigner::from_settings(st) {
+                Some(a) => EgressPicker::Auto(a),
+                None => EgressPicker::Direct,
+            },
+            Some(s) => match s.parse::<usize>() {
+                Ok(i) if i < pool.len() => EgressPicker::Fixed(pool[i].clone()),
+                // 无效索引(网关被删/越界)→ 退回直连,绝不乱投到错误出口。
+                _ => EgressPicker::Direct,
+            },
+        }
+    }
+
+    /// 取本账号应写入 `extra.proxy` 的 URL(直连=None;选定=固定;自动=最少使用)。
+    fn next(&mut self) -> Option<String> {
+        match self {
+            EgressPicker::Direct => None,
+            EgressPicker::Fixed(u) => Some(u.clone()),
+            EgressPicker::Auto(a) => a.next(),
+        }
+    }
+}
 
 /// account_id 规则:1–64 个 URL-safe 字符(进路径段)。
 fn validate_account_id(id: &str) -> Result<(), &'static str> {
@@ -45,6 +150,10 @@ pub struct CreateAccountBody {
     /// provider 专属凭据字段(refresh_token 等),原样存为 extra JSON。
     #[serde(default)]
     extra: Option<serde_json::Map<String, serde_json::Value>>,
+    /// 上号选择的出口网关:""/缺省/"direct"=直连;"auto"=自动均衡;数字=egress_pool 索引。
+    /// 仅在 extra 未显式带 proxy 时生效。
+    #[serde(default)]
+    egress: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +179,7 @@ pub fn router() -> Router<AdminState> {
     Router::new()
         .route("/accounts", get(list_accounts).post(create_account))
         .route("/accounts/import", post(import_accounts))
+        .route("/accounts/rebalance-egress", post(rebalance_egress))
         .route("/accounts/runtime", get(runtime))
         .route("/accounts/{id}", patch(update_account).delete(delete_account))
         .route("/accounts/{id}/reset", post(reset_account))
@@ -172,6 +282,17 @@ async fn create_account(
             }
         }
     }
+    // 无显式 proxy 且设置里配了 egress_pool → 自动分配最少使用的出口 IP(粘性)。
+    let has_proxy = extra_map
+        .get("proxy")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_proxy {
+        if let Some(url) = EgressPicker::build(&st, body.egress.as_deref()).next() {
+            extra_map.insert("proxy".into(), serde_json::json!(url));
+        }
+    }
     let extra_json = match serde_json::to_string(&extra_map) {
         Ok(s) => s,
         Err(e) => return internal_error(e),
@@ -212,6 +333,10 @@ pub struct ImportBody {
     /// 批量出口代理(可选):给本批所有导入账号写 extra.proxy。空/缺省=不设。
     #[serde(default)]
     batch_proxy: Option<String>,
+    /// 上号选择的出口网关:""/缺省/"direct"=直连;"auto"=自动均衡;数字=egress_pool 索引。
+    /// 显式 batch_proxy 优先于此。
+    #[serde(default)]
+    egress: Option<String>,
 }
 
 /// 账号的稳定身份(user_id 优先,否则 email),用于导入碰撞核对。
@@ -268,6 +393,10 @@ async fn import_accounts(
         _ => None,
     };
 
+    // 上号选择的出口网关(直连/自动均衡/选定网关);显式 batch_proxy 仍优先,
+    // 已存在号合并不动 proxy。
+    let mut egress_picker = EgressPicker::build(&st, body.egress.as_deref());
+
     let mut created = 0u32;
     let mut merged = 0u32;
     let mut skipped = 0u32;
@@ -294,6 +423,9 @@ async fn import_accounts(
             let mut new_extra = imp.extra.clone();
             if let Some(bp) = &batch_proxy {
                 new_extra.insert("proxy".into(), serde_json::json!(bp));
+            } else if let Some(url) = egress_picker.next() {
+                // 选定网关 / 自动均衡:写 extra.proxy(自动模式每号挑最少使用,粘性铺满)。
+                new_extra.insert("proxy".into(), serde_json::json!(url));
             }
             let extra_json = match serde_json::to_string(&new_extra) {
                 Ok(s) => s,
@@ -395,6 +527,123 @@ async fn import_accounts(
         "created": created, "merged": merged, "skipped": skipped, "items": items
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RebalanceEgressBody {
+    /// true(默认):只给当前**无**出口代理的账号分配池 URL(不打扰已固定专属代理/已在池内的号);
+    /// false:全量重铺所有账号到池(忽略当前 proxy)。
+    #[serde(default = "default_only_unassigned")]
+    only_unassigned: bool,
+}
+fn default_only_unassigned() -> bool {
+    true
+}
+
+/// `POST /accounts/rebalance-egress` —— 把账号按「最少使用」均衡铺到出口池(`egress_pool`)。
+///
+/// 配好 egress_pool 后用它把现有账号回填到美国多 IP。只改 `extra.proxy`
+/// (merge_account_extra,绝不碰凭据字段);改完捅 worker 立即同步。
+async fn rebalance_egress(
+    State(st): State<AdminState>,
+    Json(body): Json<RebalanceEgressBody>,
+) -> axum::response::Response {
+    let pool = read_egress_pool(&st);
+    if pool.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "未配置 egress_pool(出口池),无法均衡");
+    }
+    let rows = match st.store.list_accounts() {
+        Ok(r) => r,
+        Err(e) => return internal_error(e),
+    };
+    // 计数基线:已固定在池内的账号都计入(保持均衡),无论是否重铺它们。
+    let mut counts: Vec<(String, usize)> = pool.iter().map(|u| (u.clone(), 0usize)).collect();
+    let mut to_assign: Vec<String> = Vec::new();
+    for row in &rows {
+        let cur = account_proxy(&row.extra);
+        let in_pool = cur.as_deref().map(|p| pool.iter().any(|u| u == p)).unwrap_or(false);
+        if body.only_unassigned {
+            if in_pool {
+                // 已在池内:计数,不动。
+                if let Some(p) = &cur {
+                    if let Some(c) = counts.iter_mut().find(|(u, _)| u == p) {
+                        c.1 += 1;
+                    }
+                }
+            } else if cur.is_none() {
+                // 无代理:待分配。
+                to_assign.push(row.account_id.clone());
+            }
+            // 有非池专属代理:only_unassigned 下尊重不动。
+        } else {
+            // 全量重铺:所有账号都重新分配(忽略当前 proxy)。
+            to_assign.push(row.account_id.clone());
+        }
+    }
+    let mut assigned = 0u32;
+    for aid in &to_assign {
+        let Some(idx) = counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, c))| *c)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        counts[idx].1 += 1;
+        let url = counts[idx].0.clone();
+        let delta = serde_json::json!({ "proxy": url }).to_string();
+        match st.store.merge_account_extra(aid, &delta) {
+            Ok(_) => assigned += 1,
+            Err(e) => return internal_error(e),
+        }
+    }
+    if assigned > 0 {
+        poke_workers_sync(&st).await;
+    }
+    // distribution 用 redact_proxy_url 掩码,避免经接口泄漏代理口令。
+    let distribution: Vec<serde_json::Value> = counts
+        .iter()
+        .map(|(u, c)| serde_json::json!({ "proxy": redact_proxy_url(u), "count": c }))
+        .collect();
+    Json(serde_json::json!({
+        "assigned": assigned,
+        "pool_size": pool.len(),
+        "distribution": distribution,
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::EgressAssigner;
+
+    #[test]
+    fn assigner_picks_unique_least() {
+        let mut a = EgressAssigner {
+            counts: vec![("A".into(), 5), ("B".into(), 1), ("C".into(), 3)],
+        };
+        // B 计数最少 → 先补 B。
+        assert_eq!(a.next().as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn assigner_balances_toward_equal() {
+        let mut a = EgressAssigner {
+            counts: vec![("A".into(), 2), ("B".into(), 0), ("C".into(), 0)],
+        };
+        // 第一个补到最少的(B/C 之一)。
+        let first = a.next().unwrap();
+        assert!(first == "B" || first == "C", "应先补最少的, got {first}");
+        // 再连续分配若干次,三者计数差 ≤ 1(趋于均衡铺满)。
+        for _ in 0..4 {
+            a.next();
+        }
+        let counts: Vec<usize> = a.counts.iter().map(|(_, c)| *c).collect();
+        let max = *counts.iter().max().unwrap();
+        let min = *counts.iter().min().unwrap();
+        assert!(max - min <= 1, "应趋于均衡, got {counts:?}");
+    }
 }
 
 async fn update_account(

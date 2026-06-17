@@ -1,5 +1,60 @@
 # Changelog
 
+## [ingress-body-limit] - 2026-06-17
+
+### Features
+
+- **放开入站请求体上限(修大图片/PDF 在入口被 413 闷死)**:客户端含大量 base64 图片/PDF 的请求体常 >2MB,
+  axum 0.8 的 `Bytes`/`Json` 提取器默认上限仅 **2MB**,超了在 handler 执行前就被框架直接 **413**,
+  请求根本到不了业务逻辑——**不入库、后台不可见**(线上实测 `status_code=413, bad response status code 413`)。
+  - `SystemConfig` 新增 `max_request_body_bytes`(默认 **16MB**,`0`/缺省回落默认),`effective_max_request_body_bytes()` 取有效值。
+  - router(`/v1/messages` 等 + admin 全路由)与 worker(`/v1/messages`)**两处入站咽喉**各挂 `DefaultBodyLimit::max(..)`——
+    缺一处仍会在另一侧 413。router 的 layer 挂在 `nest("/admin/api")` **之后**,使大 JSON 导入也一并放开。
+  - 两进程启动时各打印生效上限,便于核对配置一致(只重启一侧导致漂移时,日志即现形)。
+
+### Design Rationale
+
+- 取 **16MB** = 出站 6.3MB 护栏(`DEFAULT_MAX_BODY_BYTES`,对齐 Kiro 上游 ~7.3MB 硬限)的 ~2.5×:给当前轮 +
+  可被 `shed` 裁掉的历史媒体留余量;放开入口只是让大请求**抵达**内容感知护栏(裁剪/压缩/清晰报错)而非被框架裸 413。
+- 用有界 `DefaultBodyLimit::max()` 而非 `disable()`:网关 `:38991` 对外、入口提取在鉴权前完成,无界缓冲是 DoS 面;
+  16MB 较旧 2MB 已 8× 决定性解除闷死,同时把缓冲面控制在合理范围,需更大可在 `system.yaml` 显式上调。
+- 该值是**启动期参数**(axum `DefaultBodyLimit` app 构建期固定),故意**不进** `SystemSettings` 热调 overlay,
+  避免「前端改了不重启不生效」的误导;改动需同时重启 router + worker。
+
+### Notes & Caveats
+
+- **PDF 结构性上限**:文档无法像图像那样压缩(base64 原样透传),且 `shed` 只裁历史不裁当前轮 → 单个原始 >~4.5MB 的
+  PDF(base64 ~6.16MB + 脚手架顶破 6.3MB)在当前轮仍会被 `gw-kiro` 本地 `BadRequest`,无法自动补救——需产品侧引导拆分/缩小。
+- **待硬化(本次未做)**:router 入口缓冲在鉴权前完成,理想应加 鉴权前置 / Content-Length 预检 / 并发护栏;
+  当前以「有界默认 + 可配」缓解。`tool_result` 内嵌图(browser 截图)目前不走压缩,满体量撞 6.3MB 墙,可后续纳入压缩。
+- 入站放开**不绕过**出站 6.3MB 护栏:二者是上下游两道独立闸门(入站 Anthropic body vs 出站 Kiro body)。
+
+## [anti-ban-retry-cascade + egress-gateways] - 2026-06-17
+
+### Features
+
+- **重试雪崩止血(防大面积封号)**:`messages()` 重试循环改用 `UpstreamErrorKind::worth_switching_account()`
+  + 新增硬上限 `max_switch_attempts`(默认 **2**,热调)。一个失败请求最多波及 2 个号、不再走遍全组。
+  - `worth_switching_account()`:`BadRequest / EmptyResponse / TemporarilyBlocked` 一律**不换号**。
+  - `error_map`:403 拆分——含封禁标记(`is_account_suspended`,"suspend")→ `TemporarilyBlocked`;否则 → `TokenInvalid`。
+  - 新增 `DisabledReason::TemporarilySuspended` + `suspended_cooldown_secs`(默认 **3600=1h**,热调):封禁号较长冷却、面板标 `temporarily_suspended`,不每 5min 重戳。
+  - `token.rs` 刷新错误也认 403+suspend → `TemporarilyBlocked`,封禁号不再被永久禁死。
+- **出口网关(美国多 IP)+ 上号可选**:
+  - `SystemSettings.egress_pool`(每行一个代理 URL = 一个网关)+ 设置页可配;新增 `max_switch_attempts`/`suspended_cooldown_secs` 热调项。
+  - 导入/新建账号对话框新增「出口网关」下拉:**直连 / 自动均衡(最少使用) / 指定网关**(`EgressPicker` + body `egress` 字段,按索引解析,密码不经前端)。
+  - `POST /admin/api/accounts/rebalance-egress`:把现有号按最少使用回填到网关池。
+
+### Design Rationale
+
+- 根因:旧循环上限=账号总数且从不调 `worth_switching_account()`,封号 403 被错分 `TokenInvalid` → 刷新失败 → 换号把同一(被封内容/高频)请求扩散到健康号 → 雪崩封全池。硬上限 + 内容/封禁类不换号双管齐下,把单请求爆破半径从「全池」降到 2。
+- `TemporarilyBlocked` 走冷却自愈而非永久禁用:封禁多为临时,1h 后自愈再试、仍封则再冷却,既不扩散也不每 5min 重戳产生异常指纹。
+- 出口选择按**索引**回传而非明文 URL:后端响应已掩码代理密码,前端拿不到真值,选索引由后端解析,杜绝密码经接口往返。
+
+### Notes & Caveats
+
+- `is_account_suspended` 仅匹配 "suspend"(覆盖 `TEMPORARILY_SUSPENDED`);上线后需用真实封禁 403 body 复核标记串。即便标记不中,`max_switch_attempts=2` 仍是兜底。
+- Vultr 附加 IP(66/140 段)经实测进出均不通(元数据挂着但 Vultr 未路由),3-IP 需面板 re-attach;当前单主 IP 美国出口可用。
+
 ## [tool-repair] - 2026-06-16
 
 ### Fix —— 工具参数双重编码防御性修复（tool_repair）

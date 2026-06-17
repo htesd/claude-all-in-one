@@ -209,7 +209,11 @@ fn classify_refresh_error(status: u16, body: &str, flow: &str) -> UpstreamError 
         .with_status(status);
     }
     let kind = match status {
-        401 | 403 => UpstreamErrorKind::TokenInvalid,
+        401 => UpstreamErrorKind::TokenInvalid,
+        // 403 + 封禁标记 → TemporarilyBlocked(冷却自愈,不永久禁号):账号被临时封禁时
+        // 刷新端点也会 403,若归 TokenInvalid 会把"临时封禁"升级成"永久禁用",封解了也救不回。
+        403 if crate::error_map::is_account_suspended(body) => UpstreamErrorKind::TemporarilyBlocked,
+        403 => UpstreamErrorKind::TokenInvalid,
         429 => UpstreamErrorKind::RateLimited,
         500..=599 => UpstreamErrorKind::ServerError,
         _ => UpstreamErrorKind::Other,

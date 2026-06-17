@@ -41,6 +41,8 @@ struct Tuning {
     affinity_ttl: Duration,
     /// 429 限流冷却时长(到期自愈)。
     rate_limit_cooldown: Duration,
+    /// 账号被上游临时封禁的冷却时长(默认 1h,比限流长——别频繁重戳封禁号)。
+    suspended_cooldown: Duration,
     /// 空响应冷却时长(v58 阈值冷却用)。
     empty_cooldown: Duration,
     /// 空响应固定窗口:窗口内累计 empty 达阈值才冷却(避免误伤偶发 empty 的健康号)。
@@ -50,6 +52,8 @@ struct Tuning {
     max_failures: u32,
     /// worker 后台配额轮询开关(热生效:设置面板改后 30s 内经 update_tuning 替换)。
     quota_poll_enabled: bool,
+    /// 单请求换号重试硬上限(默认 2)。杜绝一个失败请求走遍全组(2026-06 雪崩防护)。
+    max_switch_attempts: u32,
 }
 
 impl From<&SchedulerConfig> for Tuning {
@@ -57,11 +61,13 @@ impl From<&SchedulerConfig> for Tuning {
         Self {
             affinity_ttl: Duration::from_secs(c.affinity_ttl_secs.max(1)),
             rate_limit_cooldown: Duration::from_secs(c.rate_limit_cooldown_secs.max(1)),
+            suspended_cooldown: Duration::from_secs(c.suspended_cooldown_secs.max(1)),
             empty_cooldown: Duration::from_secs(c.empty_response_cooldown_secs.max(1)),
             empty_window: Duration::from_secs(c.empty_response_window_secs.max(1)),
             empty_threshold: c.empty_response_threshold.max(1),
             max_failures: c.max_failures.max(1),
             quota_poll_enabled: c.quota_poll_enabled,
+            max_switch_attempts: c.max_switch_attempts.max(1),
         }
     }
 }
@@ -75,6 +81,9 @@ enum DisabledReason {
     QuotaExhausted,
     /// 429 限流,冷却到期自愈。
     RateLimited,
+    /// 账号被上游临时封禁/暂停(TEMPORARILY_SUSPENDED),较长冷却到期自愈。
+    /// 与 RateLimited 区分:冷却更长(别每 5min 重戳封禁号产生异常指纹)、面板标识不同。
+    TemporarilySuspended,
     /// 空响应达阈值,冷却到期自愈。
     EmptyResponse,
     /// refresh_token 永久失效(invalid_grant),持久。
@@ -84,7 +93,12 @@ enum DisabledReason {
 impl DisabledReason {
     /// 是否为可冷却自愈类(到期自动恢复)。其余为持久禁用(需人工/全灭自愈)。
     fn is_cooldown(self) -> bool {
-        matches!(self, DisabledReason::RateLimited | DisabledReason::EmptyResponse)
+        matches!(
+            self,
+            DisabledReason::RateLimited
+                | DisabledReason::TemporarilySuspended
+                | DisabledReason::EmptyResponse
+        )
     }
 }
 
@@ -260,6 +274,12 @@ impl AccountScheduler {
     /// 组内账号总数。
     pub fn total(&self) -> usize {
         self.entries.lock().len()
+    }
+
+    /// 单请求换号重试硬上限(热值;worker 30s 轮询经 [`Self::update_tuning`] 替换)。
+    /// 反雪崩:`messages()` 用它把单请求波及的账号数封顶,而非走遍全组。
+    pub fn max_switch_attempts(&self) -> usize {
+        self.tuning.read().max_switch_attempts as usize
     }
 
     /// 冷却自愈 sweep:RateLimited/EmptyResponse 且 disabled_until 已到期 → 重新启用。
@@ -625,6 +645,7 @@ impl AccountScheduler {
             .map(|e| {
                 let reason = match e.disabled_reason {
                     Some(DisabledReason::RateLimited) => "rate_limited",
+                    Some(DisabledReason::TemporarilySuspended) => "temporarily_suspended",
                     Some(DisabledReason::EmptyResponse) => "empty_response",
                     Some(DisabledReason::QuotaExhausted) => "quota_exhausted",
                     Some(DisabledReason::InvalidRefreshToken) => "invalid_refresh_token",
@@ -727,12 +748,22 @@ impl AccountScheduler {
             return;
         }
         match kind {
-            UpstreamErrorKind::RateLimited | UpstreamErrorKind::TemporarilyBlocked => {
+            UpstreamErrorKind::RateLimited => {
                 e.disabled = true;
                 e.disabled_reason = Some(DisabledReason::RateLimited);
                 e.disabled_until = Some(now + tuning.rate_limit_cooldown);
                 tracing::warn!(account = %id, "命中限流,冷却 {}s",
                     tuning.rate_limit_cooldown.as_secs());
+            }
+            UpstreamErrorKind::TemporarilyBlocked => {
+                // 账号被上游临时封禁:较长冷却(默认 1h),到期自愈再试、仍封则再冷却。
+                // 不换号(worth_switching_account=false)——杜绝把封禁请求扩散到健康号;
+                // 比限流长是为了别每 5min 重戳封禁号、产生异常调用指纹加剧风控。
+                e.disabled = true;
+                e.disabled_reason = Some(DisabledReason::TemporarilySuspended);
+                e.disabled_until = Some(now + tuning.suspended_cooldown);
+                tracing::warn!(account = %id, "账号被上游临时封禁,冷却 {}s",
+                    tuning.suspended_cooldown.as_secs());
             }
             UpstreamErrorKind::EmptyResponse => {
                 // v58 固定窗口阈值:窗口内累计达阈值才冷却,避免误伤偶发 empty 的健康号。
