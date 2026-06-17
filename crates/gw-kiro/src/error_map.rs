@@ -31,6 +31,18 @@ fn is_transient_invalid_model(body: &str) -> bool {
     b.contains("invalid") && b.contains("model")
 }
 
+/// 账号被上游封禁/暂停的 403 响应体特征(Kiro `TEMPORARILY_SUSPENDED` 等)。
+///
+/// 只命中明确的封禁词:纯 token 过期/未授权体(ExpiredToken/Unauthorized/invalid_grant)
+/// **不**命中,保持「刷新同号」行为。命中则归 `TemporarilyBlocked`(冷却自愈 + 不换号),
+/// 杜绝把"被封请求"换号扩散到健康号(2026-06 雪崩根因)。
+///
+/// ⚠️ 部署前用 139 `request_logs` 里真实被封号的 403 body 复核此标记串(见计划 §B)。
+/// `pub(crate)`:token.rs 的刷新错误分类也复用它(403+suspend 刷新失败 → 临时冷却而非永久禁号)。
+pub(crate) fn is_account_suspended(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("suspend")
+}
+
 /// 把 generateAssistantResponse 的失败响应分类。
 ///
 /// `status` = HTTP 状态码,`body` = 响应体文本(可空)。
@@ -43,7 +55,13 @@ pub fn classify_chat_error(status: u16, body: &str) -> UpstreamError {
         // 400:瞬时 invalid model 可重试(归 ServerError),否则请求非法(BadRequest 不换号)
         400 if is_transient_invalid_model(body) => UpstreamErrorKind::ServerError,
         400 => UpstreamErrorKind::BadRequest,
-        401 | 403 => UpstreamErrorKind::TokenInvalid,
+        401 => UpstreamErrorKind::TokenInvalid,
+        // 403:区分「账号被封禁/暂停」与「access_token 失效」——这是 2026-06 雪崩的关键。
+        // - 封禁(TEMPORARILY_SUSPENDED 等)→ TemporarilyBlocked:冷却自愈 + **不换号**
+        //   (worth_switching_account=false),否则换号把同一请求扩散到健康号 → 封全池。
+        // - 其余 403(token 过期/撤销)→ TokenInvalid:刷新同号,失败再换。
+        403 if is_account_suspended(body) => UpstreamErrorKind::TemporarilyBlocked,
+        403 => UpstreamErrorKind::TokenInvalid,
         408 => UpstreamErrorKind::ServerError,
         500..=599 => UpstreamErrorKind::ServerError,
         _ => UpstreamErrorKind::Other,
@@ -86,7 +104,19 @@ mod tests {
     #[test]
     fn unauthorized_is_token_invalid() {
         assert_eq!(classify_chat_error(401, "").kind, UpstreamErrorKind::TokenInvalid);
+        // 无封禁标记的 403 → TokenInvalid(刷新同号)。
         assert_eq!(classify_chat_error(403, "").kind, UpstreamErrorKind::TokenInvalid);
+    }
+
+    #[test]
+    fn suspended_403_is_temporarily_blocked_not_token_invalid() {
+        // 封号 403 → TemporarilyBlocked:冷却自愈 + **不换号**(杜绝雪崩扩散)。
+        let e = classify_chat_error(403, r#"{"reason":"TEMPORARILY_SUSPENDED"}"#);
+        assert_eq!(e.kind, UpstreamErrorKind::TemporarilyBlocked);
+        assert!(!e.kind.worth_switching_account(), "封号请求绝不能换号扩散到健康号");
+        // 纯 token 失效的 403 不命中封禁标记,仍走刷新同号。
+        let t = classify_chat_error(403, "Unauthorized: access token expired");
+        assert_eq!(t.kind, UpstreamErrorKind::TokenInvalid);
     }
 
     #[test]

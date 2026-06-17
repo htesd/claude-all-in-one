@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
 import { Select } from '@/components/ui/select'
 import { useGroups } from '@/features/groups/hooks'
+import { useSettings } from '@/features/settings/hooks'
 import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 
@@ -36,6 +37,17 @@ function pickStr(o: Record<string, unknown>, ...keys: string[]): string {
   return ''
 }
 
+/** 把网关代理 URL 显示成「序号. host:port」(密码段已被后端掩码,host 仍可识别)。 */
+function gatewayLabel(url: string, i: number): string {
+  let host = url
+  try {
+    host = new URL(url).host || url
+  } catch {
+    host = url
+  }
+  return `${i + 1}. ${host}`
+}
+
 interface CreateAccountDialogProps {
   open: boolean
   onClose: () => void
@@ -45,6 +57,8 @@ interface CreateAccountDialogProps {
 export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps) {
   const { t } = useI18n()
   const groupsQuery = useGroups()
+  const settingsQuery = useSettings()
+  const gateways = settingsQuery.data?.egress_pool ?? []
   const mutation = useCreateAccount()
 
   const [accountId, setAccountId] = useState('')
@@ -55,7 +69,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
   const [region, setRegion] = useState('')
   const [machineId, setMachineId] = useState('')
   const [concurrency, setConcurrency] = useState('2')
-  const [proxy, setProxy] = useState('')
+  const [egress, setEgress] = useState('auto')
   const [paste, setPaste] = useState('')
   const [detected, setDetected] = useState<DetectedType>(null)
   const [error, setError] = useState<string | null>(null)
@@ -71,7 +85,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       setRegion('')
       setMachineId('')
       setConcurrency('2')
-      setProxy('')
+      setEgress('auto')
       setPaste('')
       setDetected(null)
       setError(null)
@@ -173,13 +187,12 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
     if (trimmedRegion !== '') extra.region = trimmedRegion
     const trimmedMachineId = machineId.trim()
     if (trimmedMachineId !== '') extra.machine_id = trimmedMachineId
-    const trimmedProxy = proxy.trim()
-    if (trimmedProxy !== '') extra.proxy = trimmedProxy
 
     const payload: CreateAccountPayload = {
       account_id: accountId,
       max_concurrency: parsedConcurrency,
       extra,
+      egress,
     }
     if (group !== '') payload.group = group
 
@@ -382,21 +395,25 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
           />
         </div>
 
-        {/* 出口代理（可选） */}
+        {/* 出口网关（上号时选：直连 / 自动均衡 / 指定网关） */}
         <div className="space-y-1.5">
-          <label htmlFor="account-proxy" className="text-xs font-medium text-muted-foreground">
-            {t('accounts.field.proxy')}
+          <label htmlFor="account-egress" className="text-xs font-medium text-muted-foreground">
+            {t('accounts.field.egress')}
           </label>
-          <input
-            id="account-proxy"
-            type="text"
-            value={proxy}
-            onChange={(event) => setProxy(event.target.value)}
-            placeholder={t('accounts.field.proxyPlaceholder')}
-            spellCheck={false}
-            autoComplete="off"
-            className={inputClass}
-          />
+          <Select
+            id="account-egress"
+            value={egress}
+            onChange={(event) => setEgress(event.target.value)}
+            className="w-full"
+          >
+            <option value="direct">{t('accounts.egress.direct')}</option>
+            <option value="auto">{t('accounts.egress.auto')}</option>
+            {gateways.map((url, i) => (
+              <option key={i} value={String(i)}>
+                {gatewayLabel(url, i)}
+              </option>
+            ))}
+          </Select>
         </div>
 
         {error !== null && <p className="text-sm text-destructive">{error}</p>}

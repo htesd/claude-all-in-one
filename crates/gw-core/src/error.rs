@@ -36,10 +36,25 @@ pub enum UpstreamErrorKind {
 }
 
 impl UpstreamErrorKind {
-    /// 该错误是否意味着"换个账号可能成功"。
-    /// `BadRequest` 是请求本身的问题,换号无意义。
+    /// 该错误是否意味着"换个账号可能成功"——调度层据此决定是否换号重试。
+    ///
+    /// 返回 `false` 的三类**绝不换号**(否则把同一请求扩散到健康号 → 雪崩封号,
+    /// 2026-06 大面积封号根因):
+    /// - `BadRequest`:请求本身非法,换号一样错。
+    /// - `EmptyResponse`:上游对该**内容**的确定性空流(疑 guardrail);换号救不回且放大
+    ///   成多条 error 招封号(实战已证,见 caio-empty-response-not-fixable)。
+    /// - `TemporarilyBlocked`:账号被上游封禁/暂停;封禁号自身冷却自愈即可,把同一(被封
+    ///   内容/高频)请求喂给健康号正是雪崩根因。
+    ///
+    /// 其余(RateLimited/QuotaExhausted/TokenInvalid/ServerError/Network/Other)仍可换号,
+    /// 但受 `messages()` 的 `max_switch_attempts` 硬上限约束(默认 2,不再走遍全组)。
     pub fn worth_switching_account(&self) -> bool {
-        !matches!(self, UpstreamErrorKind::BadRequest)
+        !matches!(
+            self,
+            UpstreamErrorKind::BadRequest
+                | UpstreamErrorKind::EmptyResponse
+                | UpstreamErrorKind::TemporarilyBlocked
+        )
     }
 
     /// 该错误是否应让账号进入冷却。
@@ -126,6 +141,19 @@ mod tests {
     fn bad_request_not_worth_switching() {
         assert!(!UpstreamErrorKind::BadRequest.worth_switching_account());
         assert!(UpstreamErrorKind::RateLimited.worth_switching_account());
+    }
+
+    #[test]
+    fn content_and_ban_kinds_not_worth_switching() {
+        // 内容/封禁确定性 → 绝不换号(2026-06 雪崩防护)。
+        assert!(!UpstreamErrorKind::EmptyResponse.worth_switching_account());
+        assert!(!UpstreamErrorKind::TemporarilyBlocked.worth_switching_account());
+        // 这些换个号可能成功 → 仍可换号(但受 max_switch_attempts 硬上限约束)。
+        assert!(UpstreamErrorKind::TokenInvalid.worth_switching_account());
+        assert!(UpstreamErrorKind::QuotaExhausted.worth_switching_account());
+        assert!(UpstreamErrorKind::ServerError.worth_switching_account());
+        assert!(UpstreamErrorKind::Network.worth_switching_account());
+        assert!(UpstreamErrorKind::Other.worth_switching_account());
     }
 
     #[test]

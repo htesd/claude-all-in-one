@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
 import { Select } from '@/components/ui/select'
 import { useGroups } from '@/features/groups/hooks'
+import { useSettings } from '@/features/settings/hooks'
 import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 import { queryKeys } from '@/lib/query-keys'
@@ -47,6 +48,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** 把网关代理 URL 显示成「序号. host:port」(密码段已被后端掩码,host 仍可识别)。 */
+function gatewayLabel(url: string, i: number): string {
+  let host = url
+  try {
+    host = new URL(url).host || url
+  } catch {
+    host = url
+  }
+  return `${i + 1}. ${host}`
+}
+
 interface ImportAccountsDialogProps {
   open: boolean
   onClose: () => void
@@ -57,6 +69,8 @@ interface ImportAccountsDialogProps {
 export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProps) {
   const { t } = useI18n()
   const groupsQuery = useGroups()
+  const settingsQuery = useSettings()
+  const gateways = settingsQuery.data?.egress_pool ?? []
   const mutation = useImportAccounts()
   const queryClient = useQueryClient()
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -66,7 +80,7 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
 
   const [group, setGroup] = useState('')
   const [json, setJson] = useState('')
-  const [batchProxy, setBatchProxy] = useState('')
+  const [egress, setEgress] = useState('auto')
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ImportAccountsResult | null>(null)
 
@@ -80,7 +94,7 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
     if (open) {
       setGroup('')
       setJson('')
-      setBatchProxy('')
+      setEgress('auto')
       setError(null)
       setResult(null)
       setVerifyStates({})
@@ -164,9 +178,8 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
       return
     }
     setError(null)
-    const trimmedProxy = batchProxy.trim()
     mutation.mutate(
-      { json, group_name: group || undefined, batch_proxy: trimmedProxy || undefined },
+      { json, group_name: group || undefined, egress },
       {
         onSuccess: (data) => {
           setResult(data)
@@ -434,21 +447,25 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
             </Select>
           </div>
 
-          {/* 批量代理（可选） */}
+          {/* 出口网关（上号时选：直连 / 自动均衡 / 指定网关） */}
           <div className="space-y-1.5">
-            <label htmlFor="import-batch-proxy" className="text-xs font-medium text-muted-foreground">
-              {t('accounts.import.batchProxy')}
+            <label htmlFor="import-egress" className="text-xs font-medium text-muted-foreground">
+              {t('accounts.field.egress')}
             </label>
-            <input
-              id="import-batch-proxy"
-              type="text"
-              value={batchProxy}
-              onChange={(event) => setBatchProxy(event.target.value)}
-              placeholder={t('accounts.import.batchProxyPlaceholder')}
-              spellCheck={false}
-              autoComplete="off"
-              className={inputClass}
-            />
+            <Select
+              id="import-egress"
+              value={egress}
+              onChange={(event) => setEgress(event.target.value)}
+              className="w-full"
+            >
+              <option value="direct">{t('accounts.egress.direct')}</option>
+              <option value="auto">{t('accounts.egress.auto')}</option>
+              {gateways.map((url, i) => (
+                <option key={i} value={String(i)}>
+                  {gatewayLabel(url, i)}
+                </option>
+              ))}
+            </Select>
           </div>
 
           {/* JSON 粘贴 + 文件选择 */}

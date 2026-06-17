@@ -140,6 +140,7 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
         http: reqwest::Client::new(),
     });
 
+    let max_body = system.effective_max_request_body_bytes();
     let mut app = Router::new()
         .route("/v1/messages", post(forward))
         .route("/v1/messages/count_tokens", post(count_tokens))
@@ -170,6 +171,17 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
             app = app.nest_service("/admin", spa);
         }
     }
+
+    // 入站体积上限:客户端 base64 图片/PDF 常 >2MB,axum 默认 2MB 会在 handler 前 413 且不入库
+    // (2026-06 线上实测)。提到 system.max_request_body_bytes(默认 16MB),让大请求进得来交给
+    // 下游 worker 内容感知护栏(6.3MB 裁剪/压缩或清晰报错)。有界值(非 disable)防 DoS。
+    // **挂在 nest 之后**:axum 的 .layer() 只包住调用时已存在的路由,放这里才能同时覆盖
+    // /v1/messages 与 /admin/api(大 JSON 导入),否则 admin 仍受默认 2MB(Skeptic 审查)。
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(max_body));
+    tracing::info!(
+        max_request_body_bytes = max_body,
+        "router 入站体积上限(全路由生效;需改请改 system.yaml 后重启)"
+    );
 
     let listener = tokio::net::TcpListener::bind(&instances.router.listen).await?;
     axum::serve(listener, app)
@@ -671,6 +683,73 @@ mod tests {
             .to_string(),
         );
         assert_eq!(parse_session_id(&body), Some("sess-xyz".into()));
+    }
+
+    /// 用与生产 router/worker 同形的 layer(读 SystemConfig 的有效上限)验证 DefaultBodyLimit
+    /// 机制:<=上限放行、>上限回 413。锁住"客户端大图片/PDF 不再在入口被框架闷死"的契约,
+    /// 并防 axum 升级改变默认行为时悄悄回归。覆盖 `Bytes`(router 用)与 `Json`(worker 用)
+    /// 两种全量缓冲提取器,以及精确边界(N 放行 / N+1 拒)。
+    #[tokio::test]
+    async fn default_body_limit_layer_allows_under_and_rejects_over() {
+        use axum::body::Body;
+        use tower::ServiceExt; // oneshot
+
+        async fn echo_bytes(body: Bytes) -> String {
+            body.len().to_string()
+        }
+        async fn echo_json(Json(v): Json<serde_json::Value>) -> String {
+            v.to_string()
+        }
+
+        // 取小上限(64B)构造同形 layer(经 effective_max_request_body_bytes,显式值不回落)。
+        let mut cfg = gw_core::config::SystemConfig::default();
+        cfg.max_request_body_bytes = 64;
+        let limit = cfg.effective_max_request_body_bytes();
+        assert_eq!(limit, 64); // 显式值不被 0 回落覆盖。
+
+        // Bytes(router /v1/messages 用)+ Json(worker messages 用)两条都挂同一 layer。
+        let app: Router = Router::new()
+            .route("/b", post(echo_bytes))
+            .route("/j", post(echo_json))
+            .layer(axum::extract::DefaultBodyLimit::max(limit));
+
+        let post = |uri: &str, n: usize| {
+            // /j 需合法 JSON;用一个长度可控的 JSON 字符串。
+            let body = if uri == "/j" {
+                let pad = "x".repeat(n.saturating_sub(9).max(1)); // {"k":"…"} 约 9 字节壳
+                format!("{{\"k\":\"{pad}\"}}")
+            } else {
+                "x".repeat(n)
+            };
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let status = |app: Router, uri: &'static str, n: usize| async move {
+            app.oneshot(post(uri, n)).await.unwrap().status()
+        };
+
+        // Bytes:32B 放行;精确边界 64B 放行、65B 拒;200B 拒。
+        assert_eq!(status(app.clone(), "/b", 32).await, StatusCode::OK);
+        assert_eq!(status(app.clone(), "/b", 64).await, StatusCode::OK);
+        assert_eq!(
+            status(app.clone(), "/b", 65).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            status(app.clone(), "/b", 200).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        // Json:小 body 放行;超限 body 在提取阶段 413(handler 不执行)。
+        assert_eq!(status(app.clone(), "/j", 20).await, StatusCode::OK);
+        assert_eq!(
+            status(app.clone(), "/j", 400).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[test]

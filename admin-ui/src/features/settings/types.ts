@@ -2,6 +2,8 @@
 export interface SystemSettings {
   /** 全局默认出口代理 URL；null = 走节点源 IP。 */
   default_proxy: string | null
+  /** 出口代理池（美国多 IP）：导入/新建账号时按最少使用自动分配粘性出口。null/空 = 不自动分配。 */
+  egress_pool: string[] | null
   /** 缓存读取倍率（浮点）。 */
   cache_read_multiplier: number
   /** 缓存上限比例（浮点）。 */
@@ -14,6 +16,8 @@ export interface SystemSettings {
   cache_max_sessions: number
   /** 限流冷却时长（秒，整数）。 */
   rate_limit_cooldown_secs: number
+  /** 账号临时封禁冷却时长（秒，整数，默认 3600）。 */
+  suspended_cooldown_secs: number
   /** 空响应冷却时长（秒，整数）。 */
   empty_response_cooldown_secs: number
   /** 空响应统计窗口（秒，整数）。 */
@@ -24,6 +28,8 @@ export interface SystemSettings {
   affinity_ttl_secs: number
   /** 连续失败上限（整数）。 */
   max_failures: number
+  /** 单请求换号重试硬上限（整数，默认 2；反雪崩）。 */
+  max_switch_attempts: number
   /** 是否启用后台配额轮询（防封 ambient 流量；关掉则仅 /health 被打时刷配额）。 */
   quota_poll_enabled: boolean
   /** 是否启用图像压缩。 */

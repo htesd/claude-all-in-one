@@ -33,3 +33,13 @@ image:
   max_pixels_single: 4000000 # 单图总像素上限
   max_pixels_multi: 4000000  # 多图档总像素上限(默认与单图相同,需要更严时调小)
   multi_threshold: 20        # 请求内图片数达此值启用多图档
+
+# 入站请求体体积上限(字节)。客户端大量 base64 图片/PDF 会使请求体达数 MB;axum 默认仅
+# 2MB,超了在 handler 前直接 413 且不入库。默认 16MB(0 或缺省=16MB)。
+# ⚠️ 启动期参数:改后必须**同时重启 router 和 worker**才生效(不进设置面板热调,
+# 因 axum DefaultBodyLimit 在 app 构建期固定)。两进程务必用同一值,否则只放开一侧时
+# 大请求仍会在另一侧 413。上调会增大入口缓冲面(:38991 对外、提取在鉴权前),按机器内存权衡。
+max_request_body_bytes: 16777216
+
+# 上游流式请求总超时(秒)。Opus 大上下文常跑数百秒;0 或缺省=720s。仅 worker 消费。
+upstream_timeout_secs: 720
