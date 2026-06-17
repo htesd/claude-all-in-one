@@ -173,6 +173,11 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       return
     }
 
+    if (isDario && credentialsJson.trim() === '') {
+      setError(t('accounts.error.credentialsJsonRequired'))
+      return
+    }
+
     setError(null)
 
     let payload: CreateAccountPayload

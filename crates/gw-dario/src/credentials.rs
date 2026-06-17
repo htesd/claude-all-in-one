@@ -28,4 +28,8 @@ mod tests {
         assert_eq!(e.get("expires_at").unwrap(), "2026-06-04T00:00:00Z"); // ms→s→Z
     }
     #[test] fn errors_without_oauth_block() { assert!(parse_cc_credentials(r#"{"foo":1}"#).is_err()); }
+    #[test]
+    fn errors_when_both_tokens_empty() {
+        assert!(parse_cc_credentials(r#"{"claudeAiOauth":{"accessToken":"","refreshToken":""}}"#).is_err());
+    }
 }

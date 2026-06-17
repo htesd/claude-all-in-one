@@ -590,6 +590,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dario_config_partial_only_sidecar_url_api_key_defaults_empty() {
+        // 只提供 sidecar_url，省略 api_key → api_key 回落空串。
+        let yaml = "dario:\n  sidecar_url: \"http://127.0.0.1:39100\"\n";
+        let cfg: SystemConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.dario.sidecar_url, "http://127.0.0.1:39100");
+        assert_eq!(cfg.dario.api_key, "");
+    }
+
+    #[test]
+    fn dario_config_unknown_field_is_rejected() {
+        // deny_unknown_fields：未知子字段应返回 Err，而非静默忽略。
+        let yaml = "dario:\n  sidecar_url: \"http://127.0.0.1:39100\"\n  bogus_field: \"value\"\n";
+        assert!(
+            serde_yaml::from_str::<SystemConfig>(yaml).is_err(),
+            "未知字段应被 deny_unknown_fields 拒绝"
+        );
+    }
+
+    #[test]
     fn dario_config_defaults_and_parse() {
         // 缺省:两字段均为空串。
         let d = DarioSidecarConfig::default();
