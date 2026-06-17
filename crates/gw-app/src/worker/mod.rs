@@ -1363,6 +1363,7 @@ async fn messages(
                         None,
                         None,
                         ResponseLog::None, // 首包前失败:无模型回复。
+                        st.provider.family(),
                     );
                     return upstream_error_response(&e);
                 }
@@ -1511,6 +1512,7 @@ fn write_request_log(
     ttfb_ms: Option<i64>,
     usage: Option<ChatUsage>,
     response: ResponseLog,
+    family: &str,
 ) {
     let (input, output, cache_read, cache_creation, real_cache_read, metering_credit) = usage
         .as_ref()
@@ -1528,12 +1530,16 @@ fn write_request_log(
     // 抽出两份报文里的媒体 blob(图片/文档);合并后入库按 hash 去重(同图复用一行)。
     let (client_payload, mut blobs) =
         prepare_log_payload(serde_json::to_string(&req.body).unwrap_or_default());
+    // 守卫依据 **worker family**,而非 account.provider 字段——
+    // filter_by_provider 放行 provider 字段为空的账号进 kiro worker,
+    // 若按 account.provider 判断会丢掉空-provider kiro 号的报文渲染。
     let (account_id, kiro_payload) = match &account {
-        Some(a) => {
+        Some(a) if family == "kiro" => {
             let (kp, kb) = prepare_log_payload(gw_kiro::chat::render_kiro_payload(&req, a));
             blobs.extend(kb);
             (a.account_id.clone(), kp)
         }
+        Some(a) => (a.account_id.clone(), String::new()),
         None => (String::new(), String::new()),
     };
     // 模型回复:折叠/序列化都在此 blocking 任务内做,不占热路径。失败请求/无回复 → 空串(详情页不展示)。
@@ -1600,6 +1606,7 @@ fn spawn_request_log_blocking(
     ttfb_ms: Option<i64>,
     usage: Option<ChatUsage>,
     response: ResponseLog,
+    family: &'static str,
 ) {
     let Some(store) = st.store.clone() else {
         return;
@@ -1612,7 +1619,7 @@ fn spawn_request_log_blocking(
         let _guard = guard;
         write_request_log(
             store, req, account, client_key, is_stream, success, status_code, error_kind,
-            duration_ms, ttfb_ms, usage, response,
+            duration_ms, ttfb_ms, usage, response, family,
         );
     });
 }
@@ -1651,6 +1658,7 @@ async fn finish_response(
             client_key.to_string(),
             account,
             started_at,
+            st.provider.family(),
         )
         .await
     }
@@ -1675,6 +1683,7 @@ async fn collect_response(
     client_key: String,
     account: Arc<Account>,
     started_at: std::time::Instant,
+    family: &'static str,
 ) -> axum::response::Response {
     /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
     /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
@@ -1786,6 +1795,7 @@ async fn collect_response(
                 None,
                 last_usage,
                 response,
+                family,
             );
         });
     }
@@ -1905,6 +1915,7 @@ fn stream_response(
                 ttfb_ms,
                 usage,
                 ResponseLog::Events(std::mem::take(&mut self.resp_events)),
+                self.st.provider.family(),
             );
         }
     }
@@ -2264,7 +2275,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
@@ -2290,7 +2301,7 @@ mod tests {
                 serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
             ))),
         ];
-        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
+        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "overloaded_error");
@@ -2315,7 +2326,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -2417,5 +2428,74 @@ mod tests {
         let (out, blobs) = prepare_log_payload(raw.clone());
         assert_eq!(out, raw);
         assert!(blobs.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Phase 6 regression: write_request_log 守卫按 worker family 而非 account.provider
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 辅助:用内存 SQLite 调 write_request_log,返回落库的 kiro_payload。
+    fn log_kiro_payload_with_family(family: &str) -> String {
+        use gw_core::store::RequestLogFilter;
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        // 空 provider 字段:模拟 filter_by_provider 放行的 kiro 账号(或 dario 账号),
+        // 守卫不应依赖此字段。
+        let account = Arc::new(Account {
+            account_id: "test-acc".into(),
+            provider: String::new(), // 故意留空
+            max_concurrency: 1,
+            disabled: false,
+            extra: BTreeMap::new(),
+        });
+        let req = req_model_m();
+        write_request_log(
+            store.clone(),
+            req,
+            Some(account),
+            "sk-test".into(),
+            false,
+            true,
+            Some(200),
+            None,
+            Some(10),
+            None,
+            None,
+            ResponseLog::None,
+            family,
+        );
+        let rows = store
+            .list_request_logs(&RequestLogFilter::default(), 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "应落库恰好 1 条");
+        let detail = store.get_request_log(rows[0].id).unwrap().unwrap();
+        detail.kiro_payload
+    }
+
+    #[test]
+    fn write_request_log_kiro_family_renders_kiro_payload_even_with_empty_provider() {
+        // family="kiro" 时 kiro_payload 必须非空,且 account.provider 为空不影响渲染
+        // (防止 filter_by_provider 放行的空-provider kiro 号丢日志)。
+        let kp = log_kiro_payload_with_family("kiro");
+        assert!(
+            !kp.is_empty(),
+            "family=kiro 时 kiro_payload 应非空,实际为空"
+        );
+        // render_kiro_payload 对最简请求(model=m, messages=[]) 应产出合法 JSON
+        assert!(
+            kp.starts_with('{') || kp.starts_with('<'),
+            "kiro_payload 应是 JSON 对象或错误占位,实际: {kp}"
+        );
+    }
+
+    #[test]
+    fn write_request_log_non_kiro_family_skips_kiro_payload() {
+        // family="claude-dario" 时 kiro_payload 必须为空串
+        // (不应把 Kiro 格式强行渲染给 dario/其他 provider)。
+        let kp = log_kiro_payload_with_family("claude-dario");
+        assert!(
+            kp.is_empty(),
+            "family=claude-dario 时 kiro_payload 应为空串,实际: {kp}"
+        );
     }
 }
