@@ -165,4 +165,11 @@ mod tests {
         assert_eq!(classify_refresh_status(400), UpstreamErrorKind::TokenInvalid);
         assert_eq!(classify_refresh_status(401), UpstreamErrorKind::TokenInvalid);
     }
+
+    #[test]
+    fn apply_no_expires_in_leaves_expires_at_unset() {
+        let r = serde_json::json!({"access_token":"new-at"});
+        let u = apply_refresh(acct(), &r, 99999).unwrap();
+        assert!(u.extra_str("expires_at").is_none());
+    }
 }
