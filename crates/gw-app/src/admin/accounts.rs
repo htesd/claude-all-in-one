@@ -154,6 +154,10 @@ pub struct CreateAccountBody {
     /// 仅在 extra 未显式带 proxy 时生效。
     #[serde(default)]
     egress: Option<String>,
+    /// claude-dario 专用:粘贴 CC .credentials.json 全文。
+    /// 后端调 `gw_dario::parse_cc_credentials` 解析后并入 extra(不覆盖显式传的同名字段)。
+    #[serde(default)]
+    credentials_json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +297,33 @@ async fn create_account(
             extra_map.insert("proxy".into(), serde_json::json!(url));
         }
     }
+    // provider 在 extra_json 序列化前确定,以便 dario 路径能并入凭据。
+    let provider = body.provider.as_deref().filter(|p| !p.is_empty()).unwrap_or("kiro");
+    // claude-dario:若带了 .credentials.json 全文,解析后并入 extra(不覆盖操作者已填的同名字段),
+    // 并补生成稳定身份 device_id / account_uuid(凭证文件里没有)。
+    if provider == "claude-dario" {
+        if let Some(cred) = body.credentials_json.as_deref().filter(|s| !s.trim().is_empty()) {
+            match gw_dario::parse_cc_credentials(cred) {
+                Ok(parsed) => {
+                    for (k, v) in parsed {
+                        extra_map.entry(k).or_insert(v);
+                    }
+                }
+                Err(e) => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("解析 .credentials.json 失败: {e}"),
+                    )
+                }
+            }
+        }
+        extra_map
+            .entry("device_id".to_string())
+            .or_insert_with(|| serde_json::json!(uuid::Uuid::new_v4().to_string()));
+        extra_map
+            .entry("account_uuid".to_string())
+            .or_insert_with(|| serde_json::json!(uuid::Uuid::new_v4().to_string()));
+    }
     let extra_json = match serde_json::to_string(&extra_map) {
         Ok(s) => s,
         Err(e) => return internal_error(e),
@@ -307,7 +338,6 @@ async fn create_account(
             Err(e) => return internal_error(e),
         }
     }
-    let provider = body.provider.as_deref().filter(|p| !p.is_empty()).unwrap_or("kiro");
     let conc = body.max_concurrency.unwrap_or(2); // 缺省对齐 kiro.rs maxConcurrency=2
     match st
         .store
@@ -1428,5 +1458,99 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
         assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    // ── claude-dario 创建账号 ────────────────────────────────────────────────
+
+    /// 提供合法 .credentials.json → 账号 extra 含 access_token,provider=claude-dario,
+    /// device_id / account_uuid 为 36 字符 UUID。
+    #[tokio::test]
+    async fn create_dario_account_parses_credentials_json() {
+        let (app, store) = app();
+        let creds_json =
+            r#"{"claudeAiOauth":{"accessToken":"at-test-tok","refreshToken":"rt-test-tok","expiresAt":1780531200000}}"#;
+        let body = serde_json::json!({
+            "account_id": "dario-01",
+            "provider": "claude-dario",
+            "credentials_json": creds_json,
+            "max_concurrency": 1
+        })
+        .to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "应 201 Created");
+        let v = json_body(resp).await;
+        assert_eq!(v["provider"], "claude-dario", "provider 必须保留");
+
+        // 库里存的是完整 extra(worker 要用)。
+        let raw = store.get_account("dario-01").unwrap().unwrap();
+        let extra: serde_json::Value = serde_json::from_str(&raw.extra).unwrap();
+        assert_eq!(extra["access_token"], "at-test-tok", "access_token 须并入");
+        assert_eq!(extra["refresh_token"], "rt-test-tok", "refresh_token 须并入");
+
+        // device_id / account_uuid 自动生成,必须是 36 字符的 UUID。
+        let dev = extra["device_id"].as_str().expect("device_id 存在");
+        let uid = extra["account_uuid"].as_str().expect("account_uuid 存在");
+        assert_eq!(dev.len(), 36, "device_id 应为 UUID(36 字符),实际: {dev}");
+        assert_eq!(uid.len(), 36, "account_uuid 应为 UUID(36 字符),实际: {uid}");
+        assert_eq!(dev.chars().filter(|&c| c == '-').count(), 4, "UUID 应含 4 个连字符");
+    }
+
+    /// provider=claude-dario 但 credentials_json 为空 → 账号仍创建成功,
+    /// device_id / account_uuid 依旧自动生成(操作者可稍后通过 PATCH 补凭据)。
+    #[tokio::test]
+    async fn create_dario_account_without_credentials_json_still_creates() {
+        let (app, store) = app();
+        let body = serde_json::json!({
+            "account_id": "dario-02",
+            "provider": "claude-dario"
+        })
+        .to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let raw = store.get_account("dario-02").unwrap().unwrap();
+        let extra: serde_json::Value = serde_json::from_str(&raw.extra).unwrap();
+        let dev = extra["device_id"].as_str().expect("device_id 存在");
+        assert_eq!(dev.len(), 36, "无凭证时也应生成 device_id");
+    }
+
+    /// credentials_json 格式非法 → 400,账号不落库。
+    #[tokio::test]
+    async fn create_dario_account_bad_credentials_json_returns_400() {
+        let (app, store) = app();
+        let body = serde_json::json!({
+            "account_id": "dario-bad",
+            "provider": "claude-dario",
+            "credentials_json": r#"{"not_valid": true}"#
+        })
+        .to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "应 400");
+        let resp_json = json_body(resp).await;
+        let msg = resp_json["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("credentials.json"), "错误信息应提及 credentials.json,实际: {msg}");
+        assert!(store.get_account("dario-bad").unwrap().is_none(), "账号不得落库");
+    }
+
+    /// 操作者在 extra 里显式填了 device_id → 不覆盖(entry.or_insert_with 语义)。
+    #[tokio::test]
+    async fn create_dario_account_does_not_overwrite_explicit_device_id() {
+        let (app, store) = app();
+        let creds_json = r#"{"claudeAiOauth":{"accessToken":"at2","refreshToken":"rt2","expiresAt":1780531200000}}"#;
+        let body = serde_json::json!({
+            "account_id": "dario-03",
+            "provider": "claude-dario",
+            "credentials_json": creds_json,
+            "extra": { "device_id": "my-explicit-device-id-0000000000000" }
+        })
+        .to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let raw = store.get_account("dario-03").unwrap().unwrap();
+        let extra: serde_json::Value = serde_json::from_str(&raw.extra).unwrap();
+        assert_eq!(
+            extra["device_id"].as_str().unwrap(),
+            "my-explicit-device-id-0000000000000",
+            "显式 device_id 不得被覆盖"
+        );
     }
 }

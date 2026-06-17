@@ -23,6 +23,11 @@ export interface CreateAccountPayload {
   extra?: Record<string, unknown>
   /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
   egress?: string
+  /**
+   * claude-dario 专用：粘贴 CC .credentials.json 全文。
+   * 后端解析 claudeAiOauth 块并并入 extra（access_token / refresh_token / expires_at）。
+   */
+  credentials_json?: string
 }
 
 /** PATCH /accounts/{id}：extra 传了就是整体替换（凭据轮换），不传不动。 */
