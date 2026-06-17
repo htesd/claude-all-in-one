@@ -1,5 +1,6 @@
+use futures::StreamExt;
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
-use gw_core::provider::{CallCtx, ChatRequest, ChatStream, ChatUsage};
+use gw_core::provider::{CallCtx, ChatRequest, ChatStream, ChatUsage, SseEvent, StreamItem};
 use crate::DarioConfig;
 
 // ── Task 3.1: Usage accumulator ──────────────────────────────────────────────
@@ -113,15 +114,134 @@ pub(crate) fn affinity_from_body(body: &serde_json::Value) -> Option<String> {
     Some(format!("dario-{:016x}", h.finish()))
 }
 
-// ── Task 3.2 stub (replaced below after 3.1 commit) ──────────────────────────
+// ── Task 3.2: Forward to dario sidecar ───────────────────────────────────────
 
+/// Forward a chat request to the local dario sidecar and stream back
+/// `StreamItem` events.
+///
+/// # Key invariants
+/// - **Force `stream: true`**: Anthropic returns a single JSON blob for
+///   `stream: false`; `drain_sse_frames` cannot split it → zero events, zero
+///   usage.  caio's `collect_response` folds the SSE into a non-streaming
+///   response for clients that requested `stream: false` (spec §6.3).
+/// - **Emit Usage even on error**: a mid-stream network error must still yield
+///   the usage observed so far so per-key billing is not truncated.
 pub(crate) async fn chat_via_sidecar(
-    _cfg: &DarioConfig,
-    _client: &reqwest::Client,
-    _req: ChatRequest,
-    _ctx: &CallCtx,
+    cfg: &DarioConfig,
+    client: &reqwest::Client,
+    req: ChatRequest,
+    ctx: &CallCtx,
 ) -> Result<ChatStream, UpstreamError> {
-    Err(UpstreamError::new(UpstreamErrorKind::Other, "not implemented"))
+    // Resolve per-account credentials.
+    let access_token = ctx
+        .account
+        .extra_str("access_token")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            UpstreamError::new(
+                UpstreamErrorKind::TokenInvalid,
+                "dario account missing access_token",
+            )
+        })?
+        .to_string();
+    let device_id = ctx
+        .account
+        .extra_str("device_id")
+        .unwrap_or_default()
+        .to_string();
+    let account_uuid = ctx
+        .account
+        .extra_str("account_uuid")
+        .unwrap_or_default()
+        .to_string();
+    let session_id = ctx.session_id.clone();
+    let api_key = cfg.api_key.clone();
+
+    // Force upstream streaming so dario returns SSE regardless of what the
+    // downstream client requested.
+    let mut body = req.body.clone();
+    if let serde_json::Value::Object(ref mut m) = body {
+        m.insert("stream".into(), serde_json::Value::Bool(true));
+    }
+
+    let url = format!("{}/v1/messages", cfg.sidecar_url.trim_end_matches('/'));
+    let mut rb = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-api-key", &api_key)              // dario ingress auth (bare key, highest priority)
+        .header("x-dario-upstream-token", &access_token) // Phase 1 patch consumes this
+        .header("x-session-id", &session_id);        // dario reads x-session-id (proxy.ts:1619)
+    if !device_id.is_empty() {
+        rb = rb.header("x-dario-device-id", &device_id);
+    }
+    if !account_uuid.is_empty() {
+        rb = rb.header("x-dario-account-uuid", &account_uuid);
+    }
+
+    let resp = rb
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| UpstreamError::network(format!("dario sidecar connect failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let kind = match code {
+            400 => UpstreamErrorKind::BadRequest,
+            401 => UpstreamErrorKind::TokenInvalid,
+            403 if text.to_lowercase().contains("suspend") => {
+                UpstreamErrorKind::TemporarilyBlocked
+            }
+            403 => UpstreamErrorKind::TokenInvalid,
+            429 => UpstreamErrorKind::RateLimited,
+            500..=599 => UpstreamErrorKind::ServerError,
+            _ => UpstreamErrorKind::Other,
+        };
+        return Err(UpstreamError::new(
+            kind,
+            format!(
+                "dario/anthropic {code}: {}",
+                text.chars().take(500).collect::<String>()
+            ),
+        )
+        .with_status(code));
+    }
+
+    // Stream response bytes, parse SSE frames on the fly.
+    let mut byte_stream = resp.bytes_stream();
+    let stream = async_stream::stream! {
+        let mut buf = String::new();
+        let mut acc = UsageAcc::default();
+        loop {
+            match byte_stream.next().await {
+                Some(Ok(chunk)) => {
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    let (frames, rest) = drain_sse_frames(&buf);
+                    buf = rest;
+                    for (event, data_str) in frames {
+                        let data: serde_json::Value =
+                            serde_json::from_str(&data_str).unwrap_or(serde_json::Value::Null);
+                        acc.observe(&event, &data);
+                        yield Ok(StreamItem::Sse(SseEvent::new(event, data)));
+                    }
+                }
+                Some(Err(e)) => {
+                    // Even on a mid-stream network error, emit the usage
+                    // observed so far so per-key billing is not truncated.
+                    yield Ok(StreamItem::Usage(std::mem::take(&mut acc).into_usage()));
+                    yield Err(UpstreamError::network(format!("dario stream interrupted: {e}")));
+                    return;
+                }
+                None => break,
+            }
+        }
+        // Normal end: emit final usage.
+        yield Ok(StreamItem::Usage(acc.into_usage()));
+    };
+    Ok(Box::pin(stream))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
