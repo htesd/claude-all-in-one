@@ -652,6 +652,9 @@ pub async fn run(
         if let Some(dp) = &initial_default_proxy {
             map.insert("default_proxy".into(), serde_json::json!(dp));
         }
+        if let Ok(dario) = serde_json::to_value(&effective_system.dario) {
+            map.insert("dario".into(), dario);
+        }
     }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
 
@@ -668,6 +671,12 @@ pub async fn run(
         usage_sink = usage_sink.is_some(),
         "worker 就绪"
     );
+    if provider_family == "claude-dario" {
+        tracing::warn!(
+            worker_egress = %egress_desc,
+            "dario 组:请确保本 worker 的 egress 与所连 dario sidecar 的 --upstream-proxy 为同一美国 HTTPS 代理(否则刷新 IP≠发包 IP,关联封号风险)"
+        );
+    }
 
     let state = Arc::new(WorkerState {
         instance,
