@@ -43,3 +43,10 @@ max_request_body_bytes: 16777216
 
 # 上游流式请求总超时(秒)。Opus 大上下文常跑数百秒;0 或缺省=720s。仅 worker 消费。
 upstream_timeout_secs: 720
+
+# dario sidecar(claude-dario provider 用)。启动期段,改后需重启相关 worker。
+# sidecar_url: dario-on-Bun 监听地址;缺省(或空)回落 http://127.0.0.1:39100。
+# api_key: 对应 dario sidecar 的 DARIO_API_KEY env;loopback 无 key 时可留空。
+dario:
+  sidecar_url: "http://127.0.0.1:39100"
+  api_key: ""
