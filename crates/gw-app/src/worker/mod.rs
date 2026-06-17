@@ -658,6 +658,43 @@ pub async fn run(
     }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
 
+    // Fix6: For dario workers, filter out accounts that fail validate_account
+    // (missing access_token + refresh_token) before they enter the scheduler.
+    // Scope this to "claude-dario" only — kiro's validate_account requires
+    // refresh_token + machine_id, and there may be edge-case kiro accounts
+    // on-line that intentionally omit machine_id (e.g. legacy rows that rely
+    // on runtime defaults).  Restricting to dario eliminates any kiro regression
+    // risk while still catching dario accounts imported without credentials.
+    let accounts = if provider_family == "claude-dario" {
+        let total = accounts.len();
+        let valid: Vec<Arc<Account>> = accounts
+            .into_iter()
+            .filter(|a| match provider.validate_account(a.as_ref()) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        account = %a.account_id,
+                        reason = %e,
+                        "dario 账号校验失败,跳过不进调度池"
+                    );
+                    false
+                }
+            })
+            .collect();
+        let skipped = total - valid.len();
+        if skipped > 0 {
+            tracing::info!(
+                total,
+                valid = valid.len(),
+                skipped,
+                "dario 账号校验:部分账号缺凭据被跳过"
+            );
+        }
+        valid
+    } else {
+        accounts
+    };
+
     let usage_sink: Option<Arc<dyn UsageSink>> =
         store.clone().map(|s| s as Arc<dyn UsageSink>);
 
