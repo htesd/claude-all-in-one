@@ -78,6 +78,67 @@ struct RouterState {
     http: reqwest::Client,
 }
 
+/// 是否是合法的 instances 配置文件名:`instances.yaml` 或 `instances-<seg>.yaml`
+/// (单段、无额外点号)。排除备份/样例:`instances.old.yaml`、`instances-x.bak.yaml`、
+/// `instances.example.yaml` 等(审查 Skeptic#8/Architect#6:避免聚合到陈旧/他人配置)。
+fn is_instances_config_file(name: &str) -> bool {
+    if name == "instances.yaml" {
+        return true;
+    }
+    match name.strip_prefix("instances-").and_then(|s| s.strip_suffix(".yaml")) {
+        Some(seg) => !seg.is_empty() && !seg.contains('.'),
+        None => false,
+    }
+}
+
+/// 跨 router 运行态可见性:admin 的 worker 扇出应覆盖**所有** worker,而不仅本 router
+/// 路由的那批——多 router 部署时(kiro 主 router + 独立 dario router),主面板否则看不到
+/// dario worker(账号显示"离线/未服务"),也无法对 dario 账号做 reset/refresh/quota。
+/// 扫描 instances 同目录下所有 `instances-*.yaml`,并出 worker(按 listen 去重,own 永在内)。
+///
+/// **此并集只进 `AdminState`(admin 控制面扇出:/health 聚合 + reset/refresh/quota/sync——
+/// 后者本就是"全 worker 幂等扇出,非持有者回 404",故覆盖 dario worker 是正确且有益的)。
+/// 数据面路由用 `RouterState.workers`(=本 router 自己的 workers),与此完全分离,路由隔离不变。**
+/// 读/解析失败的文件跳过并 warn(可见性功能,静默跳过会让"面板少个 worker"难排查)。
+fn aggregate_display_workers(
+    instances_path: &Path,
+    own: &[gw_core::config::WorkerConfig],
+) -> Vec<gw_core::config::WorkerConfig> {
+    let mut out: Vec<gw_core::config::WorkerConfig> = own.to_vec();
+    let mut seen: std::collections::HashSet<String> =
+        out.iter().map(|w| w.listen.clone()).collect();
+    let dir = instances_path.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else { return out; };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_instances_config_file(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), "聚合 worker:读取 instances 文件失败,跳过: {e}");
+                continue;
+            }
+        };
+        let cfg = match serde_yaml::from_str::<InstancesConfig>(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), "聚合 worker:解析 instances 文件失败,跳过: {e}");
+                continue;
+            }
+        };
+        for w in cfg.workers {
+            if seen.insert(w.listen.clone()) {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
 pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> anyhow::Result<()> {
     let instances: InstancesConfig = {
         let text = std::fs::read_to_string(instances_path)
@@ -117,7 +178,8 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
         (Some(token), Some(store)) => Some(AdminState::new(
             Arc::new(token.to_string()),
             store.clone(),
-            instances.workers.clone(),
+            // 跨 router 并集:主面板得以显示 dario worker 等其他 router 的运行态。
+            aggregate_display_workers(instances_path, &instances.workers),
             system.clone(),
         )),
         (Some(_), None) => {
@@ -891,5 +953,19 @@ mod tests {
             failover_target(&st, Some("x"), only.instance).is_none(),
             "单 worker 无备选,只能 502"
         );
+    }
+
+    #[test]
+    fn instances_config_file_glob_excludes_backups() {
+        assert!(is_instances_config_file("instances.yaml"));
+        assert!(is_instances_config_file("instances-dario.yaml"));
+        assert!(is_instances_config_file("instances-us_pool.yaml"));
+        // 备份/样例/陈旧文件必须排除,否则会聚合到他人/过期 worker。
+        assert!(!is_instances_config_file("instances.old.yaml"));
+        assert!(!is_instances_config_file("instances-dario.bak.yaml"));
+        assert!(!is_instances_config_file("instances.example.yaml"));
+        assert!(!is_instances_config_file("instances.yaml.bak"));
+        assert!(!is_instances_config_file("docker-compose.yml"));
+        assert!(!is_instances_config_file("instances-.yaml"));
     }
 }

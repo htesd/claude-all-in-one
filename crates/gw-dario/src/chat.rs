@@ -218,21 +218,29 @@ pub(crate) async fn chat_via_sidecar(
     req: ChatRequest,
     ctx: &CallCtx,
 ) -> Result<ChatStream, UpstreamError> {
-    // Fix5: warn if this account carries a per-account proxy that cannot be
-    // honoured in MVP (all dario chat goes through a single sidecar_url).
-    if ctx
+    // Per-account upstream egress proxy (anti-ban: dario chat must exit from
+    // the account's home IP). Forwarded to the sidecar as x-dario-upstream-proxy,
+    // which the fork applies per-request (Bun fetch `proxy`). Only http(s) —
+    // dario cannot do socks; reject loudly so a misconfig never silently exits
+    // the wrong IP (refresh_auth uses the same proxy, see lib.rs::egress_client_for).
+    // Normalize via the shared helper so chat & refresh agree byte-for-byte on
+    // the proxy URL (same validation + canonical form → same egress, same cache
+    // key). Invalid/socks → BadRequest (won't switch accounts), never silently
+    // exit the wrong IP.
+    let upstream_proxy: Option<String> = match ctx
         .account
         .extra_str("proxy")
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .is_some()
     {
-        tracing::warn!(
-            account = %ctx.account.account_id,
-            "dario 账号设了 extra.proxy,但 MVP 所有 dario chat 走单一 sidecar_url——\
-             该 per-account 代理被忽略,请确保 dario 组单出口且 sidecar upstream-proxy 一致"
-        );
-    }
+        Some(raw) => Some(crate::normalize_dario_proxy(raw).map_err(|e| {
+            UpstreamError::new(
+                UpstreamErrorKind::BadRequest,
+                format!("dario account extra.proxy 非法: {e}"),
+            )
+        })?),
+        None => None,
+    };
 
     // Resolve per-account credentials.
     let access_token = ctx
@@ -285,6 +293,9 @@ pub(crate) async fn chat_via_sidecar(
     }
     if !account_uuid.is_empty() {
         rb = rb.header("x-dario-account-uuid", &account_uuid);
+    }
+    if let Some(p) = &upstream_proxy {
+        rb = rb.header("x-dario-upstream-proxy", p); // dario fork applies per-request (proxy.ts)
     }
 
     let resp = rb

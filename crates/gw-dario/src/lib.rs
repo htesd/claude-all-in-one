@@ -4,10 +4,11 @@ mod credentials;
 mod datefmt;
 mod token;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use gw_core::account::{Account, FieldSpec, FieldType};
-use gw_core::error::UpstreamError;
+use gw_core::error::{UpstreamError, UpstreamErrorKind};
 use gw_core::model::ModelInfo;
 use gw_core::provider::{CallCtx, ChatRequest, ChatStream, Provider};
 
@@ -26,6 +27,23 @@ const DARIO_ACCOUNT_SCHEMA: &[FieldSpec] = &[
     FieldSpec::new("account_uuid", "Account UUID", FieldType::String, false),
     FieldSpec::new("proxy", "出口代理", FieldType::String, false),
 ];
+
+/// 校验并**规范化** dario per-account 出口代理 URL。chat 与 refresh 共用此函数,
+/// 保证两条路径对同一字符串得到**字节一致**的判定与缓存键(消除"chat 放行/refresh
+/// 回退"的不对称——审查 Skeptic#4/Architect#2)。仅 http(s):dario sidecar 不支持
+/// socks。⚠️ 该代理必须是**固定单出口 IP**(非 rotating/backconnect)——refresh(reqwest)
+/// 与 chat(dario/Bun)是各自独立连接,只有静态出口才能保证刷新 IP==发包 IP(Skeptic#2)。
+pub(crate) fn normalize_dario_proxy(raw: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(raw.trim()).map_err(|e| format!("invalid proxy URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("dario proxy must be http(s); got {s} (socks unsupported by sidecar)")),
+    }
+    if url.host_str().unwrap_or("").is_empty() {
+        return Err("proxy URL missing host".to_string());
+    }
+    Ok(url.as_str().to_string())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct DarioConfig {
@@ -48,8 +66,12 @@ pub struct DarioProvider {
     cfg: DarioConfig,
     /// 直连 loopback(**无代理 + connect 超时**):caio→dario 本机回环,出口代理由 dario 负责。
     sidecar_client: reqwest::Client,
-    /// 注入的本组 egress client:仅 refresh_auth 直连 token 端点用(与 dario 发包同出口,防关联封号)。
+    /// 注入的本组 egress client(worker 级默认出口):账号无 extra.proxy 时 refresh_auth 用它。
     egress_client: reqwest::Client,
+    /// 按账号 extra.proxy → refresh client 缓存。chat 经 x-dario-upstream-proxy 让 dario
+    /// 按账号出口;refresh_auth 必须走**同一** proxy(否则刷新 IP≠发包 IP,关联封号)。
+    /// key = 规范化 proxy URL;reqwest::Client 内部 Arc,clone 廉价。
+    proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
 }
 
 impl DarioProvider {
@@ -57,7 +79,44 @@ impl DarioProvider {
         Self::with_clients(cfg, reqwest::Client::new(), reqwest::Client::new())
     }
     pub fn with_clients(cfg: DarioConfig, sidecar_client: reqwest::Client, egress_client: reqwest::Client) -> Self {
-        Self { cfg, sidecar_client, egress_client }
+        Self { cfg, sidecar_client, egress_client, proxy_clients: Mutex::new(HashMap::new()) }
+    }
+
+    /// refresh_auth 的出口 client。**fail-closed**(审查 Skeptic#1/Architect#1 共识阻断点):
+    /// - 账号**未设** proxy → worker 级默认 egress_client(与 chat 默认出口一致);
+    /// - 设了**合法 http(s)** proxy → 走该代理(与 chat 的 x-dario-upstream-proxy **同一**
+    ///   规范化 URL → 同出口);
+    /// - 设了但**非法/socks/构造失败** → **返回 Err 拒绝刷新**,绝不静默回退默认 IP
+    ///   (回退 = 刷新 IP≠发包 IP = 正中关联封号)。刷新失败 = 该号暂不可用(token 过期后
+    ///   下线),是**安全**的失败,远好于换 IP 刷新。
+    /// 锁内同步构造(reqwest builder 无 await),消除并发重复 build;poison 用 into_inner 恢复。
+    fn egress_client_for(&self, account: &Account) -> Result<reqwest::Client, UpstreamError> {
+        let raw = match account.extra_str("proxy").map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => p,
+            None => return Ok(self.egress_client.clone()),
+        };
+        let norm = normalize_dario_proxy(raw).map_err(|e| {
+            UpstreamError::new(
+                UpstreamErrorKind::BadRequest,
+                format!("dario account extra.proxy 非法({e}),拒绝刷新以防换 IP 刷新"),
+            )
+        })?;
+        let mut cache = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = cache.get(&norm) {
+            return Ok(c.clone());
+        }
+        let proxy = reqwest::Proxy::all(&norm).map_err(|e| {
+            UpstreamError::new(UpstreamErrorKind::BadRequest, format!("dario proxy 解析失败: {e}"))
+        })?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| {
+                UpstreamError::new(UpstreamErrorKind::Other, format!("build dario proxy client: {e}"))
+            })?;
+        cache.insert(norm, client.clone());
+        Ok(client)
     }
     pub fn from_config(cfg: &serde_json::Value, egress_client: reqwest::Client) -> anyhow::Result<Arc<dyn Provider>> {
         let c = DarioConfig::from_cfg(cfg);
@@ -113,7 +172,8 @@ impl Provider for DarioProvider {
     }
 
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
-        token::refresh(&self.egress_client, account).await
+        let client = self.egress_client_for(account)?; // fail-closed:非法 proxy 直接拒绝刷新
+        token::refresh(&client, account).await
     }
 }
 
@@ -137,5 +197,37 @@ mod tests {
     #[test] fn from_config_warns_empty_api_key_but_builds() {
         // 空 api_key 不阻断构造(loopback dario 可不设 DARIO_API_KEY),仅记 warn。
         assert!(DarioProvider::from_config(&serde_json::Value::Null, reqwest::Client::new()).is_ok());
+    }
+
+    #[test]
+    fn egress_client_for_failclosed_and_caches() {
+        use std::collections::BTreeMap;
+        fn acct(proxy: Option<&str>) -> Account {
+            let mut e = BTreeMap::new();
+            if let Some(p) = proxy { e.insert("proxy".into(), serde_json::json!(p)); }
+            Account { account_id: "d1".into(), provider: "claude-dario".into(), max_concurrency: 2, disabled: false, extra: e }
+        }
+        let p = DarioProvider::new(DarioConfig::default());
+        // 无 proxy → Ok(worker 默认出口),缓存不增长。
+        assert!(p.egress_client_for(&acct(None)).is_ok());
+        assert_eq!(p.proxy_clients.lock().unwrap().len(), 0);
+        // socks → 不支持 → Err(fail-closed:不回退默认 IP,不缓存)。
+        assert!(p.egress_client_for(&acct(Some("socks5://1.2.3.4:1080"))).is_err());
+        // 非法(缺 host)→ Err。
+        assert!(p.egress_client_for(&acct(Some("http://"))).is_err());
+        assert_eq!(p.proxy_clients.lock().unwrap().len(), 0);
+        // http(含内嵌 basic auth)→ Ok,缓存一份;同 URL 二次复用不新增。
+        assert!(p.egress_client_for(&acct(Some("http://caio:pw@45.77.219.188:13128"))).is_ok());
+        assert!(p.egress_client_for(&acct(Some("http://caio:pw@45.77.219.188:13128"))).is_ok());
+        assert_eq!(p.proxy_clients.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn normalize_dario_proxy_rules() {
+        assert!(normalize_dario_proxy("http://h:8080").is_ok());
+        assert!(normalize_dario_proxy("https://user:pw@h:8443").is_ok());
+        assert!(normalize_dario_proxy("socks5://h:1080").is_err());
+        assert!(normalize_dario_proxy("http://").is_err());
+        assert!(normalize_dario_proxy("not a url").is_err());
     }
 }
