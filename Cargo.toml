@@ -6,6 +6,7 @@ members = [
     "crates/gw-store",
     "crates/gw-app",
     "crates/gw-claude-subprocess",
+    "crates/gw-dario",
 ]
 
 [workspace.package]
@@ -20,6 +21,8 @@ gw-core = { path = "crates/gw-core" }
 gw-kiro = { path = "crates/gw-kiro" }
 gw-store = { path = "crates/gw-store" }
 gw-claude-subprocess = { path = "crates/gw-claude-subprocess" }
+gw-dario = { path = "crates/gw-dario" }
+async-stream = "0.3"
 
 # 异步运行时与 HTTP（版本对齐旧 kiro.rs，便于资产搬运）
 tokio = { version = "1.0", features = ["full"] }

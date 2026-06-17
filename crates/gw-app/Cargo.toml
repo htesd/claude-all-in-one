@@ -19,6 +19,7 @@ gw-core.workspace = true
 gw-kiro.workspace = true
 gw-store.workspace = true
 gw-claude-subprocess.workspace = true
+gw-dario.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower-http.workspace = true
