@@ -57,7 +57,17 @@ export type AccountUnavailableReason =
   | 'too_many_failures'
   | 'config'
 
-/** 账号配额(积分)只读快照,来自 worker 的 getUsageLimits;尚未查到时为 null。 */
+/** 一个用量窗口(如 dario 的 5h / 7d 滚动窗口),利用率%。 */
+export interface QuotaWindow {
+  /** 窗口标签,如 "5h" / "7d"。 */
+  label: string
+  /** 已用利用率(0–100+,可超 100 = 已进 overage)。 */
+  percent_used: number
+  /** 该窗口重置的 unix 秒(可空)。 */
+  reset_at?: number | null
+}
+
+/** 账号配额只读快照;尚未查到时为 null。Kiro=积分(used/limit);dario=利用率窗口(windows)。 */
 export interface AccountQuota {
   /** 已用额度(Credits)。 */
   used: number
@@ -69,6 +79,8 @@ export interface AccountQuota {
   percent_used: number
   /** 订阅/单位标签(如 KIRO PRO),可空。 */
   label?: string | null
+  /** 多窗口利用率(dario 的 5h/7d);空/缺省 = 基于积分的 provider(Kiro),走 remaining/limit 显示。 */
+  windows?: QuotaWindow[]
 }
 
 export interface AccountRuntimeStatus {

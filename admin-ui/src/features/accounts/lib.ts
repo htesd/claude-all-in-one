@@ -95,3 +95,26 @@ export function isQuotaLow(remaining: number, limit: number): boolean {
   if (limit <= 0) return false // 上限未知且未超额:不误报
   return remaining <= 0 || remaining / limit < 0.1
 }
+
+/** 配额展示口径:'windows' = 滚动窗口利用率(5h/7d,Claude OAuth/ccmax);
+ *  'credits' = 积分剩余/上限(Kiro)。决定账号页该 tab 的配额列语义。 */
+export type QuotaKind = 'credits' | 'windows'
+
+/** provider → 配额口径。dario(claude-dario)无积分概念,只有 5h/7d 利用率窗口。 */
+export function quotaKindForProvider(provider: string): QuotaKind {
+  return provider === 'claude-dario' ? 'windows' : 'credits'
+}
+
+/** provider → 账号页 tab 短标签(用户惯用语:claude-dario 即 "ccmax")。未知 provider 原样。 */
+export function providerTabLabel(provider: string): string {
+  switch (provider) {
+    case 'kiro':
+      return 'Kiro'
+    case 'claude-dario':
+      return 'ccmax'
+    case '':
+      return '—'
+    default:
+      return provider
+  }
+}

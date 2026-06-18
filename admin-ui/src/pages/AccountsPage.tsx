@@ -1,8 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, CheckCircle2, Plus, Upload } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
+import { Segment } from '@/components/ui/segment'
 import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import type { RuntimeQueryState } from '@/features/accounts/components/AccountTableRow'
 import { CreateAccountDialog } from '@/features/accounts/components/CreateAccountDialog'
@@ -17,7 +18,7 @@ import {
   useUpdateAccount,
 } from '@/features/accounts/hooks'
 import type { RefreshAccountResult } from '@/features/accounts/api'
-import { mergeRuntimeByAccount } from '@/features/accounts/lib'
+import { mergeRuntimeByAccount, providerTabLabel, quotaKindForProvider } from '@/features/accounts/lib'
 import type { AccountRow } from '@/features/accounts/types'
 import { useGroups } from '@/features/groups/hooks'
 import { useI18n } from '@/lib/i18n'
@@ -53,6 +54,39 @@ export default function AccountsPage() {
     () => mergeRuntimeByAccount(runtimeQuery.data),
     [runtimeQuery.data],
   )
+
+  // 按 provider 分 Tab:不同 provider 配额口径不同(Kiro=积分,ccmax/dario=5h/7d 利用率),
+  // 混在一张表里列头无法两全。统计在册的 provider(含计数),kiro→ccmax→其余 排序。
+  const providers = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const row of accountsQuery.data ?? []) {
+      counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1)
+    }
+    const rank = (p: string) => (p === 'kiro' ? 0 : p === 'claude-dario' ? 1 : 2)
+    return [...counts.entries()]
+      .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+      .map(([provider, count]) => ({ provider, count }))
+  }, [accountsQuery.data])
+
+  // 用户选中的 tab;未选/已不存在时回落到首个 provider(prefer kiro,见 rank 排序)。
+  const [activeProvider, setActiveProvider] = useState<string | null>(null)
+  // 选中的 provider 从列表消失(如删光该组账号)时清空选择,回落首个 provider。否则
+  // 该 provider 日后重新出现会把用户从当前 tab 意外弹回旧 tab(审查 Skeptic#1)。
+  useEffect(() => {
+    if (activeProvider !== null && !providers.some((p) => p.provider === activeProvider)) {
+      setActiveProvider(null)
+    }
+  }, [providers, activeProvider])
+  const effectiveProvider =
+    activeProvider !== null && providers.some((p) => p.provider === activeProvider)
+      ? activeProvider
+      : (providers[0]?.provider ?? '')
+
+  const visibleRows = useMemo(
+    () => (accountsQuery.data ?? []).filter((row) => row.provider === effectiveProvider),
+    [accountsQuery.data, effectiveProvider],
+  )
+  const quotaKind = quotaKindForProvider(effectiveProvider)
 
   // 轮询失败但还有旧数据时继续按旧数据展示（配合下方警示条）；完全没数据才降级
   const runtimeState: RuntimeQueryState = runtimeQuery.isPending
@@ -154,12 +188,25 @@ export default function AccountsPage() {
         </div>
       )}
 
+      {/* provider 分 Tab(≥2 个 provider 才显示):Kiro 显示积分,ccmax 显示 5h/7d 限额。 */}
+      {providers.length >= 2 && (
+        <Segment
+          options={providers.map((p) => ({
+            value: p.provider,
+            label: `${providerTabLabel(p.provider)} (${p.count})`,
+          }))}
+          value={effectiveProvider}
+          onChange={setActiveProvider}
+        />
+      )}
+
       <AccountsTable
-        data={accountsQuery.data}
+        data={visibleRows}
         loading={accountsQuery.isPending}
         runtimeByAccount={runtimeByAccount}
         runtimeState={runtimeState}
         groupColors={groupColors}
+        quotaKind={quotaKind}
         busyId={busyId}
         onToggleDisabled={handleToggleDisabled}
         onEdit={(row) => setEditingId(row.account_id)}
