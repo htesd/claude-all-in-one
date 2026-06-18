@@ -1046,7 +1046,8 @@ impl ControlStore for SqliteStore {
         // over_quota 在 SQL 内算好(quota_tokens NULL = 不限),鉴权路径零额外查询。
         let mut stmt = conn.prepare_cached(
             "SELECT key, disabled, \
-             (quota_tokens IS NOT NULL AND used_tokens >= quota_tokens) \
+             (quota_tokens IS NOT NULL AND used_tokens >= quota_tokens), \
+             group_name \
              FROM api_keys WHERE key = ?1",
         )?;
         let row = stmt
@@ -1055,6 +1056,7 @@ impl ControlStore for SqliteStore {
                     key_id: r.get::<_, String>(0)?,
                     disabled: r.get::<_, i64>(1)? != 0,
                     over_quota: r.get::<_, i64>(2)? != 0,
+                    group_name: r.get::<_, String>(3)?,
                 })
             })
             .ok();
@@ -1139,10 +1141,24 @@ mod tests {
 
         let ok = store.authenticate("sk-test").await.unwrap();
         assert!(ok.is_some());
-        assert_eq!(ok.unwrap().key_id, "sk-test");
+        let ok = ok.unwrap();
+        assert_eq!(ok.key_id, "sk-test");
+        assert_eq!(ok.group_name, "", "新建 key 默认未分组");
 
         let bad = store.authenticate("sk-nope").await.unwrap();
         assert!(bad.is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticate_carries_group_name() {
+        // router 的按组路由依赖鉴权返回 group_name:G0→kiro / DARIO→dario。
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.add_api_key("sk-dario", Some("ccmax")).unwrap();
+        let patch = ApiKeyPatch { group_name: Some("DARIO".into()), ..Default::default() };
+        assert!(store.update_api_key("sk-dario", &patch).unwrap());
+
+        let auth = store.authenticate("sk-dario").await.unwrap().unwrap();
+        assert_eq!(auth.group_name, "DARIO", "鉴权必须带出 key 的分组用于路由");
     }
 
     #[tokio::test]
