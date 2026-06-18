@@ -1,7 +1,98 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use futures::StreamExt;
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
-use gw_core::provider::{CallCtx, ChatRequest, ChatStream, ChatUsage, SseEvent, StreamItem};
+use gw_core::provider::{
+    AccountQuota, CallCtx, ChatRequest, ChatStream, ChatUsage, QuotaWindow, SseEvent, StreamItem,
+};
 use crate::DarioConfig;
+
+// ── 5h/7d 配额快照(从 Anthropic 经 sidecar 透传的响应头捕获)─────────────────────
+
+/// 每账号最近一次的 Anthropic 限额利用率快照。`util5h`/`util7d` 是**分数**(0–1,原始头值),
+/// 转 `AccountQuota` 时 ×100 变百分比;**`None` = 本窗口未知**(该响应没带这个头),与"0%"区分
+/// (避免 5h-only 响应把未知的 7d 显示成 0%,对抗审查 #2)。OAuth/Max 没有只读用量接口,
+/// 只能从真实聊天流量的响应头(`anthropic-ratelimit-unified-5h/7d-utilization`,由 dario sidecar
+/// 原样转发)捕获。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DarioRateLimit {
+    /// 5 小时滚动窗口利用率(分数 0–1);`None` = 本窗口未知。
+    pub util5h: Option<f64>,
+    /// 7 天滚动窗口利用率(分数 0–1);`None` = 本窗口未知。
+    pub util7d: Option<f64>,
+    /// 窗口重置 unix 秒(Anthropic 给统一的 reset,各窗口共用)。
+    pub reset: Option<i64>,
+    /// 限额状态串(`anthropic-ratelimit-unified-status`,如 allowed/rejected),作标签展示。
+    pub status: String,
+}
+
+/// 每账号快照表:account_id → 最近一次利用率。chat 写(merge)、account_quota 读。
+/// ⚠️ 进程生命周期缓存,按 account_id 键;账号删除/改名后旧键不主动清理(对抗审查 #4:
+/// 受 admin 改动量而非请求量约束,数量级=账号数,接受不剪枝)。
+pub(crate) type RateLimitStore = Arc<Mutex<HashMap<String, DarioRateLimit>>>;
+
+impl DarioRateLimit {
+    /// 用一份新解析的快照**就地合并**:只覆盖本次响应真带到的字段,缺失字段保留旧值
+    /// (5h-only 响应不会把已知的 7d 抹掉,对抗审查 #2)。
+    pub(crate) fn merge_present(&mut self, fresh: &DarioRateLimit) {
+        if fresh.util5h.is_some() {
+            self.util5h = fresh.util5h;
+        }
+        if fresh.util7d.is_some() {
+            self.util7d = fresh.util7d;
+        }
+        if fresh.reset.is_some() {
+            self.reset = fresh.reset;
+        }
+        if !fresh.status.is_empty() {
+            self.status = fresh.status.clone();
+        }
+    }
+
+    /// 转成 admin 面板用的 `AccountQuota`:**只发已知窗口**(未知窗口不渲染,不伪造 0%)。
+    /// 两窗口都未知 → `None`(面板显示「—」)。
+    pub(crate) fn to_quota(&self) -> Option<AccountQuota> {
+        let mut windows = Vec::new();
+        if let Some(u) = self.util5h {
+            windows.push(QuotaWindow { label: "5h".into(), percent_used: u * 100.0, reset_at: self.reset });
+        }
+        if let Some(u) = self.util7d {
+            windows.push(QuotaWindow { label: "7d".into(), percent_used: u * 100.0, reset_at: self.reset });
+        }
+        if windows.is_empty() {
+            return None;
+        }
+        let label = if self.status.is_empty() { None } else { Some(self.status.clone()) };
+        Some(AccountQuota::from_windows(windows, label))
+    }
+}
+
+/// 从 sidecar 透传回来的响应头解析 5h/7d 利用率。无 5h **且** 无 7d 头(如非 messages 响应或
+/// 上游未带限额头)→ `None`,调用方**保留旧快照**(不拿空响应抹掉已知用量)。
+pub(crate) fn parse_dario_ratelimit(headers: &reqwest::header::HeaderMap) -> Option<DarioRateLimit> {
+    let get_f = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+    };
+    let util5h = get_f("anthropic-ratelimit-unified-5h-utilization");
+    let util7d = get_f("anthropic-ratelimit-unified-7d-utilization");
+    if util5h.is_none() && util7d.is_none() {
+        return None;
+    }
+    let reset = headers
+        .get("anthropic-ratelimit-unified-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let status = headers
+        .get("anthropic-ratelimit-unified-status")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    Some(DarioRateLimit { util5h, util7d, reset, status })
+}
 
 // ── Task 3.1: Usage accumulator ──────────────────────────────────────────────
 
@@ -155,6 +246,23 @@ pub(crate) fn drain_sse_frames(buf: &str) -> (Vec<(String, String)>, String) {
 ///
 /// Uses `DefaultHasher` which is deterministic within a single process run —
 /// sufficient for per-worker in-process session pinning.
+/// 转发给 dario sidecar 前对客户端 body 的归一:
+/// ① 强制 `stream=true`(dario 恒以 SSE 返回,与下游是否要流无关);
+/// ② 强制 `service_tier="standard_only"` —— **屏蔽 Claude Code `/fast` 优先级档**。
+///    `/fast` = 客户端发 `service_tier:"auto"`(opt-in priority,更快但**额外计费**,
+///    Max 订阅也照扣)。dario 是唯一 verbatim 透传 body 的路径,不拦就会原样上真 Anthropic
+///    在用户 Max 号上多花钱。`"standard_only"` 是官方两个合法请求值之一(另一个就是 "auto"),
+///    强制设它=只能走普通档,不会 400。
+///    ⚠️ 这是**速度/计费档**,与 `output_config.effort`(思考强度)、`thinking` 完全无关,
+///    本函数绝不触碰它们——thinking 强度由客户端原样保留。
+fn prepare_forwarded_body(mut body: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut m) = body {
+        m.insert("stream".into(), serde_json::Value::Bool(true));
+        m.insert("service_tier".into(), serde_json::Value::String("standard_only".into()));
+    }
+    body
+}
+
 pub(crate) fn affinity_from_body(body: &serde_json::Value) -> Option<String> {
     let msgs = body.get("messages")?.as_array()?;
     let first_user_text = msgs
@@ -215,6 +323,7 @@ pub(crate) fn classify_chat_status(code: u16, body: &str) -> UpstreamErrorKind {
 pub(crate) async fn chat_via_sidecar(
     cfg: &DarioConfig,
     client: &reqwest::Client,
+    ratelimit: RateLimitStore,
     req: ChatRequest,
     ctx: &CallCtx,
 ) -> Result<ChatStream, UpstreamError> {
@@ -268,13 +377,8 @@ pub(crate) async fn chat_via_sidecar(
     let session_id = ctx.session_id.clone();
     let api_key = cfg.api_key.clone();
 
-    // Force upstream streaming so dario returns SSE regardless of what the
-    // downstream client requested.  Move `req.body` out (req's other fields
-    // are not used past this point), saving one allocation.
-    let mut body = req.body;
-    if let serde_json::Value::Object(ref mut m) = body {
-        m.insert("stream".into(), serde_json::Value::Bool(true));
-    }
+    // 归一转发给 sidecar 的 body(强制流式 + 屏蔽 fast 档)。见 prepare_forwarded_body。
+    let body = prepare_forwarded_body(req.body);
 
     let url = format!("{}/v1/messages", cfg.sidecar_url.trim_end_matches('/'));
     let mut rb = client
@@ -305,6 +409,16 @@ pub(crate) async fn chat_via_sidecar(
         .map_err(|e| UpstreamError::network(format!("dario sidecar connect failed: {e}")))?;
 
     let status = resp.status();
+
+    // 抓取经 sidecar 透传回来的 Anthropic 5h/7d 利用率头,缓存供 account_quota 只读返回。
+    // 成功与 429 响应都带这些头(429 尤其有价值:正好命中限额),故在成功/错误分流**之前**捕获。
+    // 无相关头 → 保留旧快照(不拿空响应抹掉已知用量)。**就地 merge**(只覆盖本次带到的窗口,
+    // 保留另一窗口的上次已知值)。poison 用 into_inner 恢复(与 account_quota 读路径一致,#3)。
+    if let Some(fresh) = parse_dario_ratelimit(resp.headers()) {
+        let mut m = ratelimit.lock().unwrap_or_else(|p| p.into_inner());
+        m.entry(ctx.account.account_id.clone()).or_default().merge_present(&fresh);
+    }
+
     if !status.is_success() {
         let code = status.as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -527,15 +641,114 @@ mod tests {
     }
 
     #[test]
-    fn forces_stream_true_in_forwarded_body() {
-        let req = gw_core::provider::ChatRequest::from_anthropic_body(
-            serde_json::json!({"model":"claude-opus-4-8","messages":[]}),
-        );
-        assert!(!req.stream);
-        let mut body = req.body.clone();
-        if let serde_json::Value::Object(m) = &mut body {
-            m.insert("stream".into(), serde_json::Value::Bool(true));
-        }
+    fn forwarded_body_forces_stream_and_blocks_fast_keeps_thinking() {
+        // 客户端开了 /fast(service_tier:auto)+ 拉满思考强度 + 结构化输出。
+        let body = prepare_forwarded_body(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [],
+            "stream": false,
+            "service_tier": "auto",                       // fast 档
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "output_config": {"effort": "max", "format": {"type": "json_schema"}}
+        }));
+        // 强制流式。
         assert_eq!(body["stream"], serde_json::json!(true));
+        // fast 被降级为普通档(覆盖客户端的 auto)。
+        assert_eq!(body["service_tier"], serde_json::json!("standard_only"), "必须屏蔽 fast 档");
+        // 思考强度 / thinking / 结构化输出 一律原样保留(只动 service_tier)。
+        assert_eq!(body["output_config"]["effort"], serde_json::json!("max"), "思考强度不得被动");
+        assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(4096));
+        assert_eq!(body["output_config"]["format"]["type"], serde_json::json!("json_schema"));
+    }
+
+    #[test]
+    fn forwarded_body_sets_standard_tier_even_when_client_omits_it() {
+        // 客户端没传 service_tier 时也强制 standard_only(防默认 auto 走优先级)。
+        let body = prepare_forwarded_body(serde_json::json!({
+            "model": "claude-opus-4-8", "messages": []
+        }));
+        assert_eq!(body["service_tier"], serde_json::json!("standard_only"));
+        assert_eq!(body["stream"], serde_json::json!(true));
+    }
+
+    // ── 5h/7d 配额捕获 ────────────────────────────────────────────────────────
+
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn parse_ratelimit_reads_5h_7d_reset_status_and_converts_to_percent() {
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-ratelimit-unified-5h-utilization", HeaderValue::from_static("0.37"));
+        h.insert("anthropic-ratelimit-unified-7d-utilization", HeaderValue::from_static("0.12"));
+        h.insert("anthropic-ratelimit-unified-reset", HeaderValue::from_static("1750000000"));
+        h.insert("anthropic-ratelimit-unified-status", HeaderValue::from_static("allowed"));
+        let s = parse_dario_ratelimit(&h).expect("应解析出快照");
+        assert_eq!(s.util5h, Some(0.37));
+        assert_eq!(s.util7d, Some(0.12));
+        assert_eq!(s.reset, Some(1_750_000_000));
+        assert_eq!(s.status, "allowed");
+        // 分数 → 百分比窗口
+        let q = s.to_quota().expect("两窗口齐全应有 quota");
+        assert_eq!(q.windows.len(), 2);
+        assert_eq!(q.windows[0].label, "5h");
+        assert!((q.windows[0].percent_used - 37.0).abs() < 1e-6);
+        assert_eq!(q.windows[0].reset_at, Some(1_750_000_000));
+        assert_eq!(q.windows[1].label, "7d");
+        assert!((q.windows[1].percent_used - 12.0).abs() < 1e-6);
+        assert_eq!(q.currency.as_deref(), Some("allowed"));
+        // 积分字段保持 0(dario 无积分概念)
+        assert_eq!(q.limit, 0.0);
+    }
+
+    #[test]
+    fn parse_ratelimit_none_when_no_utilization_headers() {
+        // 完全无头 → None。
+        assert!(parse_dario_ratelimit(&HeaderMap::new()).is_none());
+        // 只有 status、无 5h/7d → 仍 None(避免拿无用量的响应抹掉旧快照)。
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-ratelimit-unified-status", HeaderValue::from_static("allowed"));
+        assert!(parse_dario_ratelimit(&h).is_none());
+    }
+
+    #[test]
+    fn parse_ratelimit_partial_5h_only_emits_only_5h_window() {
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-ratelimit-unified-5h-utilization", HeaderValue::from_static("1.05"));
+        let s = parse_dario_ratelimit(&h).expect("有 5h 即应解析");
+        assert_eq!(s.util5h, Some(1.05));
+        assert_eq!(s.util7d, None); // 未知,不是 0
+        assert_eq!(s.reset, None);
+        let q = s.to_quota().expect("有 5h 即应有 quota");
+        // 只渲染已知窗口:不伪造 7d 0%(对抗审查 #2)。
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.windows[0].label, "5h");
+        // 超额(>100%)如实体现,不 clamp。
+        assert!((q.windows[0].percent_used - 105.0).abs() < 1e-6);
+        assert!(q.currency.is_none()); // status 缺失 → label None。
+    }
+
+    #[test]
+    fn merge_present_keeps_last_known_other_window() {
+        // 先有 5h+7d,再来一份 5h-only:7d 应保留上次已知值,而非被抹成未知/0。
+        let mut acc = DarioRateLimit {
+            util5h: Some(0.30),
+            util7d: Some(0.10),
+            reset: Some(100),
+            status: "allowed".into(),
+        };
+        let fresh_5h_only = DarioRateLimit {
+            util5h: Some(0.55),
+            util7d: None,
+            reset: Some(200),
+            status: String::new(),
+        };
+        acc.merge_present(&fresh_5h_only);
+        assert_eq!(acc.util5h, Some(0.55), "5h 应被更新");
+        assert_eq!(acc.util7d, Some(0.10), "7d 应保留上次已知值");
+        assert_eq!(acc.reset, Some(200), "reset 带到则更新");
+        assert_eq!(acc.status, "allowed", "status 缺失则保留旧值");
+        let q = acc.to_quota().expect("merge 后两窗口齐全");
+        assert_eq!(q.windows.len(), 2);
     }
 }
