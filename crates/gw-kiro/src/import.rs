@@ -33,16 +33,58 @@ impl ImportedAccount {
     }
 }
 
-/// 解析账号导出(顶层数组 = 扁平;`{ accounts: [...] }` = KiroManager/混合)。
+/// 宽松解析导入 JSON 文本 → `Value`。先按标准严格解析;失败再把**非标准空白**
+/// (不间断空格 nbsp 等,常见于从网页/富文本/PDF 复制粘贴的凭据,JSON 规范只认
+/// 空格/Tab/CR/LF 四种空白,nbsp 会让 serde 直接报错)归一为 ASCII 空格后重试。
+/// 仅在严格解析**失败**时才走归一兜底:合法 JSON 永不受影响;凭据值均为 ASCII,
+/// 归一对数据无损。这样用户直接粘贴上号工具的原文(哪怕带 nbsp 缩进)也能导入。
+pub fn parse_import_json(raw: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) => Ok(v),
+        Err(strict_err) => {
+            let normalized = normalize_json_whitespace(raw);
+            // 没有任何非标准空白可归一 → 归一不会改变输入,直接回报原始严格错误。
+            if normalized == raw {
+                return Err(format!("JSON 解析失败: {strict_err}"));
+            }
+            serde_json::from_str::<Value>(&normalized)
+                .map_err(|e| format!("JSON 解析失败: {e}"))
+        }
+    }
+}
+
+/// 把非标准 Unicode 空白归一为 ASCII 空格(nbsp / 窄 nbsp / figure space / 各类
+/// em-en 空格 / 零宽不换行 BOM)。仅供 [`parse_import_json`] 兜底调用。
+fn normalize_json_whitespace(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2060}' | '\u{FEFF}' => ' ',
+            '\u{2000}'..='\u{200A}' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// 解析账号导出。支持三种顶层形态:
+/// 1. **数组** `[ {...}, ... ]`(扁平/混合);
+/// 2. **`{ accounts: [...] }`** 包裹(KiroManager/混合);
+/// 3. **单个账号对象** `{ refreshToken, clientId, ... }`(部分上号工具一次只给一个号,
+///    既无外层数组也无 `accounts` 包裹)——视作 1 元素数组。
+///
 /// 跳过无 refreshToken 的条目(social/IdC 都需要它)。全部无效返回 `Err`。
 pub fn parse_accounts_export(root: &Value) -> Result<Vec<ImportedAccount>, String> {
-    let accounts: &[Value] = match root.as_array() {
-        Some(arr) => arr.as_slice(),
-        None => root
-            .get("accounts")
-            .and_then(|a| a.as_array())
-            .map(Vec::as_slice)
-            .ok_or("JSON 既不是账号数组,也不含 accounts 数组(不是支持的导出格式?)")?,
+    let accounts: &[Value] = if let Some(arr) = root.as_array() {
+        arr.as_slice()
+    } else if let Some(arr) = root.get("accounts").and_then(|a| a.as_array()) {
+        arr.as_slice()
+    } else if is_single_account_object(root) {
+        // 单账号对象:借用 root 自身组成 1 元素切片,交给 map_account 按"有无 credentials"分流。
+        std::slice::from_ref(root)
+    } else {
+        return Err(
+            "JSON 既不是账号数组/含 accounts 数组,也不是单个账号对象(缺 refreshToken/credentials)"
+                .to_string(),
+        );
     };
 
     let mut out = Vec::new();
@@ -60,6 +102,21 @@ pub fn parse_accounts_export(root: &Value) -> Result<Vec<ImportedAccount>, Strin
         ));
     }
     Ok(out)
+}
+
+/// 判断 root 是否是**单个账号对象**(而非误传的 `{version:...}` 之类元数据)。
+/// 判据:是对象,且带 `credentials` 子对象,或带非空 refreshToken/refresh_token。
+/// 严格判据避免把 `{accounts:[]}`/`{version:...}` 误当账号(它们应继续报错)。
+fn is_single_account_object(root: &Value) -> bool {
+    if !root.is_object() {
+        return false;
+    }
+    let has_rt = |k: &str| {
+        root.get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    };
+    root.get("credentials").is_some() || has_rt("refreshToken") || has_rt("refresh_token")
 }
 
 /// 单账号分流:含 `credentials` 子对象 → KiroManager 嵌套([`map_one`]);
@@ -604,6 +661,90 @@ mod tests {
     fn errors_when_no_accounts_array() {
         assert!(parse_accounts_export(&json!({"version": "1.7.5"})).is_err());
         assert!(parse_accounts_export(&json!({"accounts": []})).is_err());
+    }
+
+    /// 用户实际格式:**单个**账号对象(无外层数组、无 accounts 包裹),camelCase 扁平字段
+    /// + authMethod="IdC" + provider="BuilderId"。核心回归:必须能解析(不再报"不是支持的格式")。
+    #[test]
+    fn single_bare_object_builderid_idc_parses() {
+        let v = json!({
+            "email": "henrywood87838@outlook.de",
+            "refreshToken": "aor_single_refresh",
+            "clientId": "Win4BDl2_nmMaQg1yQBK3wE8gP6Ytwdd",
+            "clientSecret": "eyJraW_single_secret",
+            "region": "us-east-1",
+            "authMethod": "IdC",
+            "provider": "BuilderId"
+        });
+        let out = parse_accounts_export(&v).expect("单账号对象应被解析");
+        assert_eq!(out.len(), 1);
+        let a = &out[0];
+        assert_eq!(a.account_id, "henrywood87838-outlook.de");
+        assert_eq!(a.extra["refresh_token"], json!("aor_single_refresh"));
+        assert_eq!(a.extra["client_id"], json!("Win4BDl2_nmMaQg1yQBK3wE8gP6Ytwdd"));
+        assert_eq!(a.extra["client_secret"], json!("eyJraW_single_secret"));
+        assert_eq!(a.extra["region"], json!("us-east-1"));
+        assert_eq!(a.extra["kiro_provider"], json!("builderid"));
+        assert_eq!(a.extra["email"], json!("henrywood87838@outlook.de"));
+        // authMethod="IdC" 经扁平路径落为 auth_method="IdC":既非 external_idp 也非 api_key,
+        // 运行时不会误触发 TokenType 头(headers::is_external_idp 大小写不敏感比 external_idp)。
+        assert_eq!(a.extra["auth_method"], json!("IdC"));
+        // 无 machineId → 不写(BuilderId 按 rt 派生)。
+        assert!(!a.has_machine_id());
+    }
+
+    /// 单个账号对象但带 `credentials` 子对象(KiroManager 单账号导出)→ 走嵌套映射。
+    #[test]
+    fn single_bare_object_with_credentials_parses() {
+        let v = json!({
+            "email": "x@y.com",
+            "idp": "BuilderId",
+            "credentials": {"refreshToken": "rt-nested", "clientId": "c", "clientSecret": "s"}
+        });
+        let out = parse_accounts_export(&v).expect("带 credentials 的单账号对象应被解析");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].extra["refresh_token"], json!("rt-nested"));
+        assert_eq!(out[0].extra["client_id"], json!("c"));
+        assert_eq!(out[0].extra["kiro_provider"], json!("builderid"));
+    }
+
+    /// 单对象但缺 refreshToken/credentials(误传配置/元数据)→ 仍报错,不静默吞掉。
+    #[test]
+    fn single_object_without_rt_or_credentials_errors() {
+        assert!(parse_accounts_export(&json!({"email": "x@y.com", "region": "us-east-1"})).is_err());
+    }
+
+    /// 合法 JSON 严格解析直接成功,不经归一兜底。
+    #[test]
+    fn parse_import_json_accepts_strict_json() {
+        let v = parse_import_json(r#"{"refreshToken":"rt","clientId":"c"}"#).unwrap();
+        assert_eq!(v["refreshToken"], json!("rt"));
+    }
+
+    /// 用户实际粘贴:**单个对象 + nbsp 缩进**(从富文本复制)。严格 serde 会报错,
+    /// 归一兜底后可解析。端到端再过 parse_accounts_export 应得 1 个账号。
+    #[test]
+    fn parse_import_json_tolerates_nbsp_indentation() {
+        // \u{00A0} = 不间断空格;模拟 "email":   "...",缩进也用 nbsp。
+        let raw = "{\n\u{00A0}\u{00A0}\"email\":\u{00A0}\"henrywood87838@outlook.de\",\n\
+                   \u{00A0}\u{00A0}\"refreshToken\":\u{00A0}\"aor_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\n\
+                   \u{00A0}\u{00A0}\"clientId\":\u{00A0}\"Win4BDl2\",\n\
+                   \u{00A0}\u{00A0}\"provider\":\u{00A0}\"BuilderId\"\n}";
+        // 严格解析必失败(nbsp 非法空白),证明兜底确有必要。
+        assert!(serde_json::from_str::<Value>(raw).is_err(), "nbsp 应让严格解析失败");
+        let root = parse_import_json(raw).expect("归一兜底应解析成功");
+        let out = parse_accounts_export(&root).expect("应解析出账号");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].account_id, "henrywood87838-outlook.de");
+        assert_eq!(out[0].extra["client_id"], json!("Win4BDl2"));
+        assert_eq!(out[0].extra["kiro_provider"], json!("builderid"));
+    }
+
+    /// 真正坏的 JSON(无非标准空白可归一)→ 报原始严格错误,不假装成功。
+    #[test]
+    fn parse_import_json_rejects_truly_malformed() {
+        assert!(parse_import_json(r#"{"refreshToken": }"#).is_err());
+        assert!(parse_import_json("not json at all").is_err());
     }
 
     #[test]
