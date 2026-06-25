@@ -2,6 +2,7 @@
 mod chat;
 mod credentials;
 mod datefmt;
+pub mod oauth;
 mod token;
 
 use std::collections::HashMap;
@@ -72,6 +73,9 @@ pub struct DarioProvider {
     /// 按账号出口;refresh_auth 必须走**同一** proxy(否则刷新 IP≠发包 IP,关联封号)。
     /// key = 规范化 proxy URL;reqwest::Client 内部 Arc,clone 廉价。
     proxy_clients: Mutex<HashMap<String, reqwest::Client>>,
+    /// 每账号 5h/7d 利用率快照:chat 从 sidecar 透传的 Anthropic 限额头捕获写入,
+    /// `account_quota` 只读返回(OAuth/Max 无只读用量接口,只能从真实流量捕获)。
+    ratelimit: chat::RateLimitStore,
 }
 
 impl DarioProvider {
@@ -79,7 +83,13 @@ impl DarioProvider {
         Self::with_clients(cfg, reqwest::Client::new(), reqwest::Client::new())
     }
     pub fn with_clients(cfg: DarioConfig, sidecar_client: reqwest::Client, egress_client: reqwest::Client) -> Self {
-        Self { cfg, sidecar_client, egress_client, proxy_clients: Mutex::new(HashMap::new()) }
+        Self {
+            cfg,
+            sidecar_client,
+            egress_client,
+            proxy_clients: Mutex::new(HashMap::new()),
+            ratelimit: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// refresh_auth 的出口 client。**fail-closed**(审查 Skeptic#1/Architect#1 共识阻断点):
@@ -90,15 +100,21 @@ impl DarioProvider {
     ///   (回退 = 刷新 IP≠发包 IP = 正中关联封号)。刷新失败 = 该号暂不可用(token 过期后
     ///   下线),是**安全**的失败,远好于换 IP 刷新。
     /// 锁内同步构造(reqwest builder 无 await),消除并发重复 build;poison 用 into_inner 恢复。
-    fn egress_client_for(&self, account: &Account) -> Result<reqwest::Client, UpstreamError> {
-        let raw = match account.extra_str("proxy").map(str::trim).filter(|s| !s.is_empty()) {
+    /// 按 **proxy 字符串**选出口 client(fail-closed)。`egress_client_for(account)`(refresh)与
+    /// `oauth_exchange`(铸 token)**共用**此函数,保证「同一 proxy 串 → 同一出口 client」——egress
+    /// 选择只依赖 proxy 串这一个输入,消除对 Account 其它字段的隐藏耦合(审查 Architect#4)。
+    /// - `None`/空 → worker 级默认 egress_client(与 chat 默认出口一致);
+    /// - 合法 http(s) → 该代理(与 chat 的 x-dario-upstream-proxy 同一规范化 URL → 同出口);
+    /// - 非法/socks/构造失败 → **Err 拒绝**,绝不静默回退默认 IP(回退=换 IP=关联封号)。
+    fn client_for_proxy(&self, raw_proxy: Option<&str>) -> Result<reqwest::Client, UpstreamError> {
+        let raw = match raw_proxy.map(str::trim).filter(|s| !s.is_empty()) {
             Some(p) => p,
             None => return Ok(self.egress_client.clone()),
         };
         let norm = normalize_dario_proxy(raw).map_err(|e| {
             UpstreamError::new(
                 UpstreamErrorKind::BadRequest,
-                format!("dario account extra.proxy 非法({e}),拒绝刷新以防换 IP 刷新"),
+                format!("dario proxy 非法({e}),拒绝以防换 IP(刷新/铸 token 出口必须==发包出口)"),
             )
         })?;
         let mut cache = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
@@ -117,6 +133,11 @@ impl DarioProvider {
             })?;
         cache.insert(norm, client.clone());
         Ok(client)
+    }
+
+    /// refresh_auth 的出口 client：仅取该账号 `extra.proxy`,委托 [`Self::client_for_proxy`]。
+    fn egress_client_for(&self, account: &Account) -> Result<reqwest::Client, UpstreamError> {
+        self.client_for_proxy(account.extra_str("proxy"))
     }
     pub fn from_config(cfg: &serde_json::Value, egress_client: reqwest::Client) -> anyhow::Result<Arc<dyn Provider>> {
         let c = DarioConfig::from_cfg(cfg);
@@ -157,23 +178,53 @@ impl Provider for DarioProvider {
         ])
     }
 
-    /// 会话亲和:MVP 阶段返回 `None`(无亲和)。
+    /// 会话亲和键:优先取 `metadata.user_id` 里的 Claude Code 原生 session_id(UUID),
+    /// 回退首条用户消息文本哈希。多号下让同一会话钉到组内同账号,最大化 Anthropic
+    /// prompt cache 命中(按账号隔离)。详见 [`chat::affinity_key_from_body`]。
     ///
-    /// `affinity_from_body` 基于**首条用户消息文本**哈希——但同一会话后续轮次首条
-    /// 文本不变,而 dario 是 OAuth 直连(多账号池尚未稳定),基于首条文本的 key
-    /// 与 Anthropic prompt cache 的会话粒度并不对齐。多号阶段再启用时,应以
-    /// 真实 session_id(由调度层下发到 `CallCtx::session_id`)为 key,而非文本哈希。
-    fn affinity_key(&self, _req: &ChatRequest) -> Option<String> {
-        None
+    /// 注:session_id 在请求 **body** 内(`metadata.user_id`),不受 caio router 第一跳
+    /// 丢客户端 header 影响,故无需依赖 `CallCtx::session_id` 下发。
+    fn affinity_key(&self, req: &ChatRequest) -> Option<String> {
+        chat::affinity_key_from_body(&req.body)
     }
 
     async fn chat(&self, req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
-        chat::chat_via_sidecar(&self.cfg, &self.sidecar_client, req, ctx).await
+        chat::chat_via_sidecar(&self.cfg, &self.sidecar_client, self.ratelimit.clone(), req, ctx).await
+    }
+
+    /// 配额是本地廉价读(从聊天流量捕获的内存快照,无上游往返)→ 告诉 gw-app 别拿"昂贵调用"
+    /// 的 TTL 节流(尤其别让陈旧 None 挡住刚捕获的快照,见 Provider::quota_is_local)。
+    fn quota_is_local(&self) -> bool {
+        true
+    }
+
+    /// 只读返回该账号最近一次从聊天流量捕获的 5h/7d 利用率快照(无积分概念,见 [`chat::DarioRateLimit`])。
+    /// 未发过请求的号返回 `None`(面板显示「—」),因 Anthropic OAuth/Max 无只读用量接口、
+    /// 且红线禁止真号探测,只能从真实流量响应头捕获。worker 配额缓存按 TTL 调本方法,纯读不发包。
+    async fn account_quota(&self, account: &Account) -> Result<Option<gw_core::provider::AccountQuota>, UpstreamError> {
+        let m = self.ratelimit.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(m.get(&account.account_id).and_then(|s| s.to_quota()))
     }
 
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
         let client = self.egress_client_for(account)?; // fail-closed:非法 proxy 直接拒绝刷新
         token::refresh(&client, account).await
+    }
+
+    /// OAuth 上号:`authorization_code` → token set。
+    /// **复用 `egress_client_for`**(同 fail-closed + 同缓存):换码出口由该号 `proxy` 决定,
+    /// 与它将来 refresh/chat 字节一致的同一 egress → 铸 token IP == 刷新 IP == 发包 IP。
+    /// proxy 非法(socks/缺 host)直接 Err,绝不静默走默认 IP 换码。
+    async fn oauth_exchange(
+        &self,
+        proxy: Option<&str>,
+        code: &str,
+        verifier: &str,
+    ) -> Result<serde_json::Value, UpstreamError> {
+        // 换码出口 = 该号 proxy 选出的 client = 它将来 refresh/chat 的同一出口(同一 proxy 串)。
+        let client = self.client_for_proxy(proxy)?;
+        let fields = oauth::exchange(&client, code, verifier).await?;
+        Ok(serde_json::Value::Object(fields))
     }
 }
 
@@ -220,6 +271,17 @@ mod tests {
         assert!(p.egress_client_for(&acct(Some("http://caio:pw@45.77.219.188:13128"))).is_ok());
         assert!(p.egress_client_for(&acct(Some("http://caio:pw@45.77.219.188:13128"))).is_ok());
         assert_eq!(p.proxy_clients.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oauth_exchange_failclosed_on_socks_proxy() {
+        // socks proxy 非法 → egress_client_for 直接 Err(在任何换码网络请求之前),
+        // 绝不静默走默认 IP 换码(铸 token IP≠发包 IP = 关联封号)。
+        let p = DarioProvider::new(DarioConfig::default());
+        let r = p
+            .oauth_exchange(Some("socks5://1.2.3.4:1080"), "code", "verifier")
+            .await;
+        assert!(r.is_err(), "socks proxy 必须 fail-closed");
     }
 
     #[test]

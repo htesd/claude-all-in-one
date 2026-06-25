@@ -237,15 +237,8 @@ pub(crate) fn drain_sse_frames(buf: &str) -> (Vec<(String, String)>, String) {
     (frames, rest.to_string())
 }
 
-// ── Task 3.1: Affinity key ───────────────────────────────────────────────────
+// ── 转发 body 归一 ───────────────────────────────────────────────────────────
 
-/// Derive a stable session-affinity key from the first user message text.
-/// Kept for future use; currently not called (affinity_key returns None in MVP).
-#[allow(dead_code)]
-/// Returns `None` if there is no user message or the text is blank.
-///
-/// Uses `DefaultHasher` which is deterministic within a single process run —
-/// sufficient for per-worker in-process session pinning.
 /// 转发给 dario sidecar 前对客户端 body 的归一:
 /// ① 强制 `stream=true`(dario 恒以 SSE 返回,与下游是否要流无关);
 /// ② 强制 `service_tier="standard_only"` —— **屏蔽 Claude Code `/fast` 优先级档**。
@@ -263,6 +256,65 @@ fn prepare_forwarded_body(mut body: serde_json::Value) -> serde_json::Value {
     body
 }
 
+// ── 会话亲和键 ───────────────────────────────────────────────────────────────
+
+/// 会话亲和键入口(worker 据此把同会话钉到组内同账号,对齐 Anthropic prompt cache 的会话粒度)。
+///
+/// 优先级:
+/// ① `metadata.user_id` 里的 **session_id(UUID)** —— Claude Code 原生会话 ID,跨轮恒定、
+///    与消息内容无关,且在**请求 body 内**(不受 caio router 第一跳丢客户端 header 影响)。
+///    这是最稳的键:同一会话的每一轮都拿到同一个 key → 永远钉同号 → 缓存最大化。
+/// ② 回退:首条用户消息文本哈希([`affinity_from_body`])。无 metadata 的客户端(裸 API 调用)
+///    仍能在「同会话首条文本稳定」下粘同号;弱点是不同会话若首条文本恰好相同会撞同号(可接受,
+///    只影响负载分布,不影响正确性)。
+///
+/// 两路都拿不到 → `None`(调用方退化为无亲和的 LRU 选号)。
+pub(crate) fn affinity_key_from_body(body: &serde_json::Value) -> Option<String> {
+    if let Some(sid) = body
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())
+        .and_then(extract_session_id)
+    {
+        return Some(format!("dario-sid-{sid}"));
+    }
+    affinity_from_body(body)
+}
+
+/// 从 Claude Code 的 `metadata.user_id` 提取会话 UUID。
+///
+/// CC 的 user_id 可能是 JSON(`{"session_id":"<uuid>", ...}`)或形如
+/// `...session_<uuid>...` 的字符串。两种都覆盖;非合法 UUID 返回 `None`。
+/// (自包含实现,不依赖 gw-kiro;与其 `converter::session::extract_session_id` 同口径。)
+fn extract_session_id(user_id: &str) -> Option<String> {
+    // 先试 JSON 解析
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+        if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
+            if is_valid_uuid(sid) {
+                return Some(sid.to_string());
+            }
+        }
+    }
+    // 回退:查找 "session_" 之后的 36 字符 UUID
+    if let Some(pos) = user_id.find("session_") {
+        let rest = &user_id[pos + "session_".len()..];
+        if rest.len() >= 36 {
+            let candidate = &rest[..36];
+            if is_valid_uuid(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 粗校验 UUID:36 字符且含 4 个连字符(与 gw-kiro 一致,够区分会话键即可)。
+fn is_valid_uuid(s: &str) -> bool {
+    s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+}
+
+/// 基于**首条用户消息文本**的稳定哈希键(亲和回退路径)。
+/// 无用户消息或文本为空 → `None`。`DefaultHasher` 在单进程内确定性,足够 per-worker 会话钉号。
 pub(crate) fn affinity_from_body(body: &serde_json::Value) -> Option<String> {
     let msgs = body.get("messages")?.as_array()?;
     let first_user_text = msgs
@@ -638,6 +690,74 @@ mod tests {
     #[test]
     fn affinity_none_without_messages() {
         assert_eq!(affinity_from_body(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn affinity_key_prefers_session_id_from_metadata() {
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let b = serde_json::json!({
+            "metadata": {"user_id": format!("user_abc_account__session_{sid}")},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        // session_id 路径优先,且与首条文本无关
+        assert_eq!(affinity_key_from_body(&b), Some(format!("dario-sid-{sid}")));
+    }
+
+    #[test]
+    fn affinity_key_session_id_stable_across_turns_regardless_of_text() {
+        let sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let uid = serde_json::json!({"session_id": sid}).to_string();
+        let turn1 = serde_json::json!({
+            "metadata": {"user_id": uid},
+            "messages": [{"role": "user", "content": "first question"}]
+        });
+        let turn2 = serde_json::json!({
+            "metadata": {"user_id": uid},
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "totally different follow-up"}
+            ]
+        });
+        // 同会话不同轮、首条文本即便变化,session_id 键恒定 → 钉同号
+        let k = affinity_key_from_body(&turn1);
+        assert_eq!(k, Some(format!("dario-sid-{sid}")));
+        assert_eq!(k, affinity_key_from_body(&turn2));
+    }
+
+    #[test]
+    fn affinity_key_falls_back_to_text_hash_without_metadata() {
+        let b = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello world"}]}]
+        });
+        // 无 metadata → 回退首条文本哈希(与 affinity_from_body 同值)
+        assert_eq!(affinity_key_from_body(&b), affinity_from_body(&b));
+        assert!(affinity_key_from_body(&b).unwrap().starts_with("dario-"));
+    }
+
+    #[test]
+    fn affinity_key_ignores_invalid_session_id() {
+        // user_id 里没有合法 UUID → 退回文本哈希,不 panic
+        let b = serde_json::json!({
+            "metadata": {"user_id": "user_no_session_here"},
+            "messages": [{"role": "user", "content": "q"}]
+        });
+        assert_eq!(affinity_key_from_body(&b), affinity_from_body(&b));
+    }
+
+    #[test]
+    fn extract_session_id_handles_json_and_string_forms() {
+        let sid = "12345678-1234-4234-8234-123456789abc";
+        assert_eq!(
+            extract_session_id(&serde_json::json!({"session_id": sid}).to_string()),
+            Some(sid.to_string())
+        );
+        assert_eq!(
+            extract_session_id(&format!("anything_session_{sid}_suffix")),
+            Some(sid.to_string())
+        );
+        assert_eq!(extract_session_id("no uuid at all"), None);
+        assert_eq!(extract_session_id("session_not-a-valid-uuid"), None);
     }
 
     #[test]
