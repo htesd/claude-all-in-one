@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Plus, Upload } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, KeyRound, Plus, Upload } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
@@ -9,6 +9,7 @@ import type { RuntimeQueryState } from '@/features/accounts/components/AccountTa
 import { CreateAccountDialog } from '@/features/accounts/components/CreateAccountDialog'
 import { EditAccountDialog } from '@/features/accounts/components/EditAccountDialog'
 import { ImportAccountsDialog } from '@/features/accounts/components/ImportAccountsDialog'
+import { OAuthAccountDialog } from '@/features/accounts/components/OAuthAccountDialog'
 import {
   useAccounts,
   useAccountsRuntime,
@@ -38,6 +39,7 @@ export default function AccountsPage() {
 
   const [createOpen, setCreateOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [oauthOpen, setOauthOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   // 刷新 token 成功的轻量反馈（无 toast 库）：账号 + 新有效期。本地态而非派生自
   // refreshMutation.isSuccess——后者会在其它 mutation 成功后残留旧账号（审查 3 名 reviewer）。
@@ -154,6 +156,10 @@ export default function AccountsPage() {
             <Upload className="h-4 w-4" />
             {t('accounts.import')}
           </Button>
+          <Button variant="outline" onClick={() => setOauthOpen(true)}>
+            <KeyRound className="h-4 w-4" />
+            {t('accounts.oauth')}
+          </Button>
           <Button onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" />
             {t('accounts.new')}
@@ -217,6 +223,7 @@ export default function AccountsPage() {
 
       <CreateAccountDialog open={createOpen} onClose={() => setCreateOpen(false)} />
       <ImportAccountsDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <OAuthAccountDialog open={oauthOpen} onClose={() => setOauthOpen(false)} />
       <EditAccountDialog
         open={editingRow !== null}
         row={editingRow}

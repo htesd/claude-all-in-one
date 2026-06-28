@@ -1,4 +1,4 @@
-import { useState, type ComponentType } from 'react'
+import { useEffect, useRef, useState, type ComponentType } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   BarChart3,
@@ -20,10 +20,21 @@ import { useLocation, useNavigate } from 'react-router-dom'
 
 import { clearToken } from '@/lib/api'
 import { useI18n, type I18nKey } from '@/lib/i18n'
+import { useMediaQuery } from '@/lib/useMediaQuery'
 import { useTheme } from '@/lib/theme'
 import { cn } from '@/lib/utils'
 
 const COLLAPSE_STORAGE_KEY = 'caioSidebarCollapsed'
+// Mirror Tailwind's `md` breakpoint so JS layout decisions match `md:` classes.
+const DESKTOP_QUERY = '(min-width: 768px)'
+const DRAWER_WIDTH = 256
+
+interface SidebarProps {
+  /** Whether the mobile off-canvas drawer is open (ignored on desktop). */
+  mobileOpen: boolean
+  /** Close the mobile drawer (e.g. after navigation). */
+  onMobileClose: () => void
+}
 
 interface NavItem {
   to: string
@@ -73,12 +84,52 @@ function FooterButton({ icon: Icon, label, collapsed, onClick }: FooterButtonPro
   )
 }
 
-export function Sidebar() {
+export function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(readInitialCollapsed)
+  const isDesktop = useMediaQuery(DESKTOP_QUERY)
   const { t, lang, setLang } = useI18n()
   const { dark, toggleTheme } = useTheme()
   const navigate = useNavigate()
   const location = useLocation()
+
+  // On mobile the sidebar is a full-label off-canvas drawer; the desktop-only
+  // collapse state must never hide labels there.
+  const effectiveCollapsed = isDesktop && collapsed
+
+  // Snap (don't spring) when crossing the mobile/desktop breakpoint, so resizing
+  // past 768px doesn't slide the column in from its off-canvas position.
+  const prevDesktop = useRef(isDesktop)
+  const breakpointJustFlipped = isDesktop !== prevDesktop.current
+  useEffect(() => {
+    prevDesktop.current = isDesktop
+  })
+
+  // The drawer is a modal on mobile: trap Tab focus inside it while it's open.
+  const asideRef = useRef<HTMLElement>(null)
+  useEffect(() => {
+    if (isDesktop || !mobileOpen) return
+    const node = asideRef.current
+    if (!node) return
+    const focusables = node.querySelectorAll<HTMLElement>(
+      'a[href],button:not([disabled]),input,select,textarea,[tabindex]:not([tabindex="-1"])',
+    )
+    if (!focusables.length) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    first.focus()
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [isDesktop, mobileOpen])
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
@@ -92,8 +143,14 @@ export function Sidebar() {
     })
   }
 
+  const handleNavigate = (to: string) => {
+    navigate(to)
+    onMobileClose() // no-op on desktop; closes the drawer on mobile
+  }
+
   const handleLogout = () => {
     clearToken()
+    onMobileClose()
     navigate('/login', { replace: true })
   }
 
@@ -102,19 +159,37 @@ export function Sidebar() {
 
   return (
     <motion.aside
+      ref={asideRef}
       initial={false}
-      animate={{ width: collapsed ? 64 : 240 }}
-      transition={{ type: 'spring', stiffness: 320, damping: 30 }}
-      className="glass-sidebar flex h-full shrink-0 flex-col overflow-hidden border-r border-white/10"
+      animate={
+        isDesktop
+          ? { width: collapsed ? 64 : 240, x: 0 }
+          : { width: DRAWER_WIDTH, x: mobileOpen ? 0 : -DRAWER_WIDTH }
+      }
+      transition={
+        breakpointJustFlipped
+          ? { duration: 0 }
+          : { type: 'spring', stiffness: 320, damping: 34 }
+      }
+      role={!isDesktop && mobileOpen ? 'dialog' : undefined}
+      aria-modal={!isDesktop && mobileOpen ? true : undefined}
+      aria-label={t('nav.menu')}
+      className={cn(
+        'glass-sidebar flex h-full shrink-0 flex-col overflow-hidden border-r border-white/10',
+        // Mobile: fixed off-canvas drawer above the content + backdrop.
+        'fixed inset-y-0 left-0 z-50 shadow-2xl',
+        // Desktop: back into the flex flow as a flush column, no drop shadow.
+        'md:static md:z-auto md:shadow-none',
+      )}
     >
       {/* Wordmark */}
       <div
         className={cn(
           'flex h-20 items-center overflow-hidden border-b border-white/10',
-          collapsed ? 'justify-center px-2' : 'px-5',
+          effectiveCollapsed ? 'justify-center px-2' : 'px-5',
         )}
       >
-        {collapsed ? (
+        {effectiveCollapsed ? (
           <span
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-acid"
             title={t('app.title')}
@@ -152,15 +227,15 @@ export function Sidebar() {
             <button
               key={item.to}
               type="button"
-              onClick={() => navigate(item.to)}
+              onClick={() => handleNavigate(item.to)}
               className={cn(
                 'group relative w-full flex items-center overflow-hidden rounded-xl text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-acid/50',
                 active
                   ? 'text-ink'
                   : 'text-white/60 hover:bg-white/10 hover:text-white',
-                collapsed ? 'justify-center p-2.5' : 'gap-3 px-4 py-2.5',
+                effectiveCollapsed ? 'justify-center p-2.5' : 'gap-3 px-4 py-2.5',
               )}
-              title={collapsed ? label : undefined}
+              title={effectiveCollapsed ? label : undefined}
             >
               {/* Active pill: acid block, the brand signature */}
               {active && (
@@ -172,7 +247,7 @@ export function Sidebar() {
               )}
               <Icon className={cn('relative z-10 h-5 w-5 shrink-0', active && 'text-ink')} />
               <AnimatePresence initial={false}>
-                {!collapsed && (
+                {!effectiveCollapsed && (
                   <motion.span
                     key="label"
                     initial={{ opacity: 0, x: -8 }}
@@ -198,54 +273,56 @@ export function Sidebar() {
         <FooterButton
           icon={dark ? Sun : Moon}
           label={dark ? t('theme.toLight') : t('theme.toDark')}
-          collapsed={collapsed}
+          collapsed={effectiveCollapsed}
           onClick={toggleTheme}
         />
         <FooterButton
           icon={Languages}
           label={lang === 'zh' ? 'English' : '中文'}
-          collapsed={collapsed}
+          collapsed={effectiveCollapsed}
           onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
         />
         <FooterButton
           icon={LogOut}
           label={t('nav.logout')}
-          collapsed={collapsed}
+          collapsed={effectiveCollapsed}
           onClick={handleLogout}
         />
       </div>
 
-      {/* Collapse toggle */}
-      <div className="border-t border-white/10 p-2">
-        <button
-          type="button"
-          onClick={toggleCollapsed}
-          title={collapsed ? t('nav.expand') : t('nav.collapse')}
-          className="group w-full flex items-center justify-center gap-2 overflow-hidden rounded-xl px-3 py-2 text-sm text-white/55 transition-all hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-acid/50"
-        >
-          <motion.div
-            animate={{ rotate: collapsed ? 0 : 180 }}
-            transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
-            className="shrink-0"
+      {/* Collapse toggle — desktop only (the mobile drawer is always full-width). */}
+      {isDesktop && (
+        <div className="border-t border-white/10 p-2">
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            title={collapsed ? t('nav.expand') : t('nav.collapse')}
+            className="group w-full flex items-center justify-center gap-2 overflow-hidden rounded-xl px-3 py-2 text-sm text-white/55 transition-all hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-acid/50"
           >
-            <ChevronRight className="h-4 w-4" />
-          </motion.div>
-          <AnimatePresence initial={false}>
-            {!collapsed && (
-              <motion.span
-                key="collapse-label"
-                initial={{ opacity: 0, width: 0 }}
-                animate={{ opacity: 1, width: 'auto' }}
-                exit={{ opacity: 0, width: 0 }}
-                transition={{ duration: 0.15 }}
-                className="overflow-hidden whitespace-nowrap text-xs"
-              >
-                {t('nav.collapse')}
-              </motion.span>
-            )}
-          </AnimatePresence>
-        </button>
-      </div>
+            <motion.div
+              animate={{ rotate: collapsed ? 0 : 180 }}
+              transition={{ duration: 0.3, ease: [0.4, 0, 0.2, 1] }}
+              className="shrink-0"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </motion.div>
+            <AnimatePresence initial={false}>
+              {!collapsed && (
+                <motion.span
+                  key="collapse-label"
+                  initial={{ opacity: 0, width: 0 }}
+                  animate={{ opacity: 1, width: 'auto' }}
+                  exit={{ opacity: 0, width: 0 }}
+                  transition={{ duration: 0.15 }}
+                  className="overflow-hidden whitespace-nowrap text-xs"
+                >
+                  {t('nav.collapse')}
+                </motion.span>
+              )}
+            </AnimatePresence>
+          </button>
+        </div>
+      )}
     </motion.aside>
   )
 }

@@ -15,12 +15,25 @@ struct ExperimentalFlags {
     cache_point: bool,
     /// 发稳定 agentContinuationId+vibe(真实缓存命中 A/B)。
     agent_continuation: bool,
+    /// 是否在 thinking 块上附 signature(默认 **开**,保留现状)。关掉后 thinking 块照常输出但
+    /// 不带签名——用于多上游反代:caio/kiro 的合成签名是 Kiro 专用、对真 Anthropic/Bedrock 验签
+    /// 非法,跨通道(如同会话漂到 ccmax/Bedrock)会被拒 `THINKING_SIGNATURE_INVALID`。详见
+    /// [`thinking_signature_enabled`]。
+    thinking_signature: bool,
 }
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// 默认 **开** 的 env 开关:仅当显式设为 `0`/`false` 才关。用于 `thinking_signature`
+/// (现状是带签名,env 仅作"显式关闭"的启动钮;缺省/任意其它值都保持开)。
+fn env_flag_default_on(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// 进程级实验开关(默认从 env 取,settings 热应用经 [`set_experimental_flags`] 覆盖)。
@@ -31,16 +44,23 @@ fn experimental() -> &'static RwLock<ExperimentalFlags> {
             tools_in_prefix: env_flag("KIRO_TOOLS_IN_PREFIX"),
             cache_point: env_flag("KIRO_CACHE_POINT"),
             agent_continuation: env_flag("KIRO_AGENT_CONTINUATION"),
+            thinking_signature: env_flag_default_on("KIRO_THINKING_SIGNATURE"),
         })
     })
 }
 
 /// 热应用实验开关(worker 30s settings 轮询经 apply_hot_settings 调用)。
-pub(crate) fn set_experimental_flags(tools_in_prefix: bool, cache_point: bool, agent_continuation: bool) {
+pub(crate) fn set_experimental_flags(
+    tools_in_prefix: bool,
+    cache_point: bool,
+    agent_continuation: bool,
+    thinking_signature: bool,
+) {
     if let Ok(mut g) = experimental().write() {
         g.tools_in_prefix = tools_in_prefix;
         g.cache_point = cache_point;
         g.agent_continuation = agent_continuation;
+        g.thinking_signature = thinking_signature;
     }
 }
 
@@ -83,6 +103,22 @@ pub(super) fn cache_point_enabled() -> bool {
 /// A/B 期间零重启、零丢请求即可翻开关回滚(env `KIRO_AGENT_CONTINUATION` 作启动默认)。
 pub(super) fn agent_continuation_enabled() -> bool {
     experimental().read().map(|g| g.agent_continuation).unwrap_or(false)
+}
+
+/// 是否给响应里的 thinking 块附 `signature`。**默认开**(保留现状:带签名,过 hvoy/cctest 检测)。
+///
+/// 【为什么需要这个开关 —— 2026-06-18 多上游反代线上事故】caio/kiro.rs 给每个 thinking 块都挂
+/// 一个 Kiro 专用签名:上游真签名重写模型代号(`claude-quince`→官方名),无真签名则 `synthesize_signature`
+/// 合成一个。该签名仅为过检测平台(hvoy/cctest)的结构校验而造,**对真 Anthropic/Bedrock 的密码学
+/// 验签必然非法**。当反代同时挂 kiro 与"真 Claude"通道(如 ccmax/Bedrock),NewAPI 把同一会话在两通道
+/// 间负载均衡/故障转移时,Kiro 合成签名随历史漂到真通道 → 被拒 `THINKING_SIGNATURE_INVALID`。
+///
+/// 关掉(`thinking_signature=false` 或 env `KIRO_THINKING_SIGNATURE=0`)后,thinking 块照常输出但
+/// **不带 signature**,这样 caio 不再向会话注入跨通道非法签名。可经设置面板热控(worker 30s 生效)。
+/// 注:caio 自身入站已丢弃历史 thinking(`converter/history.rs`),故关签名不影响 caio 自己的会话。
+/// 锁中毒时回退 **true**(保守:维持现状行为)。
+pub(crate) fn thinking_signature_enabled() -> bool {
+    experimental().read().map(|g| g.thinking_signature).unwrap_or(true)
 }
 
 /// 实验参数：cachePoint 的 type 值。默认 EPHEMERAL。

@@ -263,9 +263,10 @@ fn eventstream_to_anthropic(
 
 /// 流状态机:管理块索引与 thinking/text 块的惰性开闭 + reasoning 签名。
 ///
-/// Anthropic 时序铁律:thinking 块必须在 text 块**之前**且独立闭合,thinking 块 stop 前
-/// 必发一个 signature_delta。块按出现顺序惰性开启(不预先固定 index 0=text),
-/// 故 reasoning 先到时拿 index 0、text 拿 index 1;无 reasoning 时 text 拿 index 0。
+/// Anthropic 时序铁律:thinking 块必须在 text 块**之前**且独立闭合;thinking 块 stop 前
+/// **默认**发一个 signature_delta——除非 `emit_signature=false`(多上游反代关签名,见该字段),
+/// 此时 thinking 块照常 start/delta/stop 但不带 signature。块按出现顺序惰性开启(不预先固定
+/// index 0=text),故 reasoning 先到时拿 index 0、text 拿 index 1;无 reasoning 时 text 拿 index 0。
 struct BlockTracker {
     /// 下一个可用 content_block 索引。
     next_index: usize,
@@ -309,6 +310,10 @@ struct BlockTracker {
     /// 当前开着的 tool_use 若需修复,缓冲其 input(配待修复字段集)。None = 逐帧透传。
     /// caio 任一时刻至多一个块开着(见 open_tool),故单 Option 即可对应当前工具。
     tool_buf: Option<ToolInputBuffer>,
+    /// 关闭 thinking 块时是否发 `signature_delta`。默认 **true**(现状:带签名)。
+    /// prod 路径据 [`crate::converter::thinking_signature_enabled`] 每请求读一次设入;关掉后
+    /// thinking 块照常输出但不带签名(多上游反代防 Kiro 合成签名漂到真 Anthropic/Bedrock 被拒)。
+    emit_signature: bool,
 }
 
 /// 需修复工具的 input 累积缓冲。`fields` 在首帧据工具短名解析自 `tool_repair_fields`，
@@ -340,6 +345,7 @@ impl BlockTracker {
             thinking_only_max_tokens: false,
             tool_repair_fields: HashMap::new(),
             tool_buf: None,
+            emit_signature: true,
         }
     }
 
@@ -347,6 +353,12 @@ impl BlockTracker {
     /// 仅 prod 路径调用;测试默认空表 = 不修复,行为与改动前一致。
     fn set_tool_repair_fields(&mut self, fields: HashMap<String, HashSet<String>>) {
         self.tool_repair_fields = fields;
+    }
+
+    /// 设置是否在 thinking 块上附 signature。prod 路径每请求据进程级热开关
+    /// [`crate::converter::thinking_signature_enabled`] 读一次设入;测试可直接置 false 验证。
+    fn set_emit_signature(&mut self, v: bool) {
+        self.emit_signature = v;
     }
 
     /// 处理 reasoningContentEvent:捕获签名 + 逐片发 thinking_delta。
@@ -464,15 +476,20 @@ impl BlockTracker {
         }
         let mut events = Vec::new();
         if let Some(idx) = self.thinking_index {
-            let signature = match &self.reasoning_signature {
-                Some(s) => s.clone(),
-                None => crate::signature::synthesize_signature(&self.model, &self.thinking_text),
-            };
-            events.push(SseEvent::new(
-                "content_block_delta",
-                json!({"type":"content_block_delta","index":idx,
-                       "delta":{"type":"signature_delta","signature":signature}}),
-            ));
+            // emit_signature 关时:thinking 块照常闭合(content_block_stop),但**不发**
+            // signature_delta。Kiro 合成/重写签名是 Kiro 专用、对真 Anthropic/Bedrock 验签非法,
+            // 多上游反代里跨通道漂移会被拒 THINKING_SIGNATURE_INVALID(见 converter::thinking_signature_enabled)。
+            if self.emit_signature {
+                let signature = match &self.reasoning_signature {
+                    Some(s) => s.clone(),
+                    None => crate::signature::synthesize_signature(&self.model, &self.thinking_text),
+                };
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":idx,
+                           "delta":{"type":"signature_delta","signature":signature}}),
+                ));
+            }
             events.push(SseEvent::new(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":idx}),
@@ -711,6 +728,9 @@ fn async_stream_like(
 
         let mut tracker = BlockTracker::new(model.clone(), thinking_enabled);
         tracker.set_tool_repair_fields(tool_repair_fields);
+        // 多上游反代:据热开关决定是否给 thinking 块附签名(默认开;关掉防 Kiro 合成签名漂到
+        // 真 Anthropic/Bedrock 通道被拒)。每请求读一次,设置面板改后下个请求即生效。
+        tracker.set_emit_signature(crate::converter::thinking_signature_enabled());
         let mut decoder = EventStreamDecoder::new();
         // 显式 stop_reason(model_context_window_exceeded / max_tokens)。None = 收尾按
         // tool_use > end_turn 优先级推导(🔵 kiro.rs stream.rs get_stop_reason)。
@@ -1177,6 +1197,54 @@ mod tests {
         assert!(!sig.is_empty(), "无上游签名时应合成非空签名");
         let raw = base64::engine::general_purpose::STANDARD.decode(sig).unwrap();
         assert!(String::from_utf8_lossy(&raw).contains("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn signature_suppressed_when_emit_disabled_even_with_real_upstream_sig() {
+        // emit_signature=false:即便上游给了真签名,关闭 thinking 块时也**不发** signature_delta,
+        // 但仍发 content_block_stop(块照常闭合)。多上游反代:不向会话注入跨通道非法签名。
+        const REAL_SIG: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.set_emit_signature(false);
+        t.on_reasoning("think", Some(REAL_SIG));
+        let close = t.close_reasoning_if_open();
+        assert!(
+            !close.iter().any(|e| e.data["delta"]["type"] == "signature_delta"),
+            "关签名时不应发 signature_delta"
+        );
+        assert!(
+            close.iter().any(|e| e.data["type"] == "content_block_stop"),
+            "thinking 块仍须正常闭合(content_block_stop)"
+        );
+    }
+
+    #[test]
+    fn signature_suppressed_when_emit_disabled_no_upstream_sig() {
+        // emit_signature=false 且上游无签名:不合成、不发 signature_delta,仍闭合块。
+        let mut t = BlockTracker::new("claude-opus-4-6".to_string(), false);
+        t.set_emit_signature(false);
+        t.on_reasoning("reasoning text here", None);
+        let close = t.close_reasoning_if_open();
+        assert!(
+            !close.iter().any(|e| e.data["delta"]["type"] == "signature_delta"),
+            "关签名且无上游签名时也不应合成/发 signature_delta"
+        );
+        assert!(
+            close.iter().any(|e| e.data["type"] == "content_block_stop"),
+            "thinking 块仍须正常闭合(content_block_stop)"
+        );
+    }
+
+    #[test]
+    fn signature_emitted_by_default_when_enabled() {
+        // 默认 emit_signature=true:行为与改动前一致,仍发 signature_delta(回归保护)。
+        let mut t = BlockTracker::new("claude-opus-4-6".to_string(), false);
+        t.on_reasoning("reasoning text here", None);
+        let close = t.close_reasoning_if_open();
+        assert!(
+            close.iter().any(|e| e.data["delta"]["type"] == "signature_delta"),
+            "默认应发 signature_delta(保留现状)"
+        );
     }
 
     #[test]
