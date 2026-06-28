@@ -216,8 +216,10 @@ impl SystemConfig {
     }
 }
 
-/// 实验性开关(默认关)。两个 on/off 可经设置面板热控;env(`KIRO_TOOLS_IN_PREFIX` /
-/// `KIRO_CACHE_POINT`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
+/// 实验性开关。`tools_in_prefix`/`cache_point`/`agent_continuation` 默认 **关**;
+/// `thinking_signature` 默认 **开**(保留现状,见其字段注释)。均可经设置面板热控;env
+/// (`KIRO_TOOLS_IN_PREFIX` / `KIRO_CACHE_POINT` / `KIRO_AGENT_CONTINUATION` /
+/// `KIRO_THINKING_SIGNATURE`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
     /// 把工具定义放进 history[0] 前缀(蹭 Kiro 缓存)。⚠️ 实测会让部分客户端工具调用失效,
@@ -231,6 +233,11 @@ pub struct ExperimentalConfig {
     /// 用于复刻 kiro.rs proven 配置做真实缓存命中的生产 A/B(见 gw-kiro converter/cache_point.rs)。
     #[serde(default = "default_agent_continuation")]
     pub agent_continuation: bool,
+    /// 是否给响应 thinking 块附 `signature`。**默认开**(保留现状)。多上游反代场景关掉:caio 的
+    /// Kiro 合成签名对真 Anthropic/Bedrock 验签非法,跨通道漂移会触发 `THINKING_SIGNATURE_INVALID`
+    /// (见 gw-kiro converter/cache_point.rs::thinking_signature_enabled)。env `KIRO_THINKING_SIGNATURE=0` 关。
+    #[serde(default = "default_thinking_signature")]
+    pub thinking_signature: bool,
 }
 
 fn env_experimental_flag(name: &str) -> bool {
@@ -247,6 +254,12 @@ fn default_cache_point() -> bool {
 fn default_agent_continuation() -> bool {
     env_experimental_flag("KIRO_AGENT_CONTINUATION")
 }
+/// thinking 签名默认 **开**(现状),仅 env 显式设 `0`/`false` 才关。
+fn default_thinking_signature() -> bool {
+    std::env::var("KIRO_THINKING_SIGNATURE")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
 
 impl Default for ExperimentalConfig {
     fn default() -> Self {
@@ -254,6 +267,7 @@ impl Default for ExperimentalConfig {
             tools_in_prefix: default_tools_in_prefix(),
             cache_point: default_cache_point(),
             agent_continuation: default_agent_continuation(),
+            thinking_signature: default_thinking_signature(),
         }
     }
 }
@@ -522,6 +536,10 @@ pub struct SystemSettings {
     /// 稳定 agentContinuationId+vibe 实验(真实缓存命中 A/B,默认关)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_continuation: Option<bool>,
+    /// thinking 块是否附 signature(默认开;多上游反代关掉以免 Kiro 合成签名漂到真 Anthropic/Bedrock
+    /// 通道被拒)。None = 用基线默认(开)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<bool>,
 }
 
 impl SystemSettings {
@@ -549,6 +567,7 @@ impl SystemSettings {
         if let Some(v) = self.tools_in_prefix { base.experimental.tools_in_prefix = v; }
         if let Some(v) = self.cache_point { base.experimental.cache_point = v; }
         if let Some(v) = self.agent_continuation { base.experimental.agent_continuation = v; }
+        if let Some(v) = self.thinking_signature { base.experimental.thinking_signature = v; }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -581,6 +600,7 @@ impl SystemSettings {
             tools_in_prefix: Some(cfg.experimental.tools_in_prefix),
             cache_point: Some(cfg.experimental.cache_point),
             agent_continuation: Some(cfg.experimental.agent_continuation),
+            thinking_signature: Some(cfg.experimental.thinking_signature),
         }
     }
 }
@@ -779,5 +799,26 @@ workers:
         full.apply_to(&mut target);
         assert_eq!(target.scheduler.max_failures, base.scheduler.max_failures);
         assert_eq!(target.cache.read_multiplier, base.cache.read_multiplier);
+    }
+
+    #[test]
+    fn settings_thinking_signature_apply_to_overrides_and_preserves() {
+        // None → 不覆盖(保留基线默认开);Some(false) → 关签名。验证 overlay 语义对新字段成立。
+        let mut base = SystemConfig::default();
+        base.experimental.thinking_signature = true;
+        SystemSettings::default().apply_to(&mut base);
+        assert!(base.experimental.thinking_signature, "None 时应保留默认(不覆盖)");
+        let s_off = SystemSettings { thinking_signature: Some(false), ..Default::default() };
+        s_off.apply_to(&mut base);
+        assert!(!base.experimental.thinking_signature, "Some(false) 应关掉 thinking 签名");
+    }
+
+    #[test]
+    fn from_effective_carries_thinking_signature() {
+        // from_effective 必须回灌 thinking_signature(否则前端拿不到真值 / 轮询热应用丢字段)。
+        let mut cfg = SystemConfig::default();
+        cfg.experimental.thinking_signature = false;
+        let s = SystemSettings::from_effective(&cfg, None);
+        assert_eq!(s.thinking_signature, Some(false), "from_effective 应带 thinking_signature 真值");
     }
 }

@@ -236,9 +236,13 @@ impl WorkerState {
         let now = std::time::Instant::now();
         let cached = self.quota_cache.lock().get(account_id).cloned();
         // fresh 看"上次尝试时刻"(成功或失败都算),失败也受 TTL 节流。
-        let fresh = cached
-            .as_ref()
-            .is_some_and(|(_, at)| now.duration_since(*at) < QUOTA_TTL);
+        // 例外:provider 的配额是本地廉价读(quota_is_local,如 dario 从流量捕获的内存快照)
+        // 时**永不视为 fresh** → 每次都后台刷新,使刚捕获的快照下一轮(~一个前端轮询)就上面板,
+        // 不被陈旧 None/旧值挡满一个 TTL(对抗审查 #1)。本地刷新无昂贵上游往返,节流无意义。
+        let fresh = !self.provider.quota_is_local()
+            && cached
+                .as_ref()
+                .is_some_and(|(_, at)| now.duration_since(*at) < QUOTA_TTL);
         if !fresh {
             self.spawn_quota_refresh(account_id.to_string());
         }
@@ -479,6 +483,12 @@ fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
             "remaining": q.remaining,
             "percent_used": q.percent_used,
             "label": q.currency,
+            // 多窗口利用率(dario 的 5h/7d);Kiro 为空数组,前端据此分流显示。
+            "windows": q.windows.iter().map(|w| serde_json::json!({
+                "label": w.label,
+                "percent_used": w.percent_used,
+                "reset_at": w.reset_at,
+            })).collect::<Vec<_>>(),
         }),
         None => serde_json::Value::Null,
     }
@@ -658,6 +668,21 @@ pub async fn run(
     }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
 
+    // 启动即把"有效设置"热应用一次:实验开关等进程级全局仅由 env 初始化,DB overlay 原本要等
+    // 30s 轮询(首跳被跳过)才生效。期间若 DB 已设 `thinking_signature=false`,这段窗口里 Kiro
+    // 仍会发 Kiro 合成签名 → 重演跨通道 THINKING_SIGNATURE_INVALID(对抗审查 #1)。这里用与轮询
+    // 同一 `from_effective` 口径先应用一次,关掉窗口。对 kiro 是幂等(cache/image/proxy 已经 from_config
+    // 设过),对 dario 是 no-op(未覆盖 apply_hot_settings)。
+    {
+        let full = gw_core::config::SystemSettings::from_effective(
+            &effective_system,
+            initial_default_proxy.clone(),
+        );
+        if let Ok(sv) = serde_json::to_value(&full) {
+            provider.apply_hot_settings(&sv);
+        }
+    }
+
     // Fix6: For dario workers, filter out accounts that fail validate_account
     // (missing access_token + refresh_token) before they enter the scheduler.
     // Scope this to "claude-dario" only — kiro's validate_account requires
@@ -827,6 +852,7 @@ pub async fn run(
             .route("/accounts/{id}/reset", post(reset_account))
             .route("/accounts/{id}/refresh", post(refresh_account))
             .route("/accounts/{id}/quota", post(quota_account))
+            .route("/oauth/exchange", post(oauth_exchange))
             .route("/sync", post(sync_now));
     } else {
         tracing::warn!(
@@ -1053,6 +1079,35 @@ async fn reset_account(
             Json(serde_json::json!({"reset": false, "account_id": id})),
         )
             .into_response()
+    }
+}
+
+/// router→worker 换码请求体。`proxy`=该号 extra.proxy(None=组默认出口),`code`/`verifier`=PKCE。
+#[derive(serde::Deserialize)]
+struct OAuthExchangeBody {
+    #[serde(default)]
+    proxy: Option<String>,
+    code: String,
+    verifier: String,
+}
+
+/// `POST /oauth/exchange` —— **无状态**铸 token:`authorization_code` → token set。
+///
+/// 走**本 worker 的 egress**(由 `provider.oauth_exchange` 经 `egress_client_for` 选)=该号
+/// 将来 refresh/chat 同一出口 IP(铸≠发=关联封号)。router 只把请求扇给目标组(account_group
+/// 匹配)的 worker,故出口正确;非 dario provider 默认实现回 BadRequest(400)。
+/// 账号此刻尚未入库——纯换码,不碰 scheduler。token 明文只回给同机 router 落库,不进日志。
+async fn oauth_exchange(
+    State(st): State<Arc<WorkerState>>,
+    Json(body): Json<OAuthExchangeBody>,
+) -> axum::response::Response {
+    match st
+        .provider
+        .oauth_exchange(body.proxy.as_deref(), &body.code, &body.verifier)
+        .await
+    {
+        Ok(tokens) => Json(tokens).into_response(),
+        Err(e) => upstream_error_response(&e),
     }
 }
 
@@ -1311,6 +1366,21 @@ async fn messages(
         //    - 其他可重试错误:上报失败、换号重试。
         match st.provider.chat(req.clone(), &ctx).await {
             Ok(stream) => {
+                // 服务端 web search:客户端声明了 `web_search_20250305` → 进执行回环
+                // (反代自搜 + 注回),把首轮流当 round 1 续跑。其余流量字节一致走原路径。
+                if let Some(spec) = crate::websearch::detect_web_search(&req.body) {
+                    return finish_web_search_response(
+                        st.clone(),
+                        lease,
+                        stream,
+                        &req,
+                        &client_key,
+                        ctx,
+                        spec,
+                        started_at,
+                    )
+                    .await;
+                }
                 return finish_response(
                     st.clone(),
                     lease,
@@ -1320,7 +1390,7 @@ async fn messages(
                     ctx.account.clone(),
                     started_at,
                 )
-                .await
+                .await;
             }
             Err(e) if e.kind == UpstreamErrorKind::TokenInvalid => {
                 tracing::info!(account = %account_id, "chat 403 token 失效,尝试同号刷新后重试");
@@ -1339,6 +1409,21 @@ async fn messages(
                         };
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
+                                if let Some(spec) =
+                                    crate::websearch::detect_web_search(&req.body)
+                                {
+                                    return finish_web_search_response(
+                                        st.clone(),
+                                        lease,
+                                        stream,
+                                        &req,
+                                        &client_key,
+                                        retry_ctx,
+                                        spec,
+                                        started_at,
+                                    )
+                                    .await;
+                                }
                                 return finish_response(
                                     st.clone(),
                                     lease,
@@ -1348,7 +1433,7 @@ async fn messages(
                                     retry_ctx.account.clone(),
                                     started_at,
                                 )
-                                .await
+                                .await;
                             }
                             Err(e2) => {
                                 // 刷新后仍失败:这次才上报失败 + 换号。
@@ -1659,6 +1744,37 @@ fn spawn_request_log_blocking(
             duration_ms, ttfb_ms, usage, response, family,
         );
     });
+}
+
+/// 服务端 web search 收尾:跑执行回环(反代自搜 DDG + 注回续跑),把组装好的标准
+/// `server_tool_use`+`web_search_tool_result`+text 响应合成为流,再交给 [`finish_response`]
+/// 复用全部流式/非流式分发、日志、usage 上报机器。回环失败按上游错误回显(不重试:已开始
+/// 消费首轮流,符合 v60 不放大错误契约)。
+#[allow(clippy::too_many_arguments)]
+async fn finish_web_search_response(
+    st: Arc<WorkerState>,
+    lease: scheduler::AccountLease,
+    first_stream: gw_core::provider::ChatStream,
+    req: &ChatRequest,
+    client_key: &str,
+    ctx: CallCtx,
+    spec: crate::websearch::WebSearchSpec,
+    started_at: std::time::Instant,
+) -> axum::response::Response {
+    let account = ctx.account.clone();
+    let account_id = account.account_id.clone();
+    match crate::websearch::run_loop(st.provider.clone(), &ctx, req, spec, first_stream).await {
+        Ok((events, usage)) => {
+            let synth = crate::websearch::synth_stream(events, usage);
+            finish_response(st, lease, synth, req, client_key, account, started_at).await
+        }
+        Err(e) => {
+            tracing::warn!(account = %account_id, kind = ?e.kind, "web search 回环失败: {e}");
+            st.scheduler.report_failure(&account_id, e.kind);
+            drop(lease);
+            upstream_error_response(&e)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -2,8 +2,8 @@ use gw_core::account::Account;
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
 use crate::format_rfc3339_z;
 
-const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(crate) const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /// 将刷新响应写回账号(纯函数,注入 now_unix 便于测试)。
 /// - 有 access_token 则覆盖;无则 Err(TokenInvalid)。
@@ -123,7 +123,7 @@ pub(crate) async fn refresh(
     apply_refresh(account.clone(), &json, now_unix())
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

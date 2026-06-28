@@ -48,6 +48,9 @@ export interface SystemSettings {
   cache_point: boolean
   /** 实验：发稳定 agentContinuationId+vibe（复刻 kiro.rs，真实缓存命中 A/B，默认关）。 */
   agent_continuation: boolean
+  /** thinking 块是否附 signature。**默认开**（保留现状，过 hvoy/cctest 检测）。多上游反代关掉：
+   *  caio 的 Kiro 合成签名对真 Anthropic/Bedrock 验签非法，跨通道漂移会被拒 THINKING_SIGNATURE_INVALID。 */
+  thinking_signature: boolean
 }
 
 /**

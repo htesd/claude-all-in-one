@@ -31,6 +31,8 @@ pub use model_map::{advertised_models, get_context_window_size, map_model, Adver
 pub use shed::{shed_history_media, MediaShed};
 /// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
 pub(crate) use cache_point::set_experimental_flags;
+/// thinking 签名发射开关(供 [`crate::chat`] 在收尾 thinking 块时判定是否附 signature)。
+pub(crate) use cache_point::thinking_signature_enabled;
 use cache_point::*;
 use content::*;
 use history::*;

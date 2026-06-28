@@ -182,6 +182,8 @@ pub struct UpdateAccountBody {
 pub fn router() -> Router<AdminState> {
     Router::new()
         .route("/accounts", get(list_accounts).post(create_account))
+        .route("/accounts/oauth/start", post(oauth_start))
+        .route("/accounts/oauth/complete", post(oauth_complete))
         .route("/accounts/import", post(import_accounts))
         .route("/accounts/rebalance-egress", post(rebalance_egress))
         .route("/accounts/runtime", get(runtime))
@@ -353,6 +355,307 @@ async fn create_account(
     }
 }
 
+// ── claude-dario OAuth 上号(铸 token 走 per-account 出口,与 refresh/chat 同 IP)─────────
+//
+// 两步:start 生成 PKCE+authorize URL(纯本地,不发网络),操作员浏览器人肉登录同意拿 code →
+// complete 把 code 扇给**目标组的 worker** 换码(走该组 egress=该号将来 refresh/chat 同出口),
+// 成功后落库 + /sync。consent 浏览器那跳 IP 不纳入保证(code 数秒失效),铸/刷/发三步同 IP。
+
+/// 待完成的上号会话(进程内存,**绝不落库、绝不进日志**;TTL 到期即弃)。
+struct PendingOAuth {
+    /// PKCE code_verifier(敏感:单次、短时、仅本会话可用)。
+    verifier: String,
+    /// 解析后的出口代理(None=组默认出口);换码与落库用同一值 → 铸=刷=发同 IP。
+    proxy: Option<String>,
+    account_id: String,
+    group: String,
+    max_concurrency: i64,
+    created_at: std::time::Instant,
+}
+
+const OAUTH_PENDING_TTL_SECS: u64 = 600; // 10 分钟:够人肉登录,过期即弃(防内存累积 + 限攻击窗口)
+const OAUTH_PENDING_MAX: usize = 256; // 硬上限:即便 TTL 内被狂发 start 也不无界增长(admin 已鉴权,够宽松)
+
+// 进程内待完成会话。⚠️ 单 admin 进程局部:`/start` 与 `/complete` 必须命中同一 router 进程
+// (admin UI 单一来源天然满足);router 重启会丢失 10 分钟窗口内的待完成会话(操作员重发即可)。
+fn oauth_pending() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingOAuth>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PendingOAuth>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 清过期项(无后台清扫线程,读写时回收以绑定内存)。
+fn sweep_expired(m: &mut std::collections::HashMap<String, PendingOAuth>) {
+    m.retain(|_, v| v.created_at.elapsed().as_secs() < OAUTH_PENDING_TTL_SECS);
+}
+
+fn insert_pending(state: String, p: PendingOAuth) {
+    let mut m = oauth_pending().lock().unwrap_or_else(|e| e.into_inner());
+    sweep_expired(&mut m);
+    // 清完仍达上限(极端突发)→ 丢最旧待完成会话,硬绑内存。
+    while m.len() >= OAUTH_PENDING_MAX {
+        let Some(oldest) = m.iter().min_by_key(|(_, v)| v.created_at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        m.remove(&oldest);
+    }
+    m.insert(state, p);
+}
+
+/// 取出并**移除**(单次);取用时也清过期(不滞留到下次 insert)。
+fn take_pending(state: &str) -> Option<PendingOAuth> {
+    let mut m = oauth_pending().lock().unwrap_or_else(|e| e.into_inner());
+    sweep_expired(&mut m);
+    m.remove(state)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartOAuthBody {
+    account_id: String,
+    #[serde(default)]
+    group: Option<String>,
+    /// 出口网关选择:""/缺省/"direct"=直连;"auto"=自动均衡;数字=egress_pool 索引。
+    /// (上号统一走 egress 选择,不单独收 raw proxy——审查 Minimalist#2:与 egress 重复。)
+    #[serde(default)]
+    egress: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<i64>,
+}
+
+/// `POST /accounts/oauth/start` —— 生成 PKCE + authorize URL,登记待完成会话。
+/// 仅探一次目标组 worker 的 /health(loopback 只读)做 dario 预检,不发任何外网请求。
+async fn oauth_start(
+    State(st): State<AdminState>,
+    Json(body): Json<StartOAuthBody>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&body.account_id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    // 提前挡掉已存在的 account_id,别让操作员登录半天才在 complete 撞 409。
+    match st.store.get_account(&body.account_id) {
+        Ok(Some(_)) => return api_error(StatusCode::CONFLICT, "account_id 已存在"),
+        Ok(None) => {}
+        Err(e) => return internal_error(e),
+    }
+    let group = body.group.as_deref().unwrap_or("").to_string();
+    if !group.is_empty() {
+        match st.store.group_exists(&group) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::BAD_REQUEST, "分组不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
+    // 目标组必须有 worker,且其 provider 必须是 claude-dario。否则 complete 会在操作员**登录之后**
+    // 才失败(白费一次 consent)。这里探一次该组 worker 的 /health(loopback 只读)提前挡掉。
+    let group_workers: Vec<&gw_core::config::WorkerConfig> =
+        st.workers.iter().filter(|w| w.account_group == group).collect();
+    if group_workers.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "该组没有 worker(无法保证铸 token 出口 IP);请先为该组配置 worker",
+        );
+    }
+    let mut is_dario = false;
+    for w in &group_workers {
+        let url = format!("http://{}/health", w.listen);
+        if let Ok(resp) = st.http.get(&url).send().await {
+            if let Ok(j) = resp.json::<serde_json::Value>().await {
+                if j.get("provider").and_then(|v| v.as_str()) == Some("claude-dario") {
+                    is_dario = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !is_dario {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "该组不是 claude-dario 组(OAuth 上号仅支持 dario);请选 dario 组,或确认其 worker 在线",
+        );
+    }
+    // 出口解析:统一按 egress 选择(显式网关/自动均衡/直连)。direct=本机出口 IP——caio 各 worker
+    // 均 network_mode:host 同机,故 direct 对该组所有 worker 是同一 IP;非 direct(proxy)则各 worker
+    // 都用同一 proxy 串 → 同 IP。换码与落库用同一 proxy 值,铸=刷=发同 IP(见 client_for_proxy)。
+    let proxy: Option<String> = EgressPicker::build(&st, body.egress.as_deref()).next();
+    let (verifier, challenge) = gw_dario::oauth::gen_pkce();
+    let state = gw_dario::oauth::gen_state();
+    let authorize_url = gw_dario::oauth::build_authorize_url(&challenge, &state);
+    insert_pending(
+        state.clone(),
+        PendingOAuth {
+            verifier,
+            proxy,
+            account_id: body.account_id,
+            group,
+            max_concurrency: body.max_concurrency.unwrap_or(2),
+            created_at: std::time::Instant::now(),
+        },
+    );
+    Json(serde_json::json!({
+        "authorize_url": authorize_url,
+        "state": state,
+        "expires_in_sec": OAUTH_PENDING_TTL_SECS,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteOAuthBody {
+    /// start 返回的 state(会话键 + CSRF 绑定)。
+    state: String,
+    /// 回调页显示的串(可能是 `code` 或 `code#state`)。
+    code: String,
+}
+
+/// `POST /accounts/oauth/complete` —— 用 code 换 token(扇给目标组 worker,走该组 egress),落库 + /sync。
+async fn oauth_complete(
+    State(st): State<AdminState>,
+    Json(body): Json<CompleteOAuthBody>,
+) -> axum::response::Response {
+    let (code, pasted_state) = gw_dario::oauth::parse_manual_code(&body.code);
+    if code.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "code 为空");
+    }
+    // 回调串若自带 #state,必须与会话 state 一致(CSRF/串号防护)。
+    if let Some(ps) = &pasted_state {
+        if ps != &body.state {
+            return api_error(StatusCode::BAD_REQUEST, "state 不匹配(请勿混用不同上号会话的 code)");
+        }
+    }
+    let Some(pending) = take_pending(&body.state) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "上号会话已过期或无效(超过 10 分钟或已用过),请重新发起",
+        );
+    };
+    // 换码前再查一次重名:缩小「成功铸出 refresh_token 却因重名被丢弃」的窗口(审查 Skeptic#4)。
+    match st.store.get_account(&pending.account_id) {
+        Ok(Some(_)) => return api_error(StatusCode::CONFLICT, "account_id 已存在"),
+        Ok(None) => {}
+        Err(e) => return internal_error(e),
+    }
+    // 扇给**目标组**的 worker(account_group 匹配)——该 worker 的 egress = 该号将来 refresh/chat
+    // 同一出口 IP。绝不扇给其它组(出口会错)。
+    let group_workers: Vec<&gw_core::config::WorkerConfig> =
+        st.workers.iter().filter(|w| w.account_group == pending.group).collect();
+    if group_workers.is_empty() {
+        // 组在 start 之后丢了 worker(罕见)→ code 未递交上游,保留会话供重试(审查 Skeptic#3)。
+        insert_pending(body.state.clone(), pending);
+        return api_error(
+            StatusCode::BAD_GATEWAY,
+            "目标组暂无 worker,上号会话已保留,请稍后重试",
+        );
+    }
+    // 换码可能经代理 + 上游往返,2s(st.http)太短;用 30s 专用 client。
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    let payload = serde_json::json!({
+        "proxy": pending.proxy,
+        "code": code,
+        "verifier": pending.verifier,
+    });
+    let mut tokens: Option<serde_json::Value> = None;
+    let mut first_error: Option<(u16, String)> = None;
+    let mut any_responded = false; // 任一 worker 给了 HTTP 应答 = code 已递交上游(无论成败)
+    for w in &group_workers {
+        let url = format!("http://{}/oauth/exchange", w.listen);
+        let resp = match client.post(&url).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(listen = %w.listen, "oauth/exchange 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        any_responded = true;
+        let status = resp.status().as_u16();
+        let rbody = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            tokens = rbody;
+            break;
+        }
+        if first_error.is_none() {
+            let msg = rbody
+                .as_ref()
+                .and_then(|b| b.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("换码失败")
+                .to_string();
+            first_error = Some((status, msg));
+        }
+    }
+    if tokens.is_none() && !any_responded {
+        // 没有任何 worker 应答(纯连接失败)→ code 未递交上游、仍有效 → 保留会话供重试(审查 Skeptic#3)。
+        insert_pending(body.state.clone(), pending);
+        return api_error(
+            StatusCode::BAD_GATEWAY,
+            "目标组 worker 当前不可达,上号会话已保留,请稍后重试",
+        );
+    }
+    let Some(tokens) = tokens else {
+        // worker 应答但换码失败(code 已被上游消费,重试无益)→ 不保留会话,透出错误。
+        if let Some((status, msg)) = first_error {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            return api_error(code, &msg);
+        }
+        return api_error(StatusCode::BAD_GATEWAY, "换码失败");
+    };
+    // 组装 extra:换码所得 token 字段 + 出口 proxy(与换码同值)+ 稳定身份(凭证里没有,生成)。
+    let mut extra_map = match tokens {
+        serde_json::Value::Object(m) => m,
+        _ => return internal_error("换码返回非对象"),
+    };
+    // 边界再校验:换码必须带来非空 refresh_token,否则号无法长期持有(审查 Architect#5 防御纵深;
+    // worker 侧 parse_token_set 已校验,此处再挡一道防 provider 改动后失守)。
+    if extra_map
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return internal_error("换码结果缺 refresh_token,拒绝落库");
+    }
+    if let Some(p) = &pending.proxy {
+        extra_map.insert("proxy".into(), serde_json::json!(p));
+    }
+    extra_map
+        .entry("device_id".to_string())
+        .or_insert_with(|| serde_json::json!(uuid::Uuid::new_v4().to_string()));
+    extra_map
+        .entry("account_uuid".to_string())
+        .or_insert_with(|| serde_json::json!(uuid::Uuid::new_v4().to_string()));
+    let extra_json = match serde_json::to_string(&extra_map) {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    match st.store.create_account(
+        &pending.account_id,
+        &pending.group,
+        "claude-dario",
+        pending.max_concurrency,
+        &extra_json,
+    ) {
+        Ok(true) => {
+            // 主动 /sync 目标组 worker,消除"上号后 30s 内按号操作报无人持有"窗口(best-effort)。
+            for w in &group_workers {
+                let url = format!("http://{}/sync", w.listen);
+                let _ = st.http.post(&url).send().await;
+            }
+            match st.store.get_account(&pending.account_id) {
+                Ok(Some(row)) => (StatusCode::CREATED, Json(redacted_view(row))).into_response(),
+                Ok(None) => internal_error("上号后读取不到账号"),
+                Err(e) => internal_error(e),
+            }
+        }
+        Ok(false) => api_error(StatusCode::CONFLICT, "account_id 已存在"),
+        Err(e) => internal_error(e),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ImportBody {
     /// 目标组(账号挂到哪个 worker 组);非空时必须真实存在。
@@ -404,9 +707,11 @@ async fn import_accounts(
         }
     }
 
-    let root: serde_json::Value = match serde_json::from_str(&body.json) {
+    // 宽松解析:容忍从富文本/网页复制粘贴带入的非标准空白(nbsp 等),否则 serde
+    // 严格解析会直接报错(用户粘贴上号工具原文常踩此坑)。
+    let root: serde_json::Value = match gw_kiro::import::parse_import_json(&body.json) {
         Ok(v) => v,
-        Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("JSON 解析失败: {e}")),
+        Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
     };
 
     let imported = match gw_kiro::import::parse_accounts_export(&root) {

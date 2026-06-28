@@ -7,6 +7,7 @@ mod admin;
 mod egress;
 mod registry;
 mod router;
+mod websearch;
 mod worker;
 
 use std::path::PathBuf;

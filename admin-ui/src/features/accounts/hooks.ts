@@ -8,10 +8,13 @@ import {
   fetchAccounts,
   fetchAccountsRuntime,
   importAccounts,
+  oauthComplete,
+  oauthStart,
   refreshAccount,
   resetAccount,
   updateAccount,
 } from './api'
+import type { OAuthStartPayload } from './api'
 import type {
   CreateAccountPayload,
   ImportAccountsPayload,
@@ -78,6 +81,22 @@ export function useResetAccount() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => resetAccount(id),
+    onSuccess: () => invalidateAccountDomains(queryClient),
+  })
+}
+
+/** OAuth 上号第一步：生成 authorize URL（不发网络，不改账号域，无需失效查询）。 */
+export function useOAuthStart() {
+  return useMutation({
+    mutationFn: (payload: OAuthStartPayload) => oauthStart(payload),
+  })
+}
+
+/** OAuth 上号第二步：换码落库；成功后刷新账号域（新账号入列）。 */
+export function useOAuthComplete() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ state, code }: { state: string; code: string }) => oauthComplete(state, code),
     onSuccess: () => invalidateAccountDomains(queryClient),
   })
 }

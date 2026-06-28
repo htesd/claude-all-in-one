@@ -387,7 +387,18 @@ impl Provider for KiroProvider {
                 .get("agent_continuation")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            crate::converter::set_experimental_flags(tools_in_prefix, cache_point, agent_continuation);
+            // thinking_signature 缺省 **true**(保留现状:带签名);只有显式 false 才关掉。
+            // 与上面三个开关相反——它们危险默认关,这个安全默认开。
+            let thinking_signature = settings
+                .get("thinking_signature")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            crate::converter::set_experimental_flags(
+                tools_in_prefix,
+                cache_point,
+                agent_continuation,
+                thinking_signature,
+            );
         }
     }
 

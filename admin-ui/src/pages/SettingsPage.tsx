@@ -38,6 +38,7 @@ interface FormState {
   tools_in_prefix: boolean
   cache_point: boolean
   agent_continuation: boolean
+  thinking_signature: boolean
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -66,6 +67,7 @@ function settingsToForm(s: SystemSettings): FormState {
     tools_in_prefix: s.tools_in_prefix,
     cache_point: s.cache_point,
     agent_continuation: s.agent_continuation,
+    thinking_signature: s.thinking_signature ?? true,
   }
 }
 
@@ -137,6 +139,7 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     'tools_in_prefix',
     'cache_point',
     'agent_continuation',
+    'thinking_signature',
   ]
   for (const k of boolFields) {
     if (form[k] !== original[k]) {
@@ -595,6 +598,23 @@ export default function SettingsPage() {
                 </span>
                 <span className="block text-xs text-muted-foreground">
                   {t('settings.field.agentContinuationHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.thinking_signature ?? true}
+                onChange={(e) => set('thinking_signature', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.thinkingSignature')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.thinkingSignatureHint')}
                 </span>
               </span>
             </label>
