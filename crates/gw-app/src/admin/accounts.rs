@@ -529,10 +529,18 @@ async fn oauth_complete(
         );
     };
     // 换码前再查一次重名:缩小「成功铸出 refresh_token 却因重名被丢弃」的窗口(审查 Skeptic#4)。
+    // code 此刻**尚未**递交上游、仍有效:重名/查询失败都属可恢复,保留会话供重试(改 account_id 后再 complete),
+    // 绝不在这里 destructive 销毁(否则操作员被迫整轮重新 consent;审查 Skeptic A1)。
     match st.store.get_account(&pending.account_id) {
-        Ok(Some(_)) => return api_error(StatusCode::CONFLICT, "account_id 已存在"),
+        Ok(Some(_)) => {
+            insert_pending(body.state.clone(), pending);
+            return api_error(StatusCode::CONFLICT, "account_id 已存在(上号会话已保留,请改用其他 ID 重试)");
+        }
         Ok(None) => {}
-        Err(e) => return internal_error(e),
+        Err(e) => {
+            insert_pending(body.state.clone(), pending);
+            return internal_error(e);
+        }
     }
     // 扇给**目标组**的 worker(account_group 匹配)——该 worker 的 egress = 该号将来 refresh/chat
     // 同一出口 IP。绝不扇给其它组(出口会错)。
@@ -1304,7 +1312,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::admin::tests_support::{app, req};
+    use crate::admin::tests_support::{app, app_with_workers, req};
 
     async fn json_body(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -1857,5 +1865,214 @@ mod tests {
             "my-explicit-device-id-0000000000000",
             "显式 device_id 不得被覆盖"
         );
+    }
+
+    // === OAuth 上号生命周期(B3 审查补测)===
+    // 假 worker(真 TCP 端口):/health 报指定 provider;/oauth/exchange 按指定 HTTP 码 + body 应答;
+    // /sync 恒 200(complete 成功后 best-effort 调用)。覆盖 start 预检 + complete 扇出/落库/会话保留语义。
+    async fn spawn_fake_worker(
+        group: &str,
+        provider: &str,
+        exchange_status: u16,
+        exchange_body: serde_json::Value,
+    ) -> gw_core::config::WorkerConfig {
+        use axum::routing::{get, post};
+        use axum::Json;
+        let provider = provider.to_string();
+        let body = exchange_body;
+        let router = axum::Router::new()
+            .route(
+                "/health",
+                get(move || {
+                    let p = provider.clone();
+                    async move { Json(serde_json::json!({ "provider": p })) }
+                }),
+            )
+            .route(
+                "/oauth/exchange",
+                post(move |_b: Json<serde_json::Value>| {
+                    let body = body.clone();
+                    async move {
+                        (axum::http::StatusCode::from_u16(exchange_status).unwrap(), Json(body))
+                    }
+                }),
+            )
+            .route("/sync", post(|| async { Json(serde_json::json!({ "ok": true })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        gw_core::config::WorkerConfig {
+            instance: 0,
+            listen: addr.to_string(),
+            egress: gw_core::config::EgressConfig::Direct,
+            account_group: group.to_string(),
+        }
+    }
+    // CHUNK_ANCHOR_OAUTH_TESTS
+
+    /// start 后从响应取 (status, authorize_url, state)。
+    async fn start(app: &axum::Router, account_id: &str, group: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "account_id": account_id, "group": group }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/oauth/start", Some(&body)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_body(resp).await)
+    }
+
+    /// complete 调用(code 可含 `#state`)。
+    async fn complete(app: &axum::Router, state: &str, code: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "state": state, "code": code }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/oauth/complete", Some(&body)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_body(resp).await)
+    }
+
+    /// 空组(无 worker)→ start 阶段即 400,**在浏览器 consent 之前**失败(审查 Architect B2:
+    /// 不让操作员登录半天才在 complete 撞死路)。
+    #[tokio::test]
+    async fn oauth_start_rejects_group_without_worker_before_consent() {
+        let (app, _store) = app_with_workers(vec![]);
+        let (status, _v) = start(&app, "dario-x", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "无 worker 的组应在 start 即拒");
+    }
+    // CHUNK_ANCHOR_OAUTH_TESTS2
+
+    /// start 命中真实 claude-dario 组 → 返回 authorize_url + state。
+    #[tokio::test]
+    async fn oauth_start_returns_authorize_url_for_dario_group() {
+        let w = spawn_fake_worker("G0", "claude-dario", 200, serde_json::json!({})).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (status, v) = start(&app, "dario-ok", "G0").await;
+        assert_eq!(status, StatusCode::OK);
+        let url = v["authorize_url"].as_str().unwrap();
+        assert!(url.starts_with("https://claude.ai/oauth/authorize?"), "authorize_url: {url}");
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(!v["state"].as_str().unwrap_or("").is_empty(), "必须返回 state");
+    }
+
+    /// 非 claude-dario 组(如 kiro)→ start 即 400(OAuth 上号仅支持 dario)。
+    #[tokio::test]
+    async fn oauth_start_rejects_non_dario_group() {
+        let w = spawn_fake_worker("G0", "kiro", 200, serde_json::json!({})).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (status, _v) = start(&app, "k-1", "G0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "非 dario 组应拒");
+    }
+
+    /// 贴回串自带的 `#state` 与会话 state 不符 → 400,且**不消费**会话(可用正确 code 重试)。
+    #[tokio::test]
+    async fn oauth_complete_state_mismatch_does_not_consume_session() {
+        let tokens = serde_json::json!({
+            "access_token": "at-1", "refresh_token": "rt-1", "expires_at": "2026-06-04T01:00:00Z"
+        });
+        let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (_s, v) = start(&app, "dario-mm", "G0").await;
+        let state = v["state"].as_str().unwrap().to_string();
+        // 贴回 code 带错误的 #state → 400,会话保留。
+        let (status, _v) = complete(&app, &state, "thecode#totally-wrong-state").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "state 不匹配应拒");
+        // 用正确 code(无 #state)重试 → 成功,证明上一步没消费会话。
+        let (status2, _v2) = complete(&app, &state, "thecode").await;
+        assert_eq!(status2, StatusCode::CREATED, "会话应仍在,重试成功");
+        assert!(store.get_account("dario-mm").unwrap().is_some());
+    }
+
+    /// 成功换码 → 账号以 claude-dario 入库,自动补稳定身份 device_id/account_uuid(36 字符 UUID)。
+    #[tokio::test]
+    async fn oauth_complete_success_creates_dario_account_with_identity() {
+        let tokens = serde_json::json!({
+            "access_token": "at-onboard-123",
+            "refresh_token": "rt-onboard-456",
+            "expires_at": "2026-06-04T01:00:00Z"
+        });
+        let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (_s, v) = start(&app, "dario-new", "G0").await;
+        let state = v["state"].as_str().unwrap().to_string();
+        let (status, _v) = complete(&app, &state, "validcode").await;
+        assert_eq!(status, StatusCode::CREATED);
+        let row = store.get_account("dario-new").unwrap().unwrap();
+        assert_eq!(row.provider, "claude-dario");
+        assert_eq!(row.group_name, "G0");
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+        assert_eq!(extra["access_token"], "at-onboard-123", "库存完整 token");
+        assert_eq!(extra["refresh_token"], "rt-onboard-456");
+        assert_eq!(extra["device_id"].as_str().unwrap().len(), 36, "自动生成 device_id UUID");
+        assert_eq!(extra["account_uuid"].as_str().unwrap().len(), 36);
+    }
+    // CHUNK_ANCHOR_OAUTH_TESTS3
+
+    /// 成功换码后 state 单次消费:同一 state 二次 complete → 会话已被取走 → 400。
+    #[tokio::test]
+    async fn oauth_complete_consumes_state_once_on_success() {
+        let tokens = serde_json::json!({
+            "access_token": "at-1", "refresh_token": "rt-1", "expires_at": "2026-06-04T01:00:00Z"
+        });
+        let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (_s, v) = start(&app, "dario-once", "G0").await;
+        let state = v["state"].as_str().unwrap().to_string();
+        let (s1, _) = complete(&app, &state, "code-1").await;
+        assert_eq!(s1, StatusCode::CREATED);
+        // 二次用同 state(且账号已存在)→ 会话已消费 → 400(过期/无效),而非 CONFLICT。
+        let (s2, _) = complete(&app, &state, "code-2").await;
+        assert_eq!(s2, StatusCode::BAD_REQUEST, "state 应单次消费");
+    }
+
+    /// **A1 修复**:换码前撞重名 409,code 尚未递交上游、仍有效 → 会话**保留**,
+    /// 改用其他 account_id 可继续完成(绝不 destructive 销毁逼操作员重新 consent)。
+    #[tokio::test]
+    async fn oauth_complete_duplicate_id_preserves_session_for_retry() {
+        let tokens = serde_json::json!({
+            "access_token": "at-9", "refresh_token": "rt-9", "expires_at": "2026-06-04T01:00:00Z"
+        });
+        let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (_s, v) = start(&app, "dario-dup", "G0").await;
+        let state = v["state"].as_str().unwrap().to_string();
+        // start 之后、complete 之前,另一路创建了同名账号(模拟并发)。
+        store.create_account("dario-dup", "G0", "claude-dario", 2, "{}").unwrap();
+        // complete → 重名 409,但会话保留。
+        let (s1, _) = complete(&app, &state, "thecode").await;
+        assert_eq!(s1, StatusCode::CONFLICT, "重名应 409");
+        // 删掉冲突账号后,同一会话用同一 state 重试 → 成功(证明会话未被销毁)。
+        let resp = app.clone().oneshot(req("DELETE", "/accounts/dario-dup", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let (s2, _) = complete(&app, &state, "thecode").await;
+        assert_eq!(s2, StatusCode::CREATED, "会话应被保留,重试成功");
+    }
+
+    /// 上游拒换码(worker 应答非 2xx,如 code 已失效)→ code 已被上游消费,重试无益 →
+    /// 会话**消费**不再保留(防留可重放凭据),错误透出。
+    #[tokio::test]
+    async fn oauth_complete_upstream_reject_consumes_session() {
+        let err = serde_json::json!({"error": {"message": "invalid_grant"}});
+        let w = spawn_fake_worker("G0", "claude-dario", 400, err).await;
+        let (app, store) = app_with_workers(vec![w]);
+        store.create_group("G0", "", "").unwrap();
+        let (_s, v) = start(&app, "dario-rej", "G0").await;
+        let state = v["state"].as_str().unwrap().to_string();
+        let (s1, _) = complete(&app, &state, "expiredcode").await;
+        assert!(s1.is_client_error() || s1.is_server_error(), "上游拒应透出错误,实际 {s1}");
+        assert!(store.get_account("dario-rej").unwrap().is_none(), "失败不得落库");
+        // 同一 state 重试 → 会话已消费 → 400(不可重放)。
+        let (s2, _) = complete(&app, &state, "expiredcode").await;
+        assert_eq!(s2, StatusCode::BAD_REQUEST, "上游拒后会话应已消费");
     }
 }

@@ -197,6 +197,20 @@ pub(crate) mod tests_support {
         (admin_api_router(st), store)
     }
 
+    /// 同 [`app`],但注入 worker 拓扑(OAuth 上号/运行态聚合等需要 worker 的测试用)。
+    pub fn app_with_workers(
+        workers: Vec<gw_core::config::WorkerConfig>,
+    ) -> (axum::Router, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let st = AdminState::new(
+            Arc::new(TOKEN.to_string()),
+            store.clone(),
+            workers,
+            gw_core::config::SystemConfig::default(),
+        );
+        (admin_api_router(st), store)
+    }
+
     pub fn req(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
         let b = Request::builder()
             .method(method)
