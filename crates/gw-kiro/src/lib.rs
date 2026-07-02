@@ -91,13 +91,17 @@ const KIRO_ACCOUNT_SCHEMA: &[FieldSpec] = &[
     FieldSpec::new("machine_id", "设备指纹 (machineId)", FieldType::String, false)
         .with_help("Social 号防封关键:填原始真机 machineId(64 hex 或 UUID);留空则按 refresh_token 派生,会随 token 刷新漂移"),
     FieldSpec::new("auth_method", "认证方式", FieldType::String, false)
-        .with_help("social / idc;留空按 client_id+secret 自动判定"),
+        .with_help("social / idc / external_idp;留空按 client_id+secret 自动判定 social/idc —— external_idp(Azure AD 企业 SSO)必须显式填写,无法从字段存在与否自动推断"),
     FieldSpec::new("kiro_provider", "身份来源", FieldType::String, false)
         .with_help("github / google / builderid / enterprise;用于缺失 profileArn 时取固定兜底"),
-    FieldSpec::new("client_id", "IdC Client ID", FieldType::String, false)
-        .with_help("IdC(企业 SSO)账号必填,与 Client Secret 成对"),
+    FieldSpec::new("client_id", "IdC / External IdP Client ID", FieldType::String, false)
+        .with_help("IdC(企业 SSO)或 external_idp(Azure AD 租户)账号必填"),
     FieldSpec::new("client_secret", "IdC Client Secret", FieldType::Password, false)
-        .with_help("IdC 账号必填;走 AWS OIDC 刷新,不易封"),
+        .with_help("IdC 账号必填;走 AWS OIDC 刷新,不易封。external_idp 账号留空(Azure AD 公开客户端刷新不用 secret)"),
+    FieldSpec::new("token_endpoint", "External IdP Token Endpoint", FieldType::String, false)
+        .with_help("auth_method=external_idp(Azure AD 企业 SSO)账号的租户刷新端点,如 https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token;从 Kiro-Go 等工具导出时会按 userId 自动派生,一般无需手填"),
+    FieldSpec::new("scope", "External IdP Scope", FieldType::String, false)
+        .with_help("external_idp 账号的 OAuth2 scope(含 offline_access 才能拿到 refresh_token);留空按 client_id 自动派生 codewhisperer 默认 scope"),
     FieldSpec::new("kiro_version", "客户端版本", FieldType::String, false)
         .with_help("⚠️ UA 里的 KiroIDE 版本,默认 0.12.155;改它而不同步 OS/Node 版本会造成现实不存在的指纹组合,非必要勿动"),
     FieldSpec::new("proxy", "出口代理 URL (可选)", FieldType::String, false)
