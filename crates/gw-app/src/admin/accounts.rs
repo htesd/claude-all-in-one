@@ -1072,6 +1072,12 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
+    // 落库后 best-effort 捅所有 worker 立即同步(同 delete_account/import 的理由):
+    // 否则启用/禁用/换组等改动要等 worker 自己最多 30s 的周期 sync 才生效,期间按号操作
+    // (如导入对话框"编辑后立即验活")会误报"没有 worker 持有该账号"。
+    if has_patch || body.proxy_url.is_some() {
+        poke_workers_sync(&st).await;
+    }
     match st.store.get_account(&id) {
         Ok(Some(row)) => Json(redacted_view(row)).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "账号不存在"),
@@ -1578,6 +1584,54 @@ mod tests {
         let row2 = store.get_account("acc1").unwrap().unwrap();
         assert!(row2.extra.contains("\"proxy\":null"), "清除应写 proxy:null: {}", row2.extra);
         assert!(row2.extra.contains("rt-secret"), "清除代理不得动凭据");
+    }
+
+    /// PATCH 落库后应立即 poke worker `/sync`,消除"改配置(启用/禁用/换组)后 30s 内
+    /// 按号操作(如立即验活)报『没有 worker 持有该账号』"的窗口——与 delete_account 同理。
+    #[tokio::test]
+    async fn update_account_pokes_workers_for_immediate_sync() {
+        use axum::routing::post;
+        use axum::Json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let sync_calls = Arc::new(AtomicUsize::new(0));
+        let counter = sync_calls.clone();
+        let router = axum::Router::new().route(
+            "/sync",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "ok": true }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let worker = gw_core::config::WorkerConfig {
+            instance: 0,
+            listen: addr.to_string(),
+            egress: gw_core::config::EgressConfig::Direct,
+            account_group: "".to_string(),
+        };
+
+        let (app, store) = app_with_workers(vec![worker]);
+        store.create_account("kiro-poke", "", "kiro", 1, "{}").unwrap();
+
+        let resp = app
+            .oneshot(req("PATCH", "/accounts/kiro-poke", Some(r#"{"disabled":false}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            sync_calls.load(Ordering::SeqCst),
+            1,
+            "PATCH 应立即 poke worker /sync,不等 30s 周期同步"
+        );
     }
 
     #[tokio::test]
