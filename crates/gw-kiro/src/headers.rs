@@ -131,7 +131,10 @@ pub(crate) fn apply_streaming_headers(
 }
 
 /// 条件头判定:auth_method == "external_idp"(大小写不敏感)。
-fn is_external_idp(account: &Account) -> bool {
+///
+/// `pub(crate)`:token.rs 的刷新分流复用同一判定,避免两处各写一份 easily-diverging
+/// 的字符串比较(此前只有本文件内部用,token.rs 的刷新分流当时压根没读 auth_method)。
+pub(crate) fn is_external_idp(account: &Account) -> bool {
     account
         .extra_str("auth_method")
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("external_idp"))

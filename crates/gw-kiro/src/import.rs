@@ -170,9 +170,34 @@ fn map_one(acc: &Value) -> Option<ImportedAccount> {
         extra.insert("profile_arn".into(), json!(arn));
     }
 
+    // 2b. External IdP(Azure AD 租户)刷新材料。**只有** credentials.authMethod 明确等于
+    //     "external_idp" 才映射 auth_method——其余值(KiroManager 的 "IdC"/"Enterprise" 等)
+    //     继续沿用第 3 步的"不映射"策略,避免误触发 TokenType: EXTERNAL_IDP 头。
+    //     Kiro-Go 自身的 external_idp 导出恰好会带 authMethod="external_idp"(其
+    //     proxy/handler.go apiExportAccounts 对该值不做大小写重写,原值透传)。
+    if str_at(creds, "authMethod").is_some_and(|v| v.trim().eq_ignore_ascii_case("external_idp")) {
+        extra.insert("auth_method".into(), json!("external_idp"));
+        // token_endpoint/scope:优先显式字段,否则从 userId + clientId 派生(逻辑与
+        // 白名单校验在 resolve_external_idp_refresh_material 里统一实现,map_flat
+        // 共用同一份,避免两条导入路径各写一份容易长歪的重复代码)。
+        let (token_endpoint, scope) = resolve_external_idp_refresh_material(
+            str_at(creds, "tokenEndpoint"),
+            str_at(creds, "scopes").or_else(|| str_at(creds, "scope")),
+            acc.get("userId").and_then(|v| v.as_str()),
+            str_at(creds, "clientId"),
+        );
+        if let Some(te) = token_endpoint {
+            extra.insert("token_endpoint".into(), json!(te));
+        }
+        if let Some(sc) = scope {
+            extra.insert("scope".into(), json!(sc));
+        }
+    }
+
     // 3. 身份来源 kiro_provider:供 profileArn 兜底 + internal 头判定。
     //    取 credentials.provider,回退顶层 idp。**不**映射 authMethod(IdC 分流看
-    //    client_id+secret;authMethod=external_idp 会误触发 TokenType 头)。
+    //    client_id+secret;authMethod=external_idp 会误触发 TokenType 头)——除
+    //    external_idp 本身外(第 2b 步已单独处理,那是本次要修的能力,不是要避免的误判)。
     let idp = str_at(creds, "provider")
         .or_else(|| acc.get("idp").and_then(|v| v.as_str()))
         .map(normalize_kiro_provider);
@@ -240,6 +265,9 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
             extra.insert(key.into(), json!(v));
         }
     }
+    // token_endpoint/scope 不在上面的通用循环里处理——它们需要 external_idp 专属的
+    // 白名单校验 + user_id 派生兜底,统一走 resolve_external_idp_refresh_material
+    // (下方,在 user_id 写入 extra 之后调用),与嵌套路径共用同一份逻辑。
 
     // machineId(若带:校验/归一,非法不写——与嵌套路径同规则)。
     if let Some(mid) = acc
@@ -304,6 +332,29 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
     {
         extra.insert("user_id".into(), json!(uid));
     }
+
+    // external_idp 账号:token_endpoint/scope 优先显式字段(camelCase/snake_case 均认,
+    // 复数拼写 "scopes" 也认),否则从 user_id + client_id 派生并过白名单——与嵌套
+    // KiroManager 路径(map_one 的 2b 步)共用同一份 resolve_external_idp_refresh_material。
+    if extra
+        .get("auth_method")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.eq_ignore_ascii_case("external_idp"))
+    {
+        let (token_endpoint, scope) = resolve_external_idp_refresh_material(
+            flat_str(acc, "token_endpoint"),
+            flat_str(acc, "scope").or_else(|| top_str(acc, "scopes")),
+            extra.get("user_id").and_then(|v| v.as_str()),
+            extra.get("client_id").and_then(|v| v.as_str()),
+        );
+        if let Some(te) = token_endpoint {
+            extra.insert("token_endpoint".into(), json!(te));
+        }
+        if let Some(sc) = scope {
+            extra.insert("scope".into(), json!(sc));
+        }
+    }
+
     if let Some(nick) = flat_str(acc, "nickname").filter(|s| !s.is_empty()) {
         extra.insert("nickname".into(), json!(nick));
     }
@@ -418,6 +469,62 @@ fn num_at(obj: Option<&Value>, field: &str) -> Option<i64> {
             .or_else(|| v.as_f64().map(|f| f as i64))
             .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
     })
+}
+
+/// 从 `userId`(external_idp 账号形如
+/// `https://login.microsoftonline.com/{tenant}/v2.0.{oid}`,或裸的 issuer URL
+/// `https://login.microsoftonline.com/{tenant}/v2.0`)派生 Azure AD token endpoint。
+/// 对齐 Kiro-Go `auth/kiro_sso.go` 的 `DeriveExternalIdpEndpoints`:取 URL path 第一段
+/// 当租户 ID,拼 `{scheme}://{host}/{tenant}/oauth2/v2.0/token`。解析失败(非 URL / 无
+/// path 段)返回 `None`——调用方据此跳过,账号仍会正常导入,只是刷新会因缺
+/// token_endpoint 报错,需运维事后在 admin 手动补(优于让整条导入失败)。
+fn derive_external_idp_token_endpoint(user_id: &str) -> Option<String> {
+    // 用真正的 URL 解析(而非手写 split)取 path 的第一段当租户 ID——手写
+    // `split_once`/`splitn` 版本不会剥离 `?query`/`#fragment`,一份带 query 的 userId
+    // 会把垃圾拼进 tenant 段、产出语法错误的 token_endpoint(审查发现的真实 bug)。
+    let parsed = url::Url::parse(user_id.trim()).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?;
+    let tenant = parsed.path_segments()?.next().filter(|s| !s.is_empty())?;
+    Some(format!("{scheme}://{host}/{tenant}/oauth2/v2.0/token"))
+}
+
+/// external_idp 账号未显式带 scope 时的默认作用域。对齐 Kiro-Go
+/// `DeriveExternalIdpEndpoints`:两个 codewhisperer scope 加 `offline_access`
+/// (`offline_access` 是拿到 refresh_token 的必要 scope,少了它 Azure AD 授权码
+/// 交换不会下发 refresh_token)。
+fn default_external_idp_scope(client_id: &str) -> String {
+    format!(
+        "api://{client_id}/codewhisperer:conversations api://{client_id}/codewhisperer:completions offline_access"
+    )
+}
+
+/// external_idp(Azure AD 租户)刷新材料的统一解析:token_endpoint/scope 优先取显式
+/// 字段,否则从 user_id + client_id 派生。嵌套(map_one)和扁平(map_flat)两条导入
+/// 路径共用同一份逻辑,避免各写一份容易长歪的重复代码(审查发现的重复)。
+///
+/// token_endpoint(不论显式还是派生)都要过 [`crate::token::validate_external_idp_endpoint`]
+/// 白名单——校验不过就丢弃、返回 `None`(账号仍正常导入,只是缺 token_endpoint,留给
+/// 运维在 admin 补;不能让一份被篡改/半可信的导出文件把服务器的 refresh_token POST
+/// 到攻击者主机——审查发现的高危缺口)。
+fn resolve_external_idp_refresh_material(
+    explicit_token_endpoint: Option<&str>,
+    explicit_scope: Option<&str>,
+    user_id: Option<&str>,
+    client_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let token_endpoint = explicit_token_endpoint
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| user_id.and_then(derive_external_idp_token_endpoint))
+        .filter(|te| crate::token::validate_external_idp_endpoint(te).is_ok());
+
+    let scope = explicit_scope
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| client_id.filter(|s| !s.is_empty()).map(default_external_idp_scope));
+
+    (token_endpoint, scope)
 }
 
 #[cfg(test)]
@@ -602,6 +709,185 @@ mod tests {
         // expiresAt(ms)→ RFC3339。
         let exp = a.extra["expires_at"].as_str().unwrap();
         assert!(exp.ends_with('Z') && exp.contains('T'), "expires_at 应为 RFC3339: {exp}");
+    }
+
+    /// Kiro-Go 真实导出的 external_idp(Azure AD)账号:authMethod="external_idp",
+    /// 带 userId(Azure 租户 URL)+ clientId,但**不带** tokenEndpoint/scopes(Kiro-Go
+    /// 自己的原生导出接口目前就是这样——这是本次要修的真实回归场景,数据取自一次
+    /// 真实导出核对过的样例)。
+    #[test]
+    fn nested_external_idp_derives_token_endpoint_and_scope_from_user_id() {
+        let v = json!({"accounts": [{
+            "email": "gijs.norrman@mrdev.cyou",
+            "userId": "https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/v2.0.ef09475c-03d4-4ace-bcea-884e4014bd1f",
+            "machineId": "7b82daf3-c8e8-4496-bc90-dea95d3e72cd",
+            "credentials": {
+                "accessToken": "at",
+                "refreshToken": "rt",
+                "clientId": "e491fadf-0239-44f9-be3b-d3e1ff193c79",
+                "authMethod": "external_idp",
+                "provider": "AzureAD",
+                "region": "us-east-1",
+                "profileArn": "arn:aws:codewhisperer:us-east-1:904962390873:profile/CQRAXYDP9YVD"
+            },
+            "subscription": {"type": "Pro", "title": "KIRO PRO MAX"}
+        }]});
+        let out = parse_accounts_export(&v).unwrap();
+        let a = &out[0];
+        assert_eq!(a.extra["auth_method"], json!("external_idp"));
+        assert_eq!(
+            a.extra["token_endpoint"],
+            json!("https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            a.extra["scope"],
+            json!("api://e491fadf-0239-44f9-be3b-d3e1ff193c79/codewhisperer:conversations api://e491fadf-0239-44f9-be3b-d3e1ff193c79/codewhisperer:completions offline_access")
+        );
+        // profile_arn/client_id/region 等既有映射不受影响。
+        assert_eq!(a.extra["client_id"], json!("e491fadf-0239-44f9-be3b-d3e1ff193c79"));
+        assert!(a.extra.contains_key("profile_arn"));
+    }
+
+    /// 显式 tokenEndpoint/scopes 优先于派生值——万一导出方以后补上了这两个字段。
+    #[test]
+    fn nested_external_idp_prefers_explicit_token_endpoint_over_derived() {
+        let v = json!({"accounts": [{
+            "userId": "https://login.microsoftonline.com/tenant-a/v2.0.oid",
+            "credentials": {
+                "refreshToken": "rt",
+                "clientId": "cid",
+                "authMethod": "external_idp",
+                "tokenEndpoint": "https://login.microsoftonline.com/tenant-b/oauth2/v2.0/token",
+                "scopes": "custom-scope"
+            }
+        }]});
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(
+            out[0].extra["token_endpoint"],
+            json!("https://login.microsoftonline.com/tenant-b/oauth2/v2.0/token")
+        );
+        assert_eq!(out[0].extra["scope"], json!("custom-scope"));
+    }
+
+    /// 攻击场景本尊:一份被篡改/伪造的导出文件把 tokenEndpoint 指向攻击者主机。
+    /// 必须整个丢弃这个字段(账号仍导入,只是缺 token_endpoint),绝不能把它原样写进
+    /// extra——写进去就等于把这个账号未来每次刷新的 refresh_token POST 给攻击者。
+    #[test]
+    fn nested_external_idp_rejects_non_allowlisted_explicit_token_endpoint() {
+        let v = json!({"accounts": [{
+            "credentials": {
+                "refreshToken": "rt",
+                "clientId": "cid",
+                "authMethod": "external_idp",
+                "tokenEndpoint": "https://attacker.example/collect"
+            }
+        }]});
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(out.len(), 1, "账号本身仍应导入成功");
+        assert!(!out[0].extra.contains_key("token_endpoint"), "恶意 endpoint 不得写入 extra");
+        // refresh_token 等其他合法字段不受牵连。
+        assert_eq!(out[0].extra["refresh_token"], json!("rt"));
+    }
+
+    /// 同一场景的派生兜底路径:userId 本身不可信,若被derive成非白名单主机同样要拒绝
+    /// (即使 derive_external_idp_token_endpoint 自己拼出的 host 恰好合法,这里额外验证
+    /// 白名单在"派生"分支也生效,不是只挡"显式"分支)。
+    #[test]
+    fn nested_external_idp_derivation_also_goes_through_allowlist() {
+        let v = json!({"accounts": [{
+            "userId": "https://attacker.example/tenant/v2.0.oid",
+            "credentials": {"refreshToken": "rt", "clientId": "cid", "authMethod": "external_idp"}
+        }]});
+        let out = parse_accounts_export(&v).unwrap();
+        assert!(!out[0].extra.contains_key("token_endpoint"));
+    }
+
+    /// 回归测试:userId 带 query string 时,旧的手写 split 实现会把 "?foo=bar" 原样拼进
+    /// tenant 段、产出语法错误的 token_endpoint;改用 url::Url 解析后必须干净剥离。
+    #[test]
+    fn nested_external_idp_userid_with_query_string_does_not_produce_malformed_endpoint() {
+        let v = json!({"accounts": [{
+            "userId": "https://login.microsoftonline.com/tenant-q/v2.0?foo=bar",
+            "credentials": {"refreshToken": "rt", "clientId": "cid", "authMethod": "external_idp"}
+        }]});
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(
+            out[0].extra["token_endpoint"],
+            json!("https://login.microsoftonline.com/tenant-q/oauth2/v2.0/token"),
+            "不应含 ?query 残留"
+        );
+    }
+
+    /// authMethod 不是 external_idp(如 KiroManager 的 "IdC")时,派生逻辑绝不触发——
+    /// 与既有的"不映射 authMethod"策略保持一致,不能因为这次改动误伤其他账号类型。
+    #[test]
+    fn nested_non_external_idp_auth_method_still_not_mapped() {
+        let v = json!({"accounts": [{
+            "userId": "https://login.microsoftonline.com/tenant/v2.0.oid",
+            "credentials": {"refreshToken": "rt", "clientId": "c", "clientSecret": "s", "authMethod": "IdC"}
+        }]});
+        let out = parse_accounts_export(&v).unwrap();
+        assert!(!out[0].extra.contains_key("auth_method"));
+        assert!(!out[0].extra.contains_key("token_endpoint"));
+        assert!(!out[0].extra.contains_key("scope"));
+    }
+
+    /// 扁平格式:显式 tokenEndpoint(camelCase)直接读入,无需派生。
+    #[test]
+    fn flat_external_idp_reads_explicit_token_endpoint_and_scopes() {
+        let v = json!([{
+            "refresh_token": "rt",
+            "auth_method": "external_idp",
+            "clientId": "cid",
+            "tokenEndpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "scopes": "api://cid/codewhisperer:conversations offline_access"
+        }]);
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(
+            out[0].extra["token_endpoint"],
+            json!("https://login.microsoftonline.com/tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(out[0].extra["scope"], json!("api://cid/codewhisperer:conversations offline_access"));
+    }
+
+    /// 扁平格式:无显式 tokenEndpoint,但有 userId → 派生兜底同样生效。
+    #[test]
+    fn flat_external_idp_derives_token_endpoint_from_user_id() {
+        let v = json!([{
+            "refresh_token": "rt",
+            "auth_method": "external_idp",
+            "client_id": "cid",
+            "userId": "https://login.microsoftonline.com/tenant-x/v2.0.oid"
+        }]);
+        let out = parse_accounts_export(&v).unwrap();
+        assert_eq!(
+            out[0].extra["token_endpoint"],
+            json!("https://login.microsoftonline.com/tenant-x/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            out[0].extra["scope"],
+            json!("api://cid/codewhisperer:conversations api://cid/codewhisperer:completions offline_access")
+        );
+    }
+
+    #[test]
+    fn derive_external_idp_token_endpoint_cases() {
+        assert_eq!(
+            derive_external_idp_token_endpoint(
+                "https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/v2.0.ef09475c-03d4-4ace-bcea-884e4014bd1f"
+            ),
+            Some("https://login.microsoftonline.com/1f44574f-f8aa-40cf-8e43-e6bff9b4298a/oauth2/v2.0/token".to_string())
+        );
+        // 裸 issuer(无 .oid 后缀)也能拿到租户段。
+        assert_eq!(
+            derive_external_idp_token_endpoint("https://login.microsoftonline.com/tenant-only/v2.0"),
+            Some("https://login.microsoftonline.com/tenant-only/oauth2/v2.0/token".to_string())
+        );
+        // 非 URL / 空 / 无 path 段 → None,不 panic。
+        assert_eq!(derive_external_idp_token_endpoint(""), None);
+        assert_eq!(derive_external_idp_token_endpoint("not a url"), None);
+        assert_eq!(derive_external_idp_token_endpoint("https://login.microsoftonline.com"), None);
+        assert_eq!(derive_external_idp_token_endpoint("https://login.microsoftonline.com/"), None);
     }
 
     #[test]
