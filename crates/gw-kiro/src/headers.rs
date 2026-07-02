@@ -140,6 +140,30 @@ pub(crate) fn is_external_idp(account: &Account) -> bool {
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("external_idp"))
 }
 
+/// external_idp(Azure AD 企业 SSO)账号:给请求补 `TokenType: EXTERNAL_IDP` 头,否则
+/// 保持原样。**所有** Kiro API 调用(不止 chat)对 external_idp 号都必须带此头——
+/// CodeWhisperer 靠它识别令牌类型并按外部 IdP 校验 Azure JWT,缺了它会静默返回空
+/// profile 列表并拒绝数据面调用(getUsageLimits/ListAvailableProfiles 得到 403)。
+/// 对齐 Kiro-Go `applyKiroBaseHeaders`(其对每次 Kiro 请求统一注入)。streaming 头
+/// 因需保持 static_flow 的严格字段顺序仍内联注入(见 `apply_streaming_headers`);
+/// 顺序不敏感的辅助只读调用(配额/profile 发现)复用此助手,避免判定散落多处。
+///
+/// 位置:调用方在基础头(含 authorization)之后追加本头——与 Kiro-Go
+/// `applyKiroBaseHeaders` 一致(那里 TokenType 也排在 Authorization/UA/optout 之后、
+/// 位于末尾),故非"随手放末尾"的臆测,而是与参考实现的相对顺序对齐。这两条是 AWS
+/// runtime REST 调用(getUsageLimits/ListAvailableProfiles),服务端按 header map 解析,
+/// 不做 data-plane 那种逐字节指纹校验,顺序不影响识别。
+pub(crate) fn apply_external_idp_token_type(
+    rb: reqwest::RequestBuilder,
+    account: &Account,
+) -> reqwest::RequestBuilder {
+    if is_external_idp(account) {
+        rb.header("TokenType", "EXTERNAL_IDP")
+    } else {
+        rb
+    }
+}
+
 /// Kiro 身份 provider(github/google/builderid/internal...)。注意:**不能**用
 /// `Account.provider`(那是适配器家族 "kiro")或 extra["provider"](与顶层字段撞名,
 /// JSON 里 `provider` 会被 serde flatten 吃到顶层而非 extra)——故用专用键 `kiro_provider`
@@ -366,5 +390,31 @@ mod tests {
         let h = req.headers();
         assert_eq!(h.get("TokenType").unwrap(), "EXTERNAL_IDP");
         assert_eq!(h.get("redirect-for-internal").unwrap(), "true");
+    }
+
+    #[test]
+    fn apply_external_idp_token_type_adds_header_only_for_external_idp() {
+        // external_idp 账号:补 TokenType 头(getUsageLimits/ListAvailableProfiles 都靠它)。
+        // 大小写/写法不敏感(is_external_idp 用 eq_ignore_ascii_case):导入文件里可能是
+        // "External_IDP"/"EXTERNAL_IDP" 等变体,都要命中,否则 Azure 号照样吃 403。
+        for am in [
+            json!({"auth_method": "external_idp"}),
+            json!({"auth_method": "External_IDP"}),
+            json!({"auth_method": "EXTERNAL_IDP"}),
+            json!({"auth_method": "  external_idp  "}),
+        ] {
+            let acc = account_with(am.clone());
+            let rb = reqwest::Client::new().get("https://q.us-east-1.amazonaws.com/x");
+            let req = apply_external_idp_token_type(rb, &acc).build().unwrap();
+            assert_eq!(req.headers().get("TokenType").unwrap(), "EXTERNAL_IDP", "{am} 应命中");
+        }
+
+        // 非 external_idp(social/idc/builderid):绝不加,免得误标令牌类型。
+        for am in [json!({}), json!({"auth_method": "idc"}), json!({"auth_method": "social"})] {
+            let acc = account_with(am);
+            let rb = reqwest::Client::new().get("https://q.us-east-1.amazonaws.com/x");
+            let req = apply_external_idp_token_type(rb, &acc).build().unwrap();
+            assert!(req.headers().get("TokenType").is_none());
+        }
     }
 }

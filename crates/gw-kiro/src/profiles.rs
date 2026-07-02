@@ -64,7 +64,7 @@ pub async fn discover_profile_arn(
     // 全部失败才向上报错(让调用方据 kind 决定惩罚与否)。
     let mut last_err: Option<UpstreamError> = None;
     for region in candidate_regions(account) {
-        match fetch_first_profile(client, &region, access_token, &x_amz_ua, &ua).await {
+        match fetch_first_profile(client, account, &region, access_token, &x_amz_ua, &ua).await {
             Ok(Some(arn)) => return Ok(Some(arn)),
             Ok(None) => {}
             Err(e) => last_err = Some(e),
@@ -94,6 +94,7 @@ fn candidate_regions(account: &Account) -> Vec<String> {
 /// 查单个区域的 ListAvailableProfiles,翻页取第一个非空 arn。
 async fn fetch_first_profile(
     client: &reqwest::Client,
+    account: &Account,
     region: &str,
     access_token: &str,
     x_amz_ua: &str,
@@ -104,7 +105,7 @@ async fn fetch_first_profile(
     let mut next_token: Option<String> = None;
 
     loop {
-        let resp = client
+        let rb = client
             .post(&url)
             .header("x-amz-user-agent", x_amz_ua)
             .header("user-agent", ua)
@@ -114,7 +115,11 @@ async fn fetch_first_profile(
             .header("content-type", "application/json")
             .header("accept", "application/json")
             .header("authorization", format!("Bearer {access_token}"))
-            .header("connection", "close")
+            .header("connection", "close");
+        // external_idp(Azure AD)号必须带 TokenType 头,否则 ListAvailableProfiles
+        // 静默返回空 profile 列表 / 403,profileArn 发现永远失败。
+        let rb = headers::apply_external_idp_token_type(rb, account);
+        let resp = rb
             .json(&ListAvailableProfilesRequest {
                 next_token: next_token.clone(),
             })

@@ -52,7 +52,7 @@ pub async fn get_account_quota(
         }
     }
 
-    let resp = client
+    let rb = client
         .get(url)
         .header("x-amz-user-agent", x_amz_ua)
         .header("user-agent", ua)
@@ -60,7 +60,10 @@ pub async fn get_account_quota(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("authorization", format!("Bearer {access_token}"))
-        .header("connection", "close")
+        .header("connection", "close");
+    // external_idp(Azure AD)号必须带 TokenType 头,否则 getUsageLimits 吃 403。
+    let rb = headers::apply_external_idp_token_type(rb, account);
+    let resp = rb
         .send()
         .await
         .map_err(|e| UpstreamError::network(format!("配额查询请求失败: {e}")))?;
