@@ -16,6 +16,41 @@
 
 use serde_json::{json, Map, Value};
 
+/// 纯目录区(非 Kiro 数据面区)回落用的默认服务区。已知数据面区清单见
+/// [`crate::profiles::STANDARD_PROFILE_REGIONS`](us-east-1 / eu-central-1)。
+const SERVICE_REGION: &str = "us-east-1";
+
+/// 拆分「目录区」与「服务区」并写入 extra。
+///
+/// KiroManager 导出的 `region` 可能是 IdC **SSO 目录区**(如 us-east-2,仅供 OIDC 刷新,Kiro
+/// 数据面在该区 NXDOMAIN),也可能本就是一个真实 Kiro 服务区(us-east-1 / eu-central-1)。规则:
+/// - `auth_region` 恒记导出 region:OIDC 刷新读 `auth_region ?? region`(token.rs),拿到真目录区
+///   → `oidc.<dir>.amazonaws.com` 正确(us-east-2 的 oidc 存在)。
+/// - `region`(数据面 q./runtime/ListAvailableProfiles):导出 region **本身是已知 Kiro 服务区**则
+///   沿用(如 eu-central-1,别误改成 us-east-1 打错区);否则(纯目录区,如 us-east-2)回落
+///   us-east-1——否则拼出的 `q.<dir>.amazonaws.com` / `runtime.<dir>.kiro.dev` 会 NXDOMAIN
+///   (quota/chat 网络层失败)。
+///
+/// 对齐 xkiro.rs 的 auth_region/api_region 拆分。external_idp(Azure)刷新走 token_endpoint 不读
+/// region(token.rs::refresh_external_idp),故对其 auth_region 是惰性元数据,region 仍按上述规则取
+/// 正确服务区,无害。
+fn insert_region_split(extra: &mut Map<String, Value>, exported_region: Option<&str>) {
+    let dir = exported_region.map(str::trim).filter(|s| !s.is_empty());
+    // 数据面区:导出值是已知服务区则保留(如 eu-central-1),否则(纯目录区)回落 us-east-1。
+    let service = dir
+        .filter(|r| {
+            crate::profiles::STANDARD_PROFILE_REGIONS
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(r))
+        })
+        .unwrap_or(SERVICE_REGION);
+    extra.insert("region".into(), json!(service));
+    // 目录区(供 OIDC 刷新):原样保留导出值。
+    if let Some(r) = dir {
+        extra.insert("auth_region".into(), json!(r));
+    }
+}
+
 /// 一个映射好的待导入账号(account_id + 完整 extra)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedAccount {
@@ -39,18 +74,37 @@ impl ImportedAccount {
 /// 仅在严格解析**失败**时才走归一兜底:合法 JSON 永不受影响;凭据值均为 ASCII,
 /// 归一对数据无损。这样用户直接粘贴上号工具的原文(哪怕带 nbsp 缩进)也能导入。
 pub fn parse_import_json(raw: &str) -> Result<Value, String> {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(v) => Ok(v),
-        Err(strict_err) => {
-            let normalized = normalize_json_whitespace(raw);
-            // 没有任何非标准空白可归一 → 归一不会改变输入,直接回报原始严格错误。
-            if normalized == raw {
-                return Err(format!("JSON 解析失败: {strict_err}"));
-            }
-            serde_json::from_str::<Value>(&normalized)
-                .map_err(|e| format!("JSON 解析失败: {e}"))
+    // 1) 严格解析:整段必须恰好是一个 JSON 值。
+    let strict_err = match serde_json::from_str::<Value>(raw) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    // 2) 归一非标准 Unicode 空白(nbsp 等)后再严格解析。
+    let normalized = normalize_json_whitespace(raw);
+    if normalized != raw {
+        if let Ok(v) = serde_json::from_str::<Value>(&normalized) {
+            return Ok(v);
         }
     }
+    // 3) 宽松兜底:只取文本里的**第一个完整 JSON 值**,忽略其后的尾随字符。
+    //    覆盖高频误操作:从多账号文件里单独复制一个账号,尾巴带上了数组/外层的收尾括号
+    //    (如 `{...}\n]\n}`)——严格解析报 "trailing characters",但前面那个账号对象本身
+    //    完好可用。用流式 Deserializer 取首值、不校验输入是否恰好在此结束。
+    //    这是原严格行为的**超集**:所有原本合法的整段 JSON 仍在步骤 1/2 命中,行为不变。
+    if let Some(v) = parse_leading_json_value(&normalized) {
+        return Ok(v);
+    }
+    // 4) 仍解析不出任何完整首值(如 `{"refreshToken": }` / 纯文本):回报原始严格错误。
+    Err(format!("JSON 解析失败: {strict_err}"))
+}
+
+/// 解析文本中的**第一个完整 JSON 值**,忽略其后的任意尾随字符;解析不出首值返回 None。
+/// 用于容忍「从多账号文件里复制单个账号」时带上的尾随 `]` / `}` 等碎片。
+fn parse_leading_json_value(s: &str) -> Option<Value> {
+    serde_json::Deserializer::from_str(s)
+        .into_iter::<Value>()
+        .next()
+        .and_then(|r| r.ok())
 }
 
 /// 把非标准 Unicode 空白归一为 ASCII 空格(nbsp / 窄 nbsp / figure space / 各类
@@ -163,9 +217,8 @@ fn map_one(acc: &Value) -> Option<ImportedAccount> {
     if let Some(cs) = str_at(creds, "clientSecret").filter(|s| !s.is_empty()) {
         extra.insert("client_secret".into(), json!(cs));
     }
-    if let Some(region) = str_at(creds, "region").filter(|s| !s.is_empty()) {
-        extra.insert("region".into(), json!(region));
-    }
+    // 目录区 → auth_region(OIDC 刷新);服务区 region 恒 us-east-1。见 insert_region_split。
+    insert_region_split(&mut extra, str_at(creds, "region"));
     if let Some(arn) = str_at(creds, "profileArn").filter(|s| !s.is_empty()) {
         extra.insert("profile_arn".into(), json!(arn));
     }
@@ -217,12 +270,7 @@ fn map_one(acc: &Value) -> Option<ImportedAccount> {
     if let Some(nick) = acc.get("nickname").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
         extra.insert("nickname".into(), json!(nick));
     }
-    if let Some(title) = acc
-        .get("subscription")
-        .and_then(|s| s.get("title").or_else(|| s.get("type")))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(title) = subscription_title_of(acc) {
         extra.insert("subscription_title".into(), json!(title));
     }
 
@@ -257,7 +305,6 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
         "access_token",
         "client_id",
         "client_secret",
-        "region",
         "profile_arn",
         "auth_method",
     ] {
@@ -265,6 +312,8 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
             extra.insert(key.into(), json!(v));
         }
     }
+    // 目录区 → auth_region(OIDC 刷新);服务区 region 恒 us-east-1。见 insert_region_split。
+    insert_region_split(&mut extra, flat_str(acc, "region"));
     // token_endpoint/scope 不在上面的通用循环里处理——它们需要 external_idp 专属的
     // 白名单校验 + user_id 派生兜底,统一走 resolve_external_idp_refresh_material
     // (下方,在 user_id 写入 extra 之后调用),与嵌套路径共用同一份逻辑。
@@ -358,14 +407,7 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
     if let Some(nick) = flat_str(acc, "nickname").filter(|s| !s.is_empty()) {
         extra.insert("nickname".into(), json!(nick));
     }
-    if let Some(title) = flat_str(acc, "subscription_title")
-        .or_else(|| {
-            acc.get("subscription")
-                .and_then(|s| s.get("title").or_else(|| s.get("type")))
-                .and_then(|v| v.as_str())
-        })
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(title) = subscription_title_of(acc) {
         extra.insert("subscription_title".into(), json!(title));
     }
 
@@ -381,6 +423,37 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
 }
 
 /// 取顶层字符串字段(扁平格式用)。
+/// 提取订阅档名(供 profileArn 自愈的**付费闸门** + 模型过滤 + 展示)。兼容多种导出结构:
+/// ① 扁平 `subscription_title`(snake/camel);② `subscription.{title,type}`;
+/// ③ `usageData.subscriptionInfo.subscriptionTitle`(**KiroManager 桌面版真实结构**)。
+/// 缺失 → None。
+///
+/// 之所以必须认 ③:KiroManager 桌面版把订阅档嵌在 `usageData.subscriptionInfo` 里,只认
+/// ①② 会让付费 builderid 号导入后 `subscription_title` 为空 → 付费闸门当它是免费号、跳过
+/// profileArn 强制发现 → 用错免费共享 ARN → getUsageLimits/chat 403 → 被误禁。构成死锁
+/// (发现需订阅档 / 订阅档靠成功配额回填 / 配额需正确 profileArn),导入时就填上即可断链。
+///
+/// ③ **只信 `subscriptionTitle`,不兜底 `type`**:该字段同时喂两个用 `!contains("FREE")`
+/// 的脆弱闸门(付费发现 + opus 能力过滤),而人读标题("KIRO POWER"/"KIRO FREE")可靠含
+/// FREE 字样、机器枚举 `type`(如 `Q_DEVELOPER_STANDALONE_POWER`)的免费档字面未证实含
+/// FREE——用 type 兜底有把免费号误判成付费的风险(放行 opus→403 误禁 + 污染免费 ARN)。
+/// 且与 runtime `usage_limits.rs::SubscriptionInfo`(只认 subscriptionTitle)口径一致。
+fn subscription_title_of(acc: &Value) -> Option<&str> {
+    flat_str(acc, "subscription_title")
+        .or_else(|| {
+            acc.get("subscription")
+                .and_then(|s| s.get("title").or_else(|| s.get("type")))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            acc.get("usageData")
+                .and_then(|u| u.get("subscriptionInfo"))
+                .and_then(|si| si.get("subscriptionTitle"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.is_empty())
+}
+
 fn top_str<'a>(acc: &'a Value, field: &str) -> Option<&'a str> {
     acc.get(field).and_then(|v| v.as_str())
 }
@@ -711,6 +784,121 @@ mod tests {
         assert!(exp.ends_with('Z') && exp.contains('T'), "expires_at 应为 RFC3339: {exp}");
     }
 
+    /// KiroManager 桌面版导出:扁平账号对象(无 credentials 子对象、无顶层 subscription),
+    /// 订阅档嵌在 `usageData.subscriptionInfo.subscriptionTitle`。回归:此前只认扁平
+    /// `subscription_title` 与 `subscription.{title,type}`,漏掉此路径 → 付费 builderid 号
+    /// 导入后 subscription_title 为空 → profileArn 自愈的付费闸门死锁(getUsageLimits/chat
+    /// 403 → 误禁健康付费号)。见 [`subscription_title_of`] 与 caio-idc-dead-account 记忆。
+    #[test]
+    fn kiromanager_desktop_subscription_from_usage_data() {
+        let export = json!([{
+            "email": "awspofig3816@gmail.com",
+            "refreshToken": "rt_xxx",
+            "accessToken": "at_xxx",
+            "clientId": "cid",
+            "clientSecret": "cs",
+            "region": "us-east-1",
+            "provider": "BuilderId",
+            "authMethod": "IdC",
+            "profileArn": null,
+            "usageData": {
+                "subscriptionInfo": {
+                    "subscriptionTitle": "KIRO POWER",
+                    "type": "Q_DEVELOPER_STANDALONE_POWER"
+                }
+            }
+        }]);
+        let out = parse_accounts_export(&export).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].extra["subscription_title"],
+            json!("KIRO POWER"),
+            "必须从 usageData.subscriptionInfo.subscriptionTitle 提取,否则付费闸门死锁"
+        );
+        // 付费 builderid 号:kiro_provider=builderid、无 profile_arn(留给运行时自愈发现)。
+        assert_eq!(out[0].extra["kiro_provider"], json!("builderid"));
+        assert!(!out[0].extra.contains_key("profile_arn"), "profileArn=null 不应写入");
+    }
+
+    /// us-east-2 IdC 企业号(KiroManager 桌面扁平导出):目录区 us-east-2 必须落 `auth_region`
+    /// (OIDC 刷新走 oidc.us-east-2.amazonaws.com),而服务区 `region` 恒置 us-east-1——否则
+    /// getUsageLimits 拼 `q.us-east-2.amazonaws.com`、chat 拼 `runtime.us-east-2.kiro.dev`
+    /// (均 NXDOMAIN)→ 网络层失败(实测导入 3816 同批号 quota 502)。见 insert_region_split
+    /// 与 caio-idc-dead-account 记忆「第四刀:region 拆分」。
+    #[test]
+    fn flat_idc_us_east_2_splits_directory_region_to_auth_region() {
+        let export = json!([{
+            "email": "HYL08@d-9a675b2b69.local",
+            "refreshToken": "aor_us_east_2_refresh",
+            "accessToken": "aoa_at",
+            "clientId": "cT4xLY5D9a48sjFLMnSRY3VzLWVhc3QtMg",
+            "clientSecret": "eyJraW_secret",
+            "region": "us-east-2",
+            "provider": "Enterprise",
+            "authMethod": "IdC",
+            "profileArn": null,
+            "usageData": { "subscriptionInfo": { "subscriptionTitle": "KIRO POWER" } }
+        }]);
+        let out = parse_accounts_export(&export).unwrap();
+        assert_eq!(out.len(), 1);
+        let a = &out[0];
+        // 服务区恒 us-east-1(数据面 q./runtime/ListAvailableProfiles 只在此区)。
+        assert_eq!(a.extra["region"], json!("us-east-1"), "service region 必须 us-east-1");
+        // 目录区落 auth_region 供 OIDC 刷新(token.rs auth_region() 读 auth_region ?? region)。
+        assert_eq!(a.extra["auth_region"], json!("us-east-2"), "目录区必须进 auth_region");
+        // 企业 IdC:kiro_provider=enterprise、无固定 profileArn(留运行时发现)。
+        assert_eq!(a.extra["kiro_provider"], json!("enterprise"));
+        assert!(!a.extra.contains_key("profile_arn"), "profileArn=null 不应写入");
+        // 付费闸门靠它(走 usageData.subscriptionInfo.subscriptionTitle)。
+        assert_eq!(a.extra["subscription_title"], json!("KIRO POWER"));
+        // 扁平路径 auth_method 按原值搬运(map_flat 约定):KiroManager 桌面的 "IdC" 原样落库。
+        // 惰性无害——仅 auth_method=="external_idp" 才触发 TokenType: EXTERNAL_IDP 头,"IdC" 不会;
+        // IdC 刷新分流看 client_id+secret 而非 auth_method。
+        assert_eq!(a.extra["auth_method"], json!("IdC"));
+        assert_eq!(a.extra["client_id"], json!("cT4xLY5D9a48sjFLMnSRY3VzLWVhc3QtMg"));
+    }
+
+    /// 锁定 Finding 1:导出 region 本身是**已知 Kiro 服务区**(eu-central-1,数据面真实存在)时
+    /// **不得**被强改成 us-east-1——否则 EU 数据面号的 quota/chat 会被打到错误区。此时 region 沿用
+    /// eu-central-1,auth_region 也记 eu-central-1(刷新同区)。对照 us-east-2(纯目录区)才回落。
+    #[test]
+    fn flat_known_service_region_eu_central_1_is_preserved() {
+        let export = json!([{
+            "email": "eu-user@example.com",
+            "refreshToken": "rt_eu",
+            "clientId": "cid",
+            "clientSecret": "cs",
+            "region": "eu-central-1",
+            "provider": "Enterprise",
+            "authMethod": "IdC"
+        }]);
+        let out = parse_accounts_export(&export).unwrap();
+        assert_eq!(out.len(), 1);
+        let a = &out[0];
+        assert_eq!(a.extra["region"], json!("eu-central-1"), "已知服务区必须保留,勿改 us-east-1");
+        assert_eq!(a.extra["auth_region"], json!("eu-central-1"));
+    }
+
+    /// 锁定:`usageData.subscriptionInfo` 只带机器枚举 `type`(无人读 `subscriptionTitle`)时,
+    /// **不**提取为 subscription_title。理由:该字段喂两个 `!contains("FREE")` 脆弱闸门(付费
+    /// 发现 + opus 过滤),而免费档 `type` 字面是否含 FREE 未经证实——只信人读标题 subscriptionTitle
+    /// (可靠含 "KIRO FREE"),缺失即按免费保守处理,避免把免费号误判成付费。
+    #[test]
+    fn usage_data_type_only_is_not_taken_as_subscription() {
+        let export = json!([{
+            "email": "free-user@gmail.com",
+            "refreshToken": "rt",
+            "provider": "BuilderId",
+            "usageData": { "subscriptionInfo": { "type": "Q_DEVELOPER_STANDALONE_POWER" } }
+        }]);
+        let out = parse_accounts_export(&export).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out[0].extra.contains_key("subscription_title"),
+            "usageData 只信 subscriptionTitle,绝不从机器枚举 type 兜底提取"
+        );
+    }
+
     /// Kiro-Go 真实导出的 external_idp(Azure AD)账号:authMethod="external_idp",
     /// 带 userId(Azure 租户 URL)+ clientId,但**不带** tokenEndpoint/scopes(Kiro-Go
     /// 自己的原生导出接口目前就是这样——这是本次要修的真实回归场景,数据取自一次
@@ -1031,6 +1219,19 @@ mod tests {
     fn parse_import_json_rejects_truly_malformed() {
         assert!(parse_import_json(r#"{"refreshToken": }"#).is_err());
         assert!(parse_import_json("not json at all").is_err());
+    }
+
+    #[test]
+    fn parse_import_json_recovers_leading_object_with_trailing_brackets() {
+        // 从多账号文件里单独复制一个账号时,尾巴常带上数组/外层的收尾括号 `]` `}`,
+        // 严格 JSON 报 trailing characters(前端旧行为=「JSON 解析失败」)。兜底应取回
+        // 前面那个完好的账号对象,并顺利走通单账号导入路径。
+        let raw = "{\n  \"refreshToken\": \"rt\",\n  \"clientId\": \"c\"\n}\n  ]\n}";
+        let v = parse_import_json(raw).expect("尾随括号应被容忍");
+        assert_eq!(v.get("refreshToken").and_then(|x| x.as_str()), Some("rt"));
+        let accts = parse_accounts_export(&v).unwrap();
+        assert_eq!(accts.len(), 1);
+        assert_eq!(accts[0].extra["refresh_token"], json!("rt"));
     }
 
     #[test]

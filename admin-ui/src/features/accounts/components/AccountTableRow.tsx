@@ -9,7 +9,7 @@ import { GroupChip } from '@/features/groups/components/GroupChip'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
-import { deriveAccountStatus, formatCredits, isQuotaLow, type QuotaKind } from '../lib'
+import { deriveAccountStatus, formatCredits, isQuotaLow, priorityToTier, type QuotaKind } from '../lib'
 import type { AccountRow, AccountRuntimeEntry } from '../types'
 import { AccountStatusBadge } from './AccountStatusBadge'
 
@@ -160,6 +160,18 @@ export function AccountTableRow({
         )}
       </TD>
 
+      {/* 调度优先级:两档(高/低)。高层号被优先·积极调度。 */}
+      <TD className="text-right">
+        <span
+          className={cn(priorityToTier(row.priority) === 'high' && 'font-medium text-primary')}
+          title={t('table.priorityHint')}
+        >
+          {priorityToTier(row.priority) === 'high'
+            ? t('accounts.priorityTier.high')
+            : t('accounts.priorityTier.low')}
+        </span>
+      </TD>
+
       {/* 连续失败次数：> 0 才显示 */}
       <TD className="text-right">
         {runtimeState === 'loading' ? (
@@ -169,6 +181,18 @@ export function AccountTableRow({
         ) : (
           <span className="text-muted-foreground">—</span>
         )}
+      </TD>
+
+      {/* 累计成功/失败：来自账号行的 success_count / failure_count（后端新增，旧数据视为 0）。
+          与「连续失败」列不同：这里是生命周期累计值，连续失败列是当前冷却期连续失败计数。 */}
+      <TD className="text-right">
+        <span className="tabular-nums">
+          <span className="text-success">{row.success_count ?? 0}</span>
+          <span className="text-muted-foreground"> / </span>
+          <span className={cn((row.failure_count ?? 0) > 0 ? 'text-destructive' : 'text-muted-foreground')}>
+            {row.failure_count ?? 0}
+          </span>
+        </span>
       </TD>
 
       {/* 操作：启停 + 编辑 + 删除（二次确认） */}

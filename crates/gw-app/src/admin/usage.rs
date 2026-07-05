@@ -119,7 +119,10 @@ pub fn router() -> Router<AdminState> {
         .route("/usage/by-key", get(by_key))
 }
 
-async fn summary(State(st): State<AdminState>, Query(q): Query<RangeQuery>) -> axum::response::Response {
+async fn summary(
+    State(st): State<AdminState>,
+    Query(q): Query<RangeQuery>,
+) -> axum::response::Response {
     let filter = q.to_filter();
     let base = match st.store.usage_summary(&filter) {
         Ok(s) => s,
@@ -147,7 +150,10 @@ async fn summary(State(st): State<AdminState>, Query(q): Query<RangeQuery>) -> a
     .into_response()
 }
 
-async fn by_model(State(st): State<AdminState>, Query(q): Query<RangeQuery>) -> axum::response::Response {
+async fn by_model(
+    State(st): State<AdminState>,
+    Query(q): Query<RangeQuery>,
+) -> axum::response::Response {
     match st.store.usage_by_model(&q.to_filter()) {
         Ok(rows) => {
             let out: Vec<ModelResp> = rows
@@ -169,7 +175,10 @@ async fn by_model(State(st): State<AdminState>, Query(q): Query<RangeQuery>) -> 
     }
 }
 
-async fn by_key(State(st): State<AdminState>, Query(q): Query<RangeQuery>) -> axum::response::Response {
+async fn by_key(
+    State(st): State<AdminState>,
+    Query(q): Query<RangeQuery>,
+) -> axum::response::Response {
     match st.store.usage_by_key(&q.to_filter()) {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => internal_error(e),
@@ -180,7 +189,13 @@ async fn by_key(State(st): State<AdminState>, Query(q): Query<RangeQuery>) -> ax
 mod tests {
     use super::*;
 
-    fn row(model: &str, input: u64, cache_read: u64, real_cache_read: u64, output: u64) -> UsageByModel {
+    fn row(
+        model: &str,
+        input: u64,
+        cache_read: u64,
+        real_cache_read: u64,
+        output: u64,
+    ) -> UsageByModel {
         UsageByModel {
             model: model.into(),
             requests: 1,

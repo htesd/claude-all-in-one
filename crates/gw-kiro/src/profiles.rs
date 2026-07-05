@@ -24,8 +24,9 @@ use crate::headers;
 use crate::machine_id;
 use crate::usage_limits::runtime_user_agents;
 
-/// 标准商业区(对齐 static_flow `KIRO_STANDARD_PROFILE_REGIONS`)。
-const STANDARD_PROFILE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
+/// 标准商业区(对齐 static_flow `KIRO_STANDARD_PROFILE_REGIONS`)。也是已知的 Kiro **数据面**
+/// 区(q./runtime 真实存在);import 拆分目录区/服务区时复用它判断导出 region 是否为真实服务区。
+pub(crate) const STANDARD_PROFILE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
 
 /// 发现该账号的 profileArn(若需要)。返回:
 /// - `Ok(None)`:账号已有显式 profile_arn,或可用固定兜底(social/builderid)——无需发现;
@@ -37,7 +38,9 @@ pub async fn discover_profile_arn(
     client: &reqwest::Client,
     account: &Account,
 ) -> Result<Option<String>, UpstreamError> {
-    // 已有显式 profileArn 或固定兜底 → 不需要发现(省一次网络)。
+    // 已有显式 profileArn 或固定兜底 → 不需要发现(省一次网络;chat/正常配额热路径此处
+    // 不打 ListAvailableProfiles)。付费 builderid 号被固定兜底短路后拿不到自己的 profile,
+    // 由 gw-app 在配额 403 兜底里改走 [`force_discover_profile_arn`]。
     if account
         .extra_str("profile_arn")
         .is_some_and(|s| !s.trim().is_empty())
@@ -45,7 +48,34 @@ pub async fn discover_profile_arn(
     {
         return Ok(None);
     }
+    do_discover(client, account).await
+}
 
+/// 强制发现:**绕过固定兜底短路**,直接 ListAvailableProfiles 查真实 profileArn。
+///
+/// 场景:`provider=BuilderId` 的**付费**号(有自己的 profile)被免费层共享 ARN
+/// (`BUILDER_ID_PROFILE_ARN`)短路,套错 ARN → Kiro 对 getUsageLimits/chat 回 403
+/// "bearer token invalid"。gw-app 收到配额 403 后调本函数强制查真值并持久化;免费号
+/// 查不到(空/错)则维持固定兜底不变。仍尊重「已有显式 profile_arn 则跳过」(不覆盖真值)。
+pub async fn force_discover_profile_arn(
+    client: &reqwest::Client,
+    account: &Account,
+) -> Result<Option<String>, UpstreamError> {
+    if account
+        .extra_str("profile_arn")
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return Ok(None);
+    }
+    do_discover(client, account).await
+}
+
+/// 实际发现:ListAvailableProfiles 逐候选区查,第一个非空 arn 即用。**无短路判定**
+/// (短路在两个入口各自处理,故付费号强制发现与普通发现共用同一份网络逻辑)。
+async fn do_discover(
+    client: &reqwest::Client,
+    account: &Account,
+) -> Result<Option<String>, UpstreamError> {
     let access_token = account
         .extra_str("access_token")
         .filter(|s| !s.is_empty())
@@ -234,5 +264,41 @@ mod tests {
         assert_eq!(candidate_regions(&a2), vec!["ap-southeast-1", "us-east-1", "eu-central-1"]);
         let a3 = acct(&[]);
         assert_eq!(candidate_regions(&a3), vec!["us-east-1", "eu-central-1"]);
+    }
+
+    #[tokio::test]
+    async fn force_discover_bypasses_fixed_arn_shortcircuit() {
+        // builderid 有固定兜底 ARN。无 access_token 时:
+        //  - discover_profile_arn 被固定兜底短路 → Ok(None)(不发请求);
+        //  - force_discover_profile_arn 绕过短路 → 进入 do_discover → 因缺 access_token 报 Err。
+        // 二者行为分叉即证明 force 版不吃固定兜底短路(付费 builderid 才查得到自己的 profile)。
+        let a = acct(&[("kiro_provider", "builderid")]);
+        let client = reqwest::Client::new();
+        assert_eq!(
+            discover_profile_arn(&client, &a).await.unwrap(),
+            None,
+            "普通 discover 应被 builderid 固定兜底短路"
+        );
+        assert!(
+            force_discover_profile_arn(&client, &a).await.is_err(),
+            "force_discover 应绕过短路进入发现(此处因无 access_token 报 Err),而非 Ok(None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_discover_still_skips_when_explicit_profile_arn() {
+        // 已有显式 profile_arn:force 版也应跳过,绝不覆盖已发现/导入的真值。
+        let a = acct(&[
+            ("profile_arn", "arn:aws:codewhisperer:us-east-1:1:profile/X"),
+            ("kiro_provider", "builderid"),
+            ("access_token", "t"),
+        ]);
+        assert_eq!(
+            force_discover_profile_arn(&reqwest::Client::new(), &a)
+                .await
+                .unwrap(),
+            None,
+            "已有显式 profile_arn 时 force_discover 应跳过"
+        );
     }
 }

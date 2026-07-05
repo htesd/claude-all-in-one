@@ -147,6 +147,9 @@ pub struct CreateAccountBody {
     provider: Option<String>,
     #[serde(default)]
     max_concurrency: Option<i64>,
+    /// 调度优先级:写入 extra.priority(数值越小越优先,缺省 100);缺省不写(scheduler 视作 100)。
+    #[serde(default)]
+    priority: Option<i64>,
     /// provider 专属凭据字段(refresh_token 等),原样存为 extra JSON。
     #[serde(default)]
     extra: Option<serde_json::Map<String, serde_json::Value>>,
@@ -177,6 +180,10 @@ pub struct UpdateAccountBody {
     /// 无法区分"清除"与"不动";故清除约定为传空串。)
     #[serde(default)]
     proxy_url: Option<String>,
+    /// 定点更新调度优先级(写 extra.priority,数值越小越优先,缺省 100)。
+    /// 缺省=不动;走 merge_account_extra 绝不碰凭据(仿 proxy_url)。
+    #[serde(default)]
+    priority: Option<i64>,
 }
 
 pub fn router() -> Router<AdminState> {
@@ -248,14 +255,22 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
         }
         other => other,
     };
+    // 调度优先级顶层吐出(数值越小越优先,缺省 100;与 worker/scheduler.rs 分层 LRU 口径一致)。
+    // priority 是普通数值、键名不含 token/secret/password/key,不被上面的脱敏改写,读脱敏后的
+    // extra 与读原始值等价。
+    let priority = extra.get("priority").and_then(|v| v.as_i64()).unwrap_or(100);
     serde_json::json!({
         "account_id": row.account_id,
         "group_name": row.group_name,
         "provider": row.provider,
         "max_concurrency": row.max_concurrency,
+        "priority": priority,
         "disabled": row.disabled,
         "extra": extra,
         "created_at": row.created_at,
+        // 累计成功/失败请求计数(监控用,非计费)。前端账号页展示"累计成功/失败"列。
+        "success_count": row.success_count,
+        "failure_count": row.failure_count,
     })
 }
 
@@ -325,6 +340,10 @@ async fn create_account(
         extra_map
             .entry("account_uuid".to_string())
             .or_insert_with(|| serde_json::json!(uuid::Uuid::new_v4().to_string()));
+    }
+    // 调度优先级:显式传了才写 extra.priority(不传 → scheduler 缺省 100)。
+    if let Some(pri) = body.priority {
+        extra_map.insert("priority".into(), serde_json::json!(pri));
     }
     let extra_json = match serde_json::to_string(&extra_map) {
         Ok(s) => s,
@@ -1072,10 +1091,20 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
+    // 定点优先级合并(同 proxy_url:在整块替换之后走增量 merge,绝不碰凭据)。
+    // 数值越小越优先,缺省 100(见 worker/scheduler.rs 分层 LRU);缺省=不动 priority。
+    if let Some(pri) = body.priority {
+        let delta = serde_json::json!({ "priority": pri }).to_string();
+        match st.store.merge_account_extra(&id, &delta) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     // 落库后 best-effort 捅所有 worker 立即同步(同 delete_account/import 的理由):
     // 否则启用/禁用/换组等改动要等 worker 自己最多 30s 的周期 sync 才生效,期间按号操作
     // (如导入对话框"编辑后立即验活")会误报"没有 worker 持有该账号"。
-    if has_patch || body.proxy_url.is_some() {
+    if has_patch || body.proxy_url.is_some() || body.priority.is_some() {
         poke_workers_sync(&st).await;
     }
     match st.store.get_account(&id) {
@@ -1584,6 +1613,84 @@ mod tests {
         let row2 = store.get_account("acc1").unwrap().unwrap();
         assert!(row2.extra.contains("\"proxy\":null"), "清除应写 proxy:null: {}", row2.extra);
         assert!(row2.extra.contains("rt-secret"), "清除代理不得动凭据");
+    }
+
+    #[tokio::test]
+    async fn update_priority_merges_without_touching_credentials() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account(
+                "acc1",
+                "G0",
+                "kiro",
+                2,
+                r#"{"refresh_token":"rt-secret","client_secret":"cs"}"#,
+            )
+            .unwrap();
+        // 仅设 priority:不带 extra,凭据必须原样保留;顶层视图应回显新值。
+        let body = serde_json::json!({"priority": 30}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view: serde_json::Value = json_body(resp).await;
+        assert_eq!(view["priority"].as_i64(), Some(30), "顶层 priority 应回显: {view}");
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains("\"priority\":30"), "priority 应写入 extra: {}", row.extra);
+        assert!(row.extra.contains("rt-secret"), "凭据不得被定点合并冲掉");
+        assert!(row.extra.contains("\"client_secret\":\"cs\""));
+    }
+
+    #[tokio::test]
+    async fn view_defaults_priority_to_100_when_absent() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account("acc1", "G0", "kiro", 2, r#"{"refresh_token":"rt"}"#)
+            .unwrap();
+        let resp = app
+            .oneshot(req("GET", "/accounts", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list: serde_json::Value = json_body(resp).await;
+        assert_eq!(
+            list[0]["priority"].as_i64(),
+            Some(100),
+            "无 extra.priority 时顶层应回落 100: {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_extra_rotation_and_priority_together_both_apply() {
+        // 同一 PATCH 同时轮换 token(整块 extra 替换)+ 改 priority(定点合并)。priority 合并
+        // 硬编码在整块替换【之后】,即便 extra 里带的是打开弹窗时的旧 priority 快照,最终也应是
+        // 新值 —— 锁定这个顺序不变量(审查 Low#3),防未来重排三段顺序静默退化。
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account("acc1", "G0", "kiro", 2, r#"{"refresh_token":"rt-old","priority":100}"#)
+            .unwrap();
+        let body = serde_json::json!({
+            "extra": {"refresh_token": "rt-new", "priority": 100},
+            "priority": 30
+        })
+        .to_string();
+        let resp = app
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains("rt-new"), "token 应被轮换: {}", row.extra);
+        assert!(
+            row.extra.contains("\"priority\":30"),
+            "priority 定点合并应覆盖旧快照为 30: {}",
+            row.extra
+        );
     }
 
     /// PATCH 落库后应立即 poke worker `/sync`,消除"改配置(启用/禁用/换组)后 30s 内

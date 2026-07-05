@@ -332,6 +332,16 @@ impl Provider for KiroProvider {
         profiles::discover_profile_arn(&client, account).await
     }
 
+    /// 强制发现 profileArn(绕过固定兜底短路):付费 builderid 号被免费层共享 ARN 短路时,
+    /// gw-app 在配额 403 兜底里调本方法查真实 profileArn。见 [`profiles::force_discover_profile_arn`]。
+    async fn force_discover_profile_arn(
+        &self,
+        account: &Account,
+    ) -> Result<Option<String>, UpstreamError> {
+        let client = self.resolver.client_for(account);
+        profiles::force_discover_profile_arn(&client, account).await
+    }
+
     /// 热应用设置(worker 30s 轮询):更新默认代理 + 缓存计费 + 图像压缩参数。
     /// 仅覆盖 JSON 中出现的字段(部分更新);无副作用、线程安全(内部 RwLock)。
     fn apply_hot_settings(&self, settings: &serde_json::Value) {
@@ -397,11 +407,18 @@ impl Provider for KiroProvider {
                 .get("thinking_signature")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            // q_endpoint 与前三个开关同款:危险默认关(缺失→false=现状 runtime.kiro.dev),
+            // 显式 true 才切旧 q.amazonaws.com 端点。
+            let q_endpoint = settings
+                .get("q_endpoint")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             crate::converter::set_experimental_flags(
                 tools_in_prefix,
                 cache_point,
                 agent_continuation,
                 thinking_signature,
+                q_endpoint,
             );
         }
     }

@@ -147,8 +147,7 @@ fn html_unescape(s: &str) -> String {
         };
         out = num_re
             .replace_all(&out, |c: &regex::Captures| {
-                c[1]
-                    .parse::<u32>()
+                c[1].parse::<u32>()
                     .ok()
                     .and_then(char::from_u32)
                     .map(|ch| ch.to_string())
@@ -184,7 +183,10 @@ pub fn parse_ddg_lite(html: &str) -> Vec<SearchResult> {
         .captures_iter(html)
         .map(|c| {
             let m = c.get(0).unwrap();
-            (m.start(), strip_tags(c.get(1).map(|x| x.as_str()).unwrap_or("")))
+            (
+                m.start(),
+                strip_tags(c.get(1).map(|x| x.as_str()).unwrap_or("")),
+            )
         })
         .collect();
 
@@ -250,7 +252,10 @@ async fn ddg_search(query: &str) -> SearchOutcome {
     let output = match output {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
-            tracing::warn!("DDG curl 非零退出 query={query:?} code={:?}", o.status.code());
+            tracing::warn!(
+                "DDG curl 非零退出 query={query:?} code={:?}",
+                o.status.code()
+            );
             return SearchOutcome::Unavailable;
         }
         Err(e) => {
@@ -337,7 +342,10 @@ fn usage_json(u: &ChatUsage) -> Value {
 /// (对抗审查 H1)。同时能被 [`gw_core::fold::fold_sse_to_message`] 无损折回。
 pub fn synth_sse(message: &Value, usage: &ChatUsage) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let id = message.get("id").and_then(Value::as_str).unwrap_or("msg_ws");
+    let id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("msg_ws");
     let model = message
         .get("model")
         .and_then(Value::as_str)
@@ -396,9 +404,15 @@ pub fn synth_sse(message: &Value, usage: &ChatUsage) -> Vec<SseEvent> {
                     idx,
                     json!({"type":"thinking","thinking":"","signature":""}),
                 ));
-                events.push(cb_delta(idx, json!({"type":"thinking_delta","thinking":thinking})));
+                events.push(cb_delta(
+                    idx,
+                    json!({"type":"thinking_delta","thinking":thinking}),
+                ));
                 if !sig.is_empty() {
-                    events.push(cb_delta(idx, json!({"type":"signature_delta","signature":sig})));
+                    events.push(cb_delta(
+                        idx,
+                        json!({"type":"signature_delta","signature":sig}),
+                    ));
                 }
                 events.push(cb_stop(idx));
             }
@@ -427,7 +441,10 @@ pub fn synth_sse(message: &Value, usage: &ChatUsage) -> Vec<SseEvent> {
         "message_delta",
         json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":usage.output_tokens}}),
     ));
-    events.push(SseEvent::new("message_stop", json!({"type":"message_stop"})));
+    events.push(SseEvent::new(
+        "message_stop",
+        json!({"type":"message_stop"}),
+    ));
     events
 }
 
@@ -585,7 +602,11 @@ pub async fn run_loop(
         let mut tool_results: Vec<Value> = Vec::new();
         let mut force_answer = false;
         for tc in &tool_calls {
-            let tc_id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let tc_id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if is_web_search_call(tc, &spec) && searches < spec.max_uses {
                 searches += 1;
                 let query = tc
@@ -637,7 +658,11 @@ pub async fn run_loop(
     }
 
     // 降级收尾:若没拿到模型的最终文本答案,补一句诚实说明(避免只回搜索块、无答案)。
-    if degraded && !assembled.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("text")) {
+    if degraded
+        && !assembled
+            .iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+    {
         assembled.push(json!({"type":"text","text":"(已执行 web 搜索,但模型因上游临时错误未能生成最终回答,请重试。)"}));
     }
 
@@ -688,7 +713,10 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].url, "https://www.fifa.com/messi-2026");
         assert_eq!(r[0].title, "Lionel Messi headlines Argentina squad - FIFA");
-        assert_eq!(r[0].snippet, "Scaloni unveiled the 26-player squad for the World Cup.");
+        assert_eq!(
+            r[0].snippet,
+            "Scaloni unveiled the 26-player squad for the World Cup."
+        );
         assert_eq!(r[1].url, "https://www.usatoday.com/messi");
         assert!(r[1].snippet.contains("undecided"));
     }
@@ -700,13 +728,17 @@ mod tests {
 
     #[test]
     fn html_unescape_common_entities() {
-        assert_eq!(html_unescape("a &amp; b &#x27;c&#x27; &#39;d&#39;"), "a & b 'c' 'd'");
+        assert_eq!(
+            html_unescape("a &amp; b &#x27;c&#x27; &#39;d&#39;"),
+            "a & b 'c' 'd'"
+        );
         assert_eq!(html_unescape("Here&#x27;s"), "Here's");
     }
 
     #[test]
     fn detect_finds_server_web_search() {
-        let body = json!({"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8}]});
+        let body =
+            json!({"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8}]});
         let spec = detect_web_search(&body).expect("应探测到");
         assert_eq!(spec.name, "web_search");
         assert_eq!(spec.max_uses, 8);
@@ -720,9 +752,11 @@ mod tests {
 
     #[test]
     fn detect_clamps_max_uses() {
-        let body = json!({"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":999}]});
+        let body =
+            json!({"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":999}]});
         assert_eq!(detect_web_search(&body).unwrap().max_uses, MAX_USES_CAP);
-        let body0 = json!({"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":0}]});
+        let body0 =
+            json!({"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":0}]});
         assert_eq!(detect_web_search(&body0).unwrap().max_uses, 1);
     }
 
@@ -734,11 +768,26 @@ mod tests {
 
     #[test]
     fn is_web_search_call_tolerates_cc_name() {
-        let spec = WebSearchSpec { name: "web_search".into(), max_uses: 5 };
-        assert!(is_web_search_call(&json!({"type":"tool_use","name":"web_search"}), &spec));
-        assert!(is_web_search_call(&json!({"type":"tool_use","name":"WebSearch"}), &spec));
-        assert!(!is_web_search_call(&json!({"type":"tool_use","name":"Bash"}), &spec));
-        assert!(!is_web_search_call(&json!({"type":"text","text":"hi"}), &spec));
+        let spec = WebSearchSpec {
+            name: "web_search".into(),
+            max_uses: 5,
+        };
+        assert!(is_web_search_call(
+            &json!({"type":"tool_use","name":"web_search"}),
+            &spec
+        ));
+        assert!(is_web_search_call(
+            &json!({"type":"tool_use","name":"WebSearch"}),
+            &spec
+        ));
+        assert!(!is_web_search_call(
+            &json!({"type":"tool_use","name":"Bash"}),
+            &spec
+        ));
+        assert!(!is_web_search_call(
+            &json!({"type":"text","text":"hi"}),
+            &spec
+        ));
     }
 
     #[test]
@@ -751,7 +800,10 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "Bash");
-        assert_eq!(body["tool_choice"]["type"], "auto", "指向已删工具的 tool_choice 须中和");
+        assert_eq!(
+            body["tool_choice"]["type"], "auto",
+            "指向已删工具的 tool_choice 须中和"
+        );
     }
 
     #[test]
@@ -779,12 +831,20 @@ mod tests {
             ],
             "stop_reason":"end_turn","stop_sequence":null
         });
-        let usage = ChatUsage { input_tokens: 10, output_tokens: 20, ..Default::default() };
+        let usage = ChatUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            ..Default::default()
+        };
         let events = synth_sse(&msg, &usage);
 
         // 每个事件 data 都有顶层 type(对抗审查 H1)。
         for e in &events {
-            assert!(e.data.get("type").and_then(Value::as_str).is_some(), "事件 {} data 缺 type", e.event);
+            assert!(
+                e.data.get("type").and_then(Value::as_str).is_some(),
+                "事件 {} data 缺 type",
+                e.event
+            );
         }
 
         let folded = gw_core::fold::fold_sse_to_message(&events).expect("应折叠成功");
@@ -801,9 +861,16 @@ mod tests {
 
     #[test]
     fn results_to_text_distinguishes_empty_vs_unavailable() {
-        assert!(results_to_text("foo", &SearchOutcome::Results(vec![])).contains("No web search results"));
-        assert!(results_to_text("foo", &SearchOutcome::Unavailable).contains("temporarily unavailable"));
-        let r = SearchOutcome::Results(vec![SearchResult{title:"T".into(),url:"https://u".into(),snippet:"S".into()}]);
+        assert!(results_to_text("foo", &SearchOutcome::Results(vec![]))
+            .contains("No web search results"));
+        assert!(
+            results_to_text("foo", &SearchOutcome::Unavailable).contains("temporarily unavailable")
+        );
+        let r = SearchOutcome::Results(vec![SearchResult {
+            title: "T".into(),
+            url: "https://u".into(),
+            snippet: "S".into(),
+        }]);
         let t = results_to_text("foo", &r);
         assert!(t.contains("1. T") && t.contains("https://u") && t.contains('S'));
     }

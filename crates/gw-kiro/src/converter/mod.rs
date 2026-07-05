@@ -17,6 +17,7 @@ use crate::kiro_types::conversation::{
 
 mod cache_point;
 mod content;
+mod document_name;
 mod history;
 mod model_map;
 mod normalize;
@@ -33,8 +34,11 @@ pub use shed::{shed_history_media, MediaShed};
 pub(crate) use cache_point::set_experimental_flags;
 /// thinking 签名发射开关(供 [`crate::chat`] 在收尾 thinking 块时判定是否附 signature)。
 pub(crate) use cache_point::thinking_signature_enabled;
+/// 上游端点开关(供 [`crate::headers::runtime_base_url`] 判定走 runtime.kiro.dev 还是 q.amazonaws.com)。
+pub(crate) use cache_point::q_endpoint_enabled;
 use cache_point::*;
 use content::*;
+use document_name::dedup_document_names;
 use history::*;
 use pairing::*;
 use session::*;
@@ -172,6 +176,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 无重复时返回 None,继续用原 borrowed slice(零拷贝)。畸形输入不报错,交 pairing 兜底。
     let deduped = rewrite_duplicate_tool_use_ids(messages);
     let messages: &[_] = deduped.as_deref().unwrap_or(messages);
+
+    // 3.2 文档名去重 + 净化:Bedrock 要求 document name 全局唯一且限定字符集,否则 400
+    // INVALID_DOCUMENT_NAME(duplicate document names)。多份无名附件都兜成 "document" 是
+    // 最常见触发。零拷贝快路径,时序与 tool_id 一致(conversationId 派生之后,不扰动身份/亲和/缓存)。
+    let doc_deduped = dedup_document_names(messages);
+    let messages: &[_] = doc_deduped.as_deref().unwrap_or(messages);
 
     // 3.5 块1a:处理 messages 数组里 role=="system" 的消息(代理链中段注入)。
     // 三级分流:稳定前缀提升进 promoted_system / 动态噪声丢弃 / interrupted-user 与未知转 user。

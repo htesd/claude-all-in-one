@@ -149,7 +149,10 @@ mod tests {
             .uri("/groups")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(app.oneshot(r).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            app.oneshot(r).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
@@ -188,8 +191,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // 计数:挂 1 个 key。
-        store.create_api_key("sk-in-g0-1", None, Some("G0")).unwrap();
-        let resp = app.clone().oneshot(req("GET", "/groups", None)).await.unwrap();
+        store
+            .create_api_key("sk-in-g0-1", None, Some("G0"))
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req("GET", "/groups", None))
+            .await
+            .unwrap();
         let v = json_body(resp).await;
         assert_eq!(v[0]["key_count"], 1);
 
@@ -213,10 +222,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // 删除:key 的 group_name 被清空。
-        let resp = app.clone().oneshot(req("DELETE", "/groups/G0", None)).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req("DELETE", "/groups/G0", None))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert_eq!(store.get_api_key("sk-in-g0-1").unwrap().unwrap().group_name, "");
-        let resp = app.oneshot(req("DELETE", "/groups/G0", None)).await.unwrap();
+        assert_eq!(
+            store.get_api_key("sk-in-g0-1").unwrap().unwrap().group_name,
+            ""
+        );
+        let resp = app
+            .oneshot(req("DELETE", "/groups/G0", None))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

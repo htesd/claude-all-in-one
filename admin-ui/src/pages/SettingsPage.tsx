@@ -39,6 +39,7 @@ interface FormState {
   cache_point: boolean
   agent_continuation: boolean
   thinking_signature: boolean
+  q_endpoint: boolean
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -68,6 +69,7 @@ function settingsToForm(s: SystemSettings): FormState {
     cache_point: s.cache_point,
     agent_continuation: s.agent_continuation,
     thinking_signature: s.thinking_signature ?? true,
+    q_endpoint: s.q_endpoint ?? false,
   }
 }
 
@@ -140,6 +142,7 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     'cache_point',
     'agent_continuation',
     'thinking_signature',
+    'q_endpoint',
   ]
   for (const k of boolFields) {
     if (form[k] !== original[k]) {
@@ -615,6 +618,23 @@ export default function SettingsPage() {
                 </span>
                 <span className="block text-xs text-muted-foreground">
                   {t('settings.field.thinkingSignatureHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.q_endpoint ?? false}
+                onChange={(e) => set('q_endpoint', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.qEndpoint')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.qEndpointHint')}
                 </span>
               </span>
             </label>

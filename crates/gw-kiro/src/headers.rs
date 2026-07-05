@@ -5,8 +5,10 @@
 //! UA 里嵌的 machineId 与端点指纹,这里集中管理,改动需对照 static_flow。
 //!
 //! 主推理 `generateAssistantResponse`:
-//! - URL `https://runtime.{region}.kiro.dev/generateAssistantResponse`
-//!   (env `KIRO_RUNTIME_UPSTREAM_BASE_URL` / `KIRO_UPSTREAM_BASE_URL` 可覆盖)
+//! - URL `https://runtime.{region}.kiro.dev/generateAssistantResponse`(默认/现状)
+//!   或 `https://q.{region}.amazonaws.com/generateAssistantResponse`(`q_endpoint` 开关开,
+//!   与 kiro.rs 一致、做服务端 prompt 缓存);env `KIRO_RUNTIME_UPSTREAM_BASE_URL` /
+//!   `KIRO_UPSTREAM_BASE_URL` 整串覆盖优先(见 [`runtime_base_url`])
 //! - UA `aws-sdk-js/1.0.34 ua/2.1 os/darwin#24.6.0 lang/js md/nodejs#22.22.0
 //!   api/codewhispererstreaming#1.0.34 KiroIDE-{ver}-{machine}`(**无 `m/E`**)
 //! - 条件头:`TokenType: EXTERNAL_IDP`(auth_method=external_idp)、
@@ -35,16 +37,28 @@ pub(crate) const BUILDER_ID_PROFILE_ARN: &str =
 const RUNTIME_BASE_ENV: &str = "KIRO_RUNTIME_UPSTREAM_BASE_URL";
 const UPSTREAM_BASE_ENV: &str = "KIRO_UPSTREAM_BASE_URL";
 
-/// 主推理上游 base url:env 覆盖优先(对齐 static_flow `configured_upstream_base_url`),
-/// 否则默认 `https://runtime.{region}.kiro.dev`。
+/// 主推理上游 base url。优先级:
+/// 1. env 覆盖(`KIRO_RUNTIME_UPSTREAM_BASE_URL` / `KIRO_UPSTREAM_BASE_URL`,整串含 region,
+///    对齐 static_flow `configured_upstream_base_url`)——最高优先,给显式全 URL 场景留后门;
+/// 2. `q_endpoint` 开关(设置面板/env `KIRO_Q_ENDPOINT`):开 → `https://q.{region}.amazonaws.com`
+///    (kiro.rs 端点,做服务端 prompt 缓存);
+/// 3. 默认 → `https://runtime.{region}.kiro.dev`(现状,防封对齐当前 Kiro 客户端)。
 pub(crate) fn runtime_base_url(region: &str) -> String {
     let env_override = read_base_env(RUNTIME_BASE_ENV).or_else(|| read_base_env(UPSTREAM_BASE_ENV));
-    runtime_base_url_from(region, env_override)
+    runtime_base_url_from(region, env_override, crate::converter::q_endpoint_enabled())
 }
 
-/// 纯逻辑(env 注入便于测试):覆盖值已 trim 去尾斜杠。
-fn runtime_base_url_from(region: &str, env_override: Option<String>) -> String {
-    env_override.unwrap_or_else(|| format!("https://runtime.{region}.kiro.dev"))
+/// 纯逻辑(env 覆盖 + 端点开关注入便于测试)。env 覆盖已 trim 去尾斜杠;env 覆盖存在时
+/// **无视** `q_endpoint`(显式全 URL 优先)。
+fn runtime_base_url_from(region: &str, env_override: Option<String>, q_endpoint: bool) -> String {
+    if let Some(base) = env_override {
+        return base;
+    }
+    if q_endpoint {
+        format!("https://q.{region}.amazonaws.com")
+    } else {
+        format!("https://runtime.{region}.kiro.dev")
+    }
 }
 
 fn read_base_env(name: &str) -> Option<String> {
@@ -244,21 +258,41 @@ mod tests {
 
     #[test]
     fn runtime_base_url_defaults_to_kiro_dev() {
+        // q_endpoint=false(默认)→ runtime.kiro.dev。
         assert_eq!(
-            runtime_base_url_from("us-east-1", None),
+            runtime_base_url_from("us-east-1", None, false),
             "https://runtime.us-east-1.kiro.dev"
         );
         assert_eq!(
-            runtime_base_url_from("eu-central-1", None),
+            runtime_base_url_from("eu-central-1", None, false),
             "https://runtime.eu-central-1.kiro.dev"
         );
     }
 
     #[test]
-    fn runtime_base_url_honors_env_override() {
+    fn runtime_base_url_q_endpoint_switches_to_amazonaws() {
+        // q_endpoint=true(无 env 覆盖)→ q.{region}.amazonaws.com(与 kiro.rs 一致)。
         assert_eq!(
-            runtime_base_url_from("us-east-1", Some("https://q.us-east-1.amazonaws.com".into())),
+            runtime_base_url_from("us-east-1", None, true),
             "https://q.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            runtime_base_url_from("eu-central-1", None, true),
+            "https://q.eu-central-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn runtime_base_url_env_override_beats_q_endpoint() {
+        // env 覆盖是整串,优先级最高——即便 q_endpoint=true 也用覆盖值(显式全 URL 后门)。
+        let overridden = Some("https://custom.example.com".to_string());
+        assert_eq!(
+            runtime_base_url_from("us-east-1", overridden.clone(), true),
+            "https://custom.example.com"
+        );
+        assert_eq!(
+            runtime_base_url_from("us-east-1", overridden, false),
+            "https://custom.example.com"
         );
     }
 

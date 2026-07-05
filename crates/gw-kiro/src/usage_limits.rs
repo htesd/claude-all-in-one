@@ -72,6 +72,13 @@ pub async fn get_account_quota(
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let kind = match status.as_u16() {
+            // 封禁 403(TEMPORARILY_SUSPENDED 等)→ TemporarilyBlocked:冷却自愈、不永久禁号,
+            // 且不命中 try_fetch_quota 的 TokenInvalid 兜底(避免对封号又多打刷新/ListProfiles
+            // 制造异常指纹)。对齐 error_map.rs/token.rs 已有的 suspend 检测——此前 usage_limits
+            // 缺这道:封号做配额查询被误判 TokenInvalid → report_failure 永久禁用本可 1h 自愈的号。
+            403 if crate::error_map::is_account_suspended(&body) => {
+                UpstreamErrorKind::TemporarilyBlocked
+            }
             401 | 403 => UpstreamErrorKind::TokenInvalid,
             429 => UpstreamErrorKind::RateLimited,
             500..=599 => UpstreamErrorKind::ServerError,

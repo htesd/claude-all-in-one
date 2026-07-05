@@ -309,6 +309,16 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// 强制发现 profileArn(**绕过固定兜底短路**)。付费 builderid 号被免费层共享 ARN
+    /// 短路、拿不到自己的 profile 时,gw-app 在配额 403 兜底里调本方法查真实值。默认无此
+    /// 概念 → `Ok(None)`。**只读发现调用**,绝不发推理包;account 须已带有效 access_token。
+    async fn force_discover_profile_arn(
+        &self,
+        _account: &Account,
+    ) -> Result<Option<String>, UpstreamError> {
+        Ok(None)
+    }
+
     /// OAuth 上号:`authorization_code` → token set,返回 JSON 对象
     /// `{access_token, refresh_token, expires_at}`(由 gw-app 并入账号 extra 后入库)。
     /// 默认 provider 不支持(返回 BadRequest)。

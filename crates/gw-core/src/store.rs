@@ -151,6 +151,10 @@ pub struct AccountRow {
     pub disabled: bool,
     pub extra: String,
     pub created_at: i64,
+    /// 累计成功请求数(监控用,非计费)。每次上游调用**终态**收尾 +1(见 worker::write_request_log)。
+    pub success_count: i64,
+    /// 累计失败请求数(监控用,非计费)。含首包前 400/429/网络/额度耗尽等终态失败。
+    pub failure_count: i64,
 }
 
 /// 账号部分更新(None 字段不动)。

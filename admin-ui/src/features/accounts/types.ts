@@ -8,10 +8,16 @@ export interface AccountRow {
   group_name: string
   provider: string
   max_concurrency: number
+  /** 调度优先级：数值越小越优先（分层 LRU 先取最小层），缺省 100。 */
+  priority: number
   disabled: boolean
   extra: Record<string, unknown>
   /** 创建时间，Unix 秒。 */
   created_at: number
+  /** 累计成功请求数（后端新增；旧缓存响应可能缺失，缺省视为 0）。 */
+  success_count?: number
+  /** 累计失败请求数（后端新增；旧缓存响应可能缺失，缺省视为 0）。 */
+  failure_count?: number
 }
 
 /** POST /accounts 请求体（注意：这里的分组字段叫 `group`，PATCH 才是 `group_name`）。 */
@@ -20,6 +26,8 @@ export interface CreateAccountPayload {
   group?: string
   provider?: string
   max_concurrency?: number
+  /** 调度优先级：数值越小越优先，缺省 100（不传则由后端按 100 处理）。 */
+  priority?: number
   extra?: Record<string, unknown>
   /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
   egress?: string
@@ -36,6 +44,8 @@ export interface UpdateAccountPayload {
   group_name?: string
   max_concurrency?: number
   disabled?: boolean
+  /** 调度优先级：数值越小越优先，缺省 100。不传=不动；走后端定点合并，绝不碰凭据。 */
+  priority?: number
   extra?: Record<string, unknown>
   /**
    * 出口代理 URL。

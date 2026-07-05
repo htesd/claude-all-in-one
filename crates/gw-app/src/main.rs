@@ -56,7 +56,10 @@ enum Mode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "claude-all-in-one", about = "Claude All in One —— 多账号多进程反代")]
+#[command(
+    name = "claude-all-in-one",
+    about = "Claude All in One —— 多账号多进程反代"
+)]
 struct Args {
     /// 进程角色。
     #[arg(long, value_enum)]
@@ -100,9 +103,9 @@ async fn main() -> anyhow::Result<()> {
             router::run(&args.instances, &args.db, &args.system).await
         }
         Mode::Worker => {
-            let instance = args.instance.ok_or_else(|| {
-                anyhow::anyhow!("--mode worker 需要 --instance N")
-            })?;
+            let instance = args
+                .instance
+                .ok_or_else(|| anyhow::anyhow!("--mode worker 需要 --instance N"))?;
             tracing::info!(instance, "启动 worker 角色");
             worker::run(
                 instance,
