@@ -10,7 +10,7 @@ import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 
 import { useCreateAccount } from '../hooks'
-import { parseConcurrency } from '../lib'
+import { parseConcurrency, tierToPriority, type PriorityTier } from '../lib'
 import { ACCOUNT_ID_PATTERN, type CreateAccountPayload } from '../types'
 
 const inputClass =
@@ -70,6 +70,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
   const [region, setRegion] = useState('')
   const [machineId, setMachineId] = useState('')
   const [concurrency, setConcurrency] = useState('2')
+  const [priorityTier, setPriorityTier] = useState<PriorityTier>('low')
   const [egress, setEgress] = useState('auto')
   const [paste, setPaste] = useState('')
   const [detected, setDetected] = useState<DetectedType>(null)
@@ -91,6 +92,7 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       setRegion('')
       setMachineId('')
       setConcurrency('2')
+      setPriorityTier('low')
       setEgress('auto')
       setPaste('')
       setDetected(null)
@@ -173,6 +175,9 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       return
     }
 
+    // 优先级两档:高=0 / 低=100。默认低(100)不写入 extra,保持新账号 extra 干净。
+    const priorityValue = tierToPriority(priorityTier)
+
     if (isDario && credentialsJson.trim() === '') {
       setError(t('accounts.error.credentialsJsonRequired'))
       return
@@ -222,6 +227,8 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
     }
 
     if (group !== '') payload.group = group
+    // 默认 100(低)不写入 extra,保持新账号 extra 干净(后端缺省即 100)。
+    if (priorityValue !== 100) payload.priority = priorityValue
 
     mutation.mutate(payload, {
       onSuccess: onClose,
@@ -469,6 +476,23 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
             onChange={(event) => setConcurrency(event.target.value)}
             className={inputClass}
           />
+        </div>
+
+        {/* 调度优先级 */}
+        <div className="space-y-1.5">
+          <label htmlFor="account-priority" className="text-xs font-medium text-muted-foreground">
+            {t('accounts.field.priority')}
+          </label>
+          <Select
+            id="account-priority"
+            value={priorityTier}
+            onChange={(event) => setPriorityTier(event.target.value as PriorityTier)}
+            className="w-full"
+          >
+            <option value="high">{t('accounts.priorityTier.high')}</option>
+            <option value="low">{t('accounts.priorityTier.low')}</option>
+          </Select>
+          <p className="text-xs text-muted-foreground">{t('accounts.field.priorityHint')}</p>
         </div>
 
         {/* 出口网关（上号时选：直连 / 自动均衡 / 指定网关） */}

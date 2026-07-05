@@ -439,7 +439,61 @@ impl WorkerState {
         let account = self.ensure_credentialed(account).await?;
         // 企业/IdC 号 getUsageLimits 同样要求 profileArn:缺则先发现+持久化。
         let account = self.ensure_profile_arn(account).await;
-        self.provider.account_quota(&account).await
+        match self.provider.account_quota(&account).await {
+            // TokenInvalid(401/403 bearer invalid)兜底一次,治两类常见误判:
+            //  (1) at 已过期——导入号无 expires_at,has_fresh_token 误当新鲜、没预刷;
+            //  (2) profileArn 套错——付费 builderid 号被免费层固定共享 ARN 短路,拿不到自己的 profile。
+            // 故:强制刷新 at + (若仍无自带 profile_arn)强制重发现真实 profileArn 并持久化,
+            // 再重试一次;仍失败才透出(真死号/真被封)。对齐 chat 路径 refresh_after_rejection 精神。
+            Err(e) if matches!(e.kind, UpstreamErrorKind::TokenInvalid) => {
+                let account = self.force_refresh(account).await?;
+                // 付费号 profileArn 套错自愈:强制发现真实 ARN 并持久化(免费号/已有值不动)。
+                // 与 chat 路径 403 兜底共用 discover_paid_profile_arn,逻辑单一来源不分叉。
+                let account = self
+                    .discover_paid_profile_arn(&account, "profileArn(配额 403 兜底强制发现)")
+                    .await
+                    .unwrap_or(account);
+                self.provider.account_quota(&account).await
+            }
+            other => other,
+        }
+    }
+
+    /// 付费号 profileArn 套错**自愈**:强制发现真实 profileArn 并持久化,返回更新后账号。
+    ///
+    /// 仅当 [`needs_profile_discovery`] 成立(账号无自带 profile_arn 且订阅为付费非 FREE)
+    /// 才发现——免费号维持免费层固定共享 ARN,绝不被后台/chat 的例行 403 带进 force_discover
+    /// 污染其真实 chat(resolve_profile_arn 被 chat 复用)。返回:
+    /// - `Some(账号)`:发现到真实 arn 且已持久化(调用方改用它重试);
+    /// - `None`:非付费 / 已有 arn / 发现失败(调用方维持原账号)。
+    ///
+    /// 配额路径(`try_fetch_quota`)与 chat 路径 403 兜底共用本方法,避免逻辑分叉。
+    async fn discover_paid_profile_arn(
+        self: &Arc<Self>,
+        account: &Arc<Account>,
+        trigger: &str,
+    ) -> Option<Arc<Account>> {
+        if !needs_profile_discovery(account) {
+            return None;
+        }
+        match self.provider.force_discover_profile_arn(account).await {
+            Ok(Some(arn)) => {
+                self.persist_extra_field(
+                    &account.account_id,
+                    "profile_arn",
+                    serde_json::Value::String(arn),
+                    trigger,
+                )
+                .await;
+                Some(
+                    self.scheduler
+                        .account(&account.account_id)
+                        .unwrap_or_else(|| account.clone()),
+                )
+            }
+            // 免费号发现不到(空/错)/ 发现调用失败 → None,维持固定兜底靠刷新后的新 at 过。
+            _ => None,
+        }
     }
 
     /// 从 DB 重读组内账号集并同步进 scheduler —— 30s 周期循环与 `/sync` 立即同步
@@ -492,6 +546,19 @@ fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
         }),
         None => serde_json::Value::Null,
     }
+}
+
+/// 是否需要为该账号强制发现真实 profileArn:无自带 profile_arn(空/缺)**且**订阅为付费
+/// (subscription_title 存在且不含 FREE)。付费 builderid 号有自己的 profile,被免费层固定
+/// 共享 ARN 短路后 getUsageLimits/chat 都 403;免费号(或订阅档未回填)一律不发现,维持
+/// 共享 ARN,绝不误污染健康免费号。付费闸门 = 免费/付费结构同构下唯一安全的区分维度。
+fn needs_profile_discovery(account: &Account) -> bool {
+    account
+        .extra_str("profile_arn")
+        .map_or(true, |s| s.trim().is_empty())
+        && account
+            .extra_str("subscription_title")
+            .is_some_and(|t| !t.to_uppercase().contains("FREE"))
 }
 
 /// 账号是否持有未过期(且非临近过期)的 access_token。
@@ -1277,6 +1344,28 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
     }
 }
 
+/// 换号重试上限:按错误类别分档。
+///
+/// 良性冷却类错误(RateLimited/QuotaExhausted)自限流(命中即进冷却 → 后续请求的
+/// `eligible_ids` 直接跳过该号、不再重复打上游)且不传播毒性,故解绑紧上限、允许沿
+/// **优先级阶梯**下探到组内所有号(cap=total):高优先级层全限流/额度耗尽时,请求自动
+/// 落到低优先级兜底池,而不是把限流错误抛回客户端。
+///
+/// 其余可换号错误(TokenInvalid/ServerError/Network/Other)仍守 `general_cap`(默认
+/// max_switch_attempts=2)—— 2026-06 大面积封号雪崩正是这类「毒请求/高频重试」逐个打爆
+/// 全池,绝不放开。(EmptyResponse/TemporarilyBlocked/BadRequest 更早被
+/// `worth_switching_account()=false` 命中首个号即止,根本进不来这里。)
+fn switch_cap(kind: UpstreamErrorKind, total: usize, general_cap: usize) -> usize {
+    if matches!(
+        kind,
+        UpstreamErrorKind::RateLimited | UpstreamErrorKind::QuotaExhausted
+    ) {
+        total.max(1)
+    } else {
+        general_cap
+    }
+}
+
 async fn messages(
     State(st): State<Arc<WorkerState>>,
     headers: HeaderMap,
@@ -1298,11 +1387,11 @@ async fn messages(
     // 选号 + 发起 chat 的重试循环:token 失效(403/401)时刷新该号并对账号生命周期上报,
     // 换号重试;首包前的可重试错误最多走 total 个账号。committed(首包已出)后不重试。
     let total = st.scheduler.total().max(1);
-    // 换号重试硬上限:一个失败请求最多波及 max_switch_attempts 个号(默认 2),而非走遍全组。
-    // 2026-06 大面积封号雪崩根因正是 `attempts < total` 让一个「毒请求/高频重试」逐个打爆全池;
-    // 内容/封禁类错误(EmptyResponse/TemporarilyBlocked)更靠 worth_switching_account()=false
-    // 命中首个号即止,不扩散。
-    let max_attempts = st.scheduler.max_switch_attempts().min(total).max(1);
+    // 换号重试上限按错误类别分档(见 `switch_cap`):
+    // - 良性冷却类(限速/额度耗尽):沿优先级阶梯下探到组内所有号(cap=total),落低优先级兜底池;
+    // - 其余可换号错误:守 general_cap(默认 max_switch_attempts=2),防换号雪崩封号
+    //   (2026-06 大面积封号根因正是让一个毒请求逐个打爆全池)。
+    let general_cap = st.scheduler.max_switch_attempts().min(total).max(1);
     let mut attempts = 0;
 
     loop {
@@ -1342,7 +1431,9 @@ async fn messages(
                 tracing::warn!(account = %account_id, kind = ?e.kind, "凭证刷新失败: {e}");
                 st.scheduler.report_failure(&account_id, e.kind);
                 drop(lease);
-                if !e.kind.worth_switching_account() || attempts >= max_attempts {
+                if !e.kind.worth_switching_account()
+                    || attempts >= switch_cap(e.kind, total, general_cap)
+                {
                     return upstream_error_response(&e);
                 }
                 continue;
@@ -1436,11 +1527,80 @@ async fn messages(
                                 .await;
                             }
                             Err(e2) => {
-                                // 刷新后仍失败:这次才上报失败 + 换号。
+                                // 刷新已成功(rt 证明有效)。若重试仍是 403 TokenInvalid,极可能
+                                // profileArn 套错——付费 builderid 号被免费层固定共享 ARN 短路、
+                                // 拿不到自己的 profile。镜像配额路径:强制发现真实 ARN 持久化后用真
+                                // ARN 再重试一次,成功即救回(治「导入即入活跃池、客户 chat 抢在验活
+                                // force_discover 前命中、用错 ARN 403」的竞态)。
+                                let e2 = if e2.kind == UpstreamErrorKind::TokenInvalid {
+                                    match st
+                                        .discover_paid_profile_arn(
+                                            &retry_ctx.account,
+                                            "profileArn(chat 403 兜底强制发现)",
+                                        )
+                                        .await
+                                    {
+                                        Some(healed) => {
+                                            let heal_ctx = CallCtx {
+                                                account: healed,
+                                                session_id: affinity_key
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                cache_key: affinity_key
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                            };
+                                            match st.provider.chat(req.clone(), &heal_ctx).await {
+                                                Ok(stream) => {
+                                                    if let Some(spec) =
+                                                        crate::websearch::detect_web_search(
+                                                            &req.body,
+                                                        )
+                                                    {
+                                                        return finish_web_search_response(
+                                                            st.clone(),
+                                                            lease,
+                                                            stream,
+                                                            &req,
+                                                            &client_key,
+                                                            heal_ctx,
+                                                            spec,
+                                                            started_at,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    return finish_response(
+                                                        st.clone(),
+                                                        lease,
+                                                        stream,
+                                                        &req,
+                                                        &client_key,
+                                                        heal_ctx.account.clone(),
+                                                        started_at,
+                                                    )
+                                                    .await;
+                                                }
+                                                // 带真 ARN 仍失败 → 真死号/真封禁,携 e3 继续统一失败处理。
+                                                Err(e3) => e3,
+                                            }
+                                        }
+                                        None => e2,
+                                    }
+                                } else {
+                                    e2
+                                };
+                                // 刷新成功后仍失败:上报**真实** e2.kind + 换号。heal 已把可救的
+                                // profileArn 套错救回(救回则上面直接 return);走到这里=该号确实当前
+                                // 不能服务——e3(带真 ARN 仍 403)是最强死号信号、或非付费/发现失败,
+                                // 一律保留原分类语义(TokenInvalid→invalid_refresh_token 永久禁用),
+                                // 不弱化死号识别。注:「刷新成功⇒rt 有效」只证认证有效,不代表 entitlement
+                                // 未被服务端撤销,故不能据此把 TokenInvalid 一律降级(对抗审查 HIGH)。
                                 tracing::warn!(account = %account_id, kind = ?e2.kind, "刷新后重试仍失败: {e2}");
                                 st.scheduler.report_failure(&account_id, e2.kind);
                                 drop(lease);
-                                if !e2.kind.worth_switching_account() || attempts >= max_attempts {
+                                if !e2.kind.worth_switching_account()
+                                    || attempts >= switch_cap(e2.kind, total, general_cap)
+                                {
                                     return upstream_error_response(&e2);
                                 }
                                 continue;
@@ -1452,7 +1612,9 @@ async fn messages(
                         tracing::warn!(account = %account_id, kind = ?re.kind, "同号刷新失败: {re}");
                         st.scheduler.report_failure(&account_id, re.kind);
                         drop(lease);
-                        if !re.kind.worth_switching_account() || attempts >= max_attempts {
+                        if !re.kind.worth_switching_account()
+                            || attempts >= switch_cap(re.kind, total, general_cap)
+                        {
                             return upstream_error_response(&re);
                         }
                         continue;
@@ -1464,7 +1626,7 @@ async fn messages(
                 tracing::warn!(account = %account_id, kind = ?kind, "chat 失败: {e}");
                 st.scheduler.report_failure(&account_id, kind);
                 drop(lease);
-                if !kind.worth_switching_account() || attempts >= max_attempts {
+                if !kind.worth_switching_account() || attempts >= switch_cap(kind, total, general_cap) {
                     // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
                     // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
                     let status = if kind == UpstreamErrorKind::BadRequest {
@@ -1708,6 +1870,11 @@ fn write_request_log(
     };
     if let Err(e) = store.insert_request_log(&log, REQUEST_LOG_CAP) {
         tracing::warn!(error = %e, account = %log.account_id, "请求日志落库失败");
+    }
+    // 账号累计成功/失败计数(监控用,非计费)。与请求日志同处 blocking 任务,不占热路径;
+    // 每次上游调用终态收尾恰好一次(成功/终态失败),account_id 空则内部跳过。
+    if let Err(e) = store.bump_account_counters(&log.account_id, success) {
+        tracing::warn!(error = %e, account = %log.account_id, "账号计数更新失败");
     }
 }
 
@@ -2185,6 +2352,21 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn switch_cap_benign_descends_full_ladder_risky_capped() {
+        // 良性冷却类(限速/额度耗尽):解绑紧上限,沿优先级阶梯下探到组内所有号(cap=total),
+        // 使高优先级层全限流时落到低优先级兜底池,而非把限流错误抛回客户端。
+        assert_eq!(switch_cap(UpstreamErrorKind::RateLimited, 12, 2), 12);
+        assert_eq!(switch_cap(UpstreamErrorKind::QuotaExhausted, 12, 2), 12);
+        // 风险类换号错误:仍守 general_cap(默认 2),防换号雪崩封号。
+        assert_eq!(switch_cap(UpstreamErrorKind::ServerError, 12, 2), 2);
+        assert_eq!(switch_cap(UpstreamErrorKind::TokenInvalid, 12, 2), 2);
+        assert_eq!(switch_cap(UpstreamErrorKind::Network, 12, 2), 2);
+        assert_eq!(switch_cap(UpstreamErrorKind::Other, 12, 2), 2);
+        // total=0 兜底 max(1),不产生"0 上限=一次都不换"的退化。
+        assert_eq!(switch_cap(UpstreamErrorKind::RateLimited, 0, 2), 1);
+    }
+
+    #[test]
     fn serialize_response_small_is_passthrough_json() {
         let msg = serde_json::json!({
             "type":"message","role":"assistant",
@@ -2534,6 +2716,40 @@ mod tests {
         // 无 expires_at → 当作有效(靠 403 兜底)。
         assert!(has_fresh_token(&acct(&[("access_token", "t")])));
     }
+
+    #[test]
+    fn needs_profile_discovery_paid_missing_arn() {
+        // 付费(非 FREE)+ 无 profile_arn → 需要强制发现真实 ARN。
+        assert!(needs_profile_discovery(&acct(&[(
+            "subscription_title",
+            "KIRO POWER"
+        )])));
+        // 空白 profile_arn 视同缺失。
+        assert!(needs_profile_discovery(&acct(&[
+            ("subscription_title", "KIRO PRO"),
+            ("profile_arn", "   "),
+        ])));
+    }
+
+    #[test]
+    fn needs_profile_discovery_free_or_present_arn_skips() {
+        // 免费号:即便结构同构(带 client_secret、无 arn)也不发现,维持共享 ARN。
+        assert!(!needs_profile_discovery(&acct(&[
+            ("subscription_title", "KIRO FREE"),
+            ("client_secret", "cs"),
+        ])));
+        // 订阅档未回填(缺 subscription_title)→ 保守跳过,绝不误污染健康免费号。
+        assert!(!needs_profile_discovery(&acct(&[("client_secret", "cs")])));
+        // 已有真实 profile_arn → 绝不覆盖。
+        assert!(!needs_profile_discovery(&acct(&[
+            ("subscription_title", "KIRO POWER"),
+            (
+                "profile_arn",
+                "arn:aws:codewhisperer:us-east-1:1:profile/X"
+            ),
+        ])));
+    }
+
 
     #[test]
     fn expired_token_is_not_fresh() {

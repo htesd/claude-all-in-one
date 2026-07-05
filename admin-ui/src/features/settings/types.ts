@@ -51,6 +51,9 @@ export interface SystemSettings {
   /** thinking 块是否附 signature。**默认开**（保留现状，过 hvoy/cctest 检测）。多上游反代关掉：
    *  caio 的 Kiro 合成签名对真 Anthropic/Bedrock 验签非法，跨通道漂移会被拒 THINKING_SIGNATURE_INVALID。 */
   thinking_signature: boolean
+  /** 主推理上游端点：false=runtime.kiro.dev（默认/现状），true=q.amazonaws.com（kiro.rs 端点，做服务端
+   *  prompt 缓存、真实命中 82-92% 省积分；runtime.kiro.dev 端点实测真实缓存 0%、计费 ~2x）。默认关。 */
+  q_endpoint: boolean
 }
 
 /**

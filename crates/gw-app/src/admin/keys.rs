@@ -193,7 +193,9 @@ mod tests {
     #[tokio::test]
     async fn list_keys_returns_seeded_rows() {
         let (app, store) = app();
-        store.create_api_key("sk-alice-prod-7788", Some("alice"), None).unwrap();
+        store
+            .create_api_key("sk-alice-prod-7788", Some("alice"), None)
+            .unwrap();
         let resp = app.oneshot(req("GET", "/keys", None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
@@ -215,7 +217,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
         let v = json_body(resp).await;
         let key = v["key"].as_str().unwrap();
-        assert!(key.starts_with("sk-gw-"), "服务端生成前缀 sk-gw-,实际 {key}");
+        assert!(
+            key.starts_with("sk-gw-"),
+            "服务端生成前缀 sk-gw-,实际 {key}"
+        );
         assert_eq!(key.len(), "sk-gw-".len() + 32, "uuid simple = 32 hex");
         assert_eq!(v["label"], "新客户");
         // 生成的 key 立即可用于鉴权。
@@ -227,7 +232,11 @@ mod tests {
     async fn create_custom_key_then_conflict() {
         let (app, _) = app();
         let body = r#"{"key":"sk-custom-12345678","label":null}"#;
-        let resp = app.clone().oneshot(req("POST", "/keys", Some(body))).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/keys", Some(body)))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let v = json_body(resp).await;
         assert_eq!(v["key"], "sk-custom-12345678");
@@ -241,30 +250,43 @@ mod tests {
     async fn create_rejects_invalid_custom_key() {
         let (app, _) = app();
         for bad in [
-            r#"{"key":"short"}"#,                  // 太短
-            r#"{"key":"sk has space"}"#,           // 含空格
-            r#"{"key":"sk-中文键-8888"}"#,          // 非 ASCII
-            r#"{"key":"sk-bad/slash8"}"#,          // URL 路径敌对字符(PATCH/DELETE 路径段)
-            r#"{"key":"sk-bad#hash888"}"#,         // 同上
+            r#"{"key":"short"}"#,          // 太短
+            r#"{"key":"sk has space"}"#,   // 含空格
+            r#"{"key":"sk-中文键-8888"}"#, // 非 ASCII
+            r#"{"key":"sk-bad/slash8"}"#,  // URL 路径敌对字符(PATCH/DELETE 路径段)
+            r#"{"key":"sk-bad#hash888"}"#, // 同上
         ] {
-            let resp = app.clone().oneshot(req("POST", "/keys", Some(bad))).await.unwrap();
+            let resp = app
+                .clone()
+                .oneshot(req("POST", "/keys", Some(bad)))
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "应拒绝 {bad}");
         }
         // 超长(>128)。
         let long = format!(r#"{{"key":"sk-{}"}}"#, "x".repeat(130));
-        let resp = app.oneshot(req("POST", "/keys", Some(&long))).await.unwrap();
+        let resp = app
+            .oneshot(req("POST", "/keys", Some(&long)))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn patch_updates_fields_and_404s() {
         let (app, store) = app();
-        store.create_api_key("sk-patch-me-1", Some("旧备注"), None).unwrap();
+        store
+            .create_api_key("sk-patch-me-1", Some("旧备注"), None)
+            .unwrap();
 
         // 禁用,label 不动。
         let resp = app
             .clone()
-            .oneshot(req("PATCH", "/keys/sk-patch-me-1", Some(r#"{"disabled":true}"#)))
+            .oneshot(req(
+                "PATCH",
+                "/keys/sk-patch-me-1",
+                Some(r#"{"disabled":true}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -298,7 +320,11 @@ mod tests {
         // 挂真实组 OK。
         let resp = app
             .clone()
-            .oneshot(req("POST", "/keys", Some(r#"{"key":"sk-grouped-01","group":"G0"}"#)))
+            .oneshot(req(
+                "POST",
+                "/keys",
+                Some(r#"{"key":"sk-grouped-01","group":"G0"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -307,12 +333,20 @@ mod tests {
         // 幽灵组 → 400(POST 与 PATCH)。
         let resp = app
             .clone()
-            .oneshot(req("POST", "/keys", Some(r#"{"key":"sk-grouped-02","group":"GO"}"#)))
+            .oneshot(req(
+                "POST",
+                "/keys",
+                Some(r#"{"key":"sk-grouped-02","group":"GO"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let resp = app
-            .oneshot(req("PATCH", "/keys/sk-grouped-01", Some(r#"{"group_name":"GO"}"#)))
+            .oneshot(req(
+                "PATCH",
+                "/keys/sk-grouped-01",
+                Some(r#"{"group_name":"GO"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -328,7 +362,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        let resp = app.oneshot(req("DELETE", "/keys/sk-del-me-99", None)).await.unwrap();
+        let resp = app
+            .oneshot(req("DELETE", "/keys/sk-del-me-99", None))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

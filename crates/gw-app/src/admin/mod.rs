@@ -92,8 +92,7 @@ pub(crate) fn validate_proxy_url(raw: &str) -> Result<String, &'static str> {
     if s.contains("***") {
         return Err("代理含掩码占位 ***,请输入完整 URL 或留空清除");
     }
-    reqwest::Proxy::all(s)
-        .map_err(|_| "代理 URL 非法(支持 socks5:// / http:// / https://)")?;
+    reqwest::Proxy::all(s).map_err(|_| "代理 URL 非法(支持 socks5:// / http:// / https://)")?;
     Ok(s.to_string())
 }
 
@@ -272,7 +271,10 @@ mod tests {
 
     #[test]
     fn extract_prefers_x_api_key_over_bearer() {
-        let h = headers(&[("x-api-key", "fromkey"), ("authorization", "Bearer frombearer")]);
+        let h = headers(&[
+            ("x-api-key", "fromkey"),
+            ("authorization", "Bearer frombearer"),
+        ]);
         assert_eq!(extract_admin_key(&h), Some("fromkey".to_string()));
     }
 
@@ -280,13 +282,22 @@ mod tests {
     fn extract_none_when_absent_or_empty() {
         assert_eq!(extract_admin_key(&headers(&[])), None);
         assert_eq!(extract_admin_key(&headers(&[("x-api-key", "")])), None);
-        assert_eq!(extract_admin_key(&headers(&[("authorization", "Basic xxx")])), None);
-        assert_eq!(extract_admin_key(&headers(&[("authorization", "Bearer ")])), None);
+        assert_eq!(
+            extract_admin_key(&headers(&[("authorization", "Basic xxx")])),
+            None
+        );
+        assert_eq!(
+            extract_admin_key(&headers(&[("authorization", "Bearer ")])),
+            None
+        );
     }
 
     #[test]
     fn validate_proxy_url_accepts_valid_rejects_garbage_and_masked() {
-        assert_eq!(validate_proxy_url("  socks5://u:p@h:1080  ").unwrap(), "socks5://u:p@h:1080");
+        assert_eq!(
+            validate_proxy_url("  socks5://u:p@h:1080  ").unwrap(),
+            "socks5://u:p@h:1080"
+        );
         assert!(validate_proxy_url("http://1.2.3.4:8888").is_ok());
         assert!(validate_proxy_url("").is_err());
         assert!(validate_proxy_url("   ").is_err());
@@ -296,11 +307,20 @@ mod tests {
 
     #[test]
     fn redact_proxy_url_masks_only_password() {
-        assert_eq!(redact_proxy_url("socks5://user:secret@host:1080"), "socks5://user:***@host:1080");
+        assert_eq!(
+            redact_proxy_url("socks5://user:secret@host:1080"),
+            "socks5://user:***@host:1080"
+        );
         // 无 password(只有 user)不掩。
-        assert_eq!(redact_proxy_url("socks5://user@host:1080"), "socks5://user@host:1080");
+        assert_eq!(
+            redact_proxy_url("socks5://user@host:1080"),
+            "socks5://user@host:1080"
+        );
         // 无 userinfo 原样返回。
         assert_eq!(redact_proxy_url("http://host:8888"), "http://host:8888");
-        assert_eq!(redact_proxy_url("socks5://1.2.3.4:1080"), "socks5://1.2.3.4:1080");
+        assert_eq!(
+            redact_proxy_url("socks5://1.2.3.4:1080"),
+            "socks5://1.2.3.4:1080"
+        );
     }
 }

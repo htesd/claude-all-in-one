@@ -26,7 +26,11 @@ pub fn router() -> Router<AdminState> {
 
 /// 4xx 错误响应(请求体问题)。
 fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
-    (status, Json(serde_json::json!({"type":"error","error":{"message": msg}}))).into_response()
+    (
+        status,
+        Json(serde_json::json!({"type":"error","error":{"message": msg}})),
+    )
+        .into_response()
 }
 
 /// 由 DB overlay JSON 解析出 [`SystemSettings`](解析失败/无行 → 默认空 overlay)。
@@ -90,7 +94,8 @@ async fn put_settings(
     };
 
     // 现有 overlay(原始 JSON map)→ 合并 patch:null 删键、非 null 设键。
-    let mut overlay_map: serde_json::Map<String, serde_json::Value> = match st.store.get_settings() {
+    let mut overlay_map: serde_json::Map<String, serde_json::Value> = match st.store.get_settings()
+    {
         Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_default(),
         Ok(None) => serde_json::Map::new(),
         Err(e) => return internal_error(e),
@@ -127,7 +132,10 @@ async fn put_settings(
                     let mut validated = Vec::with_capacity(arr.len());
                     for item in arr {
                         let Some(s) = item.as_str() else {
-                            return api_error(StatusCode::BAD_REQUEST, "egress_pool 每项须为字符串");
+                            return api_error(
+                                StatusCode::BAD_REQUEST,
+                                "egress_pool 每项须为字符串",
+                            );
                         };
                         match super::validate_proxy_url(s) {
                             Ok(valid) => validated.push(serde_json::Value::String(valid)),
@@ -145,12 +153,11 @@ async fn put_settings(
 
     // 校验合并后的 overlay 能解析为 SystemSettings(deny_unknown_fields:拼错 key 直接拒,
     // 类型不符也拒,不写坏库)。
-    let overlay: SystemSettings = match serde_json::from_value(serde_json::Value::Object(
-        overlay_map.clone(),
-    )) {
-        Ok(s) => s,
-        Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("设置字段不合法: {e}")),
-    };
+    let overlay: SystemSettings =
+        match serde_json::from_value(serde_json::Value::Object(overlay_map.clone())) {
+            Ok(s) => s,
+            Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("设置字段不合法: {e}")),
+        };
 
     let json = serde_json::to_string(&overlay_map).unwrap_or_else(|_| "{}".into());
     if let Err(e) = st.store.upsert_settings(&json) {
@@ -227,7 +234,11 @@ mod tests {
     async fn put_rejects_wrong_type() {
         let (app, _store) = app();
         let resp = app
-            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": "not-a-number"}"#)))
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"max_failures": "not-a-number"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "类型不合法应 400,不写坏库");
@@ -249,7 +260,11 @@ mod tests {
         let (app, _store) = app();
         // 含掩码占位的回传值必须拒绝(fail-closed,绝不把脱敏形态当真值存)。
         let resp = app
-            .oneshot(req("PUT", "/settings", Some(r#"{"default_proxy": "socks5://u:***@h:1080"}"#)))
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(r#"{"default_proxy": "socks5://u:***@h:1080"}"#),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "非法/掩码代理应 400");

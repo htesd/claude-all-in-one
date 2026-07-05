@@ -10,7 +10,14 @@ import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 import { useUpdateAccount } from '../hooks'
-import { buildRotatedExtra, getMaskedRefreshToken, parseConcurrency } from '../lib'
+import {
+  buildRotatedExtra,
+  getMaskedRefreshToken,
+  parseConcurrency,
+  priorityToTier,
+  tierToPriority,
+  type PriorityTier,
+} from '../lib'
 import type { AccountRow, UpdateAccountPayload } from '../types'
 
 const inputClass =
@@ -35,6 +42,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
 
   const [group, setGroup] = useState('')
   const [concurrency, setConcurrency] = useState('1')
+  const [priorityTier, setPriorityTier] = useState<PriorityTier>('low')
   const [rotateOpen, setRotateOpen] = useState(false)
   const [token, setToken] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -46,6 +54,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     if (open && row) {
       setGroup(row.group_name)
       setConcurrency(String(row.max_concurrency))
+      setPriorityTier(priorityToTier(row.priority))
       setRotateOpen(false)
       setToken('')
       const currentProxy = typeof row.extra.proxy === 'string' ? row.extra.proxy : ''
@@ -67,12 +76,15 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
       setError(t('accounts.error.invalidConcurrency'))
       return
     }
+    // 优先级两档:高=0 / 低=100。
+    const priorityValue = tierToPriority(priorityTier)
     setError(null)
 
     // 只 PATCH 变化的字段；凭据留空 = 不传 extra
     const patch: UpdateAccountPayload = {}
     if (group !== row.group_name) patch.group_name = group
     if (parsedConcurrency !== row.max_concurrency) patch.max_concurrency = parsedConcurrency
+    if (priorityValue !== row.priority) patch.priority = priorityValue
     const trimmedToken = token.trim()
     if (trimmedToken !== '') patch.extra = buildRotatedExtra(row.extra, trimmedToken)
     // proxy_url: 不传=不动，'' = 清除，非空字符串 = 设置
@@ -148,6 +160,26 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
               onChange={(event) => setConcurrency(event.target.value)}
               className={inputClass}
             />
+          </div>
+
+          {/* 调度优先级 */}
+          <div className="space-y-1.5">
+            <label
+              htmlFor="edit-account-priority"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t('accounts.field.priority')}
+            </label>
+            <Select
+              id="edit-account-priority"
+              value={priorityTier}
+              onChange={(event) => setPriorityTier(event.target.value as PriorityTier)}
+              className="w-full"
+            >
+              <option value="high">{t('accounts.priorityTier.high')}</option>
+              <option value="low">{t('accounts.priorityTier.low')}</option>
+            </Select>
+            <p className="text-xs text-muted-foreground">{t('accounts.field.priorityHint')}</p>
           </div>
 
           {/* 出口代理（可选） */}

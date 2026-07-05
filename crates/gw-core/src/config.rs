@@ -216,10 +216,10 @@ impl SystemConfig {
     }
 }
 
-/// 实验性开关。`tools_in_prefix`/`cache_point`/`agent_continuation` 默认 **关**;
+/// 实验性开关。`tools_in_prefix`/`cache_point`/`agent_continuation`/`q_endpoint` 默认 **关**;
 /// `thinking_signature` 默认 **开**(保留现状,见其字段注释)。均可经设置面板热控;env
 /// (`KIRO_TOOLS_IN_PREFIX` / `KIRO_CACHE_POINT` / `KIRO_AGENT_CONTINUATION` /
-/// `KIRO_THINKING_SIGNATURE`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
+/// `KIRO_THINKING_SIGNATURE` / `KIRO_Q_ENDPOINT`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
     /// 把工具定义放进 history[0] 前缀(蹭 Kiro 缓存)。⚠️ 实测会让部分客户端工具调用失效,
@@ -238,6 +238,14 @@ pub struct ExperimentalConfig {
     /// (见 gw-kiro converter/cache_point.rs::thinking_signature_enabled)。env `KIRO_THINKING_SIGNATURE=0` 关。
     #[serde(default = "default_thinking_signature")]
     pub thinking_signature: bool,
+    /// 主推理上游端点选择。默认 **关**=`runtime.{region}.kiro.dev`(现状,防封对齐 static_flow
+    /// 当前客户端);开=`q.{region}.amazonaws.com`(旧 CodeWhisperer 端点,与 kiro.rs 一致)。
+    /// 【为何是开关】线上实测:runtime.kiro.dev 端点**真实 prompt 缓存命中 0%**、每 token 计费 ~2x;
+    /// kiro.rs 走 q.amazonaws.com 端点真实命中 82-92%(报文/账号/亲和完全一致,唯一变量是端点)。
+    /// ⚠️ 切旧端点更省积分,但客户端指纹偏离当前 Kiro,理论封号风险略升(kiro.rs 长期用它在跑);
+    /// 可经设置面板热切,出问题一键切回。env `KIRO_Q_ENDPOINT=1` 作启动默认。
+    #[serde(default = "default_q_endpoint")]
+    pub q_endpoint: bool,
 }
 
 fn env_experimental_flag(name: &str) -> bool {
@@ -254,6 +262,9 @@ fn default_cache_point() -> bool {
 fn default_agent_continuation() -> bool {
     env_experimental_flag("KIRO_AGENT_CONTINUATION")
 }
+fn default_q_endpoint() -> bool {
+    env_experimental_flag("KIRO_Q_ENDPOINT")
+}
 /// thinking 签名默认 **开**(现状),仅 env 显式设 `0`/`false` 才关。
 fn default_thinking_signature() -> bool {
     std::env::var("KIRO_THINKING_SIGNATURE")
@@ -268,6 +279,7 @@ impl Default for ExperimentalConfig {
             cache_point: default_cache_point(),
             agent_continuation: default_agent_continuation(),
             thinking_signature: default_thinking_signature(),
+            q_endpoint: default_q_endpoint(),
         }
     }
 }
@@ -540,6 +552,10 @@ pub struct SystemSettings {
     /// 通道被拒)。None = 用基线默认(开)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<bool>,
+    /// 主推理上游端点:false=`runtime.kiro.dev`(默认/现状),true=`q.amazonaws.com`(kiro.rs 端点,
+    /// 做服务端 prompt 缓存、真实命中 82-92% 省积分)。None=用基线默认。见 [`ExperimentalConfig::q_endpoint`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_endpoint: Option<bool>,
 }
 
 impl SystemSettings {
@@ -568,6 +584,7 @@ impl SystemSettings {
         if let Some(v) = self.cache_point { base.experimental.cache_point = v; }
         if let Some(v) = self.agent_continuation { base.experimental.agent_continuation = v; }
         if let Some(v) = self.thinking_signature { base.experimental.thinking_signature = v; }
+        if let Some(v) = self.q_endpoint { base.experimental.q_endpoint = v; }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -601,6 +618,7 @@ impl SystemSettings {
             cache_point: Some(cfg.experimental.cache_point),
             agent_continuation: Some(cfg.experimental.agent_continuation),
             thinking_signature: Some(cfg.experimental.thinking_signature),
+            q_endpoint: Some(cfg.experimental.q_endpoint),
         }
     }
 }
@@ -811,6 +829,23 @@ workers:
         let s_off = SystemSettings { thinking_signature: Some(false), ..Default::default() };
         s_off.apply_to(&mut base);
         assert!(!base.experimental.thinking_signature, "Some(false) 应关掉 thinking 签名");
+    }
+
+    #[test]
+    fn settings_q_endpoint_default_off_overlay_and_roundtrip() {
+        // 无 env 时默认关(runtime.kiro.dev)。
+        assert!(!super::default_q_endpoint(), "q_endpoint 默认关(无 KIRO_Q_ENDPOINT)");
+        // None → 不覆盖(保留基线);Some(true) → 切旧 q 端点。
+        let mut base = SystemConfig::default();
+        base.experimental.q_endpoint = false;
+        SystemSettings::default().apply_to(&mut base);
+        assert!(!base.experimental.q_endpoint, "None 时应保留默认(不误切端点)");
+        let s_on = SystemSettings { q_endpoint: Some(true), ..Default::default() };
+        s_on.apply_to(&mut base);
+        assert!(base.experimental.q_endpoint, "Some(true) 应切到 q.amazonaws.com 端点");
+        // from_effective 往返:开着的 q_endpoint 应被 Some(true) 回灌。
+        let full = SystemSettings::from_effective(&base, None);
+        assert_eq!(full.q_endpoint, Some(true), "from_effective 须回灌 q_endpoint 当前值");
     }
 
     #[test]

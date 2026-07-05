@@ -108,7 +108,10 @@ fn is_instances_config_file(name: &str) -> bool {
     if name == "instances.yaml" {
         return true;
     }
-    match name.strip_prefix("instances-").and_then(|s| s.strip_suffix(".yaml")) {
+    match name
+        .strip_prefix("instances-")
+        .and_then(|s| s.strip_suffix(".yaml"))
+    {
         Some(seg) => !seg.is_empty() && !seg.contains('.'),
         None => false,
     }
@@ -131,7 +134,9 @@ fn aggregate_display_workers(
     let mut seen: std::collections::HashSet<String> =
         out.iter().map(|w| w.listen.clone()).collect();
     let dir = instances_path.parent().unwrap_or_else(|| Path::new("."));
-    let Ok(entries) = std::fs::read_dir(dir) else { return out; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -190,7 +195,10 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
     // 本 router 自身必须定义 ≥1 worker:default_group 由它的首个 worker 派生,空了
     // 会让回落组为 "",空组/降级流量全 503(审查 Skeptic#5)。聚合非空但 own 空时也拒。
     if instances.workers.is_empty() {
-        anyhow::bail!("本 router 的 {} 未定义任何 worker", instances_path.display());
+        anyhow::bail!(
+            "本 router 的 {} 未定义任何 worker",
+            instances_path.display()
+        );
     }
 
     // 全局唯一性护栏:聚合跨文件后,以下重复都会破坏数据面正确性,提级为"启动即报错":
@@ -318,7 +326,13 @@ async fn health(State(st): State<Arc<RouterState>>) -> impl IntoResponse {
     let mut worker_status = Vec::new();
     for w in &st.workers {
         let url = format!("{}/health", w.base_url);
-        let status = match st.http.get(&url).timeout(Duration::from_secs(3)).send().await {
+        let status = match st
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => r
                 .json::<serde_json::Value>()
                 .await
@@ -407,8 +421,7 @@ async fn forward(
     let mut target = target;
     let mut failed_over = false;
     loop {
-        match send_messages_to_worker(&st, &target, &headers, &body, client_key.as_deref()).await
-        {
+        match send_messages_to_worker(&st, &target, &headers, &body, client_key.as_deref()).await {
             Ok(resp) => return proxy_response(resp),
             Err(e) => {
                 tracing::error!(instance = target.instance, "转发到 worker 失败: {e}");
@@ -417,14 +430,15 @@ async fn forward(
                 }
                 match failover_target(&st, session_id.as_deref(), group, target.instance) {
                     Some(t) => {
-                        tracing::warn!(from = target.instance, to = t.instance,
-                            "故障转移:换 worker 重发");
+                        tracing::warn!(
+                            from = target.instance,
+                            to = t.instance,
+                            "故障转移:换 worker 重发"
+                        );
                         target = t;
                         failed_over = true;
                     }
-                    None => {
-                        return (StatusCode::BAD_GATEWAY, "worker 不可达").into_response()
-                    }
+                    None => return (StatusCode::BAD_GATEWAY, "worker 不可达").into_response(),
                 }
             }
         }
@@ -519,7 +533,10 @@ async fn authorize(
 ) -> Result<Authed, axum::response::Response> {
     let Some(store) = st.store.as_ref() else {
         // P0:无控制面库,放行且无归属/无分组(路由用 default_group)。
-        return Ok(Authed { key_id: None, group: None });
+        return Ok(Authed {
+            key_id: None,
+            group: None,
+        });
     };
     match extract_bearer(headers) {
         Some(k) => match store.authenticate(&k).await {
@@ -542,7 +559,9 @@ async fn authorize(
                 Err((StatusCode::INTERNAL_SERVER_ERROR, "鉴权失败").into_response())
             }
         },
-        None => Err(unauthorized("缺少 API key(x-api-key 或 Authorization: Bearer)")),
+        None => Err(unauthorized(
+            "缺少 API key(x-api-key 或 Authorization: Bearer)",
+        )),
     }
 }
 
@@ -569,7 +588,13 @@ async fn forward_models(
             .into_response();
     };
     let url = format!("{}/v1/models", target.base_url);
-    match st.http.get(&url).timeout(Duration::from_secs(10)).send().await {
+    match st
+        .http
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             let mut builder = axum::response::Response::builder().status(status);
@@ -582,7 +607,10 @@ async fn forward_models(
             })
         }
         Err(e) => {
-            tracing::error!(instance = target.instance, "转发 models 到 worker 失败: {e}");
+            tracing::error!(
+                instance = target.instance,
+                "转发 models 到 worker 失败: {e}"
+            );
             (StatusCode::BAD_GATEWAY, "worker 不可达").into_response()
         }
     }
@@ -673,7 +701,11 @@ fn least_loaded_locked(
 /// 同会话稳定钉同 worker→同账号→缓存热(审查 #131①:统一身份链)。仍提不到才 None(轮转)。
 fn parse_session_id(body: &Bytes) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    if let Some(user_id) = v.get("metadata").and_then(|m| m.get("user_id")).and_then(|u| u.as_str()) {
+    if let Some(user_id) = v
+        .get("metadata")
+        .and_then(|m| m.get("user_id"))
+        .and_then(|u| u.as_str())
+    {
         if let Some(sid) = extract_session_from_metadata(user_id) {
             return Some(sid);
         }
@@ -788,7 +820,10 @@ mod embedded_ui {
         fn asset_key_normalizes_paths() {
             assert_eq!(asset_key("/"), "index.html");
             assert_eq!(asset_key(""), "index.html");
-            assert_eq!(asset_key("/assets/index-abc123.js"), "assets/index-abc123.js");
+            assert_eq!(
+                asset_key("/assets/index-abc123.js"),
+                "assets/index-abc123.js"
+            );
             assert_eq!(asset_key("/usage"), "usage"); // 未知路径由 serve 兜底回 index.html
         }
 
@@ -838,18 +873,27 @@ mod tests {
         );
         // 两者都在 → 优先 x-api-key(本网关对外是 Anthropic 线缆)。
         assert_eq!(
-            extract_bearer(&hdr(&[("x-api-key", "sk-xak"), ("authorization", "Bearer sk-auth")]))
-                .as_deref(),
+            extract_bearer(&hdr(&[
+                ("x-api-key", "sk-xak"),
+                ("authorization", "Bearer sk-auth")
+            ]))
+            .as_deref(),
             Some("sk-xak")
         );
         // 空 x-api-key 回退到 Authorization。
         assert_eq!(
-            extract_bearer(&hdr(&[("x-api-key", "  "), ("authorization", "Bearer sk-fallback")]))
-                .as_deref(),
+            extract_bearer(&hdr(&[
+                ("x-api-key", "  "),
+                ("authorization", "Bearer sk-fallback")
+            ]))
+            .as_deref(),
             Some("sk-fallback")
         );
         // 都没有 → None。
-        assert_eq!(extract_bearer(&hdr(&[("accept", "application/json")])), None);
+        assert_eq!(
+            extract_bearer(&hdr(&[("accept", "application/json")])),
+            None
+        );
     }
 
     #[test]
@@ -1009,7 +1053,11 @@ mod tests {
             .map(|sid| pick_worker_at(&st, Some(sid), "G0", t0).unwrap().instance)
             .collect();
         let a = placed[0];
-        assert_eq!(placed.iter().filter(|&&i| i == a).count(), 2, "前置:应 2/2 均铺");
+        assert_eq!(
+            placed.iter().filter(|&&i| i == a).count(),
+            2,
+            "前置:应 2/2 均铺"
+        );
 
         // a 上的两个 session 全部过期(模拟时间推进:只刷新另一台的 last_seen)。
         let t1 = t0 + AFFINITY_TTL + Duration::from_secs(1);
@@ -1023,8 +1071,14 @@ mod tests {
         }
         // 活跃负载 a=0、b=2:接下来两个新 session 都必须落到 a。
         // (旧实现累计计数不回落,第二个会被错误分到 b。)
-        assert_eq!(pick_worker_at(&st, Some("n1"), "G0", t1).unwrap().instance, a);
-        assert_eq!(pick_worker_at(&st, Some("n2"), "G0", t1).unwrap().instance, a);
+        assert_eq!(
+            pick_worker_at(&st, Some("n1"), "G0", t1).unwrap().instance,
+            a
+        );
+        assert_eq!(
+            pick_worker_at(&st, Some("n2"), "G0", t1).unwrap().instance,
+            a
+        );
     }
 
     #[test]
@@ -1033,12 +1087,18 @@ mod tests {
         let key = affinity_key("G0", "ghost");
         st.affinity.lock().entries.insert(
             key.clone(),
-            AffinityEntry { instance: 99, last_seen: Instant::now() },
+            AffinityEntry {
+                instance: 99,
+                last_seen: Instant::now(),
+            },
         );
         // 亲和指向已不存在的 worker(拓扑变更):应重选一个真实 worker 并修正亲和。
         let picked = pick_worker(&st, Some("ghost"), "G0").expect("应能重选真实 worker");
         assert!(st.workers.iter().any(|w| w.instance == picked.instance));
-        assert_eq!(st.affinity.lock().entries.get(&key).unwrap().instance, picked.instance);
+        assert_eq!(
+            st.affinity.lock().entries.get(&key).unwrap().instance,
+            picked.instance
+        );
     }
 
     #[test]
@@ -1049,8 +1109,13 @@ mod tests {
         {
             let mut aff = st.affinity.lock();
             // s1 钉在 instance 1 上但早已过期;全表清理"刚跑过"(节流未到期)。
-            aff.entries
-                .insert(affinity_key("G0", "s1"), AffinityEntry { instance: 1, last_seen: t0 });
+            aff.entries.insert(
+                affinity_key("G0", "s1"),
+                AffinityEntry {
+                    instance: 1,
+                    last_seen: t0,
+                },
+            );
             aff.last_cleanup = t1;
         }
         // 命中路径必须 O(1) 精确判过期,不依赖节流的全表清理兜底:
@@ -1067,7 +1132,12 @@ mod tests {
             failover_target(&st, Some("s1"), "G0", first.instance).expect("双 worker 应有备选");
         assert_ne!(next.instance, first.instance, "备选必须避开故障实例");
         assert_eq!(
-            st.affinity.lock().entries.get(&affinity_key("G0", "s1")).unwrap().instance,
+            st.affinity
+                .lock()
+                .entries
+                .get(&affinity_key("G0", "s1"))
+                .unwrap()
+                .instance,
             next.instance,
             "亲和应重钉到备选 worker"
         );
@@ -1099,7 +1169,9 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(pick_worker(&st, Some("g0-sess"), "G0").unwrap().instance, 0);
             assert_eq!(
-                pick_worker(&st, Some("dario-sess"), "DARIO").unwrap().instance,
+                pick_worker(&st, Some("dario-sess"), "DARIO")
+                    .unwrap()
+                    .instance,
                 1
             );
         }
@@ -1110,7 +1182,10 @@ mod tests {
         // 配了分组但无对应 worker(如 G1)→ None,调用方 503;绝不回落到别组。
         let st = mk_state_grouped(vec![(0, "G0".into()), (1, "DARIO".into())]);
         assert!(pick_worker(&st, Some("s"), "G1").is_none());
-        assert!(pick_worker(&st, None, "G1").is_none(), "/v1/models 路径同样不跨组");
+        assert!(
+            pick_worker(&st, None, "G1").is_none(),
+            "/v1/models 路径同样不跨组"
+        );
     }
 
     #[test]
@@ -1119,10 +1194,16 @@ mod tests {
         // 且彼此**不驱逐**(审查共识修复:复合键 (group,sid) 杜绝跨组亲和抖动)。
         let st = mk_state_grouped(vec![(0, "G0".into()), (1, "DARIO".into())]);
         assert_eq!(pick_worker(&st, Some("shared"), "G0").unwrap().instance, 0);
-        assert_eq!(pick_worker(&st, Some("shared"), "DARIO").unwrap().instance, 1);
+        assert_eq!(
+            pick_worker(&st, Some("shared"), "DARIO").unwrap().instance,
+            1
+        );
         // 关键:DARIO 那次不得抹掉 G0 的 pin —— 再查 G0 仍稳定在 0。
         assert_eq!(pick_worker(&st, Some("shared"), "G0").unwrap().instance, 0);
-        assert_eq!(pick_worker(&st, Some("shared"), "DARIO").unwrap().instance, 1);
+        assert_eq!(
+            pick_worker(&st, Some("shared"), "DARIO").unwrap().instance,
+            1
+        );
         // 两组各自一条亲和记录,共存。
         assert_eq!(st.affinity.lock().entries.len(), 2);
     }
@@ -1130,7 +1211,11 @@ mod tests {
     #[test]
     fn failover_stays_within_group() {
         // G0 两台 + DARIO 一台:G0 故障转移只在 G0 内换,绝不跳到 DARIO。
-        let st = mk_state_grouped(vec![(0, "G0".into()), (1, "G0".into()), (2, "DARIO".into())]);
+        let st = mk_state_grouped(vec![
+            (0, "G0".into()),
+            (1, "G0".into()),
+            (2, "DARIO".into()),
+        ]);
         let first = pick_worker(&st, Some("s1"), "G0").unwrap();
         assert_eq!(first.account_group, "G0");
         let next = failover_target(&st, Some("s1"), "G0", first.instance).unwrap();

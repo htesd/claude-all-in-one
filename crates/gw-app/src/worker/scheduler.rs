@@ -12,9 +12,16 @@
 //! ## v52 亲和铁律:「落在哪个号就认哪个号」
 //!
 //! - 新会话:在合格账号里按**优先级分层 LRU** 选 primary(最高优先级层内 last_selected 最旧);
-//! - 老会话且 primary 当下可用:一直用 primary(缓存热);
+//! - 老会话且 primary 当下可用:一直用 primary(缓存热);**唯一例外**=向上迁移(见下);
 //! - primary 当下不可用(busy/冷却/禁用):**立即**改选 LRU 候选并**当场转正为新 primary**,
-//!   此后钉死新号、**永不主动迁回**原号(消除旧版「空↔满」抖动导致的橡皮筋横跳)。
+//!   此后钉死新号、**永不主动向下/同层迁回**原号(消除旧版「空↔满」抖动导致的橡皮筋横跳)。
+//!
+//! ### 例外:两层优先级下的「向上迁移」
+//! primary 落在**低优先级层**、而此刻**更高层有空闲 permit** 时,允许迁回高层一次并转正
+//! (让稀缺的高优先级号被积极使用,而非被老会话永久粘在低层浪费)。为不重演橡皮筋横跳,
+//! 迁移带去抖 [`MIGRATE_UP_DEBOUNCE`](每会话跨层迁移 ≤1 次/窗口);高层饱和(permit=0)时
+//! 不迁。**同层内**仍严格「永不迁回」。代价:每次跨层迁移 = 新账号对 Kiro 一次冷启动
+//! (cache_sim 按会话键、对换号无感,会短暂高估命中→计费失真;去抖已把频率压到最低)。
 //!
 //! ## 亲和键 = conversationId(不是 metadata session_id)
 //!
@@ -182,6 +189,12 @@ pub struct SyncOutcome {
     pub removed: usize,
 }
 
+/// 老会话「向上迁移」去抖窗口:一次跨层迁回高层后,距上次迁移不足此窗口不再迁。
+/// 把跨层横跳频率硬上限到每会话 ≤1 次/窗口——防止高层在饱和线附近抖动时,会话被
+/// 「上迁 → 瞬时挤下 → 上迁」反复拉扯(重演 v52 橡皮筋 cache 崩,见 affinity-rubber-band-v52)。
+/// 被挤下的那段时间会话稳定服务于低层(缓存热),窗口过后才再尝试回高层。
+const MIGRATE_UP_DEBOUNCE: Duration = Duration::from_secs(60);
+
 /// 会话亲和记录:session_key → 当前 primary 账号(带 TTL 淘汰)。
 /// v52:只留 primary + last_access,删 alt/streak(「落在哪个号就认哪个号」)。
 struct AffinityEntry {
@@ -189,6 +202,8 @@ struct AffinityEntry {
     primary: String,
     /// 最后访问时刻(TTL 淘汰用)。
     last_access: Instant,
+    /// 上次「向上迁移」时刻(去抖用;None=从未迁移)。见 [`MIGRATE_UP_DEBOUNCE`]。
+    last_upgrade: Option<Instant>,
 }
 
 /// 一次成功选号的租约:选中的账号 + 并发许可(持有期间占用并发槽,Drop 即释放)。
@@ -339,6 +354,37 @@ impl AccountScheduler {
             .unwrap_or_else(|| ids[0].clone())
     }
 
+    /// 老会话向上迁移的目标:合格集合里「优先级严格高于 `worse_than` 且此刻**有空闲
+    /// permit**」的号,层内 LRU 最旧者;无则 `None`(维持原 primary)。
+    ///
+    /// 关键用 `available_permits()` 而非仅「未禁用/未 busy」——高优先级层被并发占满
+    /// (permit=0)时**不迁**,避免高层饱和(用户抱怨的常态)时每请求空跑
+    /// select→try_lease busy→回退的浪费。仅当高层真有空位才迁并转正;跨层横跳频率由调用方
+    /// [`MIGRATE_UP_DEBOUNCE`] 去抖硬上限。注:permit 的 select→try_lease 之间仍有 TOCTOU
+    /// 竞态窗口(读到有空位但真取时被抢),失败由 acquire_where 的 exclude 重试兜底回落到
+    /// 低层,不产生错误状态,仅偶发一次空跑。注:该竞态失败路径也会烧掉 `last_upgrade`
+    /// (置位在迁移决策点、早于 try_lease),故不破坏去抖上限——被挤下后 60s 内不再重迁。
+    fn best_available_higher(
+        entries: &HashMap<String, CredentialState>,
+        ids: &[String],
+        worse_than: i64,
+    ) -> Option<String> {
+        let cands: Vec<String> = ids
+            .iter()
+            .filter(|id| {
+                entries
+                    .get(*id)
+                    .is_some_and(|e| e.priority < worse_than && e.semaphore.available_permits() > 0)
+            })
+            .cloned()
+            .collect();
+        if cands.is_empty() {
+            None
+        } else {
+            Some(Self::tiered_lru(entries, &cands))
+        }
+    }
+
     /// 按会话亲和选一个账号 id(v52「落在哪个号就认哪个号」),并更新亲和表 + last_selected。
     /// `session_key = None` 时退化为分层 LRU(无亲和记忆)。`exclude` = 本轮已 busy 的号。
     /// `supports` = 模型能力过滤:primary 不支持本次模型时同样走「改选 + 当场转正」。
@@ -368,17 +414,41 @@ impl AccountScheduler {
                         let id = Self::tiered_lru(&entries, &eligible);
                         map.insert(
                             key.to_string(),
-                            AffinityEntry { primary: id.clone(), last_access: now },
+                            AffinityEntry { primary: id.clone(), last_access: now, last_upgrade: None },
                         );
                         id
                     }
                     Some(ent) => {
                         ent.last_access = now;
                         if eligible_set.contains(&ent.primary) {
-                            // primary 当下可用 → 继续用(缓存热)。
-                            ent.primary.clone()
+                            // primary 当下可用。同层保持 v52 粘着(缓存热);但若 primary 落在
+                            // 低优先级层、而此刻更高层**有空闲 permit**,则向上迁移一次并转正
+                            // ——让高优先级号被积极使用。高层饱和 / 已在最高层 → 维持粘着。
+                            // 去抖:距上次向上迁移不足 MIGRATE_UP_DEBOUNCE 则**不再迁**(cooled=false
+                            // 时连 best_available_higher 扫描都跳过),把跨层横跳频率硬上限到
+                            // 1 次/窗口/会话,防高层饱和线附近的橡皮筋抖动(见该常量注释)。
+                            let primary_priority = entries
+                                .get(&ent.primary)
+                                .map(|e| e.priority)
+                                .unwrap_or(i64::MAX);
+                            let cooled = ent
+                                .last_upgrade
+                                .map_or(true, |t| now.duration_since(t) >= MIGRATE_UP_DEBOUNCE);
+                            let target = if cooled {
+                                Self::best_available_higher(&entries, &eligible, primary_priority)
+                            } else {
+                                None
+                            };
+                            match target {
+                                Some(higher) => {
+                                    ent.primary = higher.clone();
+                                    ent.last_upgrade = Some(now);
+                                    higher
+                                }
+                                None => ent.primary.clone(),
+                            }
                         } else {
-                            // primary 不可用 → 立即改选并当场转正,永不迁回。
+                            // primary 不可用 → 立即改选并当场转正,永不迁回(下沉/同层横切同理)。
                             let id = Self::tiered_lru(&entries, &eligible);
                             ent.primary = id.clone();
                             id
@@ -892,6 +962,118 @@ mod tests {
         s.report_failure(&id, UpstreamErrorKind::RateLimited);
         let other = s.acquire(Some("s")).await.unwrap().account_id().to_string();
         assert_ne!(other, id, "限流号应被跳过");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_top_tier_descends_to_lower_priority_pool() {
+        // 高优先级层两个号(priority=1)+ 低优先级兜底号(priority=100)。
+        // 逐个把高优先级层限流后,acquire 应沿优先级阶梯下探到低优先级兜底号,而非无号可选。
+        let s = sched(vec![
+            acct("hi-1", 4, Some(1)),
+            acct("hi-2", 4, Some(1)),
+            acct("lo", 4, Some(100)),
+        ]);
+        let first = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        assert!(first == "hi-1" || first == "hi-2", "先落最高优先级层: {first}");
+        s.report_failure(&first, UpstreamErrorKind::RateLimited);
+        let second = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        assert!(
+            (second == "hi-1" || second == "hi-2") && second != first,
+            "高优先级层还有号时仍停在本层: {second}"
+        );
+        s.report_failure(&second, UpstreamErrorKind::RateLimited);
+        // 高优先级层全冷却 → 下探到低优先级兜底池。
+        let third = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        assert_eq!(third, "lo", "高优先级层全限流后应下探到低优先级号");
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_top_tier_descends_to_lower_priority_pool() {
+        // 额度耗尽与限流同属"良性可下探":高优先级号额度用光后,acquire 落到低优先级兜底号。
+        let s = sched(vec![acct("hi", 4, Some(1)), acct("lo", 4, Some(100))]);
+        let first = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        assert_eq!(first, "hi", "先落最高优先级层");
+        s.report_failure(&first, UpstreamErrorKind::QuotaExhausted);
+        let second = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        assert_eq!(second, "lo", "高优先级号额度耗尽后应下探到低优先级号");
+    }
+
+    #[tokio::test]
+    async fn low_tier_session_migrates_up_when_high_tier_frees() {
+        // hi 仅 1 permit;先用别的会话占满 hi,逼会话 s 下沉到低层 lo。
+        let s = sched(vec![acct("hi", 1, Some(1)), acct("lo", 4, Some(100))]);
+        let occupy = s.acquire(Some("occupy")).await.unwrap();
+        assert_eq!(occupy.account_id(), "hi", "占位会话先落最高层");
+        let on_lo = s.acquire(Some("s")).await.unwrap();
+        assert_eq!(on_lo.account_id(), "lo", "hi 满 → 会话 s 下沉低层并转正");
+        drop(on_lo);
+        drop(occupy); // 释放高层 permit
+        let migrated = s.acquire(Some("s")).await.unwrap();
+        assert_eq!(migrated.account_id(), "hi", "高层空出 → 老会话向上迁移到高层");
+        drop(migrated);
+        // 迁后钉住:再取仍是 hi(不横跳、不下沉)。
+        let stay = s.acquire(Some("s")).await.unwrap();
+        assert_eq!(stay.account_id(), "hi", "迁后钉在高层");
+    }
+
+    #[tokio::test]
+    async fn high_tier_primary_stays_when_no_higher_available() {
+        // 会话已在最高层:高层内不横跳(无更高层可迁),保持 v52 粘着。
+        let s = sched(vec![acct("hi-1", 4, Some(1)), acct("hi-2", 4, Some(1))]);
+        let first = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        for _ in 0..5 {
+            let again = s.acquire(Some("s")).await.unwrap();
+            assert_eq!(again.account_id(), first, "已在最高层 → 粘着,不横跳");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_upward_migration_when_high_tier_busy() {
+        // hi 仅 1 permit 且被占位会话占满**不释放**:老会话落 lo 后不误迁到 permit=0 的 hi
+        // (证明高层饱和时不空跑 select→busy)。
+        let s = sched(vec![acct("hi", 1, Some(1)), acct("lo", 4, Some(100))]);
+        let _occupy = s.acquire(Some("occupy")).await.unwrap();
+        assert_eq!(_occupy.account_id(), "hi");
+        let on_lo = s.acquire(Some("s")).await.unwrap().account_id().to_string();
+        assert_eq!(on_lo, "lo", "hi 满 → 落低层");
+        for _ in 0..3 {
+            let again = s.acquire(Some("s")).await.unwrap();
+            assert_eq!(again.account_id(), "lo", "高层 busy(permit=0)时不向上迁移");
+        }
+    }
+
+    #[tokio::test]
+    async fn upgraded_session_debounced_against_rethrash() {
+        // 复现对抗审查 Finding 1 的橡皮筋场景并验证去抖:会话上迁到高层后被瞬时挤下低层,
+        // MIGRATE_UP_DEBOUNCE(60s)窗口内不再立刻迁回——防高层饱和线附近的反复横跳(cache 崩)。
+        let s = sched(vec![acct("hi", 1, Some(1)), acct("lo", 4, Some(100))]);
+        // s 先被占位逼到 lo,再(首次,允许)迁回 hi。
+        let occ = s.acquire(Some("occ")).await.unwrap();
+        assert_eq!(occ.account_id(), "hi");
+        assert_eq!(s.acquire(Some("s")).await.unwrap().account_id(), "lo");
+        drop(occ);
+        assert_eq!(
+            s.acquire(Some("s")).await.unwrap().account_id(),
+            "hi",
+            "首次迁移:高层空出 → 迁回 hi(去抖 last_upgrade 置位)"
+        );
+        // 再占位逼 s 下沉 lo(既有「primary 不可用→转正」)。
+        let occ2 = s.acquire(Some("occ2")).await.unwrap();
+        assert_eq!(occ2.account_id(), "hi");
+        assert_eq!(
+            s.acquire(Some("s")).await.unwrap().account_id(),
+            "lo",
+            "primary hi 被占 → 下沉 lo"
+        );
+        drop(occ2); // hi 又空出
+        // 去抖窗口内(距上次迁移 <60s)→ 不再立刻迁回,稳定停在 lo(反橡皮筋横跳)。
+        for _ in 0..3 {
+            assert_eq!(
+                s.acquire(Some("s")).await.unwrap().account_id(),
+                "lo",
+                "去抖窗口内不重复向上迁移"
+            );
+        }
     }
 
     #[tokio::test]

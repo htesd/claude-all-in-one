@@ -96,7 +96,10 @@ pub fn router() -> Router<AdminState> {
         .route("/logs/{id}", get(detail))
 }
 
-async fn list(State(st): State<AdminState>, Query(q): Query<LogsQuery>) -> axum::response::Response {
+async fn list(
+    State(st): State<AdminState>,
+    Query(q): Query<LogsQuery>,
+) -> axum::response::Response {
     let filter = q.to_filter();
     let (page, page_size) = q.paging();
     let items = match st.store.list_request_logs(&filter, DEFAULT_PAGE_SIZE) {

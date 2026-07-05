@@ -20,6 +20,11 @@ struct ExperimentalFlags {
     /// 非法,跨通道(如同会话漂到 ccmax/Bedrock)会被拒 `THINKING_SIGNATURE_INVALID`。详见
     /// [`thinking_signature_enabled`]。
     thinking_signature: bool,
+    /// 主推理上游端点:false=`runtime.{region}.kiro.dev`(默认/现状),true=`q.{region}.amazonaws.com`
+    /// (kiro.rs 端点)。线上实测:runtime.kiro.dev 真实 prompt 缓存 0%/计费 ~2x,q.amazonaws.com 真实
+    /// 命中 82-92%(见 [`q_endpoint_enabled`] 与 `crate::headers::runtime_base_url`)。env `KIRO_Q_ENDPOINT=1`
+    /// 作启动默认。
+    q_endpoint: bool,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -45,6 +50,7 @@ fn experimental() -> &'static RwLock<ExperimentalFlags> {
             cache_point: env_flag("KIRO_CACHE_POINT"),
             agent_continuation: env_flag("KIRO_AGENT_CONTINUATION"),
             thinking_signature: env_flag_default_on("KIRO_THINKING_SIGNATURE"),
+            q_endpoint: env_flag("KIRO_Q_ENDPOINT"),
         })
     })
 }
@@ -55,12 +61,14 @@ pub(crate) fn set_experimental_flags(
     cache_point: bool,
     agent_continuation: bool,
     thinking_signature: bool,
+    q_endpoint: bool,
 ) {
     if let Ok(mut g) = experimental().write() {
         g.tools_in_prefix = tools_in_prefix;
         g.cache_point = cache_point;
         g.agent_continuation = agent_continuation;
         g.thinking_signature = thinking_signature;
+        g.q_endpoint = q_endpoint;
     }
 }
 
@@ -103,6 +111,13 @@ pub(super) fn cache_point_enabled() -> bool {
 /// A/B 期间零重启、零丢请求即可翻开关回滚(env `KIRO_AGENT_CONTINUATION` 作启动默认)。
 pub(super) fn agent_continuation_enabled() -> bool {
     experimental().read().map(|g| g.agent_continuation).unwrap_or(false)
+}
+
+/// 主推理上游端点是否切到旧 `q.{region}.amazonaws.com`(kiro.rs 端点,做服务端 prompt 缓存)。
+/// 默认关(false)=现状 `runtime.{region}.kiro.dev`。由 [`crate::headers::runtime_base_url`] 消费。
+/// 锁中毒时回退 **false**(保守:维持现状端点,不误切)。
+pub(crate) fn q_endpoint_enabled() -> bool {
+    experimental().read().map(|g| g.q_endpoint).unwrap_or(false)
 }
 
 /// 是否给响应里的 thinking 块附 `signature`。**默认开**(保留现状:带签名,过 hvoy/cctest 检测)。
