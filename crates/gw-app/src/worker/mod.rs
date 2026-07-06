@@ -1358,7 +1358,11 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
 fn switch_cap(kind: UpstreamErrorKind, total: usize, general_cap: usize) -> usize {
     if matches!(
         kind,
-        UpstreamErrorKind::RateLimited | UpstreamErrorKind::QuotaExhausted
+        UpstreamErrorKind::RateLimited
+            | UpstreamErrorKind::QuotaExhausted
+            // ModelNotAvailable 同属良性(不禁号/不传播毒性):需沿组内遍历到有该模型的号,
+            // 且每失败一次即把该 (号,模型) 标记不可用、下一跳自动跳过,不会重复打同一个号。
+            | UpstreamErrorKind::ModelNotAvailable
     ) {
         total.max(1)
     } else {
@@ -1397,11 +1401,14 @@ async fn messages(
     loop {
         attempts += 1;
         // 1. 按会话亲和取并发租约(持有到流结束)。合格账号须支持本次模型
-        //    (FREE 订阅不支持 opus,过滤掉避免 403 误杀,对齐 kiro.rs supports_opus)。
+        //    (FREE 订阅不支持 opus,过滤掉避免 403 误杀,对齐 kiro.rs supports_opus);
+        //    并剔除已知对本模型返 INVALID_MODEL_ID 的号(区域/档位未上线),路由到有该
+        //    模型的号——否则亲和会反复选中同一不支持的号(ModelNotAvailable 不禁号)死循环。
         let lease = match st
             .scheduler
             .acquire_where(affinity_key.as_deref(), |a| {
                 st.provider.account_supports_model(a, &req.model)
+                    && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
             })
             .await
         {
@@ -1625,11 +1632,20 @@ async fn messages(
                 let kind = e.kind;
                 tracing::warn!(account = %account_id, kind = ?kind, "chat 失败: {e}");
                 st.scheduler.report_failure(&account_id, kind);
+                // 该号对本模型不可用(INVALID_MODEL_ID):记 (号,模型) 不可用,后续选号跳过它、
+                // 路由到有该模型的号(该号**不禁用**,仍服务其它模型)。
+                if kind == UpstreamErrorKind::ModelNotAvailable {
+                    st.scheduler.mark_model_unavailable(&account_id, &req.model);
+                }
                 drop(lease);
                 if !kind.worth_switching_account() || attempts >= switch_cap(kind, total, general_cap) {
                     // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
                     // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
-                    let status = if kind == UpstreamErrorKind::BadRequest {
+                    // ModelNotAvailable 与 BadRequest 同归 400(客户端应换模型/升级),其余 502。
+                    let status = if matches!(
+                        kind,
+                        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
+                    ) {
                         Some(400)
                     } else {
                         Some(502)
@@ -1657,9 +1673,12 @@ async fn messages(
     }
 }
 
-/// 把 [`UpstreamError`] 映射为对外 HTTP 响应(BadRequest→400,其余→502)。
+/// 把 [`UpstreamError`] 映射为对外 HTTP 响应(BadRequest/ModelNotAvailable→400,其余→502)。
 fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
-    let code = if e.kind == UpstreamErrorKind::BadRequest {
+    let code = if matches!(
+        e.kind,
+        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
+    ) {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::BAD_GATEWAY
@@ -2057,7 +2076,10 @@ async fn collect_response(
     let (status_code, error_kind): (Option<i64>, Option<String>) = match &outcome {
         Outcome::Ok(_) => (Some(200), None),
         Outcome::Upstream(e) => (
-            Some(if e.kind == UpstreamErrorKind::BadRequest {
+            Some(if matches!(
+                e.kind,
+                UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
+            ) {
                 400
             } else {
                 502
@@ -2074,6 +2096,11 @@ async fn collect_response(
             _ => UpstreamErrorKind::ServerError,
         };
         scheduler.report_failure(&account_id, kind);
+        // 防御:理论上 INVALID_MODEL_ID 是首包前 400 走主循环,但若上游 mid-stream 冒出
+        // 也在此记 (号,模型) 不可用,与主循环口径一致(不禁号 + 后续选号跳过该号)。
+        if kind == UpstreamErrorKind::ModelNotAvailable {
+            scheduler.mark_model_unavailable(&account_id, &req.model);
+        }
     }
     finalize_usage(
         usage_sink,
@@ -2357,6 +2384,8 @@ mod tests {
         // 使高优先级层全限流时落到低优先级兜底池,而非把限流错误抛回客户端。
         assert_eq!(switch_cap(UpstreamErrorKind::RateLimited, 12, 2), 12);
         assert_eq!(switch_cap(UpstreamErrorKind::QuotaExhausted, 12, 2), 12);
+        // ModelNotAvailable 亦良性:遍历组内找到有该模型的号(cap=total)。
+        assert_eq!(switch_cap(UpstreamErrorKind::ModelNotAvailable, 12, 2), 12);
         // 风险类换号错误:仍守 general_cap(默认 2),防换号雪崩封号。
         assert_eq!(switch_cap(UpstreamErrorKind::ServerError, 12, 2), 2);
         assert_eq!(switch_cap(UpstreamErrorKind::TokenInvalid, 12, 2), 2);

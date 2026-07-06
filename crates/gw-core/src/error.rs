@@ -29,6 +29,12 @@ pub enum UpstreamErrorKind {
     /// 请求本身非法(400 Improperly formed / schema 错误)。
     /// 动作:**不换号**(换号也一样错),直接返回客户端。
     BadRequest,
+    /// 该账号不支持所请求的模型(400 `INVALID_MODEL_ID`):模型在该号的区域/订阅档
+    /// 未上线(如 eu-central-1 号点 claude-sonnet-5)。**非账号健康问题**。
+    /// 动作:**不惩罚账号**(不计失败/不禁用)+ 换号到有该模型的号重试;调度层还会记
+    /// `(账号,模型)` 不可用(见 scheduler `mark_model_unavailable`),后续选号直接跳过该号,
+    /// 避免亲和反复选中同一不支持的号死循环。
+    ModelNotAvailable,
     /// 上游 200 空流(Kiro 首包截断等)。动作:见 empty-fallback 策略。
     EmptyResponse,
     /// 其他未分类。动作:保守切号一次。
@@ -78,6 +84,7 @@ impl fmt::Display for UpstreamErrorKind {
             UpstreamErrorKind::Network => "network",
             UpstreamErrorKind::ServerError => "server_error",
             UpstreamErrorKind::BadRequest => "bad_request",
+            UpstreamErrorKind::ModelNotAvailable => "model_not_available",
             UpstreamErrorKind::EmptyResponse => "empty_response",
             UpstreamErrorKind::Other => "other",
         };
@@ -154,6 +161,8 @@ mod tests {
         assert!(UpstreamErrorKind::ServerError.worth_switching_account());
         assert!(UpstreamErrorKind::Network.worth_switching_account());
         assert!(UpstreamErrorKind::Other.worth_switching_account());
+        // ModelNotAvailable 换号到有该模型的号(非 BadRequest 直接返回)。
+        assert!(UpstreamErrorKind::ModelNotAvailable.worth_switching_account());
     }
 
     #[test]
