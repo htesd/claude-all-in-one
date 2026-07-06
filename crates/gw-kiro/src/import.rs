@@ -20,34 +20,52 @@ use serde_json::{json, Map, Value};
 /// [`crate::profiles::STANDARD_PROFILE_REGIONS`](us-east-1 / eu-central-1)。
 const SERVICE_REGION: &str = "us-east-1";
 
-/// 拆分「目录区」与「服务区」并写入 extra。
-///
-/// KiroManager 导出的 `region` 可能是 IdC **SSO 目录区**(如 us-east-2,仅供 OIDC 刷新,Kiro
-/// 数据面在该区 NXDOMAIN),也可能本就是一个真实 Kiro 服务区(us-east-1 / eu-central-1)。规则:
-/// - `auth_region` 恒记导出 region:OIDC 刷新读 `auth_region ?? region`(token.rs),拿到真目录区
-///   → `oidc.<dir>.amazonaws.com` 正确(us-east-2 的 oidc 存在)。
-/// - `region`(数据面 q./runtime/ListAvailableProfiles):导出 region **本身是已知 Kiro 服务区**则
-///   沿用(如 eu-central-1,别误改成 us-east-1 打错区);否则(纯目录区,如 us-east-2)回落
-///   us-east-1——否则拼出的 `q.<dir>.amazonaws.com` / `runtime.<dir>.kiro.dev` 会 NXDOMAIN
-///   (quota/chat 网络层失败)。
-///
-/// 对齐 xkiro.rs 的 auth_region/api_region 拆分。external_idp(Azure)刷新走 token_endpoint 不读
-/// region(token.rs::refresh_external_idp),故对其 auth_region 是惰性元数据,region 仍按上述规则取
-/// 正确服务区,无害。
-fn insert_region_split(extra: &mut Map<String, Value>, exported_region: Option<&str>) {
+/// 从 profileArn 提取数据面区域(`arn:aws:codewhisperer:{region}:{acct}:profile/{id}` 第 4 段)。
+/// **仅**当解析出的区域是已知商业服务区([`crate::profiles::STANDARD_PROFILE_REGIONS`])才返回
+/// (返回静态表里的规范值),避免脏 ARN/未知区污染服务区。
+fn region_from_profile_arn(arn: &str) -> Option<&'static str> {
+    let region = arn.split(':').nth(3)?.trim();
+    known_service_region(Some(region))
+}
+
+/// 命中已知服务区 → 返回静态规范值;否则 None(空/未知区)。
+fn known_service_region(r: Option<&str>) -> Option<&'static str> {
+    let r = r.map(str::trim).filter(|s| !s.is_empty())?;
+    crate::profiles::STANDARD_PROFILE_REGIONS
+        .iter()
+        .find(|s| s.eq_ignore_ascii_case(r))
+        .copied()
+}
+
+/// 写入区域三兄弟,支持**认证区 ≠ 服务区**的分离区域号(号商/企业 IdC 常见:SSO/OIDC 客户端
+/// 注册在 us-east-1,但 CodeWhisperer profile/entitlement 在 eu-central-1)。
+/// - **数据面/服务区**(`region` + `api_region`,供 getUsageLimits 与 chat 建端点):优先取
+///   **profileArn 的区域**(权威——profile 在哪个区,数据面 API 就必须打哪个区),其次显式
+///   `apiRegion`,再次导出 `region`(若本身已是已知服务区),兜底 us-east-1(纯目录区导出如
+///   us-east-2 时数据面只在 us-east-1)。
+/// - **认证/目录区**(`auth_region`,供 OIDC 刷新):`authRegion` 优先,否则导出 `region`。
+///   token.rs 刷新读 `auth_region ?? region`,分离区号必须让它拿到真 SSO 区(如 us-east-1)。
+fn insert_region_split(
+    extra: &mut Map<String, Value>,
+    exported_region: Option<&str>,
+    auth_region: Option<&str>,
+    api_region: Option<&str>,
+    profile_arn: Option<&str>,
+) {
     let dir = exported_region.map(str::trim).filter(|s| !s.is_empty());
-    // 数据面区:导出值是已知服务区则保留(如 eu-central-1),否则(纯目录区)回落 us-east-1。
-    let service = dir
-        .filter(|r| {
-            crate::profiles::STANDARD_PROFILE_REGIONS
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(r))
-        })
+    // 服务区:profileArn 区域 > 显式 apiRegion > 导出 region(已知服务区)> us-east-1。
+    let service: &str = profile_arn
+        .and_then(region_from_profile_arn)
+        .or_else(|| known_service_region(api_region))
+        .or_else(|| known_service_region(exported_region))
         .unwrap_or(SERVICE_REGION);
     extra.insert("region".into(), json!(service));
-    // 目录区(供 OIDC 刷新):原样保留导出值。
-    if let Some(r) = dir {
-        extra.insert("auth_region".into(), json!(r));
+    // 显式写 api_region,让 chat 的 api_region() 直接命中(不依赖回落 region),口径清晰。
+    extra.insert("api_region".into(), json!(service));
+    // 认证区:authRegion 优先,否则导出 region(纯目录区)。
+    let auth = auth_region.map(str::trim).filter(|s| !s.is_empty()).or(dir);
+    if let Some(a) = auth {
+        extra.insert("auth_region".into(), json!(a));
     }
 }
 
@@ -217,9 +235,17 @@ fn map_one(acc: &Value) -> Option<ImportedAccount> {
     if let Some(cs) = str_at(creds, "clientSecret").filter(|s| !s.is_empty()) {
         extra.insert("client_secret".into(), json!(cs));
     }
-    // 目录区 → auth_region(OIDC 刷新);服务区 region 恒 us-east-1。见 insert_region_split。
-    insert_region_split(&mut extra, str_at(creds, "region"));
-    if let Some(arn) = str_at(creds, "profileArn").filter(|s| !s.is_empty()) {
+    // 区域三兄弟(支持认证区≠服务区的分离区号):服务区优先取 profileArn 区域,
+    // 认证区取 authRegion/region。见 insert_region_split。
+    let arn = str_at(creds, "profileArn").filter(|s| !s.is_empty());
+    insert_region_split(
+        &mut extra,
+        str_at(creds, "region"),
+        str_at(creds, "authRegion"),
+        str_at(creds, "apiRegion"),
+        arn,
+    );
+    if let Some(arn) = arn {
         extra.insert("profile_arn".into(), json!(arn));
     }
 
@@ -312,8 +338,15 @@ fn map_flat(acc: &Value) -> Option<ImportedAccount> {
             extra.insert(key.into(), json!(v));
         }
     }
-    // 目录区 → auth_region(OIDC 刷新);服务区 region 恒 us-east-1。见 insert_region_split。
-    insert_region_split(&mut extra, flat_str(acc, "region"));
+    // 区域三兄弟(支持认证区≠服务区的分离区号)。profile_arn 已在上面的循环里写入 extra;
+    // 这里从原始 acc 读 apiRegion/authRegion(flat_str snake→camel 兼容号商 camelCase 导出)。
+    insert_region_split(
+        &mut extra,
+        flat_str(acc, "region"),
+        flat_str(acc, "auth_region"),
+        flat_str(acc, "api_region"),
+        flat_str(acc, "profile_arn"),
+    );
     // token_endpoint/scope 不在上面的通用循环里处理——它们需要 external_idp 专属的
     // 白名单校验 + user_id 派生兜底,统一走 resolve_external_idp_refresh_material
     // (下方,在 user_id 写入 extra 之后调用),与嵌套路径共用同一份逻辑。
@@ -633,6 +666,7 @@ mod tests {
         assert_eq!(a.extra["client_id"], json!("NHPEspwEz8-hGjN_yUO2anVzLWVhc3QtMQ"));
         assert_eq!(a.extra["client_secret"], json!("eyJraW_flat_secret"));
         assert_eq!(a.extra["region"], json!("us-east-1"));
+        assert_eq!(a.extra["api_region"], json!("us-east-1"), "非分离号 api_region=服务区");
         assert_eq!(a.extra["profile_arn"].as_str().unwrap(), "arn:aws:codewhisperer:us-east-1:207377045753:profile/P7CDKWEEXXCG");
         assert_eq!(a.extra["email"], json!("mrdev3258"));
         // auth_method 扁平格式按原值搬运(snake_case 是我方约定;idc 安全,非 external_idp)。
@@ -773,6 +807,7 @@ mod tests {
         assert_eq!(a.extra["client_id"], json!("Gv-mRC_client"));
         assert_eq!(a.extra["client_secret"], json!("eyJraW_secret"));
         assert_eq!(a.extra["region"], json!("us-east-1"));
+        assert_eq!(a.extra["api_region"], json!("us-east-1"), "非分离号 api_region=服务区");
         assert_eq!(a.extra["profile_arn"].as_str().unwrap(), "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK");
         assert_eq!(a.extra["kiro_provider"], json!("enterprise"));
         assert_eq!(a.extra["email"], json!("mrdev+mrdev2947@example.com"));
@@ -877,6 +912,75 @@ mod tests {
         let a = &out[0];
         assert_eq!(a.extra["region"], json!("eu-central-1"), "已知服务区必须保留,勿改 us-east-1");
         assert_eq!(a.extra["auth_region"], json!("eu-central-1"));
+    }
+
+    #[test]
+    fn region_from_profile_arn_parses_known_regions_only() {
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer:eu-central-1:1:profile/X"),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer:us-east-1:1:profile/X"),
+            Some("us-east-1")
+        );
+        // 未知区(非 STANDARD_PROFILE_REGIONS)/脏 ARN → None(不污染服务区)。
+        assert_eq!(
+            region_from_profile_arn("arn:aws:codewhisperer:ap-southeast-1:1:profile/X"),
+            None
+        );
+        assert_eq!(region_from_profile_arn("garbage"), None);
+    }
+
+    /// ⭐分离区域号(认证区≠服务区):号商扁平导出,SSO/OIDC 在 us-east-1(clientId 注册区),
+    /// 但 CodeWhisperer profile 在 eu-central-1。服务区(region+api_region)须取 profileArn 区域
+    /// eu-central-1(否则 getUsageLimits/chat 打错区 → 403),认证区 auth_region=us-east-1(否则
+    /// OIDC 刷新打错区)。对齐 caio-split-region-account-import 记忆:免去逐个手工 PATCH。
+    #[test]
+    fn flat_split_region_derives_service_from_profile_arn() {
+        let export = json!([{
+            "email": "HYL02@d-906674a867.local",
+            "refreshToken": "rt_split",
+            "clientId": "cid",
+            "clientSecret": "cs",
+            "region": "us-east-1",
+            "authRegion": "us-east-1",
+            "apiRegion": "eu-central-1",
+            "authMethod": "IdC",
+            "profileArn": "arn:aws:codewhisperer:eu-central-1:447580526192:profile/HDQ4NHA4KK9Q"
+        }]);
+        let a = &parse_accounts_export(&export).unwrap()[0];
+        assert_eq!(a.extra["region"], json!("eu-central-1"), "服务区取 profileArn 区域");
+        assert_eq!(a.extra["api_region"], json!("eu-central-1"), "api_region 显式=服务区");
+        assert_eq!(a.extra["auth_region"], json!("us-east-1"), "认证区取 authRegion(SSO 注册区)");
+        assert_eq!(
+            a.extra["profile_arn"].as_str().unwrap(),
+            "arn:aws:codewhisperer:eu-central-1:447580526192:profile/HDQ4NHA4KK9Q"
+        );
+    }
+
+    /// KiroManager 嵌套(credentials 子对象)分离区号:同样从 profileArn 派生服务区。
+    #[test]
+    fn nested_kiromanager_split_region_from_profile_arn() {
+        let export = json!({
+            "accounts": [{
+                "email": "eu-nested@example.com",
+                "credentials": {
+                    "refreshToken": "rt",
+                    "clientId": "cid",
+                    "clientSecret": "cs",
+                    "region": "us-east-1",
+                    "authRegion": "us-east-1",
+                    "apiRegion": "eu-central-1",
+                    "authMethod": "IdC",
+                    "profileArn": "arn:aws:codewhisperer:eu-central-1:1:profile/X"
+                }
+            }]
+        });
+        let a = &parse_accounts_export(&export).unwrap()[0];
+        assert_eq!(a.extra["region"], json!("eu-central-1"));
+        assert_eq!(a.extra["api_region"], json!("eu-central-1"));
+        assert_eq!(a.extra["auth_region"], json!("us-east-1"));
     }
 
     /// 锁定:`usageData.subscriptionInfo` 只带机器枚举 `type`(无人读 `subscriptionTitle`)时,
