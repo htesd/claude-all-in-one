@@ -195,6 +195,11 @@ pub struct SyncOutcome {
 /// 被挤下的那段时间会话稳定服务于低层(缓存热),窗口过后才再尝试回高层。
 const MIGRATE_UP_DEBOUNCE: Duration = Duration::from_secs(60);
 
+/// `(账号, 模型)` 不可用标记(INVALID_MODEL_ID)的存活时长:到期后重新放行该号服务该
+/// 模型(重探一次)。AWS 把新模型滚动到该区域后自动恢复;重探即使仍不支持也只失败 1 次
+/// 即再标记,代价极小。6h 足够低频重探又不长期误锁。
+const MODEL_UNAVAILABLE_TTL: Duration = Duration::from_secs(6 * 3600);
+
 /// 会话亲和记录:session_key → 当前 primary 账号(带 TTL 淘汰)。
 /// v52:只留 primary + last_access,删 alt/streak(「落在哪个号就认哪个号」)。
 struct AffinityEntry {
@@ -242,7 +247,11 @@ impl std::fmt::Display for AcquireError {
             AcquireError::AllBusy => write!(f, "组内所有账号并发已满"),
             AcquireError::Empty => write!(f, "组内无账号"),
             AcquireError::NoModelSupport => {
-                write!(f, "组内无支持该模型的账号(订阅等级不足,如 FREE 不支持 opus)")
+                write!(
+                    f,
+                    "组内无可服务该模型的账号(订阅等级不足如 FREE 不支持 opus,\
+                     或该模型在账号区域/档位未上线)"
+                )
             }
         }
     }
@@ -259,6 +268,11 @@ pub struct AccountScheduler {
     /// 调度参数(可热更:admin 设置面板改后 worker 30s 轮询经 [`Self::update_tuning`] 替换;
     /// **已生效的冷却**用绝对 `Instant`,不受改参影响,只影响其后新设的冷却/阈值判定)。
     tuning: RwLock<Tuning>,
+    /// `(账号, 模型)` → 该号返回过 `INVALID_MODEL_ID`(模型在其区域/订阅档未上线)的时刻。
+    /// 选号时把命中且未过 [`MODEL_UNAVAILABLE_TTL`] 的 `(号,模型)` 从合格集剔除,让请求
+    /// 路由到有该模型的号,同时**不禁用**该号(它仍能服务其它模型)。TTL 到期后重新放行
+    /// (AWS 区域上线新模型后自动恢复);仅内存,重启即清、重新学习。规模小(仅区域受限对)。
+    model_unavailable: Mutex<HashMap<(String, String), Instant>>,
 }
 
 impl AccountScheduler {
@@ -272,6 +286,7 @@ impl AccountScheduler {
             entries: Mutex::new(entries),
             affinity: Mutex::new(HashMap::new()),
             tuning: RwLock::new(Tuning::from(cfg)),
+            model_unavailable: Mutex::new(HashMap::new()),
         }
     }
 
@@ -670,6 +685,10 @@ impl AccountScheduler {
             self.affinity
                 .lock()
                 .retain(|_, v| !removed.contains(&v.primary));
+            // 一并清掉已移除账号的模型不可用标记(仿亲和清理,防陈旧项积压)。
+            self.model_unavailable
+                .lock()
+                .retain(|(a, _), _| !removed.contains(a));
         }
         out
     }
@@ -879,8 +898,27 @@ impl AccountScheduler {
                 }
             }
             // BadRequest 是请求本身问题,不惩罚账号。
-            UpstreamErrorKind::BadRequest => {}
+            // ModelNotAvailable(该号不支持此模型)同样**不惩罚账号**——它仍能服务其它模型;
+            // 换号 + `(账号,模型)` 不可用标记由调用方处理(见 [`Self::mark_model_unavailable`])。
+            UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable => {}
         }
+    }
+
+    /// 标记 `(账号, 模型)` 不可用(收到 `INVALID_MODEL_ID` = `ModelNotAvailable` 时调用)。
+    /// 后续选号把该 `(号,模型)` 从合格集剔除(见 [`Self::is_model_unavailable`]),路由到
+    /// 有该模型的号,而**不禁用**该号(它仍服务其它模型)。
+    pub fn mark_model_unavailable(&self, account_id: &str, model: &str) {
+        self.model_unavailable
+            .lock()
+            .insert((account_id.to_string(), model.to_string()), Instant::now());
+    }
+
+    /// `(账号, 模型)` 是否在 [`MODEL_UNAVAILABLE_TTL`] 内被标记不可用(选号过滤谓词用)。
+    /// 表规模小(仅区域受限对),线性扫描避免每次选号为查询分配 key String。
+    pub fn is_model_unavailable(&self, account_id: &str, model: &str) -> bool {
+        self.model_unavailable.lock().iter().any(|((a, m), t)| {
+            a == account_id && m == model && t.elapsed() < MODEL_UNAVAILABLE_TTL
+        })
     }
 }
 
@@ -910,6 +948,46 @@ mod tests {
     /// 默认连续失败禁用阈值(配置默认值,测试断言用)。
     fn max_failures() -> u32 {
         SchedulerConfig::default().max_failures
+    }
+
+    #[test]
+    fn model_unavailable_marks_only_that_pair() {
+        let s = sched(vec![acct("a", 2, None), acct("b", 2, None)]);
+        assert!(!s.is_model_unavailable("a", "claude-sonnet-5"));
+        s.mark_model_unavailable("a", "claude-sonnet-5");
+        assert!(s.is_model_unavailable("a", "claude-sonnet-5"));
+        // 只影响该 (号,模型) 对:同号其它模型、其它号同模型都不受影响。
+        assert!(!s.is_model_unavailable("a", "claude-opus-4-8"));
+        assert!(!s.is_model_unavailable("b", "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn model_not_available_never_disables_or_counts_failure() {
+        let s = sched(vec![acct("a", 2, None)]);
+        // 反复上报 ModelNotAvailable 也绝不禁用/不计失败(号仍能服务其它模型)。
+        for _ in 0..(max_failures() + 3) {
+            s.report_failure("a", UpstreamErrorKind::ModelNotAvailable);
+        }
+        let snap = s.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(!a.disabled, "ModelNotAvailable 不得禁用账号");
+        assert_eq!(a.failure_count, 0, "ModelNotAvailable 不得计失败");
+    }
+
+    #[tokio::test]
+    async fn acquire_where_skips_model_unavailable_account() {
+        // 标记 a 对 sonnet-5 不可用后,带该过滤谓词选号只落到 b(路由到有该模型的号),
+        // 且 a 未被禁用——它仍可服务其它模型。
+        let s = sched(vec![acct("a", 4, None), acct("b", 4, None)]);
+        s.mark_model_unavailable("a", "claude-sonnet-5");
+        let supports = |acc: &Account| !s.is_model_unavailable(&acc.account_id, "claude-sonnet-5");
+        for i in 0..6 {
+            let key = format!("s{i}");
+            let lease = s.acquire_where(Some(&key), supports).await.unwrap();
+            assert_eq!(lease.account_id(), "b", "sonnet-5 应绕开被标记的 a、落到 b");
+        }
+        // a 无过滤时仍可被选(未禁用):新会话可落到 a。
+        assert!(!s.is_model_unavailable("a", "claude-opus-4-8"));
     }
 
     #[tokio::test]

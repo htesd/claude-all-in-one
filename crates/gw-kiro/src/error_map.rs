@@ -43,6 +43,12 @@ pub(crate) fn is_account_suspended(body: &str) -> bool {
     body.to_ascii_lowercase().contains("suspend")
 }
 
+/// 400 响应体是否为 Kiro 的 `INVALID_MODEL_ID`(该账号不支持所请求的模型:模型在其
+/// 区域/订阅档未上线)。归 `ModelNotAvailable`——不惩罚账号 + 换号到有该模型的号。
+fn is_invalid_model_id(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("invalid_model_id")
+}
+
 /// 把 generateAssistantResponse 的失败响应分类。
 ///
 /// `status` = HTTP 状态码,`body` = 响应体文本(可空)。
@@ -52,7 +58,11 @@ pub fn classify_chat_error(status: u16, body: &str) -> UpstreamError {
         402 => UpstreamErrorKind::QuotaExhausted, // 402 默认按额度耗尽处理
         429 if is_daily_limit(body) => UpstreamErrorKind::RateLimited,
         429 => UpstreamErrorKind::RateLimited,
-        // 400:瞬时 invalid model 可重试(归 ServerError),否则请求非法(BadRequest 不换号)
+        // 400 + INVALID_MODEL_ID:该号不支持所请求的模型(模型在其区域/订阅档未上线,
+        //   如 eu-central-1 号点 claude-sonnet-5)→ ModelNotAvailable:**不惩罚账号**
+        //   (否则计失败刷禁健康号)+ 换号到有该模型的号(见 gw_core::UpstreamErrorKind)。
+        400 if is_invalid_model_id(body) => UpstreamErrorKind::ModelNotAvailable,
+        // 其余"invalid model"文案(无 INVALID_MODEL_ID):当瞬时故障可重试(ServerError)。
         400 if is_transient_invalid_model(body) => UpstreamErrorKind::ServerError,
         400 => UpstreamErrorKind::BadRequest,
         401 => UpstreamErrorKind::TokenInvalid,
@@ -87,11 +97,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_model_400_is_retryable_server_error() {
+    fn invalid_model_id_400_is_model_not_available_and_switches() {
+        // INVALID_MODEL_ID = 该号不支持此模型 → ModelNotAvailable(不惩罚账号 + 换号)。
         let e = classify_chat_error(400, r#"{"reason":"INVALID_MODEL_ID"}"#);
-        assert_eq!(e.kind, UpstreamErrorKind::ServerError);
-        // ServerError 值得换号重试(非 BadRequest)
+        assert_eq!(e.kind, UpstreamErrorKind::ModelNotAvailable);
+        // 换号到有该模型的号(非 BadRequest 直接返回)。
         assert!(e.kind.worth_switching_account());
+    }
+
+    #[test]
+    fn transient_invalid_model_without_id_stays_server_error() {
+        // 无 INVALID_MODEL_ID 的"invalid model"文案:仍当瞬时故障重试(ServerError)。
+        let e = classify_chat_error(400, "the model is invalid right now");
+        assert_eq!(e.kind, UpstreamErrorKind::ServerError);
     }
 
     #[test]
