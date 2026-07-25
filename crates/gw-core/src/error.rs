@@ -26,6 +26,17 @@ pub enum UpstreamErrorKind {
     Network,
     /// 上游 5xx。动作:瞬时重试或切号。
     ServerError,
+    /// **模型级**过载(上游明确告知容量不足,如 Kiro 5xx + `MODEL_TEMPORARILY_UNAVAILABLE`)。
+    /// **非账号健康问题**——上游是在说"这个模型现在没容量",与用哪个号无关。
+    ///
+    /// 动作:**不惩罚账号**(不计失败/不禁用)+ **不换号**(容量是模型级的,换号打的还是同一个
+    /// 模型端点,纯粹扩散错误、白烧另一个号的配额、还丢掉会话 cache 亲和)+ 由调用方做
+    /// **同号退避重试**(见 `messages()` 的 `overload_backoff`)。对外映射 529 `overloaded_error`。
+    ///
+    /// 与 `ServerError` 拆开的理由(2026-07-25 opus-5 实测):上游容量抖动被记进账号连续失败
+    /// 计数,35 秒内把 7 个健康号禁光并触发全灭自愈;而换号重试对它毫无用处——177 次上游
+    /// 500 只救回 19 次(19%)。
+    Overloaded,
     /// 请求本身非法(400 Improperly formed / schema 错误)。
     /// 动作:**不换号**(换号也一样错),直接返回客户端。
     BadRequest,
@@ -44,13 +55,15 @@ pub enum UpstreamErrorKind {
 impl UpstreamErrorKind {
     /// 该错误是否意味着"换个账号可能成功"——调度层据此决定是否换号重试。
     ///
-    /// 返回 `false` 的三类**绝不换号**(否则把同一请求扩散到健康号 → 雪崩封号,
+    /// 返回 `false` 的四类**绝不换号**(否则把同一请求扩散到健康号 → 雪崩封号,
     /// 2026-06 大面积封号根因):
     /// - `BadRequest`:请求本身非法,换号一样错。
     /// - `EmptyResponse`:上游对该**内容**的确定性空流(疑 guardrail);换号救不回且放大
     ///   成多条 error 招封号(实战已证,见 caio-empty-response-not-fixable)。
     /// - `TemporarilyBlocked`:账号被上游封禁/暂停;封禁号自身冷却自愈即可,把同一(被封
     ///   内容/高频)请求喂给健康号正是雪崩根因。
+    /// - `Overloaded`:模型级容量不足,与账号无关。换号打的还是同一个模型端点,纯扩散;
+    ///   有效手段是**同号退避重试**(见 [`Self::worth_same_account_backoff`])。
     ///
     /// 其余(RateLimited/QuotaExhausted/TokenInvalid/ServerError/Network/Other)仍可换号,
     /// 但受 `messages()` 的 `max_switch_attempts` 硬上限约束(默认 2,不再走遍全组)。
@@ -60,6 +73,34 @@ impl UpstreamErrorKind {
             UpstreamErrorKind::BadRequest
                 | UpstreamErrorKind::EmptyResponse
                 | UpstreamErrorKind::TemporarilyBlocked
+                | UpstreamErrorKind::Overloaded
+        )
+    }
+
+    /// 该错误是否值得**在同一个号上**退避后重试(而非换号)。
+    ///
+    /// 只有 `Overloaded`:上游容量抖动是秒级自愈的,等一下再打同一个号即可,而且
+    /// 保住会话 cache 亲和(实测一次请求 `cache_read` 可达 10.7 万 token,换号全部重算)。
+    ///
+    /// **爆炸半径 = 1 个号**,比换号重试(默认 2 个号)更小,故与 2026-06 防雪崩的
+    /// `max_switch_attempts` 硬上限**不冲突**,无需放开后者。
+    pub fn worth_same_account_backoff(&self) -> bool {
+        matches!(self, UpstreamErrorKind::Overloaded)
+    }
+
+    /// 该错误是否**不应记入账号健康**(不计连续失败、不触发 `TooManyFailures` 禁用)。
+    ///
+    /// - `BadRequest`:请求本身非法,不是账号的错。
+    /// - `ModelNotAvailable`:该号只是没上线这个模型,它仍能服务其它模型。
+    /// - `Overloaded`:上游模型没容量,与账号无关。**2026-07-25 opus-5 事故正是漏了这条**——
+    ///   上游 5xx 记进 `failure_count`,35 秒内禁光 7 个健康号(禁用对**所有模型**生效,
+    ///   连带 opus-4-6/sonnet-5 一起挂)。
+    pub fn spares_account_health(&self) -> bool {
+        matches!(
+            self,
+            UpstreamErrorKind::BadRequest
+                | UpstreamErrorKind::ModelNotAvailable
+                | UpstreamErrorKind::Overloaded
         )
     }
 
@@ -83,6 +124,7 @@ impl fmt::Display for UpstreamErrorKind {
             UpstreamErrorKind::QuotaExhausted => "quota_exhausted",
             UpstreamErrorKind::Network => "network",
             UpstreamErrorKind::ServerError => "server_error",
+            UpstreamErrorKind::Overloaded => "overloaded",
             UpstreamErrorKind::BadRequest => "bad_request",
             UpstreamErrorKind::ModelNotAvailable => "model_not_available",
             UpstreamErrorKind::EmptyResponse => "empty_response",

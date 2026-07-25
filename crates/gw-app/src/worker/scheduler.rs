@@ -200,6 +200,14 @@ const MIGRATE_UP_DEBOUNCE: Duration = Duration::from_secs(60);
 /// 即再标记,代价极小。6h 足够低频重探又不长期误锁。
 const MODEL_UNAVAILABLE_TTL: Duration = Duration::from_secs(6 * 3600);
 
+/// 模型级过载窗口时长。收到显式 `MODEL_TEMPORARILY_UNAVAILABLE` 后的这段时间内,
+/// 该模型的通用 5xx 也按过载处理(见 `AccountScheduler::model_overloaded`)。
+///
+/// 取 60s 的依据:2026-07-25 实测事故是**分钟级**成簇的(35 个有 5xx 的分钟里 19 个两种
+/// 报文并存),60s 刚好覆盖一簇。取太长会把上游真内部错误也长期误判成过载;取太短
+/// (如 5s)则簇内空隙就漏掉,退回逐个禁号。
+const MODEL_OVERLOAD_WINDOW: Duration = Duration::from_secs(60);
+
 /// 会话亲和记录:session_key → 当前 primary 账号(带 TTL 淘汰)。
 /// v52:只留 primary + last_access,删 alt/streak(「落在哪个号就认哪个号」)。
 struct AffinityEntry {
@@ -273,6 +281,16 @@ pub struct AccountScheduler {
     /// 路由到有该模型的号,同时**不禁用**该号(它仍能服务其它模型)。TTL 到期后重新放行
     /// (AWS 区域上线新模型后自动恢复);仅内存,重启即清、重新学习。规模小(仅区域受限对)。
     model_unavailable: Mutex<HashMap<(String, String), Instant>>,
+    /// **模型级过载窗口**:`模型 → 最近一次收到上游显式过载信号的时刻`。
+    ///
+    /// 用途见 gw-app `correct_overload_kind`:上游有时报容量不足会带
+    /// `MODEL_TEMPORARILY_UNAVAILABLE`,有时只给 `reason:null` 的通用 5xx。实测
+    /// 2026-07-25 的 176 条通用 5xx 里 **84.7% 与显式过载出现在同一分钟**,是同一现象。
+    /// 于是拿显式信号当真相源:该模型处于窗口内时,通用 5xx 也按过载处理(不惩罚账号 +
+    /// 同号退避);窗口外仍是 `ServerError`(**绝不靠猜**——重分类必须有上游显式信号背书)。
+    ///
+    /// 仅内存,重启即清、重新学习。键规模 = 模型数(个位数)。
+    model_overloaded: Mutex<HashMap<String, Instant>>,
 }
 
 impl AccountScheduler {
@@ -287,6 +305,7 @@ impl AccountScheduler {
             affinity: Mutex::new(HashMap::new()),
             tuning: RwLock::new(Tuning::from(cfg)),
             model_unavailable: Mutex::new(HashMap::new()),
+            model_overloaded: Mutex::new(HashMap::new()),
         }
     }
 
@@ -900,7 +919,15 @@ impl AccountScheduler {
             // BadRequest 是请求本身问题,不惩罚账号。
             // ModelNotAvailable(该号不支持此模型)同样**不惩罚账号**——它仍能服务其它模型;
             // 换号 + `(账号,模型)` 不可用标记由调用方处理(见 [`Self::mark_model_unavailable`])。
-            UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable => {}
+            // Overloaded(上游模型级容量不足)也**不惩罚账号**:2026-07-25 opus-5 事故正是把它
+            // 当 ServerError 记进 failure_count,35 秒内禁光 7 个健康号 + 触发全灭自愈;而禁用
+            // 对**所有模型**生效,连带 opus-4-6/sonnet-5 一起挂。
+            // 这里刻意**穷举**而非用 `spares_account_health()` 做守卫:守卫会让新增 kind 悄悄
+            // 落进某个分支,穷举则编译不过、强迫做决策。两者一致性由
+            // `spares_account_health_matches_no_penalty_arms` 测试锁住。
+            UpstreamErrorKind::BadRequest
+            | UpstreamErrorKind::ModelNotAvailable
+            | UpstreamErrorKind::Overloaded => {}
         }
     }
 
@@ -919,6 +946,22 @@ impl AccountScheduler {
         self.model_unavailable.lock().iter().any(|((a, m), t)| {
             a == account_id && m == model && t.elapsed() < MODEL_UNAVAILABLE_TTL
         })
+    }
+
+    /// 记一次该模型的**显式**上游过载信号(收到 `Overloaded` 时调用),开启
+    /// [`MODEL_OVERLOAD_WINDOW`] 窗口。见字段 [`Self::model_overloaded`] 的说明。
+    pub fn mark_model_overloaded(&self, model: &str) {
+        self.model_overloaded
+            .lock()
+            .insert(model.to_string(), Instant::now());
+    }
+
+    /// 该模型当前是否处于过载窗口内(距上次显式过载信号 < [`MODEL_OVERLOAD_WINDOW`])。
+    pub fn is_model_overloaded(&self, model: &str) -> bool {
+        self.model_overloaded
+            .lock()
+            .get(model)
+            .is_some_and(|t| t.elapsed() < MODEL_OVERLOAD_WINDOW)
     }
 }
 
@@ -1206,6 +1249,49 @@ mod tests {
             s.report_failure("a", UpstreamErrorKind::BadRequest);
         }
         assert!(s.acquire(Some("s")).await.is_ok(), "BadRequest 不应惩罚账号");
+    }
+
+    /// 2026-07-25 opus-5 事故的回归测试:上游模型级过载**绝不能**记进账号连续失败。
+    ///
+    /// 当时把它当 ServerError,35 秒内禁光 7 个健康号并触发全灭自愈;而禁用对**所有模型**
+    /// 生效,连带 opus-4-6/sonnet-5 一起挂。单账号场景下"全灭自愈"会掩盖禁用,故这里用
+    /// **两个**账号:若 Overloaded 仍计失败,a 会被真禁用而 b 健在,自愈不触发,断言即失败。
+    #[tokio::test]
+    async fn overloaded_does_not_penalize_account() {
+        let s = sched(vec![acct("a", 4, None), acct("b", 4, None)]);
+        for _ in 0..(max_failures() * 3) {
+            s.report_failure("a", UpstreamErrorKind::Overloaded);
+        }
+        let snap = s.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").expect("账号 a 应在快照里");
+        assert_eq!(a.failure_count, 0, "上游没容量不是账号的错,failure_count 必须为 0");
+        assert!(!a.disabled, "Overloaded 绝不能禁用账号(禁用对所有模型生效)");
+    }
+
+    /// 锁住 `spares_account_health()` 与 `report_failure` 的"不惩罚"分支一致:
+    /// 前者是策略声明,后者是实现,两处分开写就可能漂移。
+    #[tokio::test]
+    async fn spares_account_health_matches_no_penalty_arms() {
+        use UpstreamErrorKind as K;
+        const ALL: &[K] = &[
+            K::TokenInvalid, K::RateLimited, K::TemporarilyBlocked, K::QuotaExhausted,
+            K::Network, K::ServerError, K::Overloaded, K::BadRequest,
+            K::ModelNotAvailable, K::EmptyResponse, K::Other,
+        ];
+        for &kind in ALL {
+            // 两个号:避免单号被禁时"全灭自愈"重置计数,掩盖真实惩罚行为。
+            let s = sched(vec![acct("a", 4, None), acct("b", 4, None)]);
+            s.report_failure("a", kind);
+            let snap = s.status_snapshot();
+            let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+            // 只有走 failure_count 分支的 kind 才会 +1;冷却/禁用类走别的字段。
+            let bumped = a.failure_count > 0;
+            assert!(
+                !(kind.spares_account_health() && bumped),
+                "{kind:?} 声明不惩罚账号,却把 failure_count 加到了 {}",
+                a.failure_count
+            );
+        }
     }
 
     #[tokio::test]

@@ -1517,8 +1517,10 @@ async fn messages(
         //    - TokenInvalid(403):access_token 失效 → **同号强制刷新一次并重试同号**
         //      (refresh-then-retry,不立刻换号,保住会话亲和/缓存);刷新或重试仍失败才换号。
         //    - BadRequest:请求本身问题,换号无益,直接返回。
+        //    - Overloaded(模型级容量不足):**同号退避重试**(见 chat_with_overload_backoff),
+        //      不换号、不记账号失败;退避用尽才透出 → 对外 529。
         //    - 其他可重试错误:上报失败、换号重试。
-        match st.provider.chat(req.clone(), &ctx).await {
+        match chat_with_overload_backoff(&st, &req, &ctx, &account_id).await {
             Ok(stream) => {
                 // 服务端 web search:客户端声明了 `web_search_20250305` → 进执行回环
                 // (反代自搜 + 注回),把首轮流当 round 1 续跑。其余流量字节一致走原路径。
@@ -1703,15 +1705,9 @@ async fn messages(
                 if !kind.worth_switching_account() || attempts >= switch_cap(kind, total, general_cap) {
                     // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
                     // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
-                    // ModelNotAvailable 与 BadRequest 同归 400(客户端应换模型/升级),其余 502。
-                    let status = if matches!(
-                        kind,
-                        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
-                    ) {
-                        Some(400)
-                    } else {
-                        Some(502)
-                    };
+                    // 与客户端实收状态码同源(见 upstream_status):
+                    // BadRequest/ModelNotAvailable→400、Overloaded→529、其余 502。
+                    let status = Some(upstream_status(kind).as_u16() as i64);
                     spawn_request_log_blocking(
                         &st,
                         req.clone(),
@@ -1735,21 +1731,151 @@ async fn messages(
     }
 }
 
-/// 把 [`UpstreamError`] 映射为对外 HTTP 响应(BadRequest/ModelNotAvailable→400,其余→502)。
-fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
-    let code = if matches!(
-        e.kind,
-        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
-    ) {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::BAD_GATEWAY
+/// `Overloaded` 的同号退避梯度(毫秒)。长度即重试次数上限。
+///
+/// 只覆盖"上游容量秒级抖动"这一种场景,故总等待封顶约 3s——再长客户端体感就不如直接
+/// 吐 529 让它自己重试。2026-07-25 实测尖峰持续约 10 分钟但**单点**空窗在秒级。
+const OVERLOAD_BACKOFF_MS: &[u64] = &[250, 750, 2_000];
+
+/// 0~40% 的正向抖动。**必需**:并发请求会在同一波容量抖动里齐刷刷失败,无抖动会同步重撞,
+/// 把重试变成新的尖峰。熵取 uuid v4 的一个字节(workspace 已依赖 uuid+fast-rng,不为此引入 rand)。
+fn jittered(base_ms: u64) -> std::time::Duration {
+    // 先把熵字节(0..=255)折成百分比 0..=40,再按百分比加成——直接拿字节做系数容易算错倍率。
+    let pct = uuid::Uuid::new_v4().as_bytes()[0] as u64 * MAX_JITTER_PCT / 255;
+    std::time::Duration::from_millis(base_ms + base_ms * pct / 100)
+}
+
+/// 抖动上限(百分比)。测试 `overload_backoff_is_bounded_and_jittered_upward` 据此断言区间。
+const MAX_JITTER_PCT: u64 = 40;
+
+/// 发一次上游 chat,并按**模型级过载窗口**校正错误类型(见 [`correct_overload_kind`])。
+///
+/// 校正放在这一个点上,让下游(退避判定、`report_failure`、状态码、请求日志)全部看到
+/// 同一个已校正的 kind,不必各自重算。
+async fn chat_once_corrected(
+    st: &Arc<WorkerState>,
+    req: &ChatRequest,
+    ctx: &CallCtx,
+) -> Result<gw_core::provider::ChatStream, gw_core::error::UpstreamError> {
+    match st.provider.chat(req.clone(), ctx).await {
+        Ok(s) => Ok(s),
+        Err(mut e) => {
+            e.kind = correct_overload_kind(&st.scheduler, &req.model, e.kind);
+            Err(e)
+        }
+    }
+}
+
+/// 按模型级过载窗口校正错误类型。
+///
+/// - 收到**显式**过载(`Overloaded`,即上游给了 `MODEL_TEMPORARILY_UNAVAILABLE`)→ 开窗并原样返回。
+/// - 窗口内的通用 `ServerError` → 升级为 `Overloaded`。依据:2026-07-25 实测 176 条
+///   `reason:null` 的通用 5xx 中 **84.7% 与显式过载落在同一分钟**,是同一波容量抖动;
+///   上游只是有时不填 `reason`。
+/// - 其余一律原样返回。**窗口外绝不升级**——重分类必须有上游显式信号背书,不靠猜。
+///
+/// 只在**首包前**的错误上调用(2026-07-25 观测到的 276 次 5xx 全部 `ttfb=NULL`,即都发生在
+/// 首包前)。流中途冒出的 5xx 仍走 `finish_response` 的原路径,不做校正。
+fn correct_overload_kind(
+    scheduler: &AccountScheduler,
+    model: &str,
+    kind: UpstreamErrorKind,
+) -> UpstreamErrorKind {
+    if kind == UpstreamErrorKind::Overloaded {
+        scheduler.mark_model_overloaded(model);
+        return kind;
+    }
+    if kind == UpstreamErrorKind::ServerError && scheduler.is_model_overloaded(model) {
+        tracing::info!(
+            model = %model,
+            "通用 5xx 落在该模型的过载窗口内,按过载处理(不惩罚账号/不换号)"
+        );
+        return UpstreamErrorKind::Overloaded;
+    }
+    kind
+}
+
+/// 发起上游 chat,遇 [`UpstreamErrorKind::Overloaded`] 时**在同一个号上**退避重试。
+///
+/// 与上方 TokenInvalid 的 refresh-then-retry 同构:握着同一枚 lease、同一个 `ctx` 重发。
+/// 这样做的三个理由:
+/// 1. 上游说的是"这个**模型**现在没容量",与用哪个号无关——换号打的还是同一个模型端点。
+/// 2. 保住会话 cache 亲和。实测一次 opus-5 请求 `cache_read` 可达 10.7 万 token,换号全部重算。
+/// 3. **爆炸半径 = 1 个号**,比换号重试(默认 2 个号)更小,故与 2026-06 防雪崩的
+///    `max_switch_attempts` 硬上限不冲突,**无需放开后者**。
+///
+/// 退避用尽仍过载 → 原样返回 `Err`,由调用方走终态路径(`worth_switching_account()=false`
+/// → 不换号,直接对外 529)。
+async fn chat_with_overload_backoff(
+    st: &Arc<WorkerState>,
+    req: &ChatRequest,
+    ctx: &CallCtx,
+    account_id: &str,
+) -> Result<gw_core::provider::ChatStream, gw_core::error::UpstreamError> {
+    let mut last = match chat_once_corrected(st, req, ctx).await {
+        Ok(s) => return Ok(s),
+        Err(e) if e.kind.worth_same_account_backoff() => e,
+        Err(e) => return Err(e),
     };
-    (
-        code,
-        Json(serde_json::json!({"type":"error","error":{"message": e.to_string()}})),
-    )
-        .into_response()
+    for (i, base_ms) in OVERLOAD_BACKOFF_MS.iter().enumerate() {
+        let wait = jittered(*base_ms);
+        tracing::info!(
+            account = %account_id, model = %req.model, attempt = i + 1,
+            wait_ms = wait.as_millis() as u64,
+            "上游模型过载,同号退避重试(不换号/不记账号失败)"
+        );
+        tokio::time::sleep(wait).await;
+        match chat_once_corrected(st, req, ctx).await {
+            Ok(s) => {
+                tracing::info!(account = %account_id, model = %req.model, attempt = i + 1,
+                    "同号退避重试成功");
+                return Ok(s);
+            }
+            // 退避期间错误类型可能变(如容量恢复但换成 403):非过载即刻透出,别用过载预算硬打。
+            Err(e) if e.kind.worth_same_account_backoff() => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// 上游错误 → 对外 HTTP 状态码。**唯一映射点**:响应与请求日志都走它,杜绝两处漂移
+/// (日志里记 502 而客户端实收 529 会让排查彻底跑偏)。
+///
+/// - `BadRequest` / `ModelNotAvailable` → 400(客户端可解:改请求 / 换模型 / 升级订阅)
+/// - `Overloaded` → **529**(Anthropic 官方过载语义:Claude Code 与各家 SDK 据此自动重试,
+///   且不会把渠道判死。语义上这也确实不是"坏网关",是上游没容量)
+/// - 其余 → 502
+fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
+    match kind {
+        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable => {
+            StatusCode::BAD_REQUEST
+        }
+        UpstreamErrorKind::Overloaded => overloaded_status(),
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// 把 [`UpstreamError`] 映射为对外 HTTP 响应(状态码见 [`upstream_status`])。
+fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
+    let code = upstream_status(e.kind);
+    // 过载走 Anthropic 的 `overloaded_error` 类型,其余保持既有形状(只有 message)。
+    let body = if e.kind == UpstreamErrorKind::Overloaded {
+        serde_json::json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": e.to_string()},
+        })
+    } else {
+        serde_json::json!({"type":"error","error":{"message": e.to_string()}})
+    };
+    (code, Json(body)).into_response()
+}
+
+/// HTTP 529 —— Anthropic 的过载状态码。`StatusCode` 无对应常量,且 `from_u16` 不是
+/// `const fn`,故用函数而非常量。529 落在合法区间(100..1000),`from_u16` 不会失败;
+/// 仍写 `unwrap_or` 兜底以免任何情况下 panic 在错误路径上。
+fn overloaded_status() -> StatusCode {
+    StatusCode::from_u16(529).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 
 /// 流结束时把本次 usage 落库(#130)。`usage=None`(空/错误流无终结用量)或 `sink=None`
@@ -2133,19 +2259,13 @@ async fn collect_response(
     };
 
     let success = matches!(outcome, Outcome::Ok(_));
-    // 非流式状态码:成功 200;上游错误经 upstream_error_response 对外 502(BadRequest 除外,
-    // 但折叠失败已落到 Bad/Upstream 两类),折叠失败 502。详情据此回显,不留空(审查 low#7)。
+    // 非流式状态码:成功 200;上游错误与客户端实收同源(见 upstream_status:BadRequest/
+    // ModelNotAvailable→400、Overloaded→529、其余 502),折叠失败 502。
+    // 详情据此回显,不留空(审查 low#7)。
     let (status_code, error_kind): (Option<i64>, Option<String>) = match &outcome {
         Outcome::Ok(_) => (Some(200), None),
         Outcome::Upstream(e) => (
-            Some(if matches!(
-                e.kind,
-                UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
-            ) {
-                400
-            } else {
-                502
-            }),
+            Some(upstream_status(e.kind).as_u16() as i64),
             Some(format!("{:?}", e.kind)),
         ),
         Outcome::Bad(_) => (Some(502), Some("bad_gateway".to_string())),
@@ -3011,5 +3131,121 @@ mod tests {
             kp.is_empty(),
             "family=claude-dario 时 kiro_payload 应为空串,实际: {kp}"
         );
+    }
+
+    /// 造一个只用于窗口判定的调度器(不发请求,只读写 model_overloaded)。
+    fn window_sched() -> AccountScheduler {
+        let acc = Arc::new(Account {
+            account_id: "a".into(),
+            provider: "kiro".into(),
+            max_concurrency: 4,
+            disabled: false,
+            extra: Default::default(),
+        });
+        AccountScheduler::new(vec![acc], &gw_core::config::SchedulerConfig::default())
+    }
+
+    #[test]
+    fn generic_5xx_upgraded_only_inside_overload_window() {
+        use UpstreamErrorKind as K;
+        let s = window_sched();
+
+        // 窗口外:通用 5xx 必须保持 ServerError(仍换号 + 仍记账号失败),绝不靠猜升级。
+        assert_eq!(
+            correct_overload_kind(&s, "claude-opus-5", K::ServerError),
+            K::ServerError,
+            "没有上游显式信号时不得把通用 5xx 当过载"
+        );
+
+        // 收到显式过载 → 开窗,且自身仍是 Overloaded。
+        assert_eq!(
+            correct_overload_kind(&s, "claude-opus-5", K::Overloaded),
+            K::Overloaded
+        );
+        // 窗口内:同一模型的通用 5xx 升级为 Overloaded。
+        assert_eq!(
+            correct_overload_kind(&s, "claude-opus-5", K::ServerError),
+            K::Overloaded,
+            "窗口内的通用 5xx 应按过载处理"
+        );
+        // **窗口是按模型隔离的**:opus-5 过载不能让 opus-4-8 的 5xx 也免罚,
+        // 否则一个模型抖动会掩盖另一个模型的真故障。
+        assert_eq!(
+            correct_overload_kind(&s, "claude-opus-4-8", K::ServerError),
+            K::ServerError,
+            "过载窗口不得跨模型泄漏"
+        );
+    }
+
+    #[test]
+    fn overload_window_never_touches_other_kinds() {
+        use UpstreamErrorKind as K;
+        let s = window_sched();
+        correct_overload_kind(&s, "m", K::Overloaded); // 开窗
+        // 窗口内也只升级 ServerError;别的 kind 各有自己的处置(禁号/冷却/400),不能被吞掉。
+        for k in [K::TokenInvalid, K::RateLimited, K::TemporarilyBlocked, K::QuotaExhausted,
+                  K::Network, K::BadRequest, K::ModelNotAvailable, K::EmptyResponse, K::Other] {
+            assert_eq!(correct_overload_kind(&s, "m", k), k, "{k:?} 不应被窗口改写");
+        }
+    }
+
+    #[test]
+    fn overloaded_maps_to_529_others_unchanged() {
+        use UpstreamErrorKind as K;
+        assert_eq!(upstream_status(K::Overloaded).as_u16(), 529, "过载须走 Anthropic 的 529");
+        // 既有映射一个都不能变。
+        assert_eq!(upstream_status(K::BadRequest), StatusCode::BAD_REQUEST);
+        assert_eq!(upstream_status(K::ModelNotAvailable), StatusCode::BAD_REQUEST);
+        for k in [K::ServerError, K::Network, K::RateLimited, K::QuotaExhausted,
+                  K::TokenInvalid, K::TemporarilyBlocked, K::EmptyResponse, K::Other] {
+            assert_eq!(upstream_status(k), StatusCode::BAD_GATEWAY, "{k:?} 应保持 502");
+        }
+    }
+
+    #[tokio::test]
+    async fn overloaded_response_carries_anthropic_error_type() {
+        async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let e = UpstreamError::new(UpstreamErrorKind::Overloaded, "high load").with_status(500);
+        let resp = upstream_error_response(&e);
+        assert_eq!(resp.status().as_u16(), 529);
+        // 客户端(Claude Code / SDK)按 error.type == "overloaded_error" 判定可重试。
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "overloaded_error");
+        assert_eq!(v["type"], "error");
+
+        // 非过载错误保持原有形状:只有 message,不带 error.type。
+        let se = UpstreamError::new(UpstreamErrorKind::ServerError, "boom").with_status(500);
+        let sresp = upstream_error_response(&se);
+        assert_eq!(sresp.status(), StatusCode::BAD_GATEWAY);
+        let sv = body_json(sresp).await;
+        assert!(sv["error"]["type"].is_null(), "既有错误体形状不应变");
+    }
+
+    #[test]
+    fn overload_backoff_is_bounded_and_jittered_upward() {
+        // 退避梯度必须递增且总时长有界:上界过大会让客户端干等,不如直接吐 529。
+        assert!(OVERLOAD_BACKOFF_MS.windows(2).all(|w| w[0] < w[1]), "退避应递增");
+        let total: u64 = OVERLOAD_BACKOFF_MS.iter().sum();
+        assert!(total <= 4_000, "总退避 {total}ms 超过 4s,客户端体感太差");
+
+        // 抖动:永不小于基值(不能把退避抖没了),且不超过 +MAX_JITTER_PCT%。
+        // 取多次样本以覆盖 uuid 熵的分布,同时验证确实产生了不同的值。
+        let hi = 1_000 + 1_000 * MAX_JITTER_PCT / 100;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            let d = jittered(1_000).as_millis() as u64;
+            assert!((1_000..=hi).contains(&d), "抖动后 {d}ms 越界(应在 1000..={hi})");
+            seen.insert(d);
+        }
+        // 最坏情况总退避(全部打满抖动)也要有界,否则客户端可能干等太久。
+        let worst: u64 = OVERLOAD_BACKOFF_MS.iter()
+            .map(|b| b + b * MAX_JITTER_PCT / 100)
+            .sum();
+        assert!(worst <= 5_000, "最坏总退避 {worst}ms 超过 5s");
+        assert!(seen.len() > 1, "抖动没起作用(200 次采样只有一个值),并发请求会同步重撞");
     }
 }
