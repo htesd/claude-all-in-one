@@ -13,6 +13,7 @@
 //! (见 [`crate::usage`]);output 逐帧累加(thinking+正文)。thinking 签名透传见
 //! [`crate::signature`],inline `<thinking>` 解析见 [`crate::inline_thinking`]。
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -122,6 +123,9 @@ pub async fn chat_stream(
         // UnsupportedModel / EmptyMessages 都是请求本身问题 → BadRequest(不换号)
         UpstreamError::bad_request(format!("转换失败: {e}"))
     })?;
+    // 工具防御性修复字段表(随流式状态机走到收尾解包双编码参数)。在 conversation_state
+    // 被移入 KiroRequest 前先取出。
+    let tool_repair_fields = conversion.tool_repair_fields;
 
     // 3. 组装顶层 KiroRequest(注入 profileArn:显式值 > 按 idp 固定兜底,对齐 static_flow)
     let profile_arn = crate::headers::resolve_profile_arn(&account);
@@ -164,12 +168,13 @@ pub async fn chat_stream(
         ));
     }
 
-    // 4. access_token(P1:要求账号已持有有效 token;刷新/重试由 scheduler 层负责)
-    let access_token = account
-        .extra_str("access_token")
-        .filter(|s| !s.is_empty())
+    // 4. bearer token(apikey→kiro_api_key,social/IdC→access_token;刷新/重试由 scheduler 层负责)
+    let access_token = crate::headers::bearer_token(&account)
         .ok_or_else(|| {
-            UpstreamError::new(UpstreamErrorKind::TokenInvalid, "账号缺少 access_token")
+            UpstreamError::new(
+                UpstreamErrorKind::TokenInvalid,
+                "账号缺少凭据(access_token / kiro_api_key)",
+            )
         })?
         .to_string();
 
@@ -226,6 +231,7 @@ pub async fn chat_stream(
         thinking_enabled,
         sim_cache,
         cache_billing,
+        tool_repair_fields,
     )))
 }
 
@@ -244,15 +250,24 @@ fn eventstream_to_anthropic(
     thinking_enabled: bool,
     sim_cache: (i32, i32),
     cache_billing: crate::CacheBilling,
+    tool_repair_fields: HashMap<String, HashSet<String>>,
 ) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
-    async_stream_like(byte_stream, model, thinking_enabled, sim_cache, cache_billing)
+    async_stream_like(
+        byte_stream,
+        model,
+        thinking_enabled,
+        sim_cache,
+        cache_billing,
+        tool_repair_fields,
+    )
 }
 
 /// 流状态机:管理块索引与 thinking/text 块的惰性开闭 + reasoning 签名。
 ///
-/// Anthropic 时序铁律:thinking 块必须在 text 块**之前**且独立闭合,thinking 块 stop 前
-/// 必发一个 signature_delta。块按出现顺序惰性开启(不预先固定 index 0=text),
-/// 故 reasoning 先到时拿 index 0、text 拿 index 1;无 reasoning 时 text 拿 index 0。
+/// Anthropic 时序铁律:thinking 块必须在 text 块**之前**且独立闭合;thinking 块 stop 前
+/// **默认**发一个 signature_delta——除非 `emit_signature=false`(多上游反代关签名,见该字段),
+/// 此时 thinking 块照常 start/delta/stop 但不带 signature。块按出现顺序惰性开启(不预先固定
+/// index 0=text),故 reasoning 先到时拿 index 0、text 拿 index 1;无 reasoning 时 text 拿 index 0。
 struct BlockTracker {
     /// 下一个可用 content_block 索引。
     next_index: usize,
@@ -290,6 +305,23 @@ struct BlockTracker {
     text_opened: bool,
     /// finish() 判定为 thinking-only:整流只有 thinking 块 → 收尾强制 stop_reason=max_tokens。
     thinking_only_max_tokens: bool,
+    /// 工具防御性修复字段表（短名 → array/object 字段集）。空 = 不修复任何工具。
+    /// 见 [`crate::tool_repair`]:模型偶发把 array/object 参数双重编码成字符串。
+    tool_repair_fields: HashMap<String, HashSet<String>>,
+    /// 当前开着的 tool_use 若需修复,缓冲其 input(配待修复字段集)。None = 逐帧透传。
+    /// caio 任一时刻至多一个块开着(见 open_tool),故单 Option 即可对应当前工具。
+    tool_buf: Option<ToolInputBuffer>,
+    /// 关闭 thinking 块时是否发 `signature_delta`。默认 **true**(现状:带签名)。
+    /// prod 路径据 [`crate::converter::thinking_signature_enabled`] 每请求读一次设入;关掉后
+    /// thinking 块照常输出但不带签名(多上游反代防 Kiro 合成签名漂到真 Anthropic/Bedrock 被拒)。
+    emit_signature: bool,
+}
+
+/// 需修复工具的 input 累积缓冲。`fields` 在首帧据工具短名解析自 `tool_repair_fields`，
+/// 与 `buf` 一起留存,避免续帧/收尾帧无 name 时无法再查表。
+struct ToolInputBuffer {
+    buf: String,
+    fields: HashSet<String>,
 }
 
 impl BlockTracker {
@@ -312,7 +344,22 @@ impl BlockTracker {
             thinking_opened: false,
             text_opened: false,
             thinking_only_max_tokens: false,
+            tool_repair_fields: HashMap::new(),
+            tool_buf: None,
+            emit_signature: true,
         }
+    }
+
+    /// 注入工具防御性修复字段表(converter 据各工具 input_schema 算得)。
+    /// 仅 prod 路径调用;测试默认空表 = 不修复,行为与改动前一致。
+    fn set_tool_repair_fields(&mut self, fields: HashMap<String, HashSet<String>>) {
+        self.tool_repair_fields = fields;
+    }
+
+    /// 设置是否在 thinking 块上附 signature。prod 路径每请求据进程级热开关
+    /// [`crate::converter::thinking_signature_enabled`] 读一次设入;测试可直接置 false 验证。
+    fn set_emit_signature(&mut self, v: bool) {
+        self.emit_signature = v;
     }
 
     /// 处理 reasoningContentEvent:捕获签名 + 逐片发 thinking_delta。
@@ -358,17 +405,36 @@ impl BlockTracker {
         events
     }
 
-    /// 关闭开着的 tool_use 块(若有):发 content_block_stop + 记入 stopped_tools。
+    /// 关闭开着的 tool_use 块(若有):先冲洗缓冲(修复后)的 input,再发 content_block_stop
+    /// + 记入 stopped_tools。这统一了正常 stop 与"新工具强关旧工具 / finish 收尾未 stop"边界——
+    /// 缓冲路径只在此处下发一次完整(已解包修复)的 input_json_delta。
     fn close_open_tool(&mut self) -> Vec<SseEvent> {
         match self.open_tool.take() {
             Some((idx, id)) => {
+                let mut events = Vec::new();
+                if let Some(tb) = self.tool_buf.take() {
+                    let repaired = crate::tool_repair::repair_str(&tb.buf, &tb.fields);
+                    if !repaired.is_empty() {
+                        self.output_tokens += (repaired.len() as i64 + 3) / 4;
+                        events.push(SseEvent::new(
+                            "content_block_delta",
+                            json!({"type":"content_block_delta","index":idx,
+                                   "delta":{"type":"input_json_delta","partial_json":repaired}}),
+                        ));
+                    }
+                }
                 self.stopped_tools.insert(id);
-                vec![SseEvent::new(
+                events.push(SseEvent::new(
                     "content_block_stop",
                     json!({"type":"content_block_stop","index":idx}),
-                )]
+                ));
+                events
             }
-            None => Vec::new(),
+            None => {
+                // open_tool 为 None 时不应有缓冲;防御性清理,避免泄漏到下一个工具。
+                self.tool_buf = None;
+                Vec::new()
+            }
         }
     }
 
@@ -411,15 +477,20 @@ impl BlockTracker {
         }
         let mut events = Vec::new();
         if let Some(idx) = self.thinking_index {
-            let signature = match &self.reasoning_signature {
-                Some(s) => s.clone(),
-                None => crate::signature::synthesize_signature(&self.model, &self.thinking_text),
-            };
-            events.push(SseEvent::new(
-                "content_block_delta",
-                json!({"type":"content_block_delta","index":idx,
-                       "delta":{"type":"signature_delta","signature":signature}}),
-            ));
+            // emit_signature 关时:thinking 块照常闭合(content_block_stop),但**不发**
+            // signature_delta。Kiro 合成/重写签名是 Kiro 专用、对真 Anthropic/Bedrock 验签非法,
+            // 多上游反代里跨通道漂移会被拒 THINKING_SIGNATURE_INVALID(见 converter::thinking_signature_enabled)。
+            if self.emit_signature {
+                let signature = match &self.reasoning_signature {
+                    Some(s) => s.clone(),
+                    None => crate::signature::synthesize_signature(&self.model, &self.thinking_text),
+                };
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":idx,
+                           "delta":{"type":"signature_delta","signature":signature}}),
+                ));
+            }
             events.push(SseEvent::new(
                 "content_block_stop",
                 json!({"type":"content_block_stop","index":idx}),
@@ -509,6 +580,15 @@ impl BlockTracker {
                 let i = self.next_index;
                 self.next_index += 1;
                 self.open_tool = Some((i, tool_use_id.to_string()));
+                // 首帧据工具短名查修复表:含 array/object 字段 → 开缓冲(续帧复用),否则透传。
+                self.tool_buf = self
+                    .tool_repair_fields
+                    .get(name)
+                    .filter(|f| !f.is_empty())
+                    .map(|f| ToolInputBuffer {
+                        buf: String::new(),
+                        fields: f.clone(),
+                    });
                 events.push(SseEvent::new(
                     "content_block_start",
                     json!({"type":"content_block_start","index":i,
@@ -517,7 +597,11 @@ impl BlockTracker {
                 i
             }
         };
-        if !input.is_empty() {
+        if let Some(tb) = self.tool_buf.as_mut() {
+            // 缓冲路径:累积 input,先不下发 delta;close_open_tool 在 stop 时解包修复后一次性下发。
+            tb.buf.push_str(input);
+        } else if !input.is_empty() {
+            // 逐帧透传路径(无 array/object 字段的工具,零行为变更)。
             // tool input 计入 output(对齐 kiro.rs:(len+3)/4 估算)。
             self.output_tokens += (input.len() as i64 + 3) / 4;
             events.push(SseEvent::new(
@@ -527,12 +611,8 @@ impl BlockTracker {
             ));
         }
         if stop {
-            events.push(SseEvent::new(
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":idx}),
-            ));
-            self.open_tool = None;
-            self.stopped_tools.insert(tool_use_id.to_string());
+            // close_open_tool 统一收尾:冲洗缓冲(修复后)+ 发 content_block_stop + tombstone。
+            events.extend(self.close_open_tool());
         }
         events
     }
@@ -618,6 +698,7 @@ fn async_stream_like(
     thinking_enabled: bool,
     sim_cache: (i32, i32),
     cache_billing: crate::CacheBilling,
+    tool_repair_fields: HashMap<String, HashSet<String>>,
 ) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamItem, UpstreamError>>(32);
 
@@ -647,6 +728,10 @@ fn async_stream_like(
         }
 
         let mut tracker = BlockTracker::new(model.clone(), thinking_enabled);
+        tracker.set_tool_repair_fields(tool_repair_fields);
+        // 多上游反代:据热开关决定是否给 thinking 块附签名(默认开;关掉防 Kiro 合成签名漂到
+        // 真 Anthropic/Bedrock 通道被拒)。每请求读一次,设置面板改后下个请求即生效。
+        tracker.set_emit_signature(crate::converter::thinking_signature_enabled());
         let mut decoder = EventStreamDecoder::new();
         // 显式 stop_reason(model_context_window_exceeded / max_tokens)。None = 收尾按
         // tool_use > end_turn 优先级推导(🔵 kiro.rs stream.rs get_stop_reason)。
@@ -1116,6 +1201,54 @@ mod tests {
     }
 
     #[test]
+    fn signature_suppressed_when_emit_disabled_even_with_real_upstream_sig() {
+        // emit_signature=false:即便上游给了真签名,关闭 thinking 块时也**不发** signature_delta,
+        // 但仍发 content_block_stop(块照常闭合)。多上游反代:不向会话注入跨通道非法签名。
+        const REAL_SIG: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.set_emit_signature(false);
+        t.on_reasoning("think", Some(REAL_SIG));
+        let close = t.close_reasoning_if_open();
+        assert!(
+            !close.iter().any(|e| e.data["delta"]["type"] == "signature_delta"),
+            "关签名时不应发 signature_delta"
+        );
+        assert!(
+            close.iter().any(|e| e.data["type"] == "content_block_stop"),
+            "thinking 块仍须正常闭合(content_block_stop)"
+        );
+    }
+
+    #[test]
+    fn signature_suppressed_when_emit_disabled_no_upstream_sig() {
+        // emit_signature=false 且上游无签名:不合成、不发 signature_delta,仍闭合块。
+        let mut t = BlockTracker::new("claude-opus-4-6".to_string(), false);
+        t.set_emit_signature(false);
+        t.on_reasoning("reasoning text here", None);
+        let close = t.close_reasoning_if_open();
+        assert!(
+            !close.iter().any(|e| e.data["delta"]["type"] == "signature_delta"),
+            "关签名且无上游签名时也不应合成/发 signature_delta"
+        );
+        assert!(
+            close.iter().any(|e| e.data["type"] == "content_block_stop"),
+            "thinking 块仍须正常闭合(content_block_stop)"
+        );
+    }
+
+    #[test]
+    fn signature_emitted_by_default_when_enabled() {
+        // 默认 emit_signature=true:行为与改动前一致,仍发 signature_delta(回归保护)。
+        let mut t = BlockTracker::new("claude-opus-4-6".to_string(), false);
+        t.on_reasoning("reasoning text here", None);
+        let close = t.close_reasoning_if_open();
+        assert!(
+            close.iter().any(|e| e.data["delta"]["type"] == "signature_delta"),
+            "默认应发 signature_delta(保留现状)"
+        );
+    }
+
+    #[test]
     fn late_reasoning_after_text_is_dropped() {
         let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
         t.on_text("正文先到");
@@ -1181,6 +1314,96 @@ mod tests {
         assert_eq!(start.data["content_block"]["name"], "get_weather");
         assert_eq!(start.data["content_block"]["input"], serde_json::json!({}));
         assert_eq!(evs.len(), 1, "空 input 且未 stop 时只应有 start");
+    }
+
+    fn repair_tracker(tool: &str, field: &str) -> BlockTracker {
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let mut fields = HashSet::new();
+        fields.insert(field.to_string());
+        let mut map = HashMap::new();
+        map.insert(tool.to_string(), fields);
+        t.set_tool_repair_fields(map);
+        t
+    }
+
+    #[test]
+    fn tool_input_repair_unwraps_double_encoded_questions() {
+        // 复刻线上 bug:questions 被模型双重编码成 JSON 字符串。
+        let mut t = repair_tracker("AskUserQuestion", "questions");
+        let evs = t.on_tool_use(
+            "AskUserQuestion",
+            "tq",
+            r#"{"questions":"[{\"header\":\"H\"}]"}"#,
+            true,
+        );
+        let delta = evs
+            .iter()
+            .find(|e| e.event == "content_block_delta")
+            .expect("应有 input_json_delta");
+        let pj = delta.data["delta"]["partial_json"].as_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(pj).unwrap();
+        assert!(v["questions"].is_array(), "questions 应被解包成数组: {pj}");
+        assert_eq!(v["questions"][0]["header"], "H");
+        assert!(evs.iter().any(|e| e.event == "content_block_stop"));
+    }
+
+    #[test]
+    fn tool_input_repair_across_fragmented_frames() {
+        // 分帧:首帧带 name 无 stop,中间续 input,末帧 stop=true;缓冲路径只在 stop 发一次 delta。
+        let mut t = repair_tracker("AskUserQuestion", "questions");
+        let mut all = Vec::new();
+        all.extend(t.on_tool_use("AskUserQuestion", "t1", r#"{"questions":"[{\"hea"#, false));
+        all.extend(t.on_tool_use("AskUserQuestion", "t1", r#"der\":\"H\"}]"}"#, false));
+        all.extend(t.on_tool_use("AskUserQuestion", "t1", "", true));
+        let deltas: Vec<_> = all
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .collect();
+        assert_eq!(deltas.len(), 1, "缓冲路径应只在 stop 时发一次 delta");
+        let pj = deltas[0].data["delta"]["partial_json"].as_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(pj).unwrap();
+        assert!(v["questions"].is_array());
+        assert_eq!(v["questions"][0]["header"], "H");
+    }
+
+    #[test]
+    fn non_repair_tool_streams_verbatim() {
+        // 未注册 repair 字段的工具 → 逐帧透传,partial_json 原样。
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        let raw = r#"{"command":"ls"}"#;
+        let evs = t.on_tool_use("Bash", "b1", raw, true);
+        let delta = evs
+            .iter()
+            .find(|e| e.event == "content_block_delta")
+            .unwrap();
+        assert_eq!(
+            delta.data["delta"]["partial_json"].as_str().unwrap(),
+            raw,
+            "透传路径应逐字保留 partial_json"
+        );
+    }
+
+    #[test]
+    fn tool_input_repair_flushes_on_finish_without_stop() {
+        // 边界:缓冲工具未收到 stop,流结束 finish() 收尾应冲洗(修复后)再关块。
+        let mut t = repair_tracker("AskUserQuestion", "questions");
+        let mut all = Vec::new();
+        all.extend(t.on_tool_use(
+            "AskUserQuestion",
+            "t1",
+            r#"{"questions":"[{\"header\":\"H\"}]"}"#,
+            false,
+        ));
+        all.extend(t.finish());
+        let delta = all
+            .iter()
+            .find(|e| e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "input_json_delta")
+            .expect("finish 应冲洗缓冲的 tool input");
+        let pj = delta.data["delta"]["partial_json"].as_str().unwrap();
+        let v: serde_json::Value = serde_json::from_str(pj).unwrap();
+        assert!(v["questions"].is_array());
+        assert!(all.iter().any(|e| e.event == "content_block_stop"));
     }
 
     #[test]
@@ -1486,6 +1709,7 @@ mod tests {
             thinking,
             (0, 100),
             crate::CacheBilling::default(),
+            HashMap::new(),
         );
         futures::StreamExt::collect::<Vec<_>>(s).await
     }
