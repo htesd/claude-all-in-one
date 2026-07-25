@@ -8,10 +8,16 @@ export interface AccountRow {
   group_name: string
   provider: string
   max_concurrency: number
+  /** 调度优先级：数值越小越优先（分层 LRU 先取最小层），缺省 100。 */
+  priority: number
   disabled: boolean
   extra: Record<string, unknown>
   /** 创建时间，Unix 秒。 */
   created_at: number
+  /** 累计成功请求数（后端新增；旧缓存响应可能缺失，缺省视为 0）。 */
+  success_count?: number
+  /** 累计失败请求数（后端新增；旧缓存响应可能缺失，缺省视为 0）。 */
+  failure_count?: number
 }
 
 /** POST /accounts 请求体（注意：这里的分组字段叫 `group`，PATCH 才是 `group_name`）。 */
@@ -20,7 +26,16 @@ export interface CreateAccountPayload {
   group?: string
   provider?: string
   max_concurrency?: number
+  /** 调度优先级：数值越小越优先，缺省 100（不传则由后端按 100 处理）。 */
+  priority?: number
   extra?: Record<string, unknown>
+  /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
+  egress?: string
+  /**
+   * claude-dario 专用：粘贴 CC .credentials.json 全文。
+   * 后端解析 claudeAiOauth 块并并入 extra（access_token / refresh_token / expires_at）。
+   */
+  credentials_json?: string
 }
 
 /** PATCH /accounts/{id}：extra 传了就是整体替换（凭据轮换），不传不动。 */
@@ -29,6 +44,8 @@ export interface UpdateAccountPayload {
   group_name?: string
   max_concurrency?: number
   disabled?: boolean
+  /** 调度优先级：数值越小越优先，缺省 100。不传=不动；走后端定点合并，绝不碰凭据。 */
+  priority?: number
   extra?: Record<string, unknown>
   /**
    * 出口代理 URL。
@@ -50,7 +67,17 @@ export type AccountUnavailableReason =
   | 'too_many_failures'
   | 'config'
 
-/** 账号配额(积分)只读快照,来自 worker 的 getUsageLimits;尚未查到时为 null。 */
+/** 一个用量窗口(如 dario 的 5h / 7d 滚动窗口),利用率%。 */
+export interface QuotaWindow {
+  /** 窗口标签,如 "5h" / "7d"。 */
+  label: string
+  /** 已用利用率(0–100+,可超 100 = 已进 overage)。 */
+  percent_used: number
+  /** 该窗口重置的 unix 秒(可空)。 */
+  reset_at?: number | null
+}
+
+/** 账号配额只读快照;尚未查到时为 null。Kiro=积分(used/limit);dario=利用率窗口(windows)。 */
 export interface AccountQuota {
   /** 已用额度(Credits)。 */
   used: number
@@ -62,6 +89,8 @@ export interface AccountQuota {
   percent_used: number
   /** 订阅/单位标签(如 KIRO PRO),可空。 */
   label?: string | null
+  /** 多窗口利用率(dario 的 5h/7d);空/缺省 = 基于积分的 provider(Kiro),走 remaining/limit 显示。 */
+  windows?: QuotaWindow[]
 }
 
 export interface AccountRuntimeStatus {
@@ -82,8 +111,19 @@ export interface ImportAccountsPayload {
   group_name?: string
   /** KiroManager 导出内容(原文字符串或已解析对象均可)。 */
   json: string
-  /** 批量出口代理：非空时应用到本次导入的所有账号。 */
+  /** 批量出口代理：非空时应用到本次导入的所有账号(API 直连用;UI 走 egress)。 */
   batch_proxy?: string
+  /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
+  egress?: string
+}
+
+/** POST /accounts/import-apikeys 请求体：粘贴的官方 API Key（ksk_）列表。 */
+export interface ImportApiKeysPayload {
+  group_name?: string
+  /** 粘贴文本，每行一个 ksk_...（空白/逗号分隔均可）。 */
+  keys: string
+  /** 出口网关选择：''/'direct'=直连；'auto'=自动均衡；数字字符串=egress_pool 索引。 */
+  egress?: string
 }
 
 /** POST /accounts/import 响应。 */

@@ -5,11 +5,12 @@ import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
 import { Select } from '@/components/ui/select'
 import { useGroups } from '@/features/groups/hooks'
+import { useSettings } from '@/features/settings/hooks'
 import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 
 import { useCreateAccount } from '../hooks'
-import { parseConcurrency } from '../lib'
+import { parseConcurrency, tierToPriority, type PriorityTier } from '../lib'
 import { ACCOUNT_ID_PATTERN, type CreateAccountPayload } from '../types'
 
 const inputClass =
@@ -36,6 +37,17 @@ function pickStr(o: Record<string, unknown>, ...keys: string[]): string {
   return ''
 }
 
+/** 把网关代理 URL 显示成「序号. host:port」(密码段已被后端掩码,host 仍可识别)。 */
+function gatewayLabel(url: string, i: number): string {
+  let host = url
+  try {
+    host = new URL(url).host || url
+  } catch {
+    host = url
+  }
+  return `${i + 1}. ${host}`
+}
+
 interface CreateAccountDialogProps {
   open: boolean
   onClose: () => void
@@ -45,8 +57,11 @@ interface CreateAccountDialogProps {
 export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps) {
   const { t } = useI18n()
   const groupsQuery = useGroups()
+  const settingsQuery = useSettings()
+  const gateways = settingsQuery.data?.egress_pool ?? []
   const mutation = useCreateAccount()
 
+  const [provider, setProvider] = useState<'kiro' | 'claude-dario'>('kiro')
   const [accountId, setAccountId] = useState('')
   const [group, setGroup] = useState('')
   const [token, setToken] = useState('')
@@ -55,14 +70,20 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
   const [region, setRegion] = useState('')
   const [machineId, setMachineId] = useState('')
   const [concurrency, setConcurrency] = useState('2')
-  const [proxy, setProxy] = useState('')
+  const [priorityTier, setPriorityTier] = useState<PriorityTier>('low')
+  const [egress, setEgress] = useState('auto')
   const [paste, setPaste] = useState('')
   const [detected, setDetected] = useState<DetectedType>(null)
+  /** claude-dario 专用：粘贴 .credentials.json 全文。 */
+  const [credentialsJson, setCredentialsJson] = useState('')
   const [error, setError] = useState<string | null>(null)
+
+  const isDario = provider === 'claude-dario'
 
   // 每次打开都从干净的表单态开始
   useEffect(() => {
     if (open) {
+      setProvider('kiro')
       setAccountId('')
       setGroup('')
       setToken('')
@@ -71,9 +92,11 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       setRegion('')
       setMachineId('')
       setConcurrency('2')
-      setProxy('')
+      setPriorityTier('low')
+      setEgress('auto')
       setPaste('')
       setDetected(null)
+      setCredentialsJson('')
       setError(null)
     }
   }, [open])
@@ -145,51 +168,74 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
       setError(t('accounts.error.invalidId'))
       return
     }
-    // refresh_token 必填；粘贴常带换行，trim 后入库
-    const trimmedToken = token.trim()
-    if (trimmedToken === '') {
-      setError(t('accounts.error.tokenRequired'))
-      return
-    }
+
     const parsedConcurrency = parseConcurrency(concurrency)
     if (parsedConcurrency === null) {
       setError(t('accounts.error.invalidConcurrency'))
       return
     }
-    // Client ID / Secret 必须成对(IdC/BuilderId 两者都需要;social 两者都空)。
-    const cid = clientId.trim()
-    const cs = clientSecret.trim()
-    if ((cid === '') !== (cs === '')) {
-      setError(t('accounts.error.clientPair'))
+
+    // 优先级两档:高=0 / 低=100。默认低(100)不写入 extra,保持新账号 extra 干净。
+    const priorityValue = tierToPriority(priorityTier)
+
+    if (isDario && credentialsJson.trim() === '') {
+      setError(t('accounts.error.credentialsJsonRequired'))
       return
     }
+
     setError(null)
 
-    const extra: Record<string, unknown> = { refresh_token: trimmedToken }
-    // IdC/BuilderId 凭据(成对、非空才写;留空 = social,只凭 rt 刷新)。
-    if (cid !== '') extra.client_id = cid
-    if (cs !== '') extra.client_secret = cs
-    const trimmedRegion = region.trim()
-    if (trimmedRegion !== '') extra.region = trimmedRegion
-    const trimmedMachineId = machineId.trim()
-    if (trimmedMachineId !== '') extra.machine_id = trimmedMachineId
-    const trimmedProxy = proxy.trim()
-    if (trimmedProxy !== '') extra.proxy = trimmedProxy
+    let payload: CreateAccountPayload
 
-    const payload: CreateAccountPayload = {
-      account_id: accountId,
-      max_concurrency: parsedConcurrency,
-      extra,
+    if (isDario) {
+      // claude-dario 路径：credentials_json 是主要凭据来源（可为空，后端允许）
+      payload = {
+        account_id: accountId,
+        provider: 'claude-dario',
+        max_concurrency: parsedConcurrency,
+        egress,
+        credentials_json: credentialsJson.trim() || undefined,
+      }
+    } else {
+      // kiro 路径（原有逻辑）
+      const trimmedToken = token.trim()
+      if (trimmedToken === '') {
+        setError(t('accounts.error.tokenRequired'))
+        return
+      }
+      // Client ID / Secret 必须成对(IdC/BuilderId 两者都需要;social 两者都空)。
+      const cid = clientId.trim()
+      const cs = clientSecret.trim()
+      if ((cid === '') !== (cs === '')) {
+        setError(t('accounts.error.clientPair'))
+        return
+      }
+      const extra: Record<string, unknown> = { refresh_token: trimmedToken }
+      if (cid !== '') extra.client_id = cid
+      if (cs !== '') extra.client_secret = cs
+      const trimmedRegion = region.trim()
+      if (trimmedRegion !== '') extra.region = trimmedRegion
+      const trimmedMachineId = machineId.trim()
+      if (trimmedMachineId !== '') extra.machine_id = trimmedMachineId
+
+      payload = {
+        account_id: accountId,
+        max_concurrency: parsedConcurrency,
+        extra,
+        egress,
+      }
     }
+
     if (group !== '') payload.group = group
+    // 默认 100(低)不写入 extra,保持新账号 extra 干净(后端缺省即 100)。
+    if (priorityValue !== 100) payload.priority = priorityValue
 
     mutation.mutate(payload, {
       onSuccess: onClose,
       onError: (err) => {
-        // 409 = ID 重复，400 = 格式非法，其余透出服务端 message
+        // 409 = ID 重复，400 = 格式非法（含凭证解析失败），其余透出服务端 message
         const status = getErrorStatus(err)
         if (status === 409) setError(t('accounts.error.duplicate'))
-        else if (status === 400) setError(t('accounts.error.invalidId'))
         else setError(extractErrorMessage(err))
       },
     })
@@ -198,44 +244,66 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
   return (
     <Modal open={open} onClose={onClose} title={t('accounts.create.title')}>
       <form onSubmit={handleSubmit} className="mt-4 space-y-4">
-        {/* 智能填充:粘贴账号 JSON → 自动识别类型并填充下方字段 */}
-        <div className="space-y-1.5 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-3">
-          <label
-            htmlFor="account-paste"
-            className="flex items-center gap-1.5 text-xs font-medium text-primary"
-          >
-            <Wand2 className="h-3.5 w-3.5" />
-            {t('accounts.field.smartFill')}
+
+        {/* 账号类型（provider）选择器 */}
+        <div className="space-y-1.5">
+          <label htmlFor="account-provider" className="text-xs font-medium text-muted-foreground">
+            {t('accounts.field.provider')}
           </label>
-          <textarea
-            id="account-paste"
-            value={paste}
-            onChange={(event) => autofill(event.target.value)}
-            placeholder={t('accounts.field.smartFillPlaceholder')}
-            rows={2}
-            spellCheck={false}
-            autoComplete="off"
-            className={`${inputClass} resize-none font-mono text-xs leading-5`}
-          />
-          {detected !== null && (
-            <p className="flex items-center gap-1.5 text-xs">
-              <span className="text-muted-foreground">{t('accounts.type.detected')}</span>
-              {detected === 'builderid' && (
-                <span className="font-medium text-success">{t('accounts.type.builderid')}</span>
-              )}
-              {detected === 'social' && (
-                <span className="font-medium text-success">{t('accounts.type.social')}</span>
-              )}
-              {detected === 'idc' && (
-                <span className="font-medium text-warning">{t('accounts.type.idc')}</span>
-              )}
-              {detected === 'idc-like' && (
-                <span className="font-medium text-foreground">{t('accounts.type.idcLike')}</span>
-              )}
-            </p>
-          )}
-          <p className="text-xs text-muted-foreground">{t('accounts.field.smartFillHint')}</p>
+          <Select
+            id="account-provider"
+            value={provider}
+            onChange={(event) => setProvider(event.target.value as 'kiro' | 'claude-dario')}
+            className="w-full"
+          >
+            <option value="kiro">{t('accounts.provider.kiro')}</option>
+            <option value="claude-dario">{t('accounts.provider.claudeDario')}</option>
+          </Select>
         </div>
+
+        {/* ── kiro 路径：智能填充 + refresh_token + Client ID/Secret 等 ── */}
+        {!isDario && (
+          <>
+            {/* 智能填充:粘贴账号 JSON → 自动识别类型并填充下方字段 */}
+            <div className="space-y-1.5 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-3">
+              <label
+                htmlFor="account-paste"
+                className="flex items-center gap-1.5 text-xs font-medium text-primary"
+              >
+                <Wand2 className="h-3.5 w-3.5" />
+                {t('accounts.field.smartFill')}
+              </label>
+              <textarea
+                id="account-paste"
+                value={paste}
+                onChange={(event) => autofill(event.target.value)}
+                placeholder={t('accounts.field.smartFillPlaceholder')}
+                rows={2}
+                spellCheck={false}
+                autoComplete="off"
+                className={`${inputClass} resize-none font-mono text-xs leading-5`}
+              />
+              {detected !== null && (
+                <p className="flex items-center gap-1.5 text-xs">
+                  <span className="text-muted-foreground">{t('accounts.type.detected')}</span>
+                  {detected === 'builderid' && (
+                    <span className="font-medium text-success">{t('accounts.type.builderid')}</span>
+                  )}
+                  {detected === 'social' && (
+                    <span className="font-medium text-success">{t('accounts.type.social')}</span>
+                  )}
+                  {detected === 'idc' && (
+                    <span className="font-medium text-warning">{t('accounts.type.idc')}</span>
+                  )}
+                  {detected === 'idc-like' && (
+                    <span className="font-medium text-foreground">{t('accounts.type.idcLike')}</span>
+                  )}
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground">{t('accounts.field.smartFillHint')}</p>
+            </div>
+          </>
+        )}
 
         {/* account_id */}
         <div className="space-y-1.5">
@@ -254,6 +322,122 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
           />
           <p className="text-xs text-muted-foreground">{t('accounts.field.idRule')}</p>
         </div>
+
+        {/* ── claude-dario 路径：粘贴 .credentials.json ── */}
+        {isDario && (
+          <div className="space-y-1.5 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-3">
+            <label
+              htmlFor="account-cred-json"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t('accounts.field.credentialsJson')}
+            </label>
+            <textarea
+              id="account-cred-json"
+              value={credentialsJson}
+              onChange={(event) => setCredentialsJson(event.target.value)}
+              placeholder={t('accounts.field.credentialsJsonPlaceholder')}
+              rows={4}
+              spellCheck={false}
+              autoComplete="off"
+              className={`${inputClass} resize-none font-mono text-xs leading-5`}
+            />
+            <p className="text-xs text-muted-foreground">{t('accounts.field.credentialsJsonHint')}</p>
+          </div>
+        )}
+
+        {/* ── kiro 路径：refresh_token + Client ID/Secret ── */}
+        {!isDario && (
+          <>
+            {/* refresh_token（必填） */}
+            <div className="space-y-1.5">
+              <label htmlFor="account-token" className="text-xs font-medium text-muted-foreground">
+                {t('accounts.field.refreshToken')}
+              </label>
+              <textarea
+                id="account-token"
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+                placeholder={t('accounts.field.refreshTokenPlaceholder')}
+                rows={3}
+                spellCheck={false}
+                autoComplete="off"
+                className={`${inputClass} resize-none font-mono text-xs leading-5`}
+              />
+            </div>
+
+            {/* 凭据（IdC / BuilderId 需填 Client ID + Secret；social 两者留空） */}
+            <div className="space-y-3 rounded-2xl border border-dashed border-black/10 p-3 dark:border-white/10">
+              <p className="text-xs text-muted-foreground">{t('accounts.field.credHint')}</p>
+              <div className="space-y-1.5">
+                <label htmlFor="account-client-id" className="text-xs font-medium text-muted-foreground">
+                  {t('accounts.field.clientId')}
+                </label>
+                <input
+                  id="account-client-id"
+                  value={clientId}
+                  onChange={(event) => setClientId(event.target.value)}
+                  placeholder={t('accounts.field.clientIdPlaceholder')}
+                  spellCheck={false}
+                  autoComplete="off"
+                  className={`${inputClass} font-mono text-xs`}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="account-client-secret"
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  {t('accounts.field.clientSecret')}
+                </label>
+                <textarea
+                  id="account-client-secret"
+                  value={clientSecret}
+                  onChange={(event) => setClientSecret(event.target.value)}
+                  placeholder={t('accounts.field.clientSecretPlaceholder')}
+                  rows={2}
+                  spellCheck={false}
+                  autoComplete="off"
+                  className={`${inputClass} resize-none font-mono text-xs leading-5`}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label htmlFor="account-region" className="text-xs font-medium text-muted-foreground">
+                    {t('accounts.field.region')}
+                  </label>
+                  <input
+                    id="account-region"
+                    value={region}
+                    onChange={(event) => setRegion(event.target.value)}
+                    placeholder={t('accounts.field.regionPlaceholder')}
+                    spellCheck={false}
+                    autoComplete="off"
+                    className={`${inputClass} font-mono text-xs`}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label
+                    htmlFor="account-machine-id"
+                    className="text-xs font-medium text-muted-foreground"
+                  >
+                    {t('accounts.field.machineId')}
+                  </label>
+                  <input
+                    id="account-machine-id"
+                    value={machineId}
+                    onChange={(event) => setMachineId(event.target.value)}
+                    placeholder={t('accounts.field.machineIdPlaceholder')}
+                    spellCheck={false}
+                    autoComplete="off"
+                    className={`${inputClass} font-mono text-xs`}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">{t('accounts.field.machineIdHint')}</p>
+            </div>
+          </>
+        )}
 
         {/* 分组 */}
         <div className="space-y-1.5">
@@ -275,94 +459,6 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
           </Select>
         </div>
 
-        {/* refresh_token（必填） */}
-        <div className="space-y-1.5">
-          <label htmlFor="account-token" className="text-xs font-medium text-muted-foreground">
-            {t('accounts.field.refreshToken')}
-          </label>
-          <textarea
-            id="account-token"
-            value={token}
-            onChange={(event) => setToken(event.target.value)}
-            placeholder={t('accounts.field.refreshTokenPlaceholder')}
-            rows={3}
-            spellCheck={false}
-            autoComplete="off"
-            className={`${inputClass} resize-none font-mono text-xs leading-5`}
-          />
-        </div>
-
-        {/* 凭据（IdC / BuilderId 需填 Client ID + Secret；social 两者留空） */}
-        <div className="space-y-3 rounded-2xl border border-dashed border-black/10 p-3 dark:border-white/10">
-          <p className="text-xs text-muted-foreground">{t('accounts.field.credHint')}</p>
-          <div className="space-y-1.5">
-            <label htmlFor="account-client-id" className="text-xs font-medium text-muted-foreground">
-              {t('accounts.field.clientId')}
-            </label>
-            <input
-              id="account-client-id"
-              value={clientId}
-              onChange={(event) => setClientId(event.target.value)}
-              placeholder={t('accounts.field.clientIdPlaceholder')}
-              spellCheck={false}
-              autoComplete="off"
-              className={`${inputClass} font-mono text-xs`}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <label
-              htmlFor="account-client-secret"
-              className="text-xs font-medium text-muted-foreground"
-            >
-              {t('accounts.field.clientSecret')}
-            </label>
-            <textarea
-              id="account-client-secret"
-              value={clientSecret}
-              onChange={(event) => setClientSecret(event.target.value)}
-              placeholder={t('accounts.field.clientSecretPlaceholder')}
-              rows={2}
-              spellCheck={false}
-              autoComplete="off"
-              className={`${inputClass} resize-none font-mono text-xs leading-5`}
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1.5">
-              <label htmlFor="account-region" className="text-xs font-medium text-muted-foreground">
-                {t('accounts.field.region')}
-              </label>
-              <input
-                id="account-region"
-                value={region}
-                onChange={(event) => setRegion(event.target.value)}
-                placeholder={t('accounts.field.regionPlaceholder')}
-                spellCheck={false}
-                autoComplete="off"
-                className={`${inputClass} font-mono text-xs`}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label
-                htmlFor="account-machine-id"
-                className="text-xs font-medium text-muted-foreground"
-              >
-                {t('accounts.field.machineId')}
-              </label>
-              <input
-                id="account-machine-id"
-                value={machineId}
-                onChange={(event) => setMachineId(event.target.value)}
-                placeholder={t('accounts.field.machineIdPlaceholder')}
-                spellCheck={false}
-                autoComplete="off"
-                className={`${inputClass} font-mono text-xs`}
-              />
-            </div>
-          </div>
-          <p className="text-xs text-muted-foreground">{t('accounts.field.machineIdHint')}</p>
-        </div>
-
         {/* 并发上限 */}
         <div className="space-y-1.5">
           <label
@@ -382,21 +478,42 @@ export function CreateAccountDialog({ open, onClose }: CreateAccountDialogProps)
           />
         </div>
 
-        {/* 出口代理（可选） */}
+        {/* 调度优先级 */}
         <div className="space-y-1.5">
-          <label htmlFor="account-proxy" className="text-xs font-medium text-muted-foreground">
-            {t('accounts.field.proxy')}
+          <label htmlFor="account-priority" className="text-xs font-medium text-muted-foreground">
+            {t('accounts.field.priority')}
           </label>
-          <input
-            id="account-proxy"
-            type="text"
-            value={proxy}
-            onChange={(event) => setProxy(event.target.value)}
-            placeholder={t('accounts.field.proxyPlaceholder')}
-            spellCheck={false}
-            autoComplete="off"
-            className={inputClass}
-          />
+          <Select
+            id="account-priority"
+            value={priorityTier}
+            onChange={(event) => setPriorityTier(event.target.value as PriorityTier)}
+            className="w-full"
+          >
+            <option value="high">{t('accounts.priorityTier.high')}</option>
+            <option value="low">{t('accounts.priorityTier.low')}</option>
+          </Select>
+          <p className="text-xs text-muted-foreground">{t('accounts.field.priorityHint')}</p>
+        </div>
+
+        {/* 出口网关（上号时选：直连 / 自动均衡 / 指定网关） */}
+        <div className="space-y-1.5">
+          <label htmlFor="account-egress" className="text-xs font-medium text-muted-foreground">
+            {t('accounts.field.egress')}
+          </label>
+          <Select
+            id="account-egress"
+            value={egress}
+            onChange={(event) => setEgress(event.target.value)}
+            className="w-full"
+          >
+            <option value="direct">{t('accounts.egress.direct')}</option>
+            <option value="auto">{t('accounts.egress.auto')}</option>
+            {gateways.map((url, i) => (
+              <option key={i} value={String(i)}>
+                {gatewayLabel(url, i)}
+              </option>
+            ))}
+          </Select>
         </div>
 
         {error !== null && <p className="text-sm text-destructive">{error}</p>}

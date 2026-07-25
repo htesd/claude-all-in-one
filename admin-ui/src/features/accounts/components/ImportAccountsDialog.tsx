@@ -15,12 +15,13 @@ import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
 import { Select } from '@/components/ui/select'
 import { useGroups } from '@/features/groups/hooks'
+import { useSettings } from '@/features/settings/hooks'
 import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 import { queryKeys } from '@/lib/query-keys'
 
 import { deleteAccount, fetchAccountQuotaNow } from '../api'
-import { useImportAccounts } from '../hooks'
+import { useImportAccounts, useImportApiKeys } from '../hooks'
 import { formatCredits } from '../lib'
 import type { AccountQuota, ImportAccountsResult } from '../types'
 
@@ -47,6 +48,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** 把网关代理 URL 显示成「序号. host:port」(密码段已被后端掩码,host 仍可识别)。 */
+function gatewayLabel(url: string, i: number): string {
+  let host = url
+  try {
+    host = new URL(url).host || url
+  } catch {
+    host = url
+  }
+  return `${i + 1}. ${host}`
+}
+
 interface ImportAccountsDialogProps {
   open: boolean
   onClose: () => void
@@ -57,16 +69,22 @@ interface ImportAccountsDialogProps {
 export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProps) {
   const { t } = useI18n()
   const groupsQuery = useGroups()
+  const settingsQuery = useSettings()
+  const gateways = settingsQuery.data?.egress_pool ?? []
   const mutation = useImportAccounts()
+  const apiKeysMutation = useImportApiKeys()
   const queryClient = useQueryClient()
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 运行序号(generation token):开/关对话框都自增,使仍在 await 中的旧验活/删除
   // 循环失效——不能用布尔 cancelled(重开会复位,4s 睡眠里的旧循环会"复活"写进新会话)。
   const runSeqRef = useRef(0)
 
+  // 导入模式:'json' = KiroManager 导出 JSON;'apikeys' = 粘贴官方 API Key(ksk_)列表。
+  const [mode, setMode] = useState<'json' | 'apikeys'>('json')
   const [group, setGroup] = useState('')
   const [json, setJson] = useState('')
-  const [batchProxy, setBatchProxy] = useState('')
+  const [keys, setKeys] = useState('')
+  const [egress, setEgress] = useState('auto')
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<ImportAccountsResult | null>(null)
 
@@ -78,9 +96,11 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
   useEffect(() => {
     runSeqRef.current += 1
     if (open) {
+      setMode('json')
       setGroup('')
       setJson('')
-      setBatchProxy('')
+      setKeys('')
+      setEgress('auto')
       setError(null)
       setResult(null)
       setVerifyStates({})
@@ -156,24 +176,38 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
     }
   }
 
+  const submitting = mutation.isPending || apiKeysMutation.isPending
+
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
-    if (mutation.isPending) return
+    if (submitting) return
+    const onSuccess = (data: ImportAccountsResult) => {
+      setResult(data)
+      void runVerification(data.items)
+    }
+    const onError = (err: unknown) => setError(extractErrorMessage(err))
+
+    if (mode === 'apikeys') {
+      if (keys.trim() === '') {
+        setError(t('accounts.import.keysEmpty'))
+        return
+      }
+      setError(null)
+      apiKeysMutation.mutate(
+        { keys, group_name: group || undefined, egress },
+        { onSuccess, onError },
+      )
+      return
+    }
+
     if (json.trim() === '') {
       setError(t('accounts.import.empty'))
       return
     }
     setError(null)
-    const trimmedProxy = batchProxy.trim()
     mutation.mutate(
-      { json, group_name: group || undefined, batch_proxy: trimmedProxy || undefined },
-      {
-        onSuccess: (data) => {
-          setResult(data)
-          void runVerification(data.items)
-        },
-        onError: (err) => setError(extractErrorMessage(err)),
-      },
+      { json, group_name: group || undefined, egress },
+      { onSuccess, onError },
     )
   }
 
@@ -228,7 +262,7 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
 
   // 只有**写操作**(导入提交/删除)进行中不允许关闭;验活是只读探测,关闭即取消
   // (审查 Architect#4/Minimalist#4:worker 离线时串行重试可达几十分钟,必须给取消路径)。
-  const busy = mutation.isPending || removing
+  const busy = submitting || removing
   const safeClose = () => {
     if (busy) return
     onClose()
@@ -414,6 +448,28 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
         </div>
       ) : (
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
+          {/* 导入模式切换:KiroManager JSON / 官方 API Key 列表 */}
+          <div className="inline-flex rounded-2xl bg-muted p-1 text-xs font-medium">
+            <button
+              type="button"
+              onClick={() => setMode('json')}
+              className={`rounded-xl px-3 py-1.5 transition-colors ${
+                mode === 'json' ? 'bg-background shadow-sm' : 'text-muted-foreground'
+              }`}
+            >
+              {t('accounts.import.modeJson')}
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('apikeys')}
+              className={`rounded-xl px-3 py-1.5 transition-colors ${
+                mode === 'apikeys' ? 'bg-background shadow-sm' : 'text-muted-foreground'
+              }`}
+            >
+              {t('accounts.import.modeApiKeys')}
+            </button>
+          </div>
+
           {/* 目标分组 */}
           <div className="space-y-1.5">
             <label htmlFor="import-group" className="text-xs font-medium text-muted-foreground">
@@ -434,71 +490,94 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
             </Select>
           </div>
 
-          {/* 批量代理（可选） */}
+          {/* 出口网关（上号时选：直连 / 自动均衡 / 指定网关） */}
           <div className="space-y-1.5">
-            <label htmlFor="import-batch-proxy" className="text-xs font-medium text-muted-foreground">
-              {t('accounts.import.batchProxy')}
+            <label htmlFor="import-egress" className="text-xs font-medium text-muted-foreground">
+              {t('accounts.field.egress')}
             </label>
-            <input
-              id="import-batch-proxy"
-              type="text"
-              value={batchProxy}
-              onChange={(event) => setBatchProxy(event.target.value)}
-              placeholder={t('accounts.import.batchProxyPlaceholder')}
-              spellCheck={false}
-              autoComplete="off"
-              className={inputClass}
-            />
+            <Select
+              id="import-egress"
+              value={egress}
+              onChange={(event) => setEgress(event.target.value)}
+              className="w-full"
+            >
+              <option value="direct">{t('accounts.egress.direct')}</option>
+              <option value="auto">{t('accounts.egress.auto')}</option>
+              {gateways.map((url, i) => (
+                <option key={i} value={String(i)}>
+                  {gatewayLabel(url, i)}
+                </option>
+              ))}
+            </Select>
           </div>
 
-          {/* JSON 粘贴 + 文件选择 */}
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <label htmlFor="import-json" className="text-xs font-medium text-muted-foreground">
-                {t('accounts.import.jsonLabel')}
-              </label>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-              >
-                <Upload className="h-3 w-3" />
-                {t('accounts.import.chooseFile')}
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".json,application/json"
-                className="hidden"
-                onChange={handleFile}
+          {mode === 'json' ? (
+            /* JSON 粘贴 + 文件选择 */
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label htmlFor="import-json" className="text-xs font-medium text-muted-foreground">
+                  {t('accounts.import.jsonLabel')}
+                </label>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                >
+                  <Upload className="h-3 w-3" />
+                  {t('accounts.import.chooseFile')}
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  className="hidden"
+                  onChange={handleFile}
+                />
+              </div>
+              <textarea
+                id="import-json"
+                value={json}
+                onChange={(event) => setJson(event.target.value)}
+                placeholder={t('accounts.import.jsonPlaceholder')}
+                rows={8}
+                spellCheck={false}
+                autoComplete="off"
+                className={`${inputClass} resize-none font-mono text-xs leading-5`}
               />
             </div>
-            <textarea
-              id="import-json"
-              value={json}
-              onChange={(event) => setJson(event.target.value)}
-              placeholder={t('accounts.import.jsonPlaceholder')}
-              rows={8}
-              spellCheck={false}
-              autoComplete="off"
-              className={`${inputClass} resize-none font-mono text-xs leading-5`}
-            />
-          </div>
+          ) : (
+            /* API Key 粘贴(每行一个 ksk_...) */
+            <div className="space-y-1.5">
+              <label htmlFor="import-keys" className="text-xs font-medium text-muted-foreground">
+                {t('accounts.import.keysLabel')}
+              </label>
+              <textarea
+                id="import-keys"
+                value={keys}
+                onChange={(event) => setKeys(event.target.value)}
+                placeholder={t('accounts.import.keysPlaceholder')}
+                rows={8}
+                spellCheck={false}
+                autoComplete="off"
+                className={`${inputClass} resize-none font-mono text-xs leading-5`}
+              />
+            </div>
+          )}
 
           {error !== null && <p className="text-sm text-destructive">{error}</p>}
 
           <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
             <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            {t('accounts.import.hint')}
+            {mode === 'apikeys' ? t('accounts.import.keysHint') : t('accounts.import.hint')}
           </p>
 
           <div className="flex justify-end gap-2 pt-1">
             <Button variant="ghost" onClick={safeClose}>
               {t('common.cancel')}
             </Button>
-            <Button type="submit" disabled={mutation.isPending}>
-              {mutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
-              {mutation.isPending ? t('accounts.import.importing') : t('accounts.import.submit')}
+            <Button type="submit" disabled={submitting}>
+              {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
+              {submitting ? t('accounts.import.importing') : t('accounts.import.submit')}
             </Button>
           </div>
         </form>

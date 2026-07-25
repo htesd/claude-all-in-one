@@ -9,7 +9,7 @@ import { GroupChip } from '@/features/groups/components/GroupChip'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
-import { deriveAccountStatus, formatCredits, isQuotaLow } from '../lib'
+import { deriveAccountStatus, formatCredits, isQuotaLow, priorityToTier, type QuotaKind } from '../lib'
 import type { AccountRow, AccountRuntimeEntry } from '../types'
 import { AccountStatusBadge } from './AccountStatusBadge'
 
@@ -27,6 +27,8 @@ interface AccountTableRowProps {
   runtimeState: RuntimeQueryState
   /** 分组颜色（来自 /groups），未命中用默认色。 */
   groupColor: string | undefined
+  /** 配额列口径(随所属 tab):'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario)。 */
+  quotaKind: QuotaKind
   /** 本行是否有进行中的 mutation（按钮置灰防连点）。 */
   busy: boolean
   onToggleDisabled: (row: AccountRow) => void
@@ -41,6 +43,7 @@ export function AccountTableRow({
   runtime,
   runtimeState,
   groupColor,
+  quotaKind,
   busy,
   onToggleDisabled,
   onEdit,
@@ -95,11 +98,35 @@ export function AccountTableRow({
         )}
       </TD>
 
-      {/* 积分:剩余/上限(来自 getUsageLimits);null = 后台查询中 */}
+      {/* 配额列:口径随所属 tab。
+          - windows(ccmax/dario):5h/7d 滚动窗口利用率%;无数据(未跑过流量/查询中)显示 —
+          - credits(Kiro):积分剩余/上限(来自 getUsageLimits) */}
       <TD className="text-right">
         {(() => {
           if (runtimeState === 'loading') return <Skeleton className="ml-auto h-4 w-16" />
           const quota = runtime?.online ? runtime.status.quota : undefined
+
+          if (quotaKind === 'windows') {
+            // ccmax:只展示利用率窗口;Anthropic 无只读用量接口,须先跑过流量才有数。
+            if (!quota?.windows || quota.windows.length === 0) {
+              return <span className="text-muted-foreground">—</span>
+            }
+            return (
+              <span className="tabular-nums" title={quota.label ?? undefined}>
+                {quota.windows.map((w, i) => (
+                  <span key={w.label}>
+                    {i > 0 && <span className="text-muted-foreground"> · </span>}
+                    <span className="text-muted-foreground">{w.label} </span>
+                    <span className={cn('font-medium', w.percent_used >= 90 && 'text-destructive')}>
+                      {Math.round(w.percent_used)}%
+                    </span>
+                  </span>
+                ))}
+              </span>
+            )
+          }
+
+          // credits(Kiro):剩余/上限。
           if (quota === undefined || quota === null) {
             return <span className="text-muted-foreground">—</span>
           }
@@ -133,6 +160,18 @@ export function AccountTableRow({
         )}
       </TD>
 
+      {/* 调度优先级:两档(高/低)。高层号被优先·积极调度。 */}
+      <TD className="text-right">
+        <span
+          className={cn(priorityToTier(row.priority) === 'high' && 'font-medium text-primary')}
+          title={t('table.priorityHint')}
+        >
+          {priorityToTier(row.priority) === 'high'
+            ? t('accounts.priorityTier.high')
+            : t('accounts.priorityTier.low')}
+        </span>
+      </TD>
+
       {/* 连续失败次数：> 0 才显示 */}
       <TD className="text-right">
         {runtimeState === 'loading' ? (
@@ -142,6 +181,18 @@ export function AccountTableRow({
         ) : (
           <span className="text-muted-foreground">—</span>
         )}
+      </TD>
+
+      {/* 累计成功/失败：来自账号行的 success_count / failure_count（后端新增，旧数据视为 0）。
+          与「连续失败」列不同：这里是生命周期累计值，连续失败列是当前冷却期连续失败计数。 */}
+      <TD className="text-right">
+        <span className="tabular-nums">
+          <span className="text-success">{row.success_count ?? 0}</span>
+          <span className="text-muted-foreground"> / </span>
+          <span className={cn((row.failure_count ?? 0) > 0 ? 'text-destructive' : 'text-muted-foreground')}>
+            {row.failure_count ?? 0}
+          </span>
+        </span>
       </TD>
 
       {/* 操作：启停 + 编辑 + 删除（二次确认） */}

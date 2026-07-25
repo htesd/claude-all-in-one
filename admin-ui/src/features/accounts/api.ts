@@ -7,6 +7,7 @@ import type {
   CreateAccountPayload,
   ImportAccountsPayload,
   ImportAccountsResult,
+  ImportApiKeysPayload,
   UpdateAccountPayload,
 } from './types'
 
@@ -41,6 +42,41 @@ export async function importAccounts(
   payload: ImportAccountsPayload,
 ): Promise<ImportAccountsResult> {
   const response = await api.post<ImportAccountsResult>('/accounts/import', payload)
+  return response.data
+}
+
+/** `POST /accounts/oauth/start` 入参：生成 authorize URL 并登记待完成会话。 */
+export interface OAuthStartPayload {
+  account_id: string
+  group?: string
+  /** 出口网关选择：""/"direct"=直连；"auto"=自动均衡；数字=egress_pool 索引。 */
+  egress?: string
+  max_concurrency?: number
+}
+
+export interface OAuthStartResult {
+  authorize_url: string
+  /** 会话键 + CSRF 绑定；complete 时原样回传。 */
+  state: string
+  expires_in_sec: number
+}
+
+/** 生成 PKCE + authorize URL（不发任何网络），登记待完成上号会话。 */
+export async function oauthStart(payload: OAuthStartPayload): Promise<OAuthStartResult> {
+  const response = await api.post<OAuthStartResult>('/accounts/oauth/start', payload)
+  return response.data
+}
+
+/** 用 code 换 token（扇给目标组 worker，走该组 egress）并落库，返回新账号（脱敏）。 */
+export async function oauthComplete(state: string, code: string): Promise<AccountRow> {
+  const response = await api.post<AccountRow>('/accounts/oauth/complete', { state, code })
+  return response.data
+}
+
+export async function importApiKeys(
+  payload: ImportApiKeysPayload,
+): Promise<ImportAccountsResult> {
+  const response = await api.post<ImportAccountsResult>('/accounts/import-apikeys', payload)
   return response.data
 }
 

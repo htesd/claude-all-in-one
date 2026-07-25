@@ -8,13 +8,18 @@ import {
   fetchAccounts,
   fetchAccountsRuntime,
   importAccounts,
+  importApiKeys,
+  oauthComplete,
+  oauthStart,
   refreshAccount,
   resetAccount,
   updateAccount,
 } from './api'
+import type { OAuthStartPayload } from './api'
 import type {
   CreateAccountPayload,
   ImportAccountsPayload,
+  ImportApiKeysPayload,
   UpdateAccountPayload,
 } from './types'
 
@@ -73,11 +78,35 @@ export function useImportAccounts() {
   })
 }
 
+export function useImportApiKeys() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: ImportApiKeysPayload) => importApiKeys(payload),
+    onSuccess: () => invalidateAccountDomains(queryClient),
+  })
+}
+
 /** 人工救号（清冷却/封禁/失败计数）；成功后立刻刷新 runtime 让状态列回正。 */
 export function useResetAccount() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => resetAccount(id),
+    onSuccess: () => invalidateAccountDomains(queryClient),
+  })
+}
+
+/** OAuth 上号第一步：生成 authorize URL（不发网络，不改账号域，无需失效查询）。 */
+export function useOAuthStart() {
+  return useMutation({
+    mutationFn: (payload: OAuthStartPayload) => oauthStart(payload),
+  })
+}
+
+/** OAuth 上号第二步：换码落库；成功后刷新账号域（新账号入列）。 */
+export function useOAuthComplete() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ state, code }: { state: string; code: string }) => oauthComplete(state, code),
     onSuccess: () => invalidateAccountDomains(queryClient),
   })
 }
