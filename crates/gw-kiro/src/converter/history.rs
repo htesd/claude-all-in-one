@@ -230,15 +230,24 @@ pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_
     // (对齐 static_flow;防上游自曝 Kiro 身份)。
     {
         let mut system_content = client_system;
+        // [EXP] thinking 前缀注入 history[0] 最前(kiro.rs 对齐),env 开关
+        if std::env::var("KIRO_THINKING_IN_HISTORY0").is_ok() {
+            if let Some(prefix) = generate_thinking_prefix(req) {
+                if !has_thinking_tags(&system_content) {
+                    system_content = if system_content.is_empty() { prefix } else { format!("{}\n{}", prefix, system_content) };
+                }
+            }
+        }
         // 分块写入策略——仅当请求确实带 Write/Edit 工具、且有真实系统提示时才注入。
-        // 该策略约束 Write/Edit 分块行为,对干净客户端注入会污染行为被检测识别(故保留门控)。
         if !system_content.is_empty() && request_has_chunked_tools(req) {
             system_content = append_line(system_content, SYSTEM_CHUNKED_POLICY);
         }
-        // 隐私策略 + 身份覆盖:逐字对齐 static_flow,每个请求都注入。
-        system_content = append_line(system_content, VISIBLE_THINKING_PRIVACY_POLICY);
-        system_content = append_line(system_content, SYSTEM_PROMPT_PRIVACY_POLICY);
-        system_content = append_line(system_content, GENERIC_ANTHROPIC_IDENTITY_OVERRIDE);
+        // 隐私策略 + 身份覆盖:逐字对齐 static_flow。[EXP] env 可跳过
+        if std::env::var("KIRO_SKIP_IDENTITY_INJECT").is_err() {
+            system_content = append_line(system_content, VISIBLE_THINKING_PRIVACY_POLICY);
+            system_content = append_line(system_content, SYSTEM_PROMPT_PRIVACY_POLICY);
+            system_content = append_line(system_content, GENERIC_ANTHROPIC_IDENTITY_OVERRIDE);
+        }
 
         // 追加结构化输出指令（如有）
         let final_content = if let Some(ref instr) = structured_instruction {

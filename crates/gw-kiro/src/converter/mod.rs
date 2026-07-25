@@ -17,6 +17,7 @@ use crate::kiro_types::conversation::{
 
 mod cache_point;
 mod content;
+mod document_name;
 mod history;
 mod model_map;
 mod normalize;
@@ -31,8 +32,13 @@ pub use model_map::{advertised_models, get_context_window_size, map_model, Adver
 pub use shed::{shed_history_media, MediaShed};
 /// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
 pub(crate) use cache_point::set_experimental_flags;
+/// thinking 签名发射开关(供 [`crate::chat`] 在收尾 thinking 块时判定是否附 signature)。
+pub(crate) use cache_point::thinking_signature_enabled;
+/// 上游端点开关(供 [`crate::headers::runtime_base_url`] 判定走 runtime.kiro.dev 还是 q.amazonaws.com)。
+pub(crate) use cache_point::q_endpoint_enabled;
 use cache_point::*;
 use content::*;
+use document_name::dedup_document_names;
 use history::*;
 use pairing::*;
 use session::*;
@@ -56,6 +62,10 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 工具防御性修复字段表：发往上游的工具短名 → 该工具 input_schema 中 type 为
+    /// array/object 的顶层字段集合。供流式收尾解包被模型双重编码成字符串的参数
+    /// （如 AskUserQuestion.questions）。无 array/object 字段的工具不入表。
+    pub tool_repair_fields: HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// 转换错误
@@ -150,13 +160,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 3. 生成会话 ID 和代理 ID。conversationId 派生逻辑抽到 [`derive_conversation_id`]
     //    (worker 会话亲和也复用它,保证 router/sim/亲和三处身份链同源)。
     let conversation_id = derive_conversation_id(req, messages);
-    // 【根因·真实缓存全 miss】(2026-06-13 线上 caio 实锤,真号 真=miss/全冷)：
-    // 旧实现自造一个稳定的 agentContinuationId 上 wire。Kiro 收到 agentContinuationId 会把请求
-    // 当成「续接一个它从未签发的 agent 上下文」,于是**绕过 conversationId 前缀缓存** → 同一对话
-    // 连续轮也每轮冷 miss、真号真实额度暴烧。static_flow(金标准)与 kiro.rs(生产)都**完全不发**
-    // 这个字段;static_flow 还专门有测试 does_not_send_random_agent_continuation_metadata 锁死。
-    // 旧注释"agentContinuationId 必须稳定/否则 3 倍计费"实为误判(对比的是「稳定发」vs「随机发」
-    // 两个都错的配置;正解是**根本不发**)。故此处不再派生、不再上 wire。见 [[real-cache-hit]] 修正。
+    // 【2026-06-15 修正·真实缓存全 miss 根因再定位】
+    // 2026-06-13 曾删除 agentContinuationId,理由"kiro.rs/static_flow 都不发、发了破缓存"。
+    // 复核证伪:kiro.rs **生产一直在发**稳定的 agentContinuationId(converter.rs:670,实测注释
+    // 稳定值 → metering 降 ~36%),且 caio 自身 2026-05-24 命中 A/B 基线**也含**此字段(6-13 才删)。
+    // 删除后线上实测 caio 真实命中 **0%**、credit **+49% vs kiro.rs**(后者同上游 ~43% 命中)。
+    // 故恢复**稳定**派生,经 `agent_continuation_enabled()` 开关上 wire(默认关,生产做可逆 A/B):
+    // 稳定 conversationId(本 crate 已保证)+ 稳定 agentContinuationId = kiro.rs proven 配置。
+    // 实际附挂在 `with_agent_continuation_metadata`(纯函数,便于直接测两个分支)。
 
     // 3.1 跨轮重复 tool_use_id 重写(🟢 static_flow)。客户端反复 auto-compact 后,同一
     // tool_use_id 可能在两个各自已完成的 assistant 轮里各出现一次,直发会让 Kiro 400。
@@ -165,6 +176,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 无重复时返回 None,继续用原 borrowed slice(零拷贝)。畸形输入不报错,交 pairing 兜底。
     let deduped = rewrite_duplicate_tool_use_ids(messages);
     let messages: &[_] = deduped.as_deref().unwrap_or(messages);
+
+    // 3.2 文档名去重 + 净化:Bedrock 要求 document name 全局唯一且限定字符集,否则 400
+    // INVALID_DOCUMENT_NAME(duplicate document names)。多份无名附件都兜成 "document" 是
+    // 最常见触发。零拷贝快路径,时序与 tool_id 一致(conversationId 派生之后,不扰动身份/亲和/缓存)。
+    let doc_deduped = dedup_document_names(messages);
+    let messages: &[_] = doc_deduped.as_deref().unwrap_or(messages);
 
     // 3.5 块1a:处理 messages 数组里 role=="system" 的消息(代理链中段注入)。
     // 三级分流:稳定前缀提升进 promoted_system / 动态噪声丢弃 / interrupted-user 与未知转 user。
@@ -192,9 +209,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let (text_content, images, documents, tool_results) =
         merge_current_message_content(current_messages)?;
 
-    // 6. 转换工具定义（超长名称自动缩短并记录映射）
+    // 6. 转换工具定义（超长名称自动缩短并记录映射；同时按 schema 收集需修复的 array/object 字段）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let mut tool_repair_fields: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut tools = convert_tools(&req.tools, &mut tool_name_map, &mut tool_repair_fields);
 
     // 7. 构建历史消息（当前轮之前的所有消息;需要先构建,以便收集历史中使用的工具）
     // promoted_system: 块1a 从 messages 数组提升上来的稳定 system 文本,折叠进 history[0]。
@@ -295,7 +313,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 块2b:thinking 前缀注入**当前轮** content(不进 system/history,避免毒化缓存前缀)。
     // 在兜底之后注入:即便当前轮是纯 tool_result/媒体占位,带 thinking 时也应让上游开思考。
     let mut content = content;
-    apply_thinking_prefix_to_current_turn(req, &mut content);
+    // [EXP] 若已把 thinking 注入 history[0],当前轮不再重复注入
+    if std::env::var("KIRO_THINKING_IN_HISTORY0").is_err() {
+        apply_thinking_prefix_to_current_turn(req, &mut content);
+    }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -348,14 +369,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         }
     }
 
-    // 13. 构建 ConversationState
-    // 【只发 chat_trigger_type=MANUAL,不发 agentContinuationId / agentTaskType】——逐字对齐
-    // static_flow 金标准(测试 does_not_send_random_agent_continuation_metadata 断言这俩为 None)
-    // 与 kiro.rs 生产(二者均不发)。详见下方根因注释。
-    let conversation_state = ConversationState::new(conversation_id)
-        .with_chat_trigger_type(chat_trigger_type)
-        .with_current_message(current_message)
-        .with_history(history);
+    // 13. 构建 ConversationState。chat_trigger_type=MANUAL 恒发;agentContinuationId + agentTaskType
+    // 仅在开关启用时上 wire(默认关,见上方根因注释 + `agent_continuation_enabled`)。
+    let conversation_state = with_agent_continuation_metadata(
+        ConversationState::new(conversation_id)
+            .with_chat_trigger_type(chat_trigger_type)
+            .with_current_message(current_message)
+            .with_history(history),
+        agent_continuation_enabled(),
+    );
 
     if !tool_name_map.is_empty() {
         tracing::info!(
@@ -367,7 +389,24 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        tool_repair_fields,
     })
+}
+
+/// 按开关把**稳定** agentContinuationId(从 `state.conversation_id` 派生,与 conversationId 同源)
+/// + agentTaskType="vibe" 附到 conversationState —— 复刻 kiro.rs proven 配置(见根因注释)。
+///
+/// **纯函数**(开关值由调用方传入,便于直接测两个分支,不依赖进程级实验全局):
+/// - `enabled=false`(默认):原样返回,两字段保持 None → 序列化时 **完全省略**(零 wire 变化);
+/// - `enabled=true`:附 agentContinuationId(稳定)+ agentTaskType="vibe"。
+fn with_agent_continuation_metadata(state: ConversationState, enabled: bool) -> ConversationState {
+    if !enabled {
+        return state;
+    }
+    let acid = derive_agent_continuation_id(&state.conversation_id);
+    state
+        .with_agent_continuation_id(acid)
+        .with_agent_task_type("vibe")
 }
 
 /// 确定聊天触发类型
