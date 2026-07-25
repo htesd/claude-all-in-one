@@ -23,23 +23,23 @@ const MODEL_IDENTITY_DELIMITER: &str = ". The exact model ID is ";
 
 /// 判定一行是否为 Claude Code 的滚动 billing 指纹行。
 ///
-/// 现象:CC 在 system prompt 拼 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=<5位16进制>;`,
-/// 其中 `cch` 是每请求都变的 body 哈希 → 即使 Kiro 真做 prompt cache,这行也让命中率永远 0。
+/// 现象:CC 在 system prompt 顶部拼 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=<5位16进制>;`,
+/// 其中 `cch` 是每请求都变的 body 哈希 → 即使上游做 prefix cache,这行也让命中率永远 0。
 ///
-/// 收窄判据(🟢 static_flow `identity.rs:369-374`):行首(忽略前导空白与大小写)是
-/// `x-anthropic-billing-header:`,**且**含 `cc_version=`/`cc_entrypoint=`/`cch=` 之一。
-/// 比旧版"删任意 `x-anthropic-` 前缀行"误伤更小——用户正文里碰巧的同前缀行不再被误删。
+/// 判据:行首(忽略前导空白与大小写)是 `x-anthropic-billing-header:` 即剥,**不再依赖具体
+/// `cc_*` 字段名**。
+///
+/// 为什么放宽:原收窄判据(要求行内含 `cc_version=`/`cc_entrypoint=`/`cch=` 之一)对 CC 版本升级
+/// 脆弱——CC 一旦改字段名/结构(实测 header 里带版本号 `cc_version=2.1.63.<build>`,字段集会随版本动),
+/// 旧判据就静默失配,每请求变化的随机 `cch` 重新泄进前缀、命中再次归零。改回只锚定 header 前缀
+/// (对齐 static_flow `converter.rs::strip_volatile_claude_code_billing_header` 的口径):
+/// `x-anthropic-billing-header:` 是 Anthropic 内部专有前缀,真实流量里 system 仅此一处,放宽不误伤用户正文。
 fn is_billing_fingerprint_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     let prefix = BILLING_HEADER_PREFIX.as_bytes();
     // 按字节比较前缀,避免在多字节字符边界上做 str 切片 panic。
-    if trimmed.len() < prefix.len() || !trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
-        return false;
-    }
-    // 前缀是纯 ASCII,prefix.len() 必落在 char 边界,可安全切片。
-    let rest = &trimmed[prefix.len()..];
-    rest.contains("cc_version=") || rest.contains("cc_entrypoint=") || rest.contains("cch=")
+    trimmed.len() >= prefix.len()
+        && trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// 删除 system 文本里的 CC 滚动 billing 指纹行(保留其余内容与换行结构)。
@@ -309,5 +309,47 @@ mod tests {
     fn thinking_suffix_echo_is_case_insensitive() {
         let (_, echo) = requested_model_identity("claude-opus-4-8-THINKING").unwrap();
         assert_eq!(echo, "claude-opus-4-8", "大写 -THINKING 也应从回显剥除");
+    }
+
+    // === billing 指纹剥离(放宽判据后的回归保护) ===
+
+    /// 当前已知格式的 billing 指纹行必须被剥,正文保留(回归保护)。
+    #[test]
+    fn strips_current_billing_fingerprint_line() {
+        let sys = "x-anthropic-billing-header: cc_version=2.1.63.a43; cc_entrypoint=cli; cch=ea527;\n\
+                   You are Claude Code, Anthropic's official CLI for Claude.\n";
+        let out = strip_rolling_fingerprints(sys);
+        assert!(!out.contains("cch="), "当前格式 billing 行应被剥");
+        assert!(out.contains("You are Claude Code"), "billing 行之后的正文应保留");
+    }
+
+    /// CC 版本漂移:billing 头改了字段名/结构(不含 cc_version/cc_entrypoint/cch)也必须被剥,
+    /// 否则每请求变化的随机量重新泄进前缀、上游 prefix cache 再次归零。
+    /// 旧收窄判据(要求含 cc_* 字段)在此 case 会漏 —— 本测试锁死放宽后的行为。
+    #[test]
+    fn strips_billing_header_with_drifted_fields() {
+        let sys = "x-anthropic-billing-header: ccv=2.2.0; entry=cli; h=abcde;\nrest of system\n";
+        let out = strip_rolling_fingerprints(sys);
+        assert!(
+            !out.contains("x-anthropic-billing-header:"),
+            "字段漂移的 billing 行也应被剥(否则随机量泄漏)"
+        );
+        assert!(out.contains("rest of system"), "正文应保留");
+    }
+
+    /// 不误伤:仅碰巧含 `x-anthropic` 但非 `x-anthropic-billing-header:` 前缀的用户正文行保留。
+    #[test]
+    fn preserves_non_billing_anthropic_lines() {
+        let sys = "see header x-anthropic-foo: bar\nx-anthropic-version: 1\n";
+        let out = strip_rolling_fingerprints(sys);
+        assert_eq!(out, sys, "非 billing-header 前缀行不应被动(零误伤)");
+    }
+
+    /// 判据对大小写与前导空白不敏感;普通正文行不命中。
+    #[test]
+    fn billing_match_is_case_and_indent_insensitive() {
+        assert!(is_billing_fingerprint_line("  X-Anthropic-Billing-Header: cch=1;\n"));
+        assert!(is_billing_fingerprint_line("x-anthropic-billing-header:\n"));
+        assert!(!is_billing_fingerprint_line("hello world\n"));
     }
 }

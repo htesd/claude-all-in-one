@@ -29,6 +29,17 @@ pub struct KiroModel {
 /// **权威表**。新增/下线模型只改这里——派生点自动跟随。
 pub const KIRO_MODELS: &[KiroModel] = &[
     KiroModel {
+        // 2026-07-25 上游新增。与 sonnet-5 同规律:modelId 是主版本裸名
+        // `claude-opus-5`(无 x.y 点号,与 4.x 各行不同)。
+        advertised_id: "claude-opus-5",
+        display_name: "Claude Opus 5",
+        kiro_model: "claude-opus-5",
+        identity_short: "Opus 5",
+        context_window: 1_000_000,
+        supports_thinking: true,
+        dated_alias: None,
+    },
+    KiroModel {
         advertised_id: "claude-opus-4-8",
         display_name: "Claude Opus 4.8",
         kiro_model: "claude-opus-4.8",
@@ -63,6 +74,17 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         context_window: 200_000,
         supports_thinking: true,
         dated_alias: Some("claude-opus-4-5-20251101"),
+    },
+    KiroModel {
+        // 2026-07-02 上游 ListAvailableModels 实测新增(标注 experimental preview),
+        // modelId 本身就是 `claude-sonnet-5`(无 x.y 点号,与其余行不同)。
+        advertised_id: "claude-sonnet-5",
+        display_name: "Claude Sonnet 5",
+        kiro_model: "claude-sonnet-5",
+        identity_short: "Sonnet 5",
+        context_window: 1_000_000,
+        supports_thinking: true,
+        dated_alias: None,
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-6",
@@ -138,11 +160,24 @@ fn map_model_substring(model_lower: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower.contains("sonnet-5") || model_lower.contains("sonnet5") {
+            // 2026-07-02: 上游新增 claude-sonnet-5（无 x.y 点号,权威表已列;此兜底覆盖异名写法,
+            // 如带前缀/后缀的未列名 `openrouter/claude-sonnet-5-preview`)。
+            // ⚠️必须锚定 `sonnet-5` 邻接串,不能用裸 `contains('5')`——否则历史名
+            // `claude-3-5-sonnet`(Claude 3.5 Sonnet,sonnet 在尾部)会被误吞成 sonnet-5。
+            Some("claude-sonnet-5".to_string())
         } else {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if model_lower.contains("opus-5") || model_lower.contains("opus5") {
+            // 2026-07-25: 上游新增 claude-opus-5(无 x.y 点号,权威表已列;此兜底覆盖
+            // 异名写法,如 `openrouter/claude-opus-5-preview`)。
+            // ⚠️必须锚定 `opus-5` 邻接串,不能用裸 contains("5")——否则未来的
+            // `claude-opus-4-5`/`4.5` 会被误吞(它们在下面各自分支处理)。
+            // 本分支置于最前:opus-5 的写法不含 4-x,与下方分支互斥。
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -161,14 +196,16 @@ fn map_model_substring(model_lower: &str) -> Option<String> {
     }
 }
 
-/// 根据模型名返回上下文窗口大小。权威表优先,兜底子串(1M 仅 sonnet-4.6/opus-4.6/4.7/4.8)。
+/// 根据模型名返回上下文窗口大小。权威表优先,兜底子串(1M 仅 sonnet-5/sonnet-4.6/opus-4.6/4.7/4.8)。
 pub fn get_context_window_size(model: &str) -> i32 {
     if let Some(m) = resolve_base(model) {
         return m.context_window;
     }
     match map_model_substring(&model.to_lowercase()) {
         Some(mapped)
-            if mapped == "claude-sonnet-4.6"
+            if mapped == "claude-opus-5"
+                || mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -301,11 +338,49 @@ mod tests {
     }
 
     #[test]
+    fn opus_5_resolves_via_table_and_fallback() {
+        // 权威表精确匹配(plain/-thinking)。
+        assert_eq!(map_model("claude-opus-5").as_deref(), Some("claude-opus-5"));
+        assert_eq!(map_model("claude-opus-5-thinking").as_deref(), Some("claude-opus-5"));
+        assert_eq!(resolve_base("claude-opus-5").map(|m| m.identity_short), Some("Opus 5"));
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        // 子串兜底(未列全名的异名)也给 1M 窗口。
+        assert_eq!(map_model("openrouter/claude-opus-5-preview").as_deref(), Some("claude-opus-5"));
+        assert_eq!(get_context_window_size("openrouter/claude-opus-5-preview"), 1_000_000);
+        // 关键边界:opus-5 分支置于最前,但绝不能吞掉 4.x 各版本。
+        assert_eq!(map_model("claude-opus-4-8").as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(map_model("claude-opus-4-7").as_deref(), Some("claude-opus-4.7"));
+        assert_eq!(map_model("claude-opus-4-6").as_deref(), Some("claude-opus-4.6"));
+        assert_eq!(map_model("claude-opus-4-5").as_deref(), Some("claude-opus-4.5"));
+        assert_eq!(map_model("claude-opus-4.5").as_deref(), Some("claude-opus-4.5"));
+        // 日期变体仍归到 4-5 基础行,不被 opus-5 误吞。
+        assert_eq!(map_model("claude-opus-4-5-20251101").as_deref(), Some("claude-opus-4.5"));
+    }
+
+    #[test]
+    fn sonnet_5_resolves_via_table_and_fallback() {
+        // 权威表精确匹配(plain/-thinking)。
+        assert_eq!(map_model("claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(map_model("claude-sonnet-5-thinking").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolve_base("claude-sonnet-5").map(|m| m.identity_short), Some("Sonnet 5"));
+        // 子串兜底(未列全名的异名),且不误吞 sonnet-4.5/4.6。
+        assert_eq!(map_model("openrouter/claude-sonnet-5-preview").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(map_model("claude-sonnet-4-5").as_deref(), Some("claude-sonnet-4.5"));
+        assert_eq!(map_model("claude-sonnet-4-6").as_deref(), Some("claude-sonnet-4.6"));
+        // 历史名 claude-3-5-sonnet(Claude 3.5 Sonnet)含 sonnet+散落的 5,绝不能被误吞成 sonnet-5。
+        // 它不含 "4-5"/"4.5"/"sonnet-5",落到子串兜底的 None(该老模型 Kiro 本就不支持,冤案排除)。
+        assert_eq!(map_model("claude-3-5-sonnet").as_deref(), None);
+        assert_eq!(map_model("claude-3-5-sonnet-20241022").as_deref(), None);
+    }
+
+    #[test]
     fn context_window_from_table_and_fallback() {
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-8-thinking"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-4-5-20250929"), 200_000);
         assert_eq!(get_context_window_size("claude-haiku-4-5"), 200_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(get_context_window_size("openrouter/claude-sonnet-5-preview"), 1_000_000);
     }
 
     #[test]
