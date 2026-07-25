@@ -6,6 +6,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table'
 import { useI18n } from '@/lib/i18n'
 
+import type { QuotaKind } from '../lib'
 import type { AccountRow, AccountRuntimeEntry } from '../types'
 import { AccountTableRow, type RuntimeQueryState } from './AccountTableRow'
 
@@ -17,6 +18,8 @@ interface AccountsTableProps {
   runtimeState: RuntimeQueryState
   /** 分组名 -> 颜色（来自 /groups），分组列上色用。 */
   groupColors: Map<string, string>
+  /** 配额列口径:'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario)。决定列头与单元格渲染。 */
+  quotaKind: QuotaKind
   /** 当前有 mutation 进行中的 account_id（仅该行操作置灰）。 */
   busyId: string | null
   onToggleDisabled: (row: AccountRow) => void
@@ -33,6 +36,7 @@ export function AccountsTable({
   runtimeByAccount,
   runtimeState,
   groupColors,
+  quotaKind,
   busyId,
   onToggleDisabled,
   onEdit,
@@ -47,9 +51,12 @@ export function AccountsTable({
     { label: t('table.group') },
     { label: t('table.provider') },
     { label: t('table.status') },
-    { label: t('table.credits'), right: true },
+    // 配额列头随口径切换:积分(Kiro) ↔ 限额 5h/7d(ccmax/dario)。
+    { label: quotaKind === 'windows' ? t('table.quotaWindows') : t('table.credits'), right: true },
     { label: t('table.concurrency'), right: true },
+    { label: t('table.priority'), right: true },
     { label: t('table.failures'), right: true },
+    { label: t('table.totalSuccessFail'), right: true },
     { label: t('table.actions'), right: true },
   ]
 
@@ -99,6 +106,7 @@ export function AccountsTable({
                 runtime={runtimeByAccount.get(row.account_id)}
                 runtimeState={runtimeState}
                 groupColor={groupColors.get(row.group_name)}
+                quotaKind={quotaKind}
                 busy={busyId === row.account_id}
                 onToggleDisabled={onToggleDisabled}
                 onEdit={onEdit}

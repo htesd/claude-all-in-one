@@ -84,6 +84,35 @@ export function parseConcurrency(input: string): number | null {
   return Number.isInteger(value) && value >= 1 ? value : null
 }
 
+/**
+ * 调度优先级输入校验：任意整数（数值越小越优先，允许 0 / 负数）；非法（空 / 非整数）返回 null。
+ * 用 `Number()` + `Number.isInteger()` 而非 parseInt 字符串往返比较，避免误拒
+ * `007` / `+5` / `1e3` 等 `<input type="number">` 语法合法的整数写法。
+ */
+export function parsePriority(input: string): number | null {
+  if (input.trim() === '') return null
+  const value = Number(input)
+  return Number.isInteger(value) ? value : null
+}
+
+/**
+ * 调度优先级两档:高=0,低=100。前端只暴露高/低两档;后端 priority 仍是 i64
+ * (分层 LRU 支持任意层),故两档映射到固定数值即可,零数据迁移(线上恰为 0 / 100)。
+ */
+export type PriorityTier = 'high' | 'low'
+export const HIGH_PRIORITY = 0
+export const LOW_PRIORITY = 100
+
+/** 两档 → 后端数值。 */
+export function tierToPriority(tier: PriorityTier): number {
+  return tier === 'high' ? HIGH_PRIORITY : LOW_PRIORITY
+}
+
+/** 后端数值 → 两档:< 100 视为「高」(兼容历史 0 及任意 < 100 的值),其余「低」。 */
+export function priorityToTier(priority: number): PriorityTier {
+  return priority < LOW_PRIORITY ? 'high' : 'low'
+}
+
 /** 积分展示格式化:整数千分位。允许负值(超额账号的 remaining=已超出多少)。 */
 export function formatCredits(n: number): string {
   return Math.round(n).toLocaleString()
@@ -94,4 +123,66 @@ export function isQuotaLow(remaining: number, limit: number): boolean {
   if (remaining < 0) return true // 超额一定标红(即使上限未知)
   if (limit <= 0) return false // 上限未知且未超额:不误报
   return remaining <= 0 || remaining / limit < 0.1
+}
+
+/** 配额展示口径:'windows' = 滚动窗口利用率(5h/7d,Claude OAuth/ccmax);
+ *  'credits' = 积分剩余/上限(Kiro)。决定账号页该 tab 的配额列语义。 */
+export type QuotaKind = 'credits' | 'windows'
+
+/** provider → 配额口径。dario(claude-dario)无积分概念,只有 5h/7d 利用率窗口。 */
+export function quotaKindForProvider(provider: string): QuotaKind {
+  return provider === 'claude-dario' ? 'windows' : 'credits'
+}
+
+/**
+ * 展示状态 → 三分桶：ok / abnormal / disabled。
+ * 用于 AccountsFilterBar 的状态筛选。
+ */
+export function accountStatusBucket(status: AccountDisplayStatus): 'ok' | 'abnormal' | 'disabled' {
+  switch (status.kind) {
+    case 'ok':
+      return 'ok'
+    case 'disabled':
+      return 'disabled'
+    default:
+      // offline / rate_limited / empty_response / quota_exhausted /
+      // invalid_refresh_token / too_many_failures
+      return 'abnormal'
+  }
+}
+
+/**
+ * 账号订阅档推导：
+ * 1. 优先用 runtime.quota.label（如 "KIRO PRO"）。
+ * 2. 回落 row.extra.subscription_title（未脱敏字符串）。
+ * 3. 大写后按关键字归档；无法识别时返回 null（未知）。
+ * 仅对 kiro provider 有意义；其他 provider 直接传 undefined runtime 即可。
+ */
+export function deriveTier(
+  row: AccountRow,
+  runtime?: AccountRuntimeEntry,
+): 'PRO' | 'POWER' | 'FREE' | 'OTHER' | null {
+  const raw =
+    (runtime?.status?.quota?.label ?? null) ||
+    (typeof row.extra?.subscription_title === 'string' ? row.extra.subscription_title : null)
+  if (!raw) return null
+  const upper = raw.toUpperCase()
+  if (upper.includes('POWER')) return 'POWER'
+  if (upper.includes('PRO')) return 'PRO'
+  if (upper.includes('FREE')) return 'FREE'
+  return 'OTHER'
+}
+
+/** provider → 账号页 tab 短标签(用户惯用语:claude-dario 即 "ccmax")。未知 provider 原样。 */
+export function providerTabLabel(provider: string): string {
+  switch (provider) {
+    case 'kiro':
+      return 'Kiro'
+    case 'claude-dario':
+      return 'ccmax'
+    case '':
+      return '—'
+    default:
+      return provider
+  }
 }

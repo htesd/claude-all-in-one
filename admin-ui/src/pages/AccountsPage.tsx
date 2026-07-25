@@ -1,13 +1,23 @@
-import { useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Plus, Upload } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { AlertTriangle, CheckCircle2, KeyRound, Plus, Upload } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
 import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import type { RuntimeQueryState } from '@/features/accounts/components/AccountTableRow'
+import {
+  AccountsFilterBar,
+  type StatusFilter,
+  type TierFilter,
+} from '@/features/accounts/components/AccountsFilterBar'
+import {
+  AccountsPagination,
+  type PageSize,
+} from '@/features/accounts/components/AccountsPagination'
 import { CreateAccountDialog } from '@/features/accounts/components/CreateAccountDialog'
 import { EditAccountDialog } from '@/features/accounts/components/EditAccountDialog'
 import { ImportAccountsDialog } from '@/features/accounts/components/ImportAccountsDialog'
+import { OAuthAccountDialog } from '@/features/accounts/components/OAuthAccountDialog'
 import {
   useAccounts,
   useAccountsRuntime,
@@ -17,7 +27,13 @@ import {
   useUpdateAccount,
 } from '@/features/accounts/hooks'
 import type { RefreshAccountResult } from '@/features/accounts/api'
-import { mergeRuntimeByAccount } from '@/features/accounts/lib'
+import {
+  accountStatusBucket,
+  deriveAccountStatus,
+  deriveTier,
+  mergeRuntimeByAccount,
+  quotaKindForProvider,
+} from '@/features/accounts/lib'
 import type { AccountRow } from '@/features/accounts/types'
 import { useGroups } from '@/features/groups/hooks'
 import { useI18n } from '@/lib/i18n'
@@ -37,11 +53,21 @@ export default function AccountsPage() {
 
   const [createOpen, setCreateOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [oauthOpen, setOauthOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   // 刷新 token 成功的轻量反馈（无 toast 库）：账号 + 新有效期。本地态而非派生自
   // refreshMutation.isSuccess——后者会在其它 mutation 成功后残留旧账号（审查 3 名 reviewer）。
   // 任一操作（含再次刷新）开始即清空，做到注释承诺的"下次操作自动消失"。
   const [refreshOk, setRefreshOk] = useState<RefreshAccountResult | null>(null)
+
+  // 筛选状态
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [providerFilter, setProviderFilter] = useState<string>('all')
+  const [tierFilter, setTierFilter] = useState<TierFilter>('all')
+
+  // 分页状态
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState<PageSize>(20)
 
   const groupColors = useMemo(() => {
     const map = new Map<string, string>()
@@ -53,6 +79,93 @@ export default function AccountsPage() {
     () => mergeRuntimeByAccount(runtimeQuery.data),
     [runtimeQuery.data],
   )
+
+  // 按 provider 统计（含计数），kiro→ccmax→其余排序
+  const providers = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const row of accountsQuery.data ?? []) {
+      counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1)
+    }
+    const rank = (p: string) => (p === 'kiro' ? 0 : p === 'claude-dario' ? 1 : 2)
+    return [...counts.entries()]
+      .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+      .map(([provider, count]) => ({ provider, count }))
+  }, [accountsQuery.data])
+
+  // 检查是否有 kiro 账号（决定是否展示档位筛选）
+  const hasKiroAccounts = useMemo(
+    () => (accountsQuery.data ?? []).some((row) => row.provider === 'kiro'),
+    [accountsQuery.data],
+  )
+
+  // 在 kiro/all 且有 kiro 账号时展示档位筛选
+  const showTierFilter =
+    hasKiroAccounts && (providerFilter === 'kiro' || providerFilter === 'all')
+
+  // 数据中出现过的档位（去重有序）
+  const distinctTiers = useMemo((): TierFilter[] => {
+    const set = new Set<TierFilter>()
+    for (const row of accountsQuery.data ?? []) {
+      if (row.provider !== 'kiro') continue
+      const tier = deriveTier(row, runtimeByAccount.get(row.account_id))
+      if (tier !== null) set.add(tier)
+    }
+    // 有序：PRO / POWER / FREE / OTHER
+    const order: TierFilter[] = ['PRO', 'POWER', 'FREE', 'OTHER']
+    return order.filter((t) => set.has(t))
+  }, [accountsQuery.data, runtimeByAccount])
+
+  // 当 provider filter 变动后，如果当前 tierFilter 在新 provider 下不再可见，重置
+  useEffect(() => {
+    if (!showTierFilter) setTierFilter('all')
+  }, [showTierFilter])
+
+  // 筛选后行 → 分页行
+  const filteredRows = useMemo(() => {
+    const all = accountsQuery.data ?? []
+    return all.filter((row) => {
+      // provider 筛选
+      if (providerFilter !== 'all' && row.provider !== providerFilter) return false
+
+      // 档位筛选（只对 kiro 账号生效）
+      if (tierFilter !== 'all' && row.provider === 'kiro') {
+        const tier = deriveTier(row, runtimeByAccount.get(row.account_id))
+        if (tier !== tierFilter) return false
+      }
+
+      // 状态筛选
+      if (statusFilter !== 'all') {
+        const runtime = runtimeByAccount.get(row.account_id)
+        const displayStatus = deriveAccountStatus(row, runtime)
+        const bucket = accountStatusBucket(displayStatus)
+        if (bucket !== statusFilter) return false
+      }
+
+      return true
+    })
+  }, [accountsQuery.data, providerFilter, tierFilter, statusFilter, runtimeByAccount])
+
+  // 任一筛选变化时重置到第 1 页
+  useEffect(() => {
+    setPage(1)
+  }, [statusFilter, providerFilter, tierFilter, pageSize])
+
+  // 页码在渲染期钳到有效范围(不写回 state):筛选变化或 15s 运行态轮询令结果集缩小时,
+  // 避免停留在越界的空白页(审查 H1/M1)。故意不走 setPage——否则每次运行态轮询都会把
+  // 正在翻页的用户拽回第 1 页。分页切片与分页控件都用这个 currentPage,口径一致。
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize))
+  const currentPage = Math.min(page, totalPages)
+
+  // 分页切片
+  const pagedRows = useMemo(() => {
+    const start = (currentPage - 1) * pageSize
+    return filteredRows.slice(start, start + pageSize)
+  }, [filteredRows, currentPage, pageSize])
+
+  // 当前 provider 的配额口径（按 providerFilter 决定；'all' 时回落第一个 provider）
+  const effectiveProviderForQuota =
+    providerFilter !== 'all' ? providerFilter : (providers[0]?.provider ?? '')
+  const quotaKind = quotaKindForProvider(effectiveProviderForQuota)
 
   // 轮询失败但还有旧数据时继续按旧数据展示（配合下方警示条）；完全没数据才降级
   const runtimeState: RuntimeQueryState = runtimeQuery.isPending
@@ -120,6 +233,10 @@ export default function AccountsPage() {
             <Upload className="h-4 w-4" />
             {t('accounts.import')}
           </Button>
+          <Button variant="outline" onClick={() => setOauthOpen(true)}>
+            <KeyRound className="h-4 w-4" />
+            {t('accounts.oauth')}
+          </Button>
           <Button onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" />
             {t('accounts.new')}
@@ -154,12 +271,26 @@ export default function AccountsPage() {
         </div>
       )}
 
+      {/* 筛选条（含提供方 tab，取代原来独立的 provider Segment） */}
+      <AccountsFilterBar
+        statusFilter={statusFilter}
+        onStatusChange={setStatusFilter}
+        providerFilter={providerFilter}
+        onProviderChange={setProviderFilter}
+        providers={providers}
+        tierFilter={tierFilter}
+        onTierChange={setTierFilter}
+        tiers={distinctTiers}
+        showTierFilter={showTierFilter}
+      />
+
       <AccountsTable
-        data={accountsQuery.data}
+        data={pagedRows}
         loading={accountsQuery.isPending}
         runtimeByAccount={runtimeByAccount}
         runtimeState={runtimeState}
         groupColors={groupColors}
+        quotaKind={quotaKind}
         busyId={busyId}
         onToggleDisabled={handleToggleDisabled}
         onEdit={(row) => setEditingId(row.account_id)}
@@ -168,8 +299,21 @@ export default function AccountsPage() {
         onRefresh={handleRefresh}
       />
 
+      {/* 分页控件 */}
+      <AccountsPagination
+        page={currentPage}
+        pageSize={pageSize}
+        total={filteredRows.length}
+        onPageChange={setPage}
+        onPageSizeChange={(size) => {
+          setPageSize(size)
+          setPage(1)
+        }}
+      />
+
       <CreateAccountDialog open={createOpen} onClose={() => setCreateOpen(false)} />
       <ImportAccountsDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <OAuthAccountDialog open={oauthOpen} onClose={() => setOauthOpen(false)} />
       <EditAccountDialog
         open={editingRow !== null}
         row={editingRow}

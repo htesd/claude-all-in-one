@@ -14,17 +14,21 @@ const inputClass =
 /** 表单内部状态：数字字段均以字符串存储，提交时解析。 */
 interface FormState {
   default_proxy: string
+  /** 出口池:文本框,每行一个代理 URL(提交时拆分成数组)。 */
+  egress_pool: string
   cache_read_multiplier: string
   cache_cap_ratio: string
   cache_floor_ratio: string
   cache_sim_ttl_secs: string
   cache_max_sessions: string
   rate_limit_cooldown_secs: string
+  suspended_cooldown_secs: string
   empty_response_cooldown_secs: string
   empty_response_window_secs: string
   empty_response_threshold: string
   affinity_ttl_secs: string
   max_failures: string
+  max_switch_attempts: string
   quota_poll_enabled: boolean
   image_enabled: boolean
   image_max_long_edge: string
@@ -33,22 +37,28 @@ interface FormState {
   image_multi_threshold: string
   tools_in_prefix: boolean
   cache_point: boolean
+  agent_continuation: boolean
+  thinking_signature: boolean
+  q_endpoint: boolean
 }
 
 function settingsToForm(s: SystemSettings): FormState {
   return {
     default_proxy: s.default_proxy ?? '',
+    egress_pool: (s.egress_pool ?? []).join('\n'),
     cache_read_multiplier: String(s.cache_read_multiplier),
     cache_cap_ratio: String(s.cache_cap_ratio),
     cache_floor_ratio: String(s.cache_floor_ratio),
     cache_sim_ttl_secs: String(s.cache_sim_ttl_secs),
     cache_max_sessions: String(s.cache_max_sessions),
     rate_limit_cooldown_secs: String(s.rate_limit_cooldown_secs),
+    suspended_cooldown_secs: String(s.suspended_cooldown_secs),
     empty_response_cooldown_secs: String(s.empty_response_cooldown_secs),
     empty_response_window_secs: String(s.empty_response_window_secs),
     empty_response_threshold: String(s.empty_response_threshold),
     affinity_ttl_secs: String(s.affinity_ttl_secs),
     max_failures: String(s.max_failures),
+    max_switch_attempts: String(s.max_switch_attempts),
     quota_poll_enabled: s.quota_poll_enabled,
     image_enabled: s.image_enabled,
     image_max_long_edge: String(s.image_max_long_edge),
@@ -57,6 +67,9 @@ function settingsToForm(s: SystemSettings): FormState {
     image_multi_threshold: String(s.image_multi_threshold),
     tools_in_prefix: s.tools_in_prefix,
     cache_point: s.cache_point,
+    agent_continuation: s.agent_continuation,
+    thinking_signature: s.thinking_signature ?? true,
+    q_endpoint: s.q_endpoint ?? false,
   }
 }
 
@@ -69,6 +82,19 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
   const serverProxy = original.default_proxy ?? ''
   if (proxyValue !== serverProxy) {
     patch.default_proxy = proxyValue === '' ? null : proxyValue
+  }
+
+  // egress_pool: 文本框(每行一个 URL)→ 数组;空 = 重置为 null。
+  // 注:GET 返回的池 URL 密码段被掩码(***),未改动时下面比较为 false → 不回传掩码值。
+  const poolLines = form.egress_pool
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l !== '')
+  const serverPool = original.egress_pool ?? []
+  const poolChanged =
+    poolLines.length !== serverPool.length || poolLines.some((l, i) => l !== serverPool[i])
+  if (poolChanged) {
+    patch.egress_pool = poolLines.length === 0 ? null : poolLines
   }
 
   // 浮点数字段
@@ -89,11 +115,13 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     ['cache_sim_ttl_secs', 'cache_sim_ttl_secs'],
     ['cache_max_sessions', 'cache_max_sessions'],
     ['rate_limit_cooldown_secs', 'rate_limit_cooldown_secs'],
+    ['suspended_cooldown_secs', 'suspended_cooldown_secs'],
     ['empty_response_cooldown_secs', 'empty_response_cooldown_secs'],
     ['empty_response_window_secs', 'empty_response_window_secs'],
     ['empty_response_threshold', 'empty_response_threshold'],
     ['affinity_ttl_secs', 'affinity_ttl_secs'],
     ['max_failures', 'max_failures'],
+    ['max_switch_attempts', 'max_switch_attempts'],
     ['image_max_long_edge', 'image_max_long_edge'],
     ['image_max_pixels_single', 'image_max_pixels_single'],
     ['image_max_pixels_multi', 'image_max_pixels_multi'],
@@ -112,6 +140,9 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     'image_enabled',
     'tools_in_prefix',
     'cache_point',
+    'agent_continuation',
+    'thinking_signature',
+    'q_endpoint',
   ]
   for (const k of boolFields) {
     if (form[k] !== original[k]) {
@@ -204,6 +235,22 @@ export default function SettingsPage() {
                 disabled={isLoading || form === null}
                 className={inputClass}
               />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {t('settings.field.egressPool')}
+              </label>
+              <textarea
+                value={form?.egress_pool ?? ''}
+                onChange={(e) => set('egress_pool', e.target.value)}
+                placeholder={t('settings.field.egressPoolPlaceholder')}
+                spellCheck={false}
+                autoComplete="off"
+                rows={3}
+                disabled={isLoading || form === null}
+                className={`${inputClass} font-mono`}
+              />
+              <p className="text-xs text-muted-foreground">{t('settings.field.egressPoolHint')}</p>
             </div>
           </CardContent>
         </Card>
@@ -309,6 +356,20 @@ export default function SettingsPage() {
             </div>
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">
+                {t('settings.field.suspendedCooldownSecs')}
+              </label>
+              <input
+                type="number"
+                step={1}
+                min={0}
+                value={form?.suspended_cooldown_secs ?? ''}
+                onChange={(e) => set('suspended_cooldown_secs', e.target.value)}
+                disabled={isLoading || form === null}
+                className={inputClass}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
                 {t('settings.field.emptyResponseCooldownSecs')}
               </label>
               <input
@@ -376,6 +437,23 @@ export default function SettingsPage() {
                 disabled={isLoading || form === null}
                 className={inputClass}
               />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {t('settings.field.maxSwitchAttempts')}
+              </label>
+              <input
+                type="number"
+                step={1}
+                min={1}
+                value={form?.max_switch_attempts ?? ''}
+                onChange={(e) => set('max_switch_attempts', e.target.value)}
+                disabled={isLoading || form === null}
+                className={inputClass}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.field.maxSwitchAttemptsHint')}
+              </p>
             </div>
             <label className="flex cursor-pointer items-center gap-3 sm:col-span-2 lg:col-span-3">
               <input
@@ -506,6 +584,57 @@ export default function SettingsPage() {
                 </span>
                 <span className="block text-xs text-muted-foreground">
                   {t('settings.field.cachePointHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.agent_continuation ?? false}
+                onChange={(e) => set('agent_continuation', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.agentContinuation')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.agentContinuationHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.thinking_signature ?? true}
+                onChange={(e) => set('thinking_signature', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.thinkingSignature')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.thinkingSignatureHint')}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.q_endpoint ?? false}
+                onChange={(e) => set('q_endpoint', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t('settings.field.qEndpoint')}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.qEndpointHint')}
                 </span>
               </span>
             </label>
