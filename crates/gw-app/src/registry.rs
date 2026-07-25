@@ -34,6 +34,7 @@ impl Registry {
             "claude-subprocess",
             gw_claude_subprocess::ClaudeSubprocessProvider::from_config,
         );
+        reg.register("claude-dario", gw_dario::DarioProvider::from_config);
         reg
     }
 
@@ -74,6 +75,12 @@ mod tests {
     fn builtins_include_claude_subprocess() {
         let reg = Registry::with_builtins();
         assert!(reg.families().contains(&"claude-subprocess"));
+    }
+
+    #[test]
+    fn builtins_include_claude_dario() {
+        let reg = Registry::with_builtins();
+        assert!(reg.families().contains(&"claude-dario"));
     }
 
     #[test]
