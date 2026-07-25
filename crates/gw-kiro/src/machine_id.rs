@@ -52,10 +52,17 @@ pub(crate) fn normalize_machine_id(machine_id: &str) -> Option<String> {
 /// `auth_method=api_key` 但实为 refresh_token 的账号,会被判成 api_key 分支、因无 key
 /// 落到随机兜底指纹,而 refresh 路径却按 social 刷新——指纹与刷新分叉,且被 freeze 固化。
 /// 以"是否真有派生材料"判定,与 refresh_auth 的分流口径一致。
-fn is_api_key_credential(account: &Account) -> bool {
+///
+/// **全局唯一判定口径**:chat/配额/刷新/profileArn/schema 校验各处的 apikey 分流
+/// **都**复用此函数(headers / usage_limits / lib / worker),避免多份定义漂移。
+pub fn is_api_key_credential(account: &Account) -> bool {
     account
         .extra_str("kiro_api_key")
-        .is_some_and(|k| !k.is_empty())
+        // **必须是形态合法的 ksk_ key**,不只是非空(审查 r2 Architect#1):否则一个 OAuth 号
+        // 若 extra 里残留占位/脏 `kiro_api_key`,会被误判成 apikey——拿占位串当 Bearer + 打
+        // `TokenType: API_KEY`、跳过刷新/profile,401/403 后被禁用。前缀校验必须在**检测**这
+        // 一层(所有建号路径共用),而非只在 import 解析器里。
+        .is_some_and(|k| k.starts_with("ksk_") && k.len() > "ksk_".len())
 }
 
 /// 根据账号生成 machineId。优先级(🔵 与旧 generate_from_credentials 一致):
@@ -137,8 +144,8 @@ fn fallback_machine_id(account: &Account) -> String {
     derived
 }
 
-/// SHA256 → 十六进制字符串(🔵 照搬)。
-fn sha256_hex(input: &str) -> String {
+/// SHA256 → 十六进制字符串(🔵 照搬)。`pub(crate)`:import 派生抗碰撞 account_id 复用。
+pub(crate) fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hex_encode(&hasher.finalize())

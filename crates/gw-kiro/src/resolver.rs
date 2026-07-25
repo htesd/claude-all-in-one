@@ -93,8 +93,12 @@ fn normalize(proxy: Option<String>) -> Option<String> {
 /// 超时/连接池参数对齐 [`crate`] worker base client(见 gw-app egress.rs)。
 fn build_proxy_client(url: &str) -> anyhow::Result<reqwest::Client> {
     let proxy = reqwest::Proxy::all(url)?;
+    // 超时对齐 worker base client 默认(见 gw-app egress.rs / DEFAULT_UPSTREAM_TIMEOUT_SECS):
+    // 旧 300s 会腰斩长 Opus 流式响应,统一抬到 720s。
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(
+            gw_core::config::DEFAULT_UPSTREAM_TIMEOUT_SECS,
+        ))
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(60))
         .proxy(proxy)

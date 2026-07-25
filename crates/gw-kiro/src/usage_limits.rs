@@ -24,12 +24,12 @@ pub async fn get_account_quota(
     client: &reqwest::Client,
     account: &Account,
 ) -> Result<AccountQuota, UpstreamError> {
-    let access_token = account
-        .extra_str("access_token")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            UpstreamError::new(UpstreamErrorKind::TokenInvalid, "配额查询缺少 access_token")
-        })?;
+    let access_token = headers::bearer_token(account).ok_or_else(|| {
+        UpstreamError::new(
+            UpstreamErrorKind::TokenInvalid,
+            "配额查询缺少凭据(access_token / kiro_api_key)",
+        )
+    })?;
 
     let region = account
         .extra_str("region")
@@ -52,7 +52,7 @@ pub async fn get_account_quota(
         }
     }
 
-    let resp = client
+    let rb = client
         .get(url)
         .header("x-amz-user-agent", x_amz_ua)
         .header("user-agent", ua)
@@ -60,7 +60,17 @@ pub async fn get_account_quota(
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
         .header("authorization", format!("Bearer {access_token}"))
-        .header("connection", "close")
+        .header("connection", "close");
+    // external_idp(Azure AD)号必须带 TokenType 头,否则 getUsageLimits 吃 403。
+    let rb = headers::apply_external_idp_token_type(rb, account);
+    // API Key 凭据同理:带 `TokenType: API_KEY`,否则上游按 OAuth 处理、报 400「Invalid
+    // profileArn」(实测)。与 external_idp 互斥,bearer 已由 bearer_token 取自 kiro_api_key。
+    let rb = if crate::machine_id::is_api_key_credential(account) {
+        rb.header("TokenType", "API_KEY")
+    } else {
+        rb
+    };
+    let resp = rb
         .send()
         .await
         .map_err(|e| UpstreamError::network(format!("配额查询请求失败: {e}")))?;
@@ -69,6 +79,13 @@ pub async fn get_account_quota(
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         let kind = match status.as_u16() {
+            // 封禁 403(TEMPORARILY_SUSPENDED 等)→ TemporarilyBlocked:冷却自愈、不永久禁号,
+            // 且不命中 try_fetch_quota 的 TokenInvalid 兜底(避免对封号又多打刷新/ListProfiles
+            // 制造异常指纹)。对齐 error_map.rs/token.rs 已有的 suspend 检测——此前 usage_limits
+            // 缺这道:封号做配额查询被误判 TokenInvalid → report_failure 永久禁用本可 1h 自愈的号。
+            403 if crate::error_map::is_account_suspended(&body) => {
+                UpstreamErrorKind::TemporarilyBlocked
+            }
             401 | 403 => UpstreamErrorKind::TokenInvalid,
             429 => UpstreamErrorKind::RateLimited,
             500..=599 => UpstreamErrorKind::ServerError,
