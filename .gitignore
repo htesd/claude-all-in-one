@@ -3,6 +3,10 @@
 /config/instances.yaml
 /config/accounts.yaml
 /config/system.yaml
+# 部署机独有配置:*.env 含 API key;instances-* 含真实公网出口/放行 IP
+/config/*.env
+/config/instances-dario.yaml
+/config/instances-exp.yaml
 /data
 *.db
 *.db-wal
@@ -10,3 +14,8 @@
 # 运行日志(debug 日志可能含 token)
 /logs
 *.log
+# 服务器上直接改代码留下的编辑残留(勿入库)
+*.bak
+*.bak.*
+*.bak-*
+*.exp-bak
