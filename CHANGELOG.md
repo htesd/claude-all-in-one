@@ -1,5 +1,50 @@
 # Changelog
 
+## [upstream-overload] - 2026-07-25
+
+### Features
+
+- **新增 `UpstreamErrorKind::Overloaded`——上游模型级过载不再当成账号故障。** 三条策略同时成立:
+  - **不惩罚账号**(`spares_account_health()`):不计 `failure_count`、不触发 `TooManyFailures` 禁用。
+  - **不换号**(`worth_switching_account() = false`):容量是模型级的,换号打的还是同一个模型端点。
+  - **同号退避重试**(`chat_with_overload_backoff`):250 / 750 / 2000ms,各叠 0~40% 抖动。
+- **模型级过载窗口**:收到显式 `MODEL_TEMPORARILY_UNAVAILABLE` 后 60s 内,该模型的通用 5xx
+  (`reason:null`)也按过载处理。窗口按模型隔离,不跨模型泄漏。
+- **对外映射 529 `overloaded_error`**(Anthropic 官方过载语义)。状态码收敛到 `upstream_status()`
+  单点,响应体与请求日志 `status_code` 同源。
+- 测试:gw-core 49 / gw-kiro 447 / gw-app 184 全绿,新增 10 条。
+
+### Design Rationale
+
+- **事故实况(2026-07-25)**:Kiro 的 opus-5 容量抖动被记进账号连续失败计数,**35 秒内禁光 7 个
+  健康号**并触发全灭自愈。禁用对**所有模型**生效,于是 opus-4-6 / sonnet-5 一起被连带打挂。
+  上游报文两种:`{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}` 与 `{"reason":null}`。
+- **为什么不换号**:实测 177 次上游 500 靠换号只救回 19 次(19%)。换号还有两笔实打实的成本——
+  白烧另一个号的配额,以及丢掉会话 cache 亲和(实测一次 opus-5 请求 `cache_read` 达 10.7 万 token,
+  换号全部重算)。
+- **为什么这不违反 2026-06 防雪崩约束**:同号退避的**爆炸半径 = 1 个号**,比原换号重试(默认 2 个号)
+  更小。`max_switch_attempts` 一字未改。
+- **为什么通用 5xx 用"窗口"而不是直接全归过载**:重分类必须有上游显式信号背书。实测 176 条通用 5xx
+  中 **84.7% 与显式过载落在同一分钟**(35 个有 5xx 的分钟里 19 个两种并存),故以显式信号为真相源;
+  窗口外的通用 5xx 一律仍是 `ServerError`(仍换号、仍记账号失败),不靠猜。
+- **窗口取 60s**:事故是分钟级成簇的,60s 刚好覆盖一簇。更长会把上游真内部错误也长期误判成过载,
+  更短则簇内空隙漏掉、退回逐个禁号。
+- **抖动是必需的**:并发请求会在同一波容量抖动里齐刷刷失败,无抖动会同步重撞,把重试变成新尖峰。
+  熵取 `uuid` v4 的一个字节(workspace 已依赖 uuid+fast-rng,不为此引入 `rand`)。
+
+### Notes & Caveats
+
+- **`report_failure` 刻意穷举 kind 而非用 `spares_account_health()` 做守卫**:守卫会让新增 kind 悄悄
+  落进某个分支,穷举则编译不过、强迫做决策。两者一致性由测试
+  `spares_account_health_matches_no_penalty_arms` 锁住。
+- **校正只作用于首包前的错误**。事故中观测到的 276 次 5xx 全部 `ttfb=NULL`(都在首包前);流中途
+  冒出的 5xx 仍走 `finish_response` 原路径,不做窗口校正。
+- **过载窗口仅内存**,重启即清、重新学习(与 `model_unavailable` 同策略)。
+- **失败请求的上游报错仍未落库**:`response_payload` 只在 `Outcome::Ok` 时写,失败一律空串,原因只在
+  `tracing::warn!` → docker 日志会轮转。所以 admin UI 的"失败"依旧不显示原因,排查仍需
+  `docker logs caio-worker0`。这是本次**未**修的独立改进项。
+- 事故期间曾把 `max_failures` 从 5 热调到 30 止血(admin settings,30s 生效);本次上线后**已调回 5**。
+
 ## [opus-5] - 2026-07-25
 
 ### Features
