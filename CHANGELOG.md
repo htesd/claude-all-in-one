@@ -1,5 +1,183 @@
 # Changelog
 
+## [opus-5] - 2026-07-25
+
+### Features
+
+- **接入 Claude Opus 5**(上游 Kiro 已支持,官方 2026-07-24 发布):对外 `claude-opus-5`,上游 `claude-opus-5`。
+  - `KIRO_MODELS` 权威表新增一行(1M 窗口、`supports_thinking=true`、`identity_short="Opus 5"`、无 `dated_alias`)。
+    `/v1/models` 目录、`map_model` 路由、`get_context_window_size` 窗口、`requested_model_identity` 身份短名
+    **全部从该行自动派生**,无需改动其它位置。
+  - `map_model_substring` 的 opus 分支新增 `opus-5`/`opus5` 邻接匹配(置于最前),覆盖未列名异名写法
+    (如 `claude-opus-5-0`、`openrouter/claude-opus-5-preview`);窗口兜底同步给 1M。
+  - 前端 `RequestLogsPage.contextWindow()` 补 `opus-5`。**顺带修复 sonnet-5 的遗漏**——上次接 sonnet-5
+    只改了后端,前端这份硬编码窗口表没跟上,导致 admin UI 里 sonnet-5 的上下文% 一直按 200k 计(实际 1M)。
+- 端到端实测通过:`claude-opus-5`(非流式)、`claude-opus-5-thinking`(返回 thinking+text 块)、
+  异名 `claude-opus-5-0`(子串兜底),对照 `claude-opus-4-8` 无回归。
+
+### Design Rationale
+
+- **5 系命名与 4.x 不同,不能套用短横转点号规则**:4.x 是对外 `claude-opus-4-8` → 上游 `claude-opus-4.8`,
+  而 5 系上游 modelId 就是主版本裸名 `claude-opus-5`(无 `x.y` 点号)——与 2026-07-02 接入的 `claude-sonnet-5`
+  同规律。历史上 sonnet-4.8 因猜错上游 id 吃过 `INVALID_MODEL_ID`,故本次上线前以真实账号实测确认。
+- **子串兜底必须锚定 `opus-5` 邻接串**,不能用裸 `contains("5")`:否则 `claude-opus-4-5`/`4.5` 会被误吞。
+  该分支置于 opus 各版本判断最前,因 opus-5 的写法不含 `4-x`,与下方分支天然互斥(测试已钉住这组边界)。
+- **不把 `claude-opus-5-0` 加进公告表**:官方 Opus 5 是无日期快照,id 仅 `claude-opus-5`;公告一个不存在的
+  id 会误导客户端(且违反"公告面 ⊆ 可服务面"的既有不变量)。该写法经子串兜底仍可正常路由,鱼与熊掌兼得。
+- 计价无需改动:`pricing.rs` 按 `contains("opus")` 归入 OPUS 档(5/25/0.5/6.25),与 Opus 5 官方价恰好一致。
+
+### Notes & Caveats
+
+- **前后端各有一份窗口表**,是既有的结构性重复(后端 `model_map.rs` / 前端 `RequestLogsPage.tsx`)。本次两处都改了,
+  但下次加模型仍会踩——sonnet-5 就是漏在前端。值得后续让前端改从 `/v1/models` 的 `context_length` 取值,消除重复。
+- **线上代码与本地 git 已严重漂移**:线上为严格超集——独有 `crates/gw-dario` 整个 crate(dario/Claude-OAuth 通道)、
+  `websearch.rs`、`tool_repair.rs`、`document_name.rs` 等 14 个文件,另有 53 个文件内容领先。
+  ⚠️ **任何从本地 rsync/部署到线上的操作都会抹掉 dario 通道**,回流前必须先把线上漂移入库。
+- 回滚:`docker tag claude-all-in-one:rollback-20260725 claude-all-in-one:local && docker tag ... :exp && docker compose up -d --no-build`。
+
+
+## [kiro-api-key-credential] - 2026-07-20
+
+### Feature —— 支持官方 Kiro API Key(ksk_)作为上游账号凭据
+
+**背景**:此前只支持 social/IdC(均需 refresh_token 运行时换 access_token)。Kiro CLI 2.0 headless
+模式引入官方 API Key(`ksk_`,app.kiro.dev 生成),长期有效、无刷新。本版把它接成一类新的上游凭据。
+
+- **鉴权(实测确定)**:apikey 号发包带 `Authorization: Bearer ksk_...` + **`TokenType: API_KEY`** 头。
+  该头**服务端强制要求**——缺它则 ksk_ 被当普通 OAuth token,报 400「profileArn is required」;带它则
+  免 profileArn,服务端按 key 自身账号解析。实测三个端点(runtime.kiro.dev / q / codewhisperer)均放行,
+  **caio 现用的 `runtime.{region}.kiro.dev/generateAssistantResponse` 直接可用**,主链路无需改端点。
+- **凭据判定**:统一以「`kiro_api_key` 非空」为准(`machine_id::is_api_key_credential`,提为 pub 复用),
+  不只看 `auth_method` 标签(防误配)。bearer 由 `headers::bearer_token` 按类型取真值:apikey→`kiro_api_key`,
+  social/IdC→`access_token`(故 apikey 号仅需一个字段,不必镜像 access_token)。
+- **旁路 OAuth 专属步骤**:apikey 号 `has_fresh_token` 恒真(不触发刷新)、`refresh_auth` 空操作、
+  `discover_profile_arn`/`ensure_profile_arn` 短路(不发 ListAvailableProfiles)、`resolve_profile_arn`
+  永不注入 profileArn。订阅档位由后台 getUsageLimits 回填(实测订阅 KIRO POWER,不含 FREE → 放行 opus)。
+- **导入 / 配置**:accounts.yaml 支持 `auth_method: api_key + kiro_api_key`;JSON 导入识别 `kiro_api_key`/
+  `apiKey` 字段及裸 `ksk_` 字符串;新增 admin `POST /accounts/import-apikeys` + 前端「导入 → 官方 API Key」
+  粘贴列表批量建号(复用既有建号/去重/逐号只读验活链路)。
+
+### Design Rationale
+- **bearer 按类型取真值,而非镜像 access_token**:apikey 号可能只从 YAML/admin 建号、只带 `kiro_api_key`;
+  强制镜像一份密钥既冗余又易漏(YAML seed / admin create 各是一条路径)。单一事实来源 = `kiro_api_key`。
+- **`TokenType: API_KEY` 是官方 CLI headless 的真实客户端形态**(非 IDE 形态),属合法官方指纹,且服务端强制。
+
+### Notes & Caveats
+- apikey 号收 403 会走一次同号刷新兜底(refresh_auth 对 apikey 空操作),retry 同 key 一次后由调度层换号/上报,
+  行为有界、无网络放大。
+- 端到端已验证:非流式 / 流式 / opus / 配额(KIRO POWER)/ 批量导入端点均实测通过。
+
+
+## [ingress-body-limit] - 2026-06-17
+
+### Features
+
+- **放开入站请求体上限(修大图片/PDF 在入口被 413 闷死)**:客户端含大量 base64 图片/PDF 的请求体常 >2MB,
+  axum 0.8 的 `Bytes`/`Json` 提取器默认上限仅 **2MB**,超了在 handler 执行前就被框架直接 **413**,
+  请求根本到不了业务逻辑——**不入库、后台不可见**(线上实测 `status_code=413, bad response status code 413`)。
+  - `SystemConfig` 新增 `max_request_body_bytes`(默认 **16MB**,`0`/缺省回落默认),`effective_max_request_body_bytes()` 取有效值。
+  - router(`/v1/messages` 等 + admin 全路由)与 worker(`/v1/messages`)**两处入站咽喉**各挂 `DefaultBodyLimit::max(..)`——
+    缺一处仍会在另一侧 413。router 的 layer 挂在 `nest("/admin/api")` **之后**,使大 JSON 导入也一并放开。
+  - 两进程启动时各打印生效上限,便于核对配置一致(只重启一侧导致漂移时,日志即现形)。
+
+### Design Rationale
+
+- 取 **16MB** = 出站 6.3MB 护栏(`DEFAULT_MAX_BODY_BYTES`,对齐 Kiro 上游 ~7.3MB 硬限)的 ~2.5×:给当前轮 +
+  可被 `shed` 裁掉的历史媒体留余量;放开入口只是让大请求**抵达**内容感知护栏(裁剪/压缩/清晰报错)而非被框架裸 413。
+- 用有界 `DefaultBodyLimit::max()` 而非 `disable()`:网关 `:38991` 对外、入口提取在鉴权前完成,无界缓冲是 DoS 面;
+  16MB 较旧 2MB 已 8× 决定性解除闷死,同时把缓冲面控制在合理范围,需更大可在 `system.yaml` 显式上调。
+- 该值是**启动期参数**(axum `DefaultBodyLimit` app 构建期固定),故意**不进** `SystemSettings` 热调 overlay,
+  避免「前端改了不重启不生效」的误导;改动需同时重启 router + worker。
+
+### Notes & Caveats
+
+- **PDF 结构性上限**:文档无法像图像那样压缩(base64 原样透传),且 `shed` 只裁历史不裁当前轮 → 单个原始 >~4.5MB 的
+  PDF(base64 ~6.16MB + 脚手架顶破 6.3MB)在当前轮仍会被 `gw-kiro` 本地 `BadRequest`,无法自动补救——需产品侧引导拆分/缩小。
+- **待硬化(本次未做)**:router 入口缓冲在鉴权前完成,理想应加 鉴权前置 / Content-Length 预检 / 并发护栏;
+  当前以「有界默认 + 可配」缓解。`tool_result` 内嵌图(browser 截图)目前不走压缩,满体量撞 6.3MB 墙,可后续纳入压缩。
+- 入站放开**不绕过**出站 6.3MB 护栏:二者是上下游两道独立闸门(入站 Anthropic body vs 出站 Kiro body)。
+
+## [anti-ban-retry-cascade + egress-gateways] - 2026-06-17
+
+### Features
+
+- **重试雪崩止血(防大面积封号)**:`messages()` 重试循环改用 `UpstreamErrorKind::worth_switching_account()`
+  + 新增硬上限 `max_switch_attempts`(默认 **2**,热调)。一个失败请求最多波及 2 个号、不再走遍全组。
+  - `worth_switching_account()`:`BadRequest / EmptyResponse / TemporarilyBlocked` 一律**不换号**。
+  - `error_map`:403 拆分——含封禁标记(`is_account_suspended`,"suspend")→ `TemporarilyBlocked`;否则 → `TokenInvalid`。
+  - 新增 `DisabledReason::TemporarilySuspended` + `suspended_cooldown_secs`(默认 **3600=1h**,热调):封禁号较长冷却、面板标 `temporarily_suspended`,不每 5min 重戳。
+  - `token.rs` 刷新错误也认 403+suspend → `TemporarilyBlocked`,封禁号不再被永久禁死。
+- **出口网关(美国多 IP)+ 上号可选**:
+  - `SystemSettings.egress_pool`(每行一个代理 URL = 一个网关)+ 设置页可配;新增 `max_switch_attempts`/`suspended_cooldown_secs` 热调项。
+  - 导入/新建账号对话框新增「出口网关」下拉:**直连 / 自动均衡(最少使用) / 指定网关**(`EgressPicker` + body `egress` 字段,按索引解析,密码不经前端)。
+  - `POST /admin/api/accounts/rebalance-egress`:把现有号按最少使用回填到网关池。
+
+### Design Rationale
+
+- 根因:旧循环上限=账号总数且从不调 `worth_switching_account()`,封号 403 被错分 `TokenInvalid` → 刷新失败 → 换号把同一(被封内容/高频)请求扩散到健康号 → 雪崩封全池。硬上限 + 内容/封禁类不换号双管齐下,把单请求爆破半径从「全池」降到 2。
+- `TemporarilyBlocked` 走冷却自愈而非永久禁用:封禁多为临时,1h 后自愈再试、仍封则再冷却,既不扩散也不每 5min 重戳产生异常指纹。
+- 出口选择按**索引**回传而非明文 URL:后端响应已掩码代理密码,前端拿不到真值,选索引由后端解析,杜绝密码经接口往返。
+
+### Notes & Caveats
+
+- `is_account_suspended` 仅匹配 "suspend"(覆盖 `TEMPORARILY_SUSPENDED`);上线后需用真实封禁 403 body 复核标记串。即便标记不中,`max_switch_attempts=2` 仍是兜底。
+- Vultr 附加 IP(66/140 段)经实测进出均不通(元数据挂着但 Vultr 未路由),3-IP 需面板 re-attach;当前单主 IP 美国出口可用。
+
+## [tool-repair] - 2026-06-16
+
+### Fix —— 工具参数双重编码防御性修复（tool_repair）
+
+**线上取证**：部分上游模型（Kiro 上的 Opus）偶发把本应是 JSON array 的工具参数序列化成 JSON
+**字符串**——1027 次 `AskUserQuestion` 调用中 223 次把 `questions` 编码成字符串，客户端按
+`input_schema` 校验拒收：`The parameter questions type is expected as array but provided as string`。
+反代逐字透传模型产出的 tool input，本身无 bug，但这是唯一可控点。
+
+- **新增 `crates/gw-kiro/src/tool_repair.rs`**：转换请求时从每个工具 `input_schema` 提取「顶层
+  type 为 array/object 的字段名集合」建表（`tool_repair_fields: 工具短名 → 字段集合`，键与上游回显的
+  wire 短名同源）；收尾组装 tool input 时，若字段当前为字符串且能解析成 array/object 就解包替换。
+- **流式（chat.rs）**：命中字段的工具走「缓冲不发 → `close_open_tool` 在 `content_block_stop` 前
+  只发一条 `repair_str` 修复后完整 `input_json_delta`」（无双发）；`finish()` 兜未显式 stop 的截断。
+  非修复工具逐帧透传。非流式经同一 BlockTracker 后 `fold_sse_to_message` 折叠，天然覆盖。
+
+### Design Rationale
+
+- 安全边界（绝不破坏正常输入）：仅 schema 声明 array/object 的顶层字段、当前值为字符串、且可解析成
+  对应类型时才替换；标量字符串、非 JSON 串、已是数组、半截 JSON 一律原样保留（11 项单测锁定）。
+- `array_object_fields` 读**原始** `input_schema`（在 normalize/多模态降级之前），故 schema 降级只改
+  发往上游的副本、不影响修复表——按客户端真实期望解包。
+
+### Notes & Caveats
+
+- 缓冲对所有含顶层 array/object 字段的工具生效（input 不再增量流式、整段缓冲到 stop；协议正确性无损）。
+- 仅解顶层一层；nullable/$ref/anyOf 包裹的 array、嵌套双编码不识别（漏修不误伤）。
+- 既有缺陷（与本修复无关、不受影响）：响应侧未消费 tool_name_map，名长 >63B 的工具向客户端泄露短哈希名。
+
+## [agent-continuation-cache-ab] - 2026-06-15
+
+### Fix(实验开关) —— 恢复稳定 agentContinuationId,修复真实缓存全 miss
+
+**背景/根因(线上取证)**:caio 真实 Kiro 前缀缓存命中 **0%**(1985/1985 success),credit **+49% vs
+kiro.rs**(opus-4-8 1.37 vs 0.92/req);而 kiro.rs 同上游同期 **~43%** 命中。逐层对比两套源码:caio
+发的 wire 看似完美可缓存(稳定 conversationId、history 前缀逐字节相同、reminder 已剥),唯一差异是
+2026-06-13 caio **删掉了** `agentContinuationId` + `agentTaskType="vibe"`,理由"kiro.rs/static_flow
+都不发"——经核对**证伪**:kiro.rs 生产一直在发稳定值(其代码实测注释:稳定 → metering 降 ~36%),
+caio 自身 2026-05-24 命中 A/B 基线也含此字段(6-13 才删)。删除疑为当时 reminder-leak bug 混淆的误判。
+
+- **恢复** `derive_agent_continuation_id`(= `SHA256("agent-continuation:"+conversationId)` 前 16 字节
+  排 UUID,**逐字节对齐 kiro.rs**;golden-vector `621628ff-…` 锁死)。
+- **新实验开关 `agent_continuation`**(默认**关**):走与 tools_in_prefix/cache_point 同款 RwLock 热控
+  (config.rs→cache_point.rs→apply_hot_settings),可经**设置面板/API 热翻**——生产做**可逆 A/B**:
+  默认关 = 部署零 wire 变化(`Option` 字段 `skip_serializing_if` 完全省略),开启 = 复刻 kiro.rs proven
+  配置(稳定 conversationId + 稳定 agentContinuationId + vibe)。
+- 附挂逻辑抽成纯函数 `with_agent_continuation_metadata(state, enabled)`,便于直接测两分支。
+- 前端设置面板加该开关 + 中英文案(指向请求日志「真」命中列)。
+- **设计取舍**:做成默认关的可逆开关(而非直接改默认)——历史测量多次被混淆,用真实流量 A/B 定论;
+  必须配稳定 conversationId(本 crate 已保证),否则每轮新值反而 miss(kiro.rs 实测)。
+- **对抗审查(Codex×2)**:修 4 项 medium——补 enabled-path 测试(纯函数双分支 + 序列化边界双向
+  断言:关→JSON 省略两 key、开→含两 key 且 = golden vector)、golden-vector 锁死、OnceLock→RwLock
+  热控(消除"重启才能翻、不可热回滚")。1 项 high 为误报(glob import,编译已过)。
+- **测试**:gw-kiro 357 + workspace 560 全绿;admin-ui tsc+build 通过;clippy 净。
+
 ## [request-log-response + modal-layout] - 2026-06-14
 
 ### Feature —— 请求日志新增「模型回复」保存 + 详情弹窗布局修复
