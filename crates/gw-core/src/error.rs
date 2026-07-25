@@ -29,6 +29,12 @@ pub enum UpstreamErrorKind {
     /// 请求本身非法(400 Improperly formed / schema 错误)。
     /// 动作:**不换号**(换号也一样错),直接返回客户端。
     BadRequest,
+    /// 该账号不支持所请求的模型(400 `INVALID_MODEL_ID`):模型在该号的区域/订阅档
+    /// 未上线(如 eu-central-1 号点 claude-sonnet-5)。**非账号健康问题**。
+    /// 动作:**不惩罚账号**(不计失败/不禁用)+ 换号到有该模型的号重试;调度层还会记
+    /// `(账号,模型)` 不可用(见 scheduler `mark_model_unavailable`),后续选号直接跳过该号,
+    /// 避免亲和反复选中同一不支持的号死循环。
+    ModelNotAvailable,
     /// 上游 200 空流(Kiro 首包截断等)。动作:见 empty-fallback 策略。
     EmptyResponse,
     /// 其他未分类。动作:保守切号一次。
@@ -36,10 +42,25 @@ pub enum UpstreamErrorKind {
 }
 
 impl UpstreamErrorKind {
-    /// 该错误是否意味着"换个账号可能成功"。
-    /// `BadRequest` 是请求本身的问题,换号无意义。
+    /// 该错误是否意味着"换个账号可能成功"——调度层据此决定是否换号重试。
+    ///
+    /// 返回 `false` 的三类**绝不换号**(否则把同一请求扩散到健康号 → 雪崩封号,
+    /// 2026-06 大面积封号根因):
+    /// - `BadRequest`:请求本身非法,换号一样错。
+    /// - `EmptyResponse`:上游对该**内容**的确定性空流(疑 guardrail);换号救不回且放大
+    ///   成多条 error 招封号(实战已证,见 caio-empty-response-not-fixable)。
+    /// - `TemporarilyBlocked`:账号被上游封禁/暂停;封禁号自身冷却自愈即可,把同一(被封
+    ///   内容/高频)请求喂给健康号正是雪崩根因。
+    ///
+    /// 其余(RateLimited/QuotaExhausted/TokenInvalid/ServerError/Network/Other)仍可换号,
+    /// 但受 `messages()` 的 `max_switch_attempts` 硬上限约束(默认 2,不再走遍全组)。
     pub fn worth_switching_account(&self) -> bool {
-        !matches!(self, UpstreamErrorKind::BadRequest)
+        !matches!(
+            self,
+            UpstreamErrorKind::BadRequest
+                | UpstreamErrorKind::EmptyResponse
+                | UpstreamErrorKind::TemporarilyBlocked
+        )
     }
 
     /// 该错误是否应让账号进入冷却。
@@ -63,6 +84,7 @@ impl fmt::Display for UpstreamErrorKind {
             UpstreamErrorKind::Network => "network",
             UpstreamErrorKind::ServerError => "server_error",
             UpstreamErrorKind::BadRequest => "bad_request",
+            UpstreamErrorKind::ModelNotAvailable => "model_not_available",
             UpstreamErrorKind::EmptyResponse => "empty_response",
             UpstreamErrorKind::Other => "other",
         };
@@ -126,6 +148,21 @@ mod tests {
     fn bad_request_not_worth_switching() {
         assert!(!UpstreamErrorKind::BadRequest.worth_switching_account());
         assert!(UpstreamErrorKind::RateLimited.worth_switching_account());
+    }
+
+    #[test]
+    fn content_and_ban_kinds_not_worth_switching() {
+        // 内容/封禁确定性 → 绝不换号(2026-06 雪崩防护)。
+        assert!(!UpstreamErrorKind::EmptyResponse.worth_switching_account());
+        assert!(!UpstreamErrorKind::TemporarilyBlocked.worth_switching_account());
+        // 这些换个号可能成功 → 仍可换号(但受 max_switch_attempts 硬上限约束)。
+        assert!(UpstreamErrorKind::TokenInvalid.worth_switching_account());
+        assert!(UpstreamErrorKind::QuotaExhausted.worth_switching_account());
+        assert!(UpstreamErrorKind::ServerError.worth_switching_account());
+        assert!(UpstreamErrorKind::Network.worth_switching_account());
+        assert!(UpstreamErrorKind::Other.worth_switching_account());
+        // ModelNotAvailable 换号到有该模型的号(非 BadRequest 直接返回)。
+        assert!(UpstreamErrorKind::ModelNotAvailable.worth_switching_account());
     }
 
     #[test]

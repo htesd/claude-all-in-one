@@ -252,6 +252,19 @@ impl SqliteStore {
             "metering_credit",
             "metering_credit REAL NOT NULL DEFAULT 0",
         )?;
+        // 账号累计成功/失败请求计数(监控用,非计费)。additive:老库升级即补 0,现有号从 0 起算。
+        Self::ensure_column(
+            conn,
+            "accounts",
+            "success_count",
+            "success_count INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            conn,
+            "accounts",
+            "failure_count",
+            "failure_count INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -485,7 +498,8 @@ impl SqliteStore {
     // ───────── 账号 CRUD(配置态;运行态见 worker /status) ─────────
 
     const ACCOUNT_COLS: &'static str =
-        "account_id, group_name, provider, max_concurrency, disabled, extra, created_at";
+        "account_id, group_name, provider, max_concurrency, disabled, extra, created_at, \
+         success_count, failure_count";
 
     fn row_to_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
         Ok(AccountRow {
@@ -496,6 +510,8 @@ impl SqliteStore {
             disabled: r.get::<_, i64>(4)? != 0,
             extra: r.get(5)?,
             created_at: r.get(6)?,
+            success_count: r.get(7)?,
+            failure_count: r.get(8)?,
         })
     }
 
@@ -723,6 +739,25 @@ impl SqliteStore {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// 账号累计成功/失败计数 +1(监控用,非计费)。在 [`write_request_log`](../../gw_app) 的
+    /// blocking 落库任务里调用,**不占热路径**。`account_id` 空(选号前无账号)则跳过;
+    /// ghost 账号(已删)UPDATE 影响 0 行,无害。
+    ///
+    /// 记的是每次上游调用的**终态**结局:成功 → success_count+1,终态失败 → failure_count+1。
+    /// 中途换号被禁用的那一次失败不计(该问题号的当前态已由运行态状态徽章暴露),count 只作量级参考。
+    pub fn bump_account_counters(&self, account_id: &str, success: bool) -> anyhow::Result<()> {
+        if account_id.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE accounts SET success_count = success_count + ?1, \
+             failure_count = failure_count + ?2 WHERE account_id = ?3",
+            rusqlite::params![success as i64, (!success) as i64, account_id],
+        )?;
         Ok(())
     }
 
@@ -1046,7 +1081,8 @@ impl ControlStore for SqliteStore {
         // over_quota 在 SQL 内算好(quota_tokens NULL = 不限),鉴权路径零额外查询。
         let mut stmt = conn.prepare_cached(
             "SELECT key, disabled, \
-             (quota_tokens IS NOT NULL AND used_tokens >= quota_tokens) \
+             (quota_tokens IS NOT NULL AND used_tokens >= quota_tokens), \
+             group_name \
              FROM api_keys WHERE key = ?1",
         )?;
         let row = stmt
@@ -1055,6 +1091,7 @@ impl ControlStore for SqliteStore {
                     key_id: r.get::<_, String>(0)?,
                     disabled: r.get::<_, i64>(1)? != 0,
                     over_quota: r.get::<_, i64>(2)? != 0,
+                    group_name: r.get::<_, String>(3)?,
                 })
             })
             .ok();
@@ -1139,10 +1176,24 @@ mod tests {
 
         let ok = store.authenticate("sk-test").await.unwrap();
         assert!(ok.is_some());
-        assert_eq!(ok.unwrap().key_id, "sk-test");
+        let ok = ok.unwrap();
+        assert_eq!(ok.key_id, "sk-test");
+        assert_eq!(ok.group_name, "", "新建 key 默认未分组");
 
         let bad = store.authenticate("sk-nope").await.unwrap();
         assert!(bad.is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticate_carries_group_name() {
+        // router 的按组路由依赖鉴权返回 group_name:G0→kiro / DARIO→dario。
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.add_api_key("sk-dario", Some("ccmax")).unwrap();
+        let patch = ApiKeyPatch { group_name: Some("DARIO".into()), ..Default::default() };
+        assert!(store.update_api_key("sk-dario", &patch).unwrap());
+
+        let auth = store.authenticate("sk-dario").await.unwrap().unwrap();
+        assert_eq!(auth.group_name, "DARIO", "鉴权必须带出 key 的分组用于路由");
     }
 
     #[tokio::test]
@@ -1585,6 +1636,38 @@ mod tests {
         assert!(store.delete_account("kiro-02").unwrap());
         assert!(!store.delete_account("kiro-02").unwrap());
         assert!(store.get_account("kiro-02").unwrap().is_none());
+    }
+
+    #[test]
+    fn bump_account_counters_tallies_success_and_failure() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_account("kiro-c", "G0", "kiro", 2, "{}").unwrap();
+        // 新号从 0 起算(additive 默认列)。
+        let a = store.get_account("kiro-c").unwrap().unwrap();
+        assert_eq!(a.success_count, 0);
+        assert_eq!(a.failure_count, 0);
+        // 3 成功 + 2 失败,独立累加。
+        for _ in 0..3 {
+            store.bump_account_counters("kiro-c", true).unwrap();
+        }
+        store.bump_account_counters("kiro-c", false).unwrap();
+        store.bump_account_counters("kiro-c", false).unwrap();
+        let a = store.get_account("kiro-c").unwrap().unwrap();
+        assert_eq!(a.success_count, 3);
+        assert_eq!(a.failure_count, 2);
+        // list_accounts 也带上计数(前端读取路径)。
+        let row = store
+            .list_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.account_id == "kiro-c")
+            .unwrap();
+        assert_eq!(row.success_count, 3);
+        assert_eq!(row.failure_count, 2);
+        // 空 account_id 跳过;ghost 账号 UPDATE 影响 0 行——不报错、不建行。
+        store.bump_account_counters("", true).unwrap();
+        store.bump_account_counters("ghost", false).unwrap();
+        assert!(store.get_account("ghost").unwrap().is_none());
     }
 
     #[test]

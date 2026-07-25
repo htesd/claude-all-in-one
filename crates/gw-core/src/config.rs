@@ -136,6 +136,45 @@ impl AccountsConfig {
 /// 注:空响应不设配置——v60 起不做任何反代侧重试/兜底(实战证明换 ID 重发救不回
 /// 且 error 放大触发封号),行为固定为:provider 终态 Err(EmptyResponse) →
 /// worker report_failure 阈值冷却 → 终态 SSE error → 客户端自重试。
+/// 上游流式请求总超时(秒)的默认值。reqwest `.timeout()` 覆盖**整请求**含读完整个
+/// 流式 body;Opus 大上下文常跑 300~700s,旧硬编码 300s 会被 reqwest 在 body 读取期
+/// 腰斩,表现为 502「读取上游流失败: error decoding response body」(2026-06-16 实测:
+/// caio 当天 33 次 stream_io 失败几乎全卡 `duration_ms≈300003`)。对齐 kiro.rs
+/// `api_timeout_secs=720`(其在同上游同模型下基本不触顶)。0 视为未设,回落本默认。
+pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 720;
+
+fn default_upstream_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_TIMEOUT_SECS
+}
+
+/// 入站请求体体积上限(字节)的默认值。客户端 base64 图片/PDF 常使整请求体达数 MB;
+/// axum 0.8 的 `Bytes`/`Json` 提取器默认上限仅 **2MB**,超了在 handler 执行前就被框架
+/// 直接 413(且请求根本到不了业务逻辑,不入库、不可见——2026-06 线上实测)。取 **16MB**:
+/// = 出站 6.3MB 护栏(gw-kiro 侧,对齐 Kiro 上游 ~7.3MB 硬限)的 ~2.5×,给当前轮 + 可被
+/// shed 裁掉的历史媒体留足余量;同时是**有界**值(非 disable),防超大 body 在 router/worker
+/// 入口无界缓冲撑爆内存(DoS——本网关 :38991 对外,入口提取在鉴权前完成)。8× 于旧 2MB 已
+/// 决定性解除闷死;需更大可在 system.yaml 显式上调。0 视为未设,回落本默认。
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn default_max_request_body_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BODY_BYTES
+}
+
+/// dario sidecar 连接配置(claude-dario provider 用)。
+///
+/// 空 `sidecar_url`/`api_key` 是合法默认值——provider 工厂收到后:
+/// - `sidecar_url` 空 → 回落 `http://127.0.0.1:39100`;
+/// - `api_key` 空 → dario 只在 loopback 放行(无 `DARIO_API_KEY` 时安全;
+///   生产部署必须与 dario `DARIO_API_KEY` env 保持一致)。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DarioSidecarConfig {
+    /// 本机 dario-on-Bun 监听地址,如 `http://127.0.0.1:39100`。
+    pub sidecar_url: String,
+    /// dario 入站鉴权 key(对应 sidecar `DARIO_API_KEY` env)。
+    pub api_key: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
@@ -148,10 +187,39 @@ pub struct SystemConfig {
     pub image: ImageConfig,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    /// 上游流式请求总超时(秒)。详见 [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]。
+    /// `#[derive(Default)]` 会给 0——build_client 内把 0 视为未设回落默认,故 0 安全。
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
+    /// 入站请求体体积上限(字节)。详见 [`DEFAULT_MAX_REQUEST_BODY_BYTES`]。
+    /// **启动期一次性参数**:axum `DefaultBodyLimit` 在 app 构建时定,不随 30s overlay 热重载,
+    /// 故不进 `SystemSettings`(避免"前端改了不重启不生效"的误导)。`#[derive(Default)]` 给 0,
+    /// 经 [`effective_max_request_body_bytes`](Self::effective_max_request_body_bytes) 回落默认。
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    /// dario sidecar(claude-dario provider)连接参数。
+    /// **启动期参数**:worker 启动时一次性注入 provider 工厂;改后需重启相关 worker。
+    #[serde(default)]
+    pub dario: DarioSidecarConfig,
 }
 
-/// 实验性开关(默认关)。两个 on/off 可经设置面板热控;env(`KIRO_TOOLS_IN_PREFIX` /
-/// `KIRO_CACHE_POINT`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
+impl SystemConfig {
+    /// 入站请求体上限的**有效值**:`0`(`#[derive(Default)]` 或显式置 0)回落
+    /// [`DEFAULT_MAX_REQUEST_BODY_BYTES`],否则用配置值。router 与 worker 两个 axum app
+    /// 构建处都调它来设 `DefaultBodyLimit::max(..)`。
+    pub fn effective_max_request_body_bytes(&self) -> usize {
+        if self.max_request_body_bytes == 0 {
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        } else {
+            self.max_request_body_bytes
+        }
+    }
+}
+
+/// 实验性开关。`tools_in_prefix`/`cache_point`/`agent_continuation`/`q_endpoint` 默认 **关**;
+/// `thinking_signature` 默认 **开**(保留现状,见其字段注释)。均可经设置面板热控;env
+/// (`KIRO_TOOLS_IN_PREFIX` / `KIRO_CACHE_POINT` / `KIRO_AGENT_CONTINUATION` /
+/// `KIRO_THINKING_SIGNATURE` / `KIRO_Q_ENDPOINT`)作启动默认(后向兼容)。详见 `gw-kiro` converter/cache_point.rs。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
     /// 把工具定义放进 history[0] 前缀(蹭 Kiro 缓存)。⚠️ 实测会让部分客户端工具调用失效,
@@ -161,6 +229,23 @@ pub struct ExperimentalConfig {
     /// 把 Anthropic `cache_control` 翻成 Kiro `cachePoint`(实测 no-op,dormant)。
     #[serde(default = "default_cache_point")]
     pub cache_point: bool,
+    /// 发**稳定** agentContinuationId(+agentTaskType="vibe")进 conversationState。默认关。
+    /// 用于复刻 kiro.rs proven 配置做真实缓存命中的生产 A/B(见 gw-kiro converter/cache_point.rs)。
+    #[serde(default = "default_agent_continuation")]
+    pub agent_continuation: bool,
+    /// 是否给响应 thinking 块附 `signature`。**默认开**(保留现状)。多上游反代场景关掉:caio 的
+    /// Kiro 合成签名对真 Anthropic/Bedrock 验签非法,跨通道漂移会触发 `THINKING_SIGNATURE_INVALID`
+    /// (见 gw-kiro converter/cache_point.rs::thinking_signature_enabled)。env `KIRO_THINKING_SIGNATURE=0` 关。
+    #[serde(default = "default_thinking_signature")]
+    pub thinking_signature: bool,
+    /// 主推理上游端点选择。默认 **关**=`runtime.{region}.kiro.dev`(现状,防封对齐 static_flow
+    /// 当前客户端);开=`q.{region}.amazonaws.com`(旧 CodeWhisperer 端点,与 kiro.rs 一致)。
+    /// 【为何是开关】线上实测:runtime.kiro.dev 端点**真实 prompt 缓存命中 0%**、每 token 计费 ~2x;
+    /// kiro.rs 走 q.amazonaws.com 端点真实命中 82-92%(报文/账号/亲和完全一致,唯一变量是端点)。
+    /// ⚠️ 切旧端点更省积分,但客户端指纹偏离当前 Kiro,理论封号风险略升(kiro.rs 长期用它在跑);
+    /// 可经设置面板热切,出问题一键切回。env `KIRO_Q_ENDPOINT=1` 作启动默认。
+    #[serde(default = "default_q_endpoint")]
+    pub q_endpoint: bool,
 }
 
 fn env_experimental_flag(name: &str) -> bool {
@@ -174,12 +259,27 @@ fn default_tools_in_prefix() -> bool {
 fn default_cache_point() -> bool {
     env_experimental_flag("KIRO_CACHE_POINT")
 }
+fn default_agent_continuation() -> bool {
+    env_experimental_flag("KIRO_AGENT_CONTINUATION")
+}
+fn default_q_endpoint() -> bool {
+    env_experimental_flag("KIRO_Q_ENDPOINT")
+}
+/// thinking 签名默认 **开**(现状),仅 env 显式设 `0`/`false` 才关。
+fn default_thinking_signature() -> bool {
+    std::env::var("KIRO_THINKING_SIGNATURE")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
 
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             tools_in_prefix: default_tools_in_prefix(),
             cache_point: default_cache_point(),
+            agent_continuation: default_agent_continuation(),
+            thinking_signature: default_thinking_signature(),
+            q_endpoint: default_q_endpoint(),
         }
     }
 }
@@ -231,6 +331,10 @@ pub struct SchedulerConfig {
     /// 429 限流冷却秒数(到期自愈)。
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
+    /// 账号临时封禁(TEMPORARILY_SUSPENDED)冷却秒数(默认 3600=1h,比限流长——别每 5min
+    /// 重戳封禁号产生异常调用指纹)。到期自愈再试,仍封则再冷却。
+    #[serde(default = "default_suspended_cooldown_secs")]
+    pub suspended_cooldown_secs: u64,
     /// 空响应冷却秒数(达阈值后)。
     #[serde(default = "default_empty_response_cooldown_secs")]
     pub empty_response_cooldown_secs: u64,
@@ -251,10 +355,18 @@ pub struct SchedulerConfig {
     /// 是为复用既有 30s 热应用路径——admin 设置面板可即时启停轮询,无需重启(对抗审查 Architect#5)。
     #[serde(default = "default_quota_poll_enabled")]
     pub quota_poll_enabled: bool,
+    /// 单个入站请求最多尝试的账号数(换号重试硬上限)。默认 **2**:一个失败请求最多波及 2 个号,
+    /// 而非走遍全组——杜绝「毒请求/高频重试逐个打爆全池」(2026-06 大面积封号雪崩根因)。
+    /// 内容/封禁类错误(见 `UpstreamErrorKind::worth_switching_account`)命中首个号即止,更不受影响。
+    #[serde(default = "default_max_switch_attempts")]
+    pub max_switch_attempts: u32,
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
     300
+}
+fn default_suspended_cooldown_secs() -> u64 {
+    3600
 }
 fn default_empty_response_cooldown_secs() -> u64 {
     60
@@ -271,6 +383,9 @@ fn default_max_failures() -> u32 {
 fn default_quota_poll_enabled() -> bool {
     true
 }
+fn default_max_switch_attempts() -> u32 {
+    2
+}
 fn default_affinity_ttl_secs() -> u64 {
     1800
 }
@@ -279,12 +394,14 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
+            suspended_cooldown_secs: default_suspended_cooldown_secs(),
             empty_response_cooldown_secs: default_empty_response_cooldown_secs(),
             empty_response_window_secs: default_empty_response_window_secs(),
             empty_response_threshold: default_empty_response_threshold(),
             max_failures: default_max_failures(),
             affinity_ttl_secs: default_affinity_ttl_secs(),
             quota_poll_enabled: default_quota_poll_enabled(),
+            max_switch_attempts: default_max_switch_attempts(),
         }
     }
 }
@@ -372,6 +489,12 @@ impl Default for CacheConfig {
 pub struct SystemSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_proxy: Option<String>,
+    /// 出口代理池(美国多 IP):导入/新建账号时按「当前分配最少」自动挑一个写进
+    /// `account.extra.proxy`(粘性,每账号固定一个出口 IP,把账号均衡铺满 N 个 IP)。
+    /// 与 `default_proxy` 一样**不进** [`SystemConfig`]:它不是运行开关,而是 admin
+    /// 导入/新建/rebalance handler 直接读的分配源。空/None = 不自动分配。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_pool: Option<Vec<String>>,
     // —— cache ——
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_multiplier: Option<f64>,
@@ -387,6 +510,8 @@ pub struct SystemSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_cooldown_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_cooldown_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub empty_response_cooldown_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub empty_response_window_secs: Option<u64>,
@@ -394,6 +519,9 @@ pub struct SystemSettings {
     pub empty_response_threshold: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_failures: Option<u32>,
+    /// 单请求换号重试硬上限(默认 2;反雪崩,见 [`SchedulerConfig::max_switch_attempts`])。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_switch_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_ttl_secs: Option<u64>,
     /// worker 后台配额轮询热开关(None = 用 yaml 基线默认 true)。
@@ -417,6 +545,17 @@ pub struct SystemSettings {
     /// cache_control→cachePoint 实验(实测 no-op,dormant)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_point: Option<bool>,
+    /// 稳定 agentContinuationId+vibe 实验(真实缓存命中 A/B,默认关)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_continuation: Option<bool>,
+    /// thinking 块是否附 signature(默认开;多上游反代关掉以免 Kiro 合成签名漂到真 Anthropic/Bedrock
+    /// 通道被拒)。None = 用基线默认(开)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<bool>,
+    /// 主推理上游端点:false=`runtime.kiro.dev`(默认/现状),true=`q.amazonaws.com`(kiro.rs 端点,
+    /// 做服务端 prompt 缓存、真实命中 82-92% 省积分)。None=用基线默认。见 [`ExperimentalConfig::q_endpoint`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_endpoint: Option<bool>,
 }
 
 impl SystemSettings {
@@ -428,10 +567,12 @@ impl SystemSettings {
         if let Some(v) = self.cache_sim_ttl_secs { base.cache.sim_ttl_secs = v; }
         if let Some(v) = self.cache_max_sessions { base.cache.max_sessions = v; }
         if let Some(v) = self.rate_limit_cooldown_secs { base.scheduler.rate_limit_cooldown_secs = v; }
+        if let Some(v) = self.suspended_cooldown_secs { base.scheduler.suspended_cooldown_secs = v; }
         if let Some(v) = self.empty_response_cooldown_secs { base.scheduler.empty_response_cooldown_secs = v; }
         if let Some(v) = self.empty_response_window_secs { base.scheduler.empty_response_window_secs = v; }
         if let Some(v) = self.empty_response_threshold { base.scheduler.empty_response_threshold = v; }
         if let Some(v) = self.max_failures { base.scheduler.max_failures = v; }
+        if let Some(v) = self.max_switch_attempts { base.scheduler.max_switch_attempts = v; }
         if let Some(v) = self.affinity_ttl_secs { base.scheduler.affinity_ttl_secs = v; }
         if let Some(v) = self.quota_poll_enabled { base.scheduler.quota_poll_enabled = v; }
         if let Some(v) = self.image_enabled { base.image.enabled = v; }
@@ -441,6 +582,9 @@ impl SystemSettings {
         if let Some(v) = self.image_multi_threshold { base.image.multi_threshold = v; }
         if let Some(v) = self.tools_in_prefix { base.experimental.tools_in_prefix = v; }
         if let Some(v) = self.cache_point { base.experimental.cache_point = v; }
+        if let Some(v) = self.agent_continuation { base.experimental.agent_continuation = v; }
+        if let Some(v) = self.thinking_signature { base.experimental.thinking_signature = v; }
+        if let Some(v) = self.q_endpoint { base.experimental.q_endpoint = v; }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -448,16 +592,21 @@ impl SystemSettings {
     pub fn from_effective(cfg: &SystemConfig, default_proxy: Option<String>) -> Self {
         Self {
             default_proxy,
+            // egress_pool 不属 SystemConfig(同 default_proxy);from_effective 不重建它,
+            // 调用方(settings::effective)从 overlay 原样回灌。
+            egress_pool: None,
             cache_read_multiplier: Some(cfg.cache.read_multiplier),
             cache_cap_ratio: Some(cfg.cache.cap_ratio),
             cache_floor_ratio: Some(cfg.cache.floor_ratio),
             cache_sim_ttl_secs: Some(cfg.cache.sim_ttl_secs),
             cache_max_sessions: Some(cfg.cache.max_sessions),
             rate_limit_cooldown_secs: Some(cfg.scheduler.rate_limit_cooldown_secs),
+            suspended_cooldown_secs: Some(cfg.scheduler.suspended_cooldown_secs),
             empty_response_cooldown_secs: Some(cfg.scheduler.empty_response_cooldown_secs),
             empty_response_window_secs: Some(cfg.scheduler.empty_response_window_secs),
             empty_response_threshold: Some(cfg.scheduler.empty_response_threshold),
             max_failures: Some(cfg.scheduler.max_failures),
+            max_switch_attempts: Some(cfg.scheduler.max_switch_attempts),
             affinity_ttl_secs: Some(cfg.scheduler.affinity_ttl_secs),
             quota_poll_enabled: Some(cfg.scheduler.quota_poll_enabled),
             image_enabled: Some(cfg.image.enabled),
@@ -467,6 +616,9 @@ impl SystemSettings {
             image_multi_threshold: Some(cfg.image.multi_threshold),
             tools_in_prefix: Some(cfg.experimental.tools_in_prefix),
             cache_point: Some(cfg.experimental.cache_point),
+            agent_continuation: Some(cfg.experimental.agent_continuation),
+            thinking_signature: Some(cfg.experimental.thinking_signature),
+            q_endpoint: Some(cfg.experimental.q_endpoint),
         }
     }
 }
@@ -474,6 +626,44 @@ impl SystemSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dario_config_partial_only_sidecar_url_api_key_defaults_empty() {
+        // 只提供 sidecar_url，省略 api_key → api_key 回落空串。
+        let yaml = "dario:\n  sidecar_url: \"http://127.0.0.1:39100\"\n";
+        let cfg: SystemConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.dario.sidecar_url, "http://127.0.0.1:39100");
+        assert_eq!(cfg.dario.api_key, "");
+    }
+
+    #[test]
+    fn dario_config_unknown_field_is_rejected() {
+        // deny_unknown_fields：未知子字段应返回 Err，而非静默忽略。
+        let yaml = "dario:\n  sidecar_url: \"http://127.0.0.1:39100\"\n  bogus_field: \"value\"\n";
+        assert!(
+            serde_yaml::from_str::<SystemConfig>(yaml).is_err(),
+            "未知字段应被 deny_unknown_fields 拒绝"
+        );
+    }
+
+    #[test]
+    fn dario_config_defaults_and_parse() {
+        // 缺省:两字段均为空串。
+        let d = DarioSidecarConfig::default();
+        assert_eq!(d.sidecar_url, "");
+        assert_eq!(d.api_key, "");
+
+        // SystemConfig 缺 dario 段 → 用默认(空串)。
+        let cfg: SystemConfig = serde_yaml::from_str("upstream_timeout_secs: 600\n").unwrap();
+        assert_eq!(cfg.dario.sidecar_url, "");
+        assert_eq!(cfg.dario.api_key, "");
+
+        // 解析 dario 段。
+        let yaml = "dario:\n  sidecar_url: \"http://127.0.0.1:39100\"\n  api_key: \"local-key\"\n";
+        let cfg2: SystemConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg2.dario.sidecar_url, "http://127.0.0.1:39100");
+        assert_eq!(cfg2.dario.api_key, "local-key");
+    }
 
     #[test]
     fn parse_instances_with_local_ip_and_proxy() {
@@ -500,6 +690,41 @@ workers:
             EgressConfig::Proxy { url, .. } => assert_eq!(url, "socks5://127.0.0.1:1080"),
             _ => panic!("expected proxy"),
         }
+    }
+
+    #[test]
+    fn max_request_body_bytes_effective_and_default() {
+        // #[derive(Default)] 给 0 → 回落默认(32MB)。
+        let d = SystemConfig::default();
+        assert_eq!(d.max_request_body_bytes, 0);
+        assert_eq!(
+            d.effective_max_request_body_bytes(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
+
+        // 显式 0 也回落默认(运维写 0 = 用默认,与 upstream_timeout_secs 同语义)。
+        let mut z = SystemConfig::default();
+        z.max_request_body_bytes = 0;
+        assert_eq!(
+            z.effective_max_request_body_bytes(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+
+        // 显式非 0 值透传,不被回落。
+        let mut c = SystemConfig::default();
+        c.max_request_body_bytes = 5_000_000;
+        assert_eq!(c.effective_max_request_body_bytes(), 5_000_000);
+
+        // YAML 缺该字段 → serde 默认填 32MB(不是 0),且其它字段照常解析。
+        let cfg: SystemConfig = serde_yaml::from_str("upstream_timeout_secs: 600\n").unwrap();
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(cfg.upstream_timeout_secs, 600);
+        // 显式写入则按写入值。
+        let cfg2: SystemConfig =
+            serde_yaml::from_str("max_request_body_bytes: 10485760\n").unwrap();
+        assert_eq!(cfg2.max_request_body_bytes, 10_485_760);
+        assert_eq!(cfg2.effective_max_request_body_bytes(), 10_485_760);
     }
 
     #[test]
@@ -592,5 +817,43 @@ workers:
         full.apply_to(&mut target);
         assert_eq!(target.scheduler.max_failures, base.scheduler.max_failures);
         assert_eq!(target.cache.read_multiplier, base.cache.read_multiplier);
+    }
+
+    #[test]
+    fn settings_thinking_signature_apply_to_overrides_and_preserves() {
+        // None → 不覆盖(保留基线默认开);Some(false) → 关签名。验证 overlay 语义对新字段成立。
+        let mut base = SystemConfig::default();
+        base.experimental.thinking_signature = true;
+        SystemSettings::default().apply_to(&mut base);
+        assert!(base.experimental.thinking_signature, "None 时应保留默认(不覆盖)");
+        let s_off = SystemSettings { thinking_signature: Some(false), ..Default::default() };
+        s_off.apply_to(&mut base);
+        assert!(!base.experimental.thinking_signature, "Some(false) 应关掉 thinking 签名");
+    }
+
+    #[test]
+    fn settings_q_endpoint_default_off_overlay_and_roundtrip() {
+        // 无 env 时默认关(runtime.kiro.dev)。
+        assert!(!super::default_q_endpoint(), "q_endpoint 默认关(无 KIRO_Q_ENDPOINT)");
+        // None → 不覆盖(保留基线);Some(true) → 切旧 q 端点。
+        let mut base = SystemConfig::default();
+        base.experimental.q_endpoint = false;
+        SystemSettings::default().apply_to(&mut base);
+        assert!(!base.experimental.q_endpoint, "None 时应保留默认(不误切端点)");
+        let s_on = SystemSettings { q_endpoint: Some(true), ..Default::default() };
+        s_on.apply_to(&mut base);
+        assert!(base.experimental.q_endpoint, "Some(true) 应切到 q.amazonaws.com 端点");
+        // from_effective 往返:开着的 q_endpoint 应被 Some(true) 回灌。
+        let full = SystemSettings::from_effective(&base, None);
+        assert_eq!(full.q_endpoint, Some(true), "from_effective 须回灌 q_endpoint 当前值");
+    }
+
+    #[test]
+    fn from_effective_carries_thinking_signature() {
+        // from_effective 必须回灌 thinking_signature(否则前端拿不到真值 / 轮询热应用丢字段)。
+        let mut cfg = SystemConfig::default();
+        cfg.experimental.thinking_signature = false;
+        let s = SystemSettings::from_effective(&cfg, None);
+        assert_eq!(s.thinking_signature, Some(false), "from_effective 应带 thinking_signature 真值");
     }
 }

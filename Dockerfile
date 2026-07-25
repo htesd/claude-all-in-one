@@ -19,8 +19,10 @@ RUN cargo build --release -p gw-app --features embed-ui
 
 # --- 3. 运行时:slim + CA 证书(reqwest rustls 需根证书;rusqlite bundled 无需系统 sqlite) ---
 FROM debian:bookworm-slim AS runtime
+# curl:web search 执行器经它发 DuckDuckGo 请求(reqwest/rustls 的 TLS 指纹被 DDG 反爬拦截,
+# curl 的 OpenSSL 指纹放行;经 curl 调用完全隔离,绝不触碰 provider/egress 的 reqwest TLS 栈)。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/claude-all-in-one /usr/local/bin/claude-all-in-one

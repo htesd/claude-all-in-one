@@ -1,0 +1,31 @@
+# 老端点实验栈:caio-exp-router(:38993)+ caio-exp-worker(组 EXP,q.eu-central-1)。
+# 复用已构建镜像 claude-all-in-one:exp/:local,不重新 build。生产容器完全不受影响。
+# 启停:docker compose -f docker-compose.exp.yml -p caio-exp up -d / down
+services:
+  exp-router:
+    image: claude-all-in-one:local
+    container_name: caio-exp-router
+    command: ["--mode", "router", "--instances", "config/instances-exp.yaml"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+
+  exp-worker:
+    image: claude-all-in-one:exp
+    container_name: caio-exp-worker
+    command: ["--mode", "worker", "--instance", "2", "--instances", "config/instances-exp.yaml"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - exp-router
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - KIRO_RUNTIME_UPSTREAM_BASE_URL=https://q.eu-central-1.amazonaws.com
+      - KIRO_THINKING_IN_HISTORY0=1

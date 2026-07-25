@@ -17,9 +17,16 @@ use reqwest::Client;
 ///
 /// 整个 worker 进程的上游请求(发包/刷新/usage)都用这个 client,
 /// 保证同出口一致性(static_flow 的代理一致性铁律,见 IMPROVEMENTS §2.3)。
-pub fn build_client(egress: &EgressConfig) -> anyhow::Result<Client> {
+pub fn build_client(egress: &EgressConfig, timeout_secs: u64) -> anyhow::Result<Client> {
+    // 0(含 SystemConfig::default() 给的零值)视为未设,回落默认 720s——见
+    // DEFAULT_UPSTREAM_TIMEOUT_SECS。绝不让 timeout(0)（reqwest 语义=瞬时超时）落地。
+    let timeout_secs = if timeout_secs == 0 {
+        gw_core::config::DEFAULT_UPSTREAM_TIMEOUT_SECS
+    } else {
+        timeout_secs
+    };
     let mut builder = Client::builder()
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_secs(timeout_secs))
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(60));
 
@@ -65,7 +72,7 @@ mod tests {
 
     #[test]
     fn build_direct_client() {
-        assert!(build_client(&EgressConfig::Direct).is_ok());
+        assert!(build_client(&EgressConfig::Direct, 720).is_ok());
     }
 
     #[test]
@@ -74,7 +81,7 @@ mod tests {
         let cfg = EgressConfig::LocalIp {
             address: "127.0.0.1".into(),
         };
-        assert!(build_client(&cfg).is_ok());
+        assert!(build_client(&cfg, 720).is_ok());
     }
 
     #[test]
@@ -82,7 +89,13 @@ mod tests {
         let cfg = EgressConfig::LocalIp {
             address: "not-an-ip".into(),
         };
-        assert!(build_client(&cfg).is_err());
+        assert!(build_client(&cfg, 720).is_err());
+    }
+
+    #[test]
+    fn build_with_zero_timeout_falls_back_to_default() {
+        // 0(含 SystemConfig::default() 给的零值)必须回落默认而非 timeout(0)。
+        assert!(build_client(&EgressConfig::Direct, 0).is_ok());
     }
 
     #[test]

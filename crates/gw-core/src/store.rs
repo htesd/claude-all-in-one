@@ -90,6 +90,9 @@ pub struct AuthenticatedKey {
     /// 已超限额(quota_tokens 非 NULL 且 used_tokens >= quota_tokens)。
     /// router 据此拒绝(429),计算在 SQL 内完成,鉴权路径零额外查询。
     pub over_quota: bool,
+    /// 客户 key 所属分组('' = 未分组)。router 据此把请求派发到对应账号组的
+    /// worker(G0→kiro / DARIO→dario);未分组回落到 router 自身主组。
+    pub group_name: String,
 }
 
 /// 一条客户端 API key 元数据(admin 管理页 / CRUD 用)。
@@ -148,6 +151,10 @@ pub struct AccountRow {
     pub disabled: bool,
     pub extra: String,
     pub created_at: i64,
+    /// 累计成功请求数(监控用,非计费)。每次上游调用**终态**收尾 +1(见 worker::write_request_log)。
+    pub success_count: i64,
+    /// 累计失败请求数(监控用,非计费)。含首包前 400/429/网络/额度耗尽等终态失败。
+    pub failure_count: i64,
 }
 
 /// 账号部分更新(None 字段不动)。

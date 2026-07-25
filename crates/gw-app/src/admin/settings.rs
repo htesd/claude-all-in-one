@@ -41,7 +41,11 @@ fn read_overlay(st: &AdminState) -> anyhow::Result<SystemSettings> {
 fn effective(st: &AdminState, overlay: &SystemSettings) -> SystemSettings {
     let mut cfg: SystemConfig = (*st.yaml_config).clone();
     overlay.apply_to(&mut cfg);
-    SystemSettings::from_effective(&cfg, overlay.default_proxy.clone())
+    let mut full = SystemSettings::from_effective(&cfg, overlay.default_proxy.clone());
+    // egress_pool 与 default_proxy 同属「不进 SystemConfig」的出口字段,from_effective 不含它,
+    // 这里从 overlay 原样回灌(供前端展示当前池)。
+    full.egress_pool = overlay.egress_pool.clone();
+    full
 }
 
 /// 把有效设置序列化为响应,并掩码 default_proxy 的密码段(防 user:pass@ 经接口泄漏,
@@ -51,6 +55,17 @@ fn respond(settings: SystemSettings) -> axum::response::Response {
     if let Some(dp) = v.get("default_proxy").and_then(|d| d.as_str()) {
         let masked = super::redact_proxy_url(dp);
         v["default_proxy"] = serde_json::json!(masked);
+    }
+    // egress_pool 每条 URL 同样可含 user:pass@,逐条掩码密码段(真实值仍在库里)。
+    if let Some(arr) = v.get("egress_pool").and_then(|d| d.as_array()) {
+        let masked: Vec<serde_json::Value> = arr
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(s) => serde_json::json!(super::redact_proxy_url(s)),
+                None => item.clone(),
+            })
+            .collect();
+        v["egress_pool"] = serde_json::Value::Array(masked);
     }
     Json(v).into_response()
 }
@@ -98,6 +113,30 @@ async fn put_settings(
                     Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
                 },
                 None => return api_error(StatusCode::BAD_REQUEST, "default_proxy 须为字符串"),
+            }
+            continue;
+        }
+        // egress_pool:出口代理池(数组)。空数组=清除;非空=逐条 validate_proxy_url(fail-closed,
+        // 同 default_proxy:拒绝含 *** 掩码的回传值,绝不把脱敏形态当真值存)。
+        if k == "egress_pool" {
+            match v.as_array() {
+                Some(arr) if arr.is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(arr) => {
+                    let mut validated = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            return api_error(StatusCode::BAD_REQUEST, "egress_pool 每项须为字符串");
+                        };
+                        match super::validate_proxy_url(s) {
+                            Ok(valid) => validated.push(serde_json::Value::String(valid)),
+                            Err(msg) => return api_error(StatusCode::BAD_REQUEST, msg),
+                        }
+                    }
+                    overlay_map.insert(k, serde_json::Value::Array(validated));
+                }
+                None => return api_error(StatusCode::BAD_REQUEST, "egress_pool 须为数组"),
             }
             continue;
         }
