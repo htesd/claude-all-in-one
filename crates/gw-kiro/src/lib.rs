@@ -27,6 +27,7 @@ pub mod resolver;
 pub mod signature;
 pub mod text_tokens;
 pub mod thinking_policy;
+pub mod tool_repair;
 pub mod import;
 pub mod token;
 pub mod usage;
@@ -82,7 +83,10 @@ impl CacheBilling {
 /// 否则按 `sha256("KotlinNativeAPI/"+refresh_token)` 派生,会随 rolling token 漂移触发风控。
 const KIRO_ACCOUNT_SCHEMA: &[FieldSpec] = &[
     FieldSpec::new("account_id", "账号 ID", FieldType::String, true),
-    FieldSpec::new("refresh_token", "Refresh Token", FieldType::Password, true),
+    FieldSpec::new("refresh_token", "Refresh Token", FieldType::Password, false)
+        .with_help("social/IdC 凭据必填;若用官方 API Key(kiro_api_key)则留空"),
+    FieldSpec::new("kiro_api_key", "Kiro API Key", FieldType::Password, false)
+        .with_help("官方 Kiro API Key(ksk_ 开头,app.kiro.dev 生成)。填此则走 API_KEY 鉴权:无需 refresh_token / profileArn / 刷新,长期有效"),
     FieldSpec::new("access_token", "Access Token", FieldType::Password, false),
     FieldSpec::new("profile_arn", "Profile ARN", FieldType::String, false),
     FieldSpec::new("region", "区域", FieldType::String, false)
@@ -90,13 +94,17 @@ const KIRO_ACCOUNT_SCHEMA: &[FieldSpec] = &[
     FieldSpec::new("machine_id", "设备指纹 (machineId)", FieldType::String, false)
         .with_help("Social 号防封关键:填原始真机 machineId(64 hex 或 UUID);留空则按 refresh_token 派生,会随 token 刷新漂移"),
     FieldSpec::new("auth_method", "认证方式", FieldType::String, false)
-        .with_help("social / idc;留空按 client_id+secret 自动判定"),
+        .with_help("social / idc / external_idp;留空按 client_id+secret 自动判定 social/idc —— external_idp(Azure AD 企业 SSO)必须显式填写,无法从字段存在与否自动推断"),
     FieldSpec::new("kiro_provider", "身份来源", FieldType::String, false)
         .with_help("github / google / builderid / enterprise;用于缺失 profileArn 时取固定兜底"),
-    FieldSpec::new("client_id", "IdC Client ID", FieldType::String, false)
-        .with_help("IdC(企业 SSO)账号必填,与 Client Secret 成对"),
+    FieldSpec::new("client_id", "IdC / External IdP Client ID", FieldType::String, false)
+        .with_help("IdC(企业 SSO)或 external_idp(Azure AD 租户)账号必填"),
     FieldSpec::new("client_secret", "IdC Client Secret", FieldType::Password, false)
-        .with_help("IdC 账号必填;走 AWS OIDC 刷新,不易封"),
+        .with_help("IdC 账号必填;走 AWS OIDC 刷新,不易封。external_idp 账号留空(Azure AD 公开客户端刷新不用 secret)"),
+    FieldSpec::new("token_endpoint", "External IdP Token Endpoint", FieldType::String, false)
+        .with_help("auth_method=external_idp(Azure AD 企业 SSO)账号的租户刷新端点,如 https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token;从 Kiro-Go 等工具导出时会按 userId 自动派生,一般无需手填"),
+    FieldSpec::new("scope", "External IdP Scope", FieldType::String, false)
+        .with_help("external_idp 账号的 OAuth2 scope(含 offline_access 才能拿到 refresh_token);留空按 client_id 自动派生 codewhisperer 默认 scope"),
     FieldSpec::new("kiro_version", "客户端版本", FieldType::String, false)
         .with_help("⚠️ UA 里的 KiroIDE 版本,默认 0.12.155;改它而不同步 OS/Node 版本会造成现实不存在的指纹组合,非必要勿动"),
     FieldSpec::new("proxy", "出口代理 URL (可选)", FieldType::String, false)
@@ -218,13 +226,16 @@ impl Provider for KiroProvider {
     }
 
     fn validate_account(&self, account: &Account) -> Result<(), UpstreamError> {
-        // 当前只支持 social/IdC(均需 refresh_token);API Key 路径尚未实现 token 换取流程
-        // (审查 Skeptic#1/Architect#1:此前 schema 暴露 kiro_api_key 但调用链不支持,
-        // 现撤下并在此明确拒绝,避免"加载通过、首请求才报缺 refresh_token"的边界破裂)。
+        // 两类凭据二选一:
+        // - **API Key**(kiro_api_key 非空):走 `TokenType: API_KEY`,无需 refresh_token /
+        //   profileArn / 刷新(chat 与配额均用 ksk_ 作 bearer)。
+        // - **social / IdC**:需 refresh_token(运行时换取 access_token)。
+        // 两者皆缺 → 该账号无任何可用凭据,加载即拒(避免"加载通过、首请求才炸"的边界破裂)。
+        let has_api_key = machine_id::is_api_key_credential(account);
         let has_refresh = account.extra_str("refresh_token").is_some_and(|s| !s.is_empty());
-        if !has_refresh {
+        if !has_api_key && !has_refresh {
             return Err(UpstreamError::bad_request(format!(
-                "Kiro 账号 '{}' 缺少 refresh_token(social/IdC 必需;API Key 凭据暂不支持)",
+                "Kiro 账号 '{}' 缺少凭据(需 refresh_token[social/IdC] 或 kiro_api_key[官方 API Key])",
                 account.account_id
             )));
         }
@@ -270,6 +281,12 @@ impl Provider for KiroProvider {
     }
 
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
+        // API Key 凭据:长期有效、无 OIDC 刷新概念,原样返回(ksk_ 就是 bearer)。
+        // 常态下不会走到这里(has_fresh_token 对 apikey 恒真);仅当 chat 收 403 走同号
+        // 刷新兜底时会调用——空操作让 retry 用同 key 再试一次,失败即由调用方换号/上报。
+        if machine_id::is_api_key_credential(account) {
+            return Ok(account.clone());
+        }
         // 用该账号的出口 client 刷新(social/IdC 自动分流),把新 token 写回 Account.extra 返回。
         // 持久化由 gw-app 负责(契约 H4)。出口与发包同源(防封):同一账号 refresh/chat 同代理。
         let client = self.resolver.client_for(account);
@@ -323,8 +340,23 @@ impl Provider for KiroProvider {
         &self,
         account: &Account,
     ) -> Result<Option<String>, UpstreamError> {
+        // API Key 凭据不需要 profileArn(TokenType: API_KEY 让服务端按 key 自身账号解析),
+        // 跳过 ListAvailableProfiles 网络调用。
+        if machine_id::is_api_key_credential(account) {
+            return Ok(None);
+        }
         let client = self.resolver.client_for(account);
         profiles::discover_profile_arn(&client, account).await
+    }
+
+    /// 强制发现 profileArn(绕过固定兜底短路):付费 builderid 号被免费层共享 ARN 短路时,
+    /// gw-app 在配额 403 兜底里调本方法查真实 profileArn。见 [`profiles::force_discover_profile_arn`]。
+    async fn force_discover_profile_arn(
+        &self,
+        account: &Account,
+    ) -> Result<Option<String>, UpstreamError> {
+        let client = self.resolver.client_for(account);
+        profiles::force_discover_profile_arn(&client, account).await
     }
 
     /// 热应用设置(worker 30s 轮询):更新默认代理 + 缓存计费 + 图像压缩参数。
@@ -371,8 +403,8 @@ impl Provider for KiroProvider {
             }
         }
 
-        // 实验开关(tools_in_prefix / cache_point)。from_effective 总会带这两个字段;
-        // 缺失时退回 false(不覆盖到危险开启)。改写进程级实验全局,converter 下轮即读到。
+        // 实验开关(tools_in_prefix / cache_point / agent_continuation)。from_effective 总会带这些
+        // 字段;缺失时退回 false(不覆盖到危险开启)。改写进程级实验全局,converter 下轮即读到。
         {
             let tools_in_prefix = settings
                 .get("tools_in_prefix")
@@ -382,7 +414,29 @@ impl Provider for KiroProvider {
                 .get("cache_point")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            crate::converter::set_experimental_flags(tools_in_prefix, cache_point);
+            let agent_continuation = settings
+                .get("agent_continuation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // thinking_signature 缺省 **true**(保留现状:带签名);只有显式 false 才关掉。
+            // 与上面三个开关相反——它们危险默认关,这个安全默认开。
+            let thinking_signature = settings
+                .get("thinking_signature")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            // q_endpoint 与前三个开关同款:危险默认关(缺失→false=现状 runtime.kiro.dev),
+            // 显式 true 才切旧 q.amazonaws.com 端点。
+            let q_endpoint = settings
+                .get("q_endpoint")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            crate::converter::set_experimental_flags(
+                tools_in_prefix,
+                cache_point,
+                agent_continuation,
+                thinking_signature,
+                q_endpoint,
+            );
         }
     }
 
@@ -547,6 +601,41 @@ mod tests {
         assert!(p.validate_account(&account_with(&[])).is_err());
         // 有 refresh_token → 通过
         assert!(p.validate_account(&account_with(&[("refresh_token", "x")])).is_ok());
+        // 有官方 API Key → 通过(无需 refresh_token)
+        assert!(p
+            .validate_account(&account_with(&[("kiro_api_key", "ksk_abc")]))
+            .is_ok());
+        // kiro_api_key 空串不算凭据 → 拒绝
+        assert!(p.validate_account(&account_with(&[("kiro_api_key", "")])).is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_is_noop_for_api_key() {
+        let p = KiroProvider::new(client());
+        // apikey 号 refresh_auth 原样返回,绝不打 OIDC(无网络)。
+        let acc = account_with(&[("kiro_api_key", "ksk_abc"), ("access_token", "ksk_abc")]);
+        let out = p.refresh_auth(&acc).await.expect("apikey refresh 应空操作成功");
+        assert_eq!(out.extra_str("kiro_api_key"), Some("ksk_abc"));
+        assert_eq!(out.extra_str("access_token"), Some("ksk_abc"));
+    }
+
+    #[tokio::test]
+    async fn discover_profile_arn_skipped_for_api_key() {
+        let p = KiroProvider::new(client());
+        let acc = account_with(&[("kiro_api_key", "ksk_abc")]);
+        // 直接 None,不发 ListAvailableProfiles(无网络)。
+        assert_eq!(p.discover_profile_arn(&acc).await.unwrap(), None);
+    }
+
+    #[test]
+    fn api_key_power_account_supports_opus() {
+        let p = KiroProvider::new(client());
+        // 实测 ksk_ 号订阅 KIRO POWER,不含 FREE → 放行 opus。
+        let power = account_with(&[
+            ("kiro_api_key", "ksk_abc"),
+            ("subscription_title", "KIRO POWER"),
+        ]);
+        assert!(p.account_supports_model(&power, "claude-opus-4-8"));
     }
 
     #[tokio::test]

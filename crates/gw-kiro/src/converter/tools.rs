@@ -127,7 +127,11 @@ pub(super) fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, Stri
 }
 
 /// 转换工具定义
-pub(super) fn convert_tools(tools: &Option<Vec<crate::anthropic_types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+pub(super) fn convert_tools(
+    tools: &Option<Vec<crate::anthropic_types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+    tool_repair_fields: &mut HashMap<String, std::collections::HashSet<String>>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -160,9 +164,17 @@ pub(super) fn convert_tools(tools: &Option<Vec<crate::anthropic_types::Tool>>, t
                 None => description,
             };
 
+            let short_name = map_tool_name(&t.name, tool_name_map);
+            // 按 schema 收集 array/object 顶层字段（供收尾解包被双编码的参数）。
+            // 仅非空才入表——纯标量参数工具不入表,零开销。键用发往上游的短名（上游回此名）。
+            let repair = crate::tool_repair::array_object_fields(&t.input_schema);
+            if !repair.is_empty() {
+                tool_repair_fields.insert(short_name.clone(), repair);
+            }
+
             Tool {
                 tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
+                    name: short_name,
                     description,
                     input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
                 },
@@ -190,7 +202,8 @@ mod desc_tests {
     fn empty_description_is_filled() {
         let tools = Some(vec![atool("my_tool", "   ")]);
         let mut map = HashMap::new();
-        let out = convert_tools(&tools, &mut map);
+        let mut repair = HashMap::new();
+        let out = convert_tools(&tools, &mut map, &mut repair);
         assert_eq!(out.len(), 1);
         // 空/空白描述应兜底为 "Client-provided tool '{name}'",避免 Kiro 400。
         assert_eq!(
@@ -203,7 +216,8 @@ mod desc_tests {
     fn nonempty_description_preserved() {
         let tools = Some(vec![atool("t", "real desc")]);
         let mut map = HashMap::new();
-        let out = convert_tools(&tools, &mut map);
+        let mut repair = HashMap::new();
+        let out = convert_tools(&tools, &mut map, &mut repair);
         assert_eq!(out[0].tool_specification.description, "real desc");
     }
 }
