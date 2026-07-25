@@ -236,9 +236,13 @@ impl WorkerState {
         let now = std::time::Instant::now();
         let cached = self.quota_cache.lock().get(account_id).cloned();
         // fresh 看"上次尝试时刻"(成功或失败都算),失败也受 TTL 节流。
-        let fresh = cached
-            .as_ref()
-            .is_some_and(|(_, at)| now.duration_since(*at) < QUOTA_TTL);
+        // 例外:provider 的配额是本地廉价读(quota_is_local,如 dario 从流量捕获的内存快照)
+        // 时**永不视为 fresh** → 每次都后台刷新,使刚捕获的快照下一轮(~一个前端轮询)就上面板,
+        // 不被陈旧 None/旧值挡满一个 TTL(对抗审查 #1)。本地刷新无昂贵上游往返,节流无意义。
+        let fresh = !self.provider.quota_is_local()
+            && cached
+                .as_ref()
+                .is_some_and(|(_, at)| now.duration_since(*at) < QUOTA_TTL);
         if !fresh {
             self.spawn_quota_refresh(account_id.to_string());
         }
@@ -345,6 +349,11 @@ impl WorkerState {
     /// 上游 400「profileArn is required」自然报错(BadRequest,不惩罚账号)。
     /// social/builderid(固定兜底)与已有显式值的账号直接短路返回,无网络调用。
     async fn ensure_profile_arn(&self, account: Arc<Account>) -> Arc<Account> {
+        // API Key 凭据不需要 profileArn(TokenType: API_KEY 让服务端按 key 自身账号解析),
+        // 短路免掉一次 discover 调用。
+        if gw_kiro::machine_id::is_api_key_credential(&account) {
+            return account;
+        }
         if account
             .extra_str("profile_arn")
             .is_some_and(|s| !s.trim().is_empty())
@@ -361,6 +370,7 @@ impl WorkerState {
                 )
                 .await;
                 tracing::info!(account = %account.account_id, "已发现并持久化 profileArn");
+                self.correct_region_from_arn(&account, &arn).await;
                 // 取回带新 profile_arn 的副本供本次请求使用。
                 self.scheduler.account(&account.account_id).unwrap_or(account)
             }
@@ -435,7 +445,94 @@ impl WorkerState {
         let account = self.ensure_credentialed(account).await?;
         // 企业/IdC 号 getUsageLimits 同样要求 profileArn:缺则先发现+持久化。
         let account = self.ensure_profile_arn(account).await;
-        self.provider.account_quota(&account).await
+        match self.provider.account_quota(&account).await {
+            // TokenInvalid(401/403 bearer invalid)兜底一次,治两类常见误判:
+            //  (1) at 已过期——导入号无 expires_at,has_fresh_token 误当新鲜、没预刷;
+            //  (2) profileArn 套错——付费 builderid 号被免费层固定共享 ARN 短路,拿不到自己的 profile。
+            // 故:强制刷新 at + (若仍无自带 profile_arn)强制重发现真实 profileArn 并持久化,
+            // 再重试一次;仍失败才透出(真死号/真被封)。对齐 chat 路径 refresh_after_rejection 精神。
+            // API Key 号排除:ksk_ 无可刷新(force_refresh 空操作)、也不需要 profileArn,
+            // 兜底刷新+重试同 key 纯属放大配额轮询流量,直接透出错误(审查 r2 Skeptic#1)。
+            Err(e)
+                if matches!(e.kind, UpstreamErrorKind::TokenInvalid)
+                    && !gw_kiro::machine_id::is_api_key_credential(&account) =>
+            {
+                let account = self.force_refresh(account).await?;
+                // 付费号 profileArn 套错自愈:强制发现真实 ARN 并持久化(免费号/已有值不动)。
+                // 与 chat 路径 403 兜底共用 discover_paid_profile_arn,逻辑单一来源不分叉。
+                let account = self
+                    .discover_paid_profile_arn(&account, "profileArn(配额 403 兜底强制发现)")
+                    .await
+                    .unwrap_or(account);
+                self.provider.account_quota(&account).await
+            }
+            other => other,
+        }
+    }
+
+    /// 付费号 profileArn 套错**自愈**:强制发现真实 profileArn 并持久化,返回更新后账号。
+    ///
+    /// 仅当 [`needs_profile_discovery`] 成立(账号无自带 profile_arn 且订阅为付费非 FREE)
+    /// 才发现——免费号维持免费层固定共享 ARN,绝不被后台/chat 的例行 403 带进 force_discover
+    /// 污染其真实 chat(resolve_profile_arn 被 chat 复用)。返回:
+    /// - `Some(账号)`:发现到真实 arn 且已持久化(调用方改用它重试);
+    /// - `None`:非付费 / 已有 arn / 发现失败(调用方维持原账号)。
+    ///
+    /// 配额路径(`try_fetch_quota`)与 chat 路径 403 兜底共用本方法,避免逻辑分叉。
+    async fn discover_paid_profile_arn(
+        self: &Arc<Self>,
+        account: &Arc<Account>,
+        trigger: &str,
+    ) -> Option<Arc<Account>> {
+        if !needs_profile_discovery(account) {
+            return None;
+        }
+        match self.provider.force_discover_profile_arn(account).await {
+            Ok(Some(arn)) => {
+                self.persist_extra_field(
+                    &account.account_id,
+                    "profile_arn",
+                    serde_json::Value::String(arn.clone()),
+                    trigger,
+                )
+                .await;
+                self.correct_region_from_arn(account, &arn).await;
+                Some(
+                    self.scheduler
+                        .account(&account.account_id)
+                        .unwrap_or_else(|| account.clone()),
+                )
+            }
+            // 免费号发现不到(空/错)/ 发现调用失败 → None,维持固定兜底靠刷新后的新 at 过。
+            _ => None,
+        }
+    }
+
+    /// profileArn 一旦被**真正发现**(运行时首次拿到,导入时该号没带),就反过来修正
+    /// `region`/`api_region`——号商导出常不带 profileArn、顶层 region 靠猜(常错),
+    /// 真实服务区只有靠 ARN 才知道。与导入时 [`gw_kiro::import::region_from_profile_arn`]
+    /// 同一份真理来源,不重复实现;`ensure_profile_arn`/`discover_paid_profile_arn` 首次
+    /// 发现 ARN 后都调用本方法,自愈不需要人工 PATCH。不改 `auth_region`(独立来源)。
+    async fn correct_region_from_arn(&self, account: &Account, arn: &str) {
+        let Some(region) = region_correction_from_arn(arn, account.extra_str("region")) else {
+            return;
+        };
+        tracing::info!(account = %account.account_id, region,
+            "profileArn 揭示服务区不符,自动修正 region/api_region");
+        self.persist_extra_field(
+            &account.account_id,
+            "region",
+            serde_json::Value::String(region.into()),
+            "region(profileArn 揭示服务区)",
+        )
+        .await;
+        self.persist_extra_field(
+            &account.account_id,
+            "api_region",
+            serde_json::Value::String(region.into()),
+            "api_region(profileArn 揭示服务区)",
+        )
+        .await;
     }
 
     /// 从 DB 重读组内账号集并同步进 scheduler —— 30s 周期循环与 `/sync` 立即同步
@@ -479,9 +576,41 @@ fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
             "remaining": q.remaining,
             "percent_used": q.percent_used,
             "label": q.currency,
+            // 多窗口利用率(dario 的 5h/7d);Kiro 为空数组,前端据此分流显示。
+            "windows": q.windows.iter().map(|w| serde_json::json!({
+                "label": w.label,
+                "percent_used": w.percent_used,
+                "reset_at": w.reset_at,
+            })).collect::<Vec<_>>(),
         }),
         None => serde_json::Value::Null,
     }
+}
+
+/// 是否需要为该账号强制发现真实 profileArn:无自带 profile_arn(空/缺)**且**订阅为付费
+/// (subscription_title 存在且不含 FREE)。付费 builderid 号有自己的 profile,被免费层固定
+/// 共享 ARN 短路后 getUsageLimits/chat 都 403;免费号(或订阅档未回填)一律不发现,维持
+/// 共享 ARN,绝不误污染健康免费号。付费闸门 = 免费/付费结构同构下唯一安全的区分维度。
+fn needs_profile_discovery(account: &Account) -> bool {
+    account
+        .extra_str("profile_arn")
+        .map_or(true, |s| s.trim().is_empty())
+        && account
+            .extra_str("subscription_title")
+            .is_some_and(|t| !t.to_uppercase().contains("FREE"))
+}
+
+/// 若新发现的 profileArn 揭示了与当前配置**不同**的已知服务区,返回该区域(供调用方
+/// 据此修正 region + api_region)。ARN 区域段不在 [`gw_kiro::import::region_from_profile_arn`]
+/// 认可的已知服务区清单内,或与当前一致 → `None`(不改动)。纯函数,不发网络请求。
+///
+/// 大小写不敏感比较:`current_region` 是 DB 里的原始字符串,admin `PATCH /accounts/{id}`
+/// 的 `extra` 整块替换不做区域大小写归一,可能存进混合大小写值(如 "US-EAST-1")。若直接
+/// `!=` 会把等价值误判成"不同"、触发多余的重写(无害但吵)——按 discovered 的归一口径比较。
+fn region_correction_from_arn(arn: &str, current_region: Option<&str>) -> Option<&'static str> {
+    let discovered = gw_kiro::import::region_from_profile_arn(arn)?;
+    let already_matches = current_region.is_some_and(|r| r.eq_ignore_ascii_case(discovered));
+    (!already_matches).then_some(discovered)
 }
 
 /// 账号是否持有未过期(且非临近过期)的 access_token。
@@ -490,6 +619,10 @@ fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
 /// 沿用旧行为;真过期会被上游 403 触发 force_refresh 兜底)。有 expires_at → 距现在
 /// < 60s 视为临近过期需提前刷新(对齐 kiro.rs cred_expiring_soon)。
 fn has_fresh_token(account: &Account) -> bool {
+    // API Key 凭据:ksk_ 长期有效、无刷新概念 → 永远"新鲜",绝不触发 refresh_auth。
+    if gw_kiro::machine_id::is_api_key_credential(account) {
+        return true;
+    }
     let Some(tok) = account.extra_str("access_token") else {
         return false;
     };
@@ -615,7 +748,7 @@ pub async fn run(
     tracing::debug!(providers = ?registry.families(), "已注册 provider");
     // 先按本 worker 的固定出口构造 egress client,注入 provider——
     // 保证该 provider 所有上游请求走同一出口 IP(防关联封号)。
-    let client = egress::build_client(&wcfg.egress)?;
+    let client = egress::build_client(&wcfg.egress, system.upstream_timeout_secs)?;
     let egress_desc = egress::describe(&wcfg.egress);
     // DB 设置 overlay:叠在 system.yaml 基线上得"有效配置"(热调首启即生效)。
     // default_proxy 单独取出注入 provider(出口选择,不属运行开关)。
@@ -652,8 +785,63 @@ pub async fn run(
         if let Some(dp) = &initial_default_proxy {
             map.insert("default_proxy".into(), serde_json::json!(dp));
         }
+        if let Ok(dario) = serde_json::to_value(&effective_system.dario) {
+            map.insert("dario".into(), dario);
+        }
     }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
+
+    // 启动即把"有效设置"热应用一次:实验开关等进程级全局仅由 env 初始化,DB overlay 原本要等
+    // 30s 轮询(首跳被跳过)才生效。期间若 DB 已设 `thinking_signature=false`,这段窗口里 Kiro
+    // 仍会发 Kiro 合成签名 → 重演跨通道 THINKING_SIGNATURE_INVALID(对抗审查 #1)。这里用与轮询
+    // 同一 `from_effective` 口径先应用一次,关掉窗口。对 kiro 是幂等(cache/image/proxy 已经 from_config
+    // 设过),对 dario 是 no-op(未覆盖 apply_hot_settings)。
+    {
+        let full = gw_core::config::SystemSettings::from_effective(
+            &effective_system,
+            initial_default_proxy.clone(),
+        );
+        if let Ok(sv) = serde_json::to_value(&full) {
+            provider.apply_hot_settings(&sv);
+        }
+    }
+
+    // Fix6: For dario workers, filter out accounts that fail validate_account
+    // (missing access_token + refresh_token) before they enter the scheduler.
+    // Scope this to "claude-dario" only — kiro's validate_account requires
+    // refresh_token + machine_id, and there may be edge-case kiro accounts
+    // on-line that intentionally omit machine_id (e.g. legacy rows that rely
+    // on runtime defaults).  Restricting to dario eliminates any kiro regression
+    // risk while still catching dario accounts imported without credentials.
+    let accounts = if provider_family == "claude-dario" {
+        let total = accounts.len();
+        let valid: Vec<Arc<Account>> = accounts
+            .into_iter()
+            .filter(|a| match provider.validate_account(a.as_ref()) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        account = %a.account_id,
+                        reason = %e,
+                        "dario 账号校验失败,跳过不进调度池"
+                    );
+                    false
+                }
+            })
+            .collect();
+        let skipped = total - valid.len();
+        if skipped > 0 {
+            tracing::info!(
+                total,
+                valid = valid.len(),
+                skipped,
+                "dario 账号校验:部分账号缺凭据被跳过"
+            );
+        }
+        valid
+    } else {
+        accounts
+    };
 
     let usage_sink: Option<Arc<dyn UsageSink>> =
         store.clone().map(|s| s as Arc<dyn UsageSink>);
@@ -668,6 +856,12 @@ pub async fn run(
         usage_sink = usage_sink.is_some(),
         "worker 就绪"
     );
+    if provider_family == "claude-dario" {
+        tracing::warn!(
+            worker_egress = %egress_desc,
+            "dario 组:本 worker 的 egress 必须与所连 dario sidecar 的出口为同一 IP,且等于该账号登录授权的来源 IP(二者均 direct 或同一代理皆可;不一致=刷新 IP≠发包 IP,关联封号风险)"
+        );
+    }
 
     let state = Arc::new(WorkerState {
         instance,
@@ -781,6 +975,7 @@ pub async fn run(
             .route("/accounts/{id}/reset", post(reset_account))
             .route("/accounts/{id}/refresh", post(refresh_account))
             .route("/accounts/{id}/quota", post(quota_account))
+            .route("/oauth/exchange", post(oauth_exchange))
             .route("/sync", post(sync_now));
     } else {
         tracing::warn!(
@@ -789,7 +984,19 @@ pub async fn run(
              reset 管理端点已禁用。请改绑 127.0.0.1,或为 router→worker 内网跳加共享密钥。"
         );
     }
-    let app = app.with_state(state.clone());
+    // 入站体积上限:messages 用 Json<Value> 全量缓冲,axum 默认 2MB 会在 handler 前 413。
+    // 提到 effective_system.max_request_body_bytes(默认 16MB)。这是第二道入站咽喉——
+    // router 放开后此处不放开仍会再 413(两处缺一不可)。管理端点无 body,层对其无害。
+    // 启动日志打印有效值:与 router 日志对照即可发现两进程配置漂移(只重启一侧时原 bug
+    // 会在 worker 侧复现——Architect 审查)。
+    let max_body = effective_system.effective_max_request_body_bytes();
+    tracing::info!(
+        max_request_body_bytes = max_body,
+        "worker 入站体积上限(应与 router 一致;不一致=配置漂移,大请求仍会在此 413)"
+    );
+    let app = app
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&wcfg.listen).await?;
     axum::serve(listener, app)
@@ -998,6 +1205,35 @@ async fn reset_account(
     }
 }
 
+/// router→worker 换码请求体。`proxy`=该号 extra.proxy(None=组默认出口),`code`/`verifier`=PKCE。
+#[derive(serde::Deserialize)]
+struct OAuthExchangeBody {
+    #[serde(default)]
+    proxy: Option<String>,
+    code: String,
+    verifier: String,
+}
+
+/// `POST /oauth/exchange` —— **无状态**铸 token:`authorization_code` → token set。
+///
+/// 走**本 worker 的 egress**(由 `provider.oauth_exchange` 经 `egress_client_for` 选)=该号
+/// 将来 refresh/chat 同一出口 IP(铸≠发=关联封号)。router 只把请求扇给目标组(account_group
+/// 匹配)的 worker,故出口正确;非 dario provider 默认实现回 BadRequest(400)。
+/// 账号此刻尚未入库——纯换码,不碰 scheduler。token 明文只回给同机 router 落库,不进日志。
+async fn oauth_exchange(
+    State(st): State<Arc<WorkerState>>,
+    Json(body): Json<OAuthExchangeBody>,
+) -> axum::response::Response {
+    match st
+        .provider
+        .oauth_exchange(body.proxy.as_deref(), &body.code, &body.verifier)
+        .await
+    {
+        Ok(tokens) => Json(tokens).into_response(),
+        Err(e) => upstream_error_response(&e),
+    }
+}
+
 /// `POST /accounts/{id}/refresh` —— 人工**强制刷新该账号 token**(rt→at 换一次)。
 ///
 /// 安全性:这就是后台配额轮询 / 按需刷新本来就在做的 OIDC token 交换,**不是** chat,
@@ -1164,6 +1400,32 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
     }
 }
 
+/// 换号重试上限:按错误类别分档。
+///
+/// 良性冷却类错误(RateLimited/QuotaExhausted)自限流(命中即进冷却 → 后续请求的
+/// `eligible_ids` 直接跳过该号、不再重复打上游)且不传播毒性,故解绑紧上限、允许沿
+/// **优先级阶梯**下探到组内所有号(cap=total):高优先级层全限流/额度耗尽时,请求自动
+/// 落到低优先级兜底池,而不是把限流错误抛回客户端。
+///
+/// 其余可换号错误(TokenInvalid/ServerError/Network/Other)仍守 `general_cap`(默认
+/// max_switch_attempts=2)—— 2026-06 大面积封号雪崩正是这类「毒请求/高频重试」逐个打爆
+/// 全池,绝不放开。(EmptyResponse/TemporarilyBlocked/BadRequest 更早被
+/// `worth_switching_account()=false` 命中首个号即止,根本进不来这里。)
+fn switch_cap(kind: UpstreamErrorKind, total: usize, general_cap: usize) -> usize {
+    if matches!(
+        kind,
+        UpstreamErrorKind::RateLimited
+            | UpstreamErrorKind::QuotaExhausted
+            // ModelNotAvailable 同属良性(不禁号/不传播毒性):需沿组内遍历到有该模型的号,
+            // 且每失败一次即把该 (号,模型) 标记不可用、下一跳自动跳过,不会重复打同一个号。
+            | UpstreamErrorKind::ModelNotAvailable
+    ) {
+        total.max(1)
+    } else {
+        general_cap
+    }
+}
+
 async fn messages(
     State(st): State<Arc<WorkerState>>,
     headers: HeaderMap,
@@ -1185,16 +1447,24 @@ async fn messages(
     // 选号 + 发起 chat 的重试循环:token 失效(403/401)时刷新该号并对账号生命周期上报,
     // 换号重试;首包前的可重试错误最多走 total 个账号。committed(首包已出)后不重试。
     let total = st.scheduler.total().max(1);
+    // 换号重试上限按错误类别分档(见 `switch_cap`):
+    // - 良性冷却类(限速/额度耗尽):沿优先级阶梯下探到组内所有号(cap=total),落低优先级兜底池;
+    // - 其余可换号错误:守 general_cap(默认 max_switch_attempts=2),防换号雪崩封号
+    //   (2026-06 大面积封号根因正是让一个毒请求逐个打爆全池)。
+    let general_cap = st.scheduler.max_switch_attempts().min(total).max(1);
     let mut attempts = 0;
 
     loop {
         attempts += 1;
         // 1. 按会话亲和取并发租约(持有到流结束)。合格账号须支持本次模型
-        //    (FREE 订阅不支持 opus,过滤掉避免 403 误杀,对齐 kiro.rs supports_opus)。
+        //    (FREE 订阅不支持 opus,过滤掉避免 403 误杀,对齐 kiro.rs supports_opus);
+        //    并剔除已知对本模型返 INVALID_MODEL_ID 的号(区域/档位未上线),路由到有该
+        //    模型的号——否则亲和会反复选中同一不支持的号(ModelNotAvailable 不禁号)死循环。
         let lease = match st
             .scheduler
             .acquire_where(affinity_key.as_deref(), |a| {
                 st.provider.account_supports_model(a, &req.model)
+                    && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
             })
             .await
         {
@@ -1224,7 +1494,9 @@ async fn messages(
                 tracing::warn!(account = %account_id, kind = ?e.kind, "凭证刷新失败: {e}");
                 st.scheduler.report_failure(&account_id, e.kind);
                 drop(lease);
-                if attempts >= total {
+                if !e.kind.worth_switching_account()
+                    || attempts >= switch_cap(e.kind, total, general_cap)
+                {
                     return upstream_error_response(&e);
                 }
                 continue;
@@ -1248,6 +1520,21 @@ async fn messages(
         //    - 其他可重试错误:上报失败、换号重试。
         match st.provider.chat(req.clone(), &ctx).await {
             Ok(stream) => {
+                // 服务端 web search:客户端声明了 `web_search_20250305` → 进执行回环
+                // (反代自搜 + 注回),把首轮流当 round 1 续跑。其余流量字节一致走原路径。
+                if let Some(spec) = crate::websearch::detect_web_search(&req.body) {
+                    return finish_web_search_response(
+                        st.clone(),
+                        lease,
+                        stream,
+                        &req,
+                        &client_key,
+                        ctx,
+                        spec,
+                        started_at,
+                    )
+                    .await;
+                }
                 return finish_response(
                     st.clone(),
                     lease,
@@ -1257,9 +1544,15 @@ async fn messages(
                     ctx.account.clone(),
                     started_at,
                 )
-                .await
+                .await;
             }
-            Err(e) if e.kind == UpstreamErrorKind::TokenInvalid => {
+            // API Key 403:ksk_ 无可刷新,同号刷新是空操作、retry 同 key 必再 403 且放大上游
+            // (审查 Skeptic#3/Architect#2)。故 apikey 的 403 **不走**同号刷新重试,直接落到下方
+            // 通用失败分支:report_failure(TokenInvalid) 禁用该号 + 换号(误伤可 admin reset 复活)。
+            Err(e)
+                if e.kind == UpstreamErrorKind::TokenInvalid
+                    && !gw_kiro::machine_id::is_api_key_credential(&ctx.account) =>
+            {
                 tracing::info!(account = %account_id, "chat 403 token 失效,尝试同号刷新后重试");
                 // 传入这枚被拒的 access_token:并发 403 时,只有第一个进锁者真刷,
                 // 其余发现 token 已被换掉即复用,避免 N 次重复上游刷新(审查 Skeptic#2)。
@@ -1276,6 +1569,21 @@ async fn messages(
                         };
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
+                                if let Some(spec) =
+                                    crate::websearch::detect_web_search(&req.body)
+                                {
+                                    return finish_web_search_response(
+                                        st.clone(),
+                                        lease,
+                                        stream,
+                                        &req,
+                                        &client_key,
+                                        retry_ctx,
+                                        spec,
+                                        started_at,
+                                    )
+                                    .await;
+                                }
                                 return finish_response(
                                     st.clone(),
                                     lease,
@@ -1285,14 +1593,83 @@ async fn messages(
                                     retry_ctx.account.clone(),
                                     started_at,
                                 )
-                                .await
+                                .await;
                             }
                             Err(e2) => {
-                                // 刷新后仍失败:这次才上报失败 + 换号。
+                                // 刷新已成功(rt 证明有效)。若重试仍是 403 TokenInvalid,极可能
+                                // profileArn 套错——付费 builderid 号被免费层固定共享 ARN 短路、
+                                // 拿不到自己的 profile。镜像配额路径:强制发现真实 ARN 持久化后用真
+                                // ARN 再重试一次,成功即救回(治「导入即入活跃池、客户 chat 抢在验活
+                                // force_discover 前命中、用错 ARN 403」的竞态)。
+                                let e2 = if e2.kind == UpstreamErrorKind::TokenInvalid {
+                                    match st
+                                        .discover_paid_profile_arn(
+                                            &retry_ctx.account,
+                                            "profileArn(chat 403 兜底强制发现)",
+                                        )
+                                        .await
+                                    {
+                                        Some(healed) => {
+                                            let heal_ctx = CallCtx {
+                                                account: healed,
+                                                session_id: affinity_key
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                cache_key: affinity_key
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                            };
+                                            match st.provider.chat(req.clone(), &heal_ctx).await {
+                                                Ok(stream) => {
+                                                    if let Some(spec) =
+                                                        crate::websearch::detect_web_search(
+                                                            &req.body,
+                                                        )
+                                                    {
+                                                        return finish_web_search_response(
+                                                            st.clone(),
+                                                            lease,
+                                                            stream,
+                                                            &req,
+                                                            &client_key,
+                                                            heal_ctx,
+                                                            spec,
+                                                            started_at,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    return finish_response(
+                                                        st.clone(),
+                                                        lease,
+                                                        stream,
+                                                        &req,
+                                                        &client_key,
+                                                        heal_ctx.account.clone(),
+                                                        started_at,
+                                                    )
+                                                    .await;
+                                                }
+                                                // 带真 ARN 仍失败 → 真死号/真封禁,携 e3 继续统一失败处理。
+                                                Err(e3) => e3,
+                                            }
+                                        }
+                                        None => e2,
+                                    }
+                                } else {
+                                    e2
+                                };
+                                // 刷新成功后仍失败:上报**真实** e2.kind + 换号。heal 已把可救的
+                                // profileArn 套错救回(救回则上面直接 return);走到这里=该号确实当前
+                                // 不能服务——e3(带真 ARN 仍 403)是最强死号信号、或非付费/发现失败,
+                                // 一律保留原分类语义(TokenInvalid→invalid_refresh_token 永久禁用),
+                                // 不弱化死号识别。注:「刷新成功⇒rt 有效」只证认证有效,不代表 entitlement
+                                // 未被服务端撤销,故不能据此把 TokenInvalid 一律降级(对抗审查 HIGH)。
                                 tracing::warn!(account = %account_id, kind = ?e2.kind, "刷新后重试仍失败: {e2}");
                                 st.scheduler.report_failure(&account_id, e2.kind);
                                 drop(lease);
-                                if e2.kind == UpstreamErrorKind::BadRequest || attempts >= total {
+                                if !e2.kind.worth_switching_account()
+                                    || attempts >= switch_cap(e2.kind, total, general_cap)
+                                {
                                     return upstream_error_response(&e2);
                                 }
                                 continue;
@@ -1304,7 +1681,9 @@ async fn messages(
                         tracing::warn!(account = %account_id, kind = ?re.kind, "同号刷新失败: {re}");
                         st.scheduler.report_failure(&account_id, re.kind);
                         drop(lease);
-                        if attempts >= total {
+                        if !re.kind.worth_switching_account()
+                            || attempts >= switch_cap(re.kind, total, general_cap)
+                        {
                             return upstream_error_response(&re);
                         }
                         continue;
@@ -1315,11 +1694,20 @@ async fn messages(
                 let kind = e.kind;
                 tracing::warn!(account = %account_id, kind = ?kind, "chat 失败: {e}");
                 st.scheduler.report_failure(&account_id, kind);
+                // 该号对本模型不可用(INVALID_MODEL_ID):记 (号,模型) 不可用,后续选号跳过它、
+                // 路由到有该模型的号(该号**不禁用**,仍服务其它模型)。
+                if kind == UpstreamErrorKind::ModelNotAvailable {
+                    st.scheduler.mark_model_unavailable(&account_id, &req.model);
+                }
                 drop(lease);
-                if kind == UpstreamErrorKind::BadRequest || attempts >= total {
+                if !kind.worth_switching_account() || attempts >= switch_cap(kind, total, general_cap) {
                     // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
                     // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
-                    let status = if kind == UpstreamErrorKind::BadRequest {
+                    // ModelNotAvailable 与 BadRequest 同归 400(客户端应换模型/升级),其余 502。
+                    let status = if matches!(
+                        kind,
+                        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
+                    ) {
                         Some(400)
                     } else {
                         Some(502)
@@ -1337,6 +1725,7 @@ async fn messages(
                         None,
                         None,
                         ResponseLog::None, // 首包前失败:无模型回复。
+                        st.provider.family(),
                     );
                     return upstream_error_response(&e);
                 }
@@ -1346,9 +1735,12 @@ async fn messages(
     }
 }
 
-/// 把 [`UpstreamError`] 映射为对外 HTTP 响应(BadRequest→400,其余→502)。
+/// 把 [`UpstreamError`] 映射为对外 HTTP 响应(BadRequest/ModelNotAvailable→400,其余→502)。
 fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
-    let code = if e.kind == UpstreamErrorKind::BadRequest {
+    let code = if matches!(
+        e.kind,
+        UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
+    ) {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::BAD_GATEWAY
@@ -1485,6 +1877,7 @@ fn write_request_log(
     ttfb_ms: Option<i64>,
     usage: Option<ChatUsage>,
     response: ResponseLog,
+    family: &str,
 ) {
     let (input, output, cache_read, cache_creation, real_cache_read, metering_credit) = usage
         .as_ref()
@@ -1502,12 +1895,16 @@ fn write_request_log(
     // 抽出两份报文里的媒体 blob(图片/文档);合并后入库按 hash 去重(同图复用一行)。
     let (client_payload, mut blobs) =
         prepare_log_payload(serde_json::to_string(&req.body).unwrap_or_default());
+    // 守卫依据 **worker family**,而非 account.provider 字段——
+    // filter_by_provider 放行 provider 字段为空的账号进 kiro worker,
+    // 若按 account.provider 判断会丢掉空-provider kiro 号的报文渲染。
     let (account_id, kiro_payload) = match &account {
-        Some(a) => {
+        Some(a) if family == "kiro" => {
             let (kp, kb) = prepare_log_payload(gw_kiro::chat::render_kiro_payload(&req, a));
             blobs.extend(kb);
             (a.account_id.clone(), kp)
         }
+        Some(a) => (a.account_id.clone(), String::new()),
         None => (String::new(), String::new()),
     };
     // 模型回复:折叠/序列化都在此 blocking 任务内做,不占热路径。失败请求/无回复 → 空串(详情页不展示)。
@@ -1555,6 +1952,11 @@ fn write_request_log(
     if let Err(e) = store.insert_request_log(&log, REQUEST_LOG_CAP) {
         tracing::warn!(error = %e, account = %log.account_id, "请求日志落库失败");
     }
+    // 账号累计成功/失败计数(监控用,非计费)。与请求日志同处 blocking 任务,不占热路径;
+    // 每次上游调用终态收尾恰好一次(成功/终态失败),account_id 空则内部跳过。
+    if let Err(e) = store.bump_account_counters(&log.account_id, success) {
+        tracing::warn!(error = %e, account = %log.account_id, "账号计数更新失败");
+    }
 }
 
 /// 把请求日志落库 detach 到 **blocking 线程池**(两份报文序列化 + 同步 SQLite 写均为阻塞工作),
@@ -1574,6 +1976,7 @@ fn spawn_request_log_blocking(
     ttfb_ms: Option<i64>,
     usage: Option<ChatUsage>,
     response: ResponseLog,
+    family: &'static str,
 ) {
     let Some(store) = st.store.clone() else {
         return;
@@ -1586,9 +1989,40 @@ fn spawn_request_log_blocking(
         let _guard = guard;
         write_request_log(
             store, req, account, client_key, is_stream, success, status_code, error_kind,
-            duration_ms, ttfb_ms, usage, response,
+            duration_ms, ttfb_ms, usage, response, family,
         );
     });
+}
+
+/// 服务端 web search 收尾:跑执行回环(反代自搜 DDG + 注回续跑),把组装好的标准
+/// `server_tool_use`+`web_search_tool_result`+text 响应合成为流,再交给 [`finish_response`]
+/// 复用全部流式/非流式分发、日志、usage 上报机器。回环失败按上游错误回显(不重试:已开始
+/// 消费首轮流,符合 v60 不放大错误契约)。
+#[allow(clippy::too_many_arguments)]
+async fn finish_web_search_response(
+    st: Arc<WorkerState>,
+    lease: scheduler::AccountLease,
+    first_stream: gw_core::provider::ChatStream,
+    req: &ChatRequest,
+    client_key: &str,
+    ctx: CallCtx,
+    spec: crate::websearch::WebSearchSpec,
+    started_at: std::time::Instant,
+) -> axum::response::Response {
+    let account = ctx.account.clone();
+    let account_id = account.account_id.clone();
+    match crate::websearch::run_loop(st.provider.clone(), &ctx, req, spec, first_stream).await {
+        Ok((events, usage)) => {
+            let synth = crate::websearch::synth_stream(events, usage);
+            finish_response(st, lease, synth, req, client_key, account, started_at).await
+        }
+        Err(e) => {
+            tracing::warn!(account = %account_id, kind = ?e.kind, "web search 回环失败: {e}");
+            st.scheduler.report_failure(&account_id, e.kind);
+            drop(lease);
+            upstream_error_response(&e)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1625,6 +2059,7 @@ async fn finish_response(
             client_key.to_string(),
             account,
             started_at,
+            st.provider.family(),
         )
         .await
     }
@@ -1649,6 +2084,7 @@ async fn collect_response(
     client_key: String,
     account: Arc<Account>,
     started_at: std::time::Instant,
+    family: &'static str,
 ) -> axum::response::Response {
     /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
     /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
@@ -1702,7 +2138,10 @@ async fn collect_response(
     let (status_code, error_kind): (Option<i64>, Option<String>) = match &outcome {
         Outcome::Ok(_) => (Some(200), None),
         Outcome::Upstream(e) => (
-            Some(if e.kind == UpstreamErrorKind::BadRequest {
+            Some(if matches!(
+                e.kind,
+                UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable
+            ) {
                 400
             } else {
                 502
@@ -1719,6 +2158,11 @@ async fn collect_response(
             _ => UpstreamErrorKind::ServerError,
         };
         scheduler.report_failure(&account_id, kind);
+        // 防御:理论上 INVALID_MODEL_ID 是首包前 400 走主循环,但若上游 mid-stream 冒出
+        // 也在此记 (号,模型) 不可用,与主循环口径一致(不禁号 + 后续选号跳过该号)。
+        if kind == UpstreamErrorKind::ModelNotAvailable {
+            scheduler.mark_model_unavailable(&account_id, &req.model);
+        }
     }
     finalize_usage(
         usage_sink,
@@ -1760,6 +2204,7 @@ async fn collect_response(
                 None,
                 last_usage,
                 response,
+                family,
             );
         });
     }
@@ -1879,6 +2324,7 @@ fn stream_response(
                 ttfb_ms,
                 usage,
                 ResponseLog::Events(std::mem::take(&mut self.resp_events)),
+                self.st.provider.family(),
             );
         }
     }
@@ -1993,6 +2439,67 @@ mod tests {
     use gw_core::provider::ChatUsage;
     use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn switch_cap_benign_descends_full_ladder_risky_capped() {
+        // 良性冷却类(限速/额度耗尽):解绑紧上限,沿优先级阶梯下探到组内所有号(cap=total),
+        // 使高优先级层全限流时落到低优先级兜底池,而非把限流错误抛回客户端。
+        assert_eq!(switch_cap(UpstreamErrorKind::RateLimited, 12, 2), 12);
+        assert_eq!(switch_cap(UpstreamErrorKind::QuotaExhausted, 12, 2), 12);
+        // ModelNotAvailable 亦良性:遍历组内找到有该模型的号(cap=total)。
+        assert_eq!(switch_cap(UpstreamErrorKind::ModelNotAvailable, 12, 2), 12);
+        // 风险类换号错误:仍守 general_cap(默认 2),防换号雪崩封号。
+        assert_eq!(switch_cap(UpstreamErrorKind::ServerError, 12, 2), 2);
+        assert_eq!(switch_cap(UpstreamErrorKind::TokenInvalid, 12, 2), 2);
+        assert_eq!(switch_cap(UpstreamErrorKind::Network, 12, 2), 2);
+        assert_eq!(switch_cap(UpstreamErrorKind::Other, 12, 2), 2);
+        // total=0 兜底 max(1),不产生"0 上限=一次都不换"的退化。
+        assert_eq!(switch_cap(UpstreamErrorKind::RateLimited, 0, 2), 1);
+    }
+
+    #[test]
+    fn region_correction_from_arn_returns_new_region_on_mismatch() {
+        let arn = "arn:aws:codewhisperer:eu-central-1:663804501012:profile/YNQNP9NWWVCQ";
+        assert_eq!(
+            region_correction_from_arn(arn, Some("us-east-1")),
+            Some("eu-central-1"),
+            "号商导出写死 us-east-1,但 profileArn 揭示真实服务区是 eu-central-1 → 应予修正"
+        );
+    }
+
+    #[test]
+    fn region_correction_from_arn_returns_none_when_matching() {
+        let arn = "arn:aws:codewhisperer:us-east-1:881967719131:profile/Q4C9VNXVKREP";
+        assert_eq!(
+            region_correction_from_arn(arn, Some("us-east-1")),
+            None,
+            "已一致 → 不该产生多余的修正/持久化"
+        );
+    }
+
+    #[test]
+    fn region_correction_from_arn_ignores_case_of_stored_region() {
+        // admin PATCH extra 整块替换不做区域大小写归一,DB 里可能存进混合大小写值;
+        // 与已归一的 discovered 值等价时不该误判"不同"触发多余重写(对抗审查 Medium)。
+        let arn = "arn:aws:codewhisperer:us-east-1:881967719131:profile/Q4C9VNXVKREP";
+        assert_eq!(region_correction_from_arn(arn, Some("US-EAST-1")), None);
+        assert_eq!(region_correction_from_arn(arn, Some("Us-East-1")), None);
+    }
+
+    #[test]
+    fn region_correction_from_arn_returns_none_for_unknown_arn_region() {
+        // ap-southeast-1 不在 STANDARD_PROFILE_REGIONS(us-east-1/eu-central-1)清单内,
+        // 未知区不该污染已配置的已知区。
+        let arn = "arn:aws:codewhisperer:ap-southeast-1:123456789012:profile/UNKNOWNXX";
+        assert_eq!(region_correction_from_arn(arn, Some("us-east-1")), None);
+    }
+
+    #[test]
+    fn region_correction_from_arn_corrects_when_region_missing() {
+        // 账号从未设过 region(极简号商导出场景)→ 只要 ARN 区域已知,也该补上。
+        let arn = "arn:aws:codewhisperer:eu-central-1:663804501012:profile/YNQNP9NWWVCQ";
+        assert_eq!(region_correction_from_arn(arn, None), Some("eu-central-1"));
+    }
 
     #[test]
     fn serialize_response_small_is_passthrough_json() {
@@ -2238,7 +2745,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
@@ -2264,7 +2771,7 @@ mod tests {
                 serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
             ))),
         ];
-        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
+        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "overloaded_error");
@@ -2289,7 +2796,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now()).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -2346,6 +2853,40 @@ mod tests {
     }
 
     #[test]
+    fn needs_profile_discovery_paid_missing_arn() {
+        // 付费(非 FREE)+ 无 profile_arn → 需要强制发现真实 ARN。
+        assert!(needs_profile_discovery(&acct(&[(
+            "subscription_title",
+            "KIRO POWER"
+        )])));
+        // 空白 profile_arn 视同缺失。
+        assert!(needs_profile_discovery(&acct(&[
+            ("subscription_title", "KIRO PRO"),
+            ("profile_arn", "   "),
+        ])));
+    }
+
+    #[test]
+    fn needs_profile_discovery_free_or_present_arn_skips() {
+        // 免费号:即便结构同构(带 client_secret、无 arn)也不发现,维持共享 ARN。
+        assert!(!needs_profile_discovery(&acct(&[
+            ("subscription_title", "KIRO FREE"),
+            ("client_secret", "cs"),
+        ])));
+        // 订阅档未回填(缺 subscription_title)→ 保守跳过,绝不误污染健康免费号。
+        assert!(!needs_profile_discovery(&acct(&[("client_secret", "cs")])));
+        // 已有真实 profile_arn → 绝不覆盖。
+        assert!(!needs_profile_discovery(&acct(&[
+            ("subscription_title", "KIRO POWER"),
+            (
+                "profile_arn",
+                "arn:aws:codewhisperer:us-east-1:1:profile/X"
+            ),
+        ])));
+    }
+
+
+    #[test]
     fn expired_token_is_not_fresh() {
         // 过去时刻 → 需刷新。
         assert!(!has_fresh_token(&acct(&[
@@ -2359,6 +2900,16 @@ mod tests {
         assert!(has_fresh_token(&acct(&[
             ("access_token", "t"),
             ("expires_at", "2099-01-01T00:00:00Z"),
+        ])));
+    }
+
+    #[test]
+    fn api_key_account_is_always_fresh() {
+        // apikey 长期有效:即便标了过去的 expires_at,也不触发刷新。
+        assert!(has_fresh_token(&acct(&[
+            ("kiro_api_key", "ksk_abc"),
+            ("access_token", "ksk_abc"),
+            ("expires_at", "2000-01-01T00:00:00Z"),
         ])));
     }
 
@@ -2391,5 +2942,74 @@ mod tests {
         let (out, blobs) = prepare_log_payload(raw.clone());
         assert_eq!(out, raw);
         assert!(blobs.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Phase 6 regression: write_request_log 守卫按 worker family 而非 account.provider
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// 辅助:用内存 SQLite 调 write_request_log,返回落库的 kiro_payload。
+    fn log_kiro_payload_with_family(family: &str) -> String {
+        use gw_core::store::RequestLogFilter;
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        // 空 provider 字段:模拟 filter_by_provider 放行的 kiro 账号(或 dario 账号),
+        // 守卫不应依赖此字段。
+        let account = Arc::new(Account {
+            account_id: "test-acc".into(),
+            provider: String::new(), // 故意留空
+            max_concurrency: 1,
+            disabled: false,
+            extra: BTreeMap::new(),
+        });
+        let req = req_model_m();
+        write_request_log(
+            store.clone(),
+            req,
+            Some(account),
+            "sk-test".into(),
+            false,
+            true,
+            Some(200),
+            None,
+            Some(10),
+            None,
+            None,
+            ResponseLog::None,
+            family,
+        );
+        let rows = store
+            .list_request_logs(&RequestLogFilter::default(), 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "应落库恰好 1 条");
+        let detail = store.get_request_log(rows[0].id).unwrap().unwrap();
+        detail.kiro_payload
+    }
+
+    #[test]
+    fn write_request_log_kiro_family_renders_kiro_payload_even_with_empty_provider() {
+        // family="kiro" 时 kiro_payload 必须非空,且 account.provider 为空不影响渲染
+        // (防止 filter_by_provider 放行的空-provider kiro 号丢日志)。
+        let kp = log_kiro_payload_with_family("kiro");
+        assert!(
+            !kp.is_empty(),
+            "family=kiro 时 kiro_payload 应非空,实际为空"
+        );
+        // render_kiro_payload 对最简请求(model=m, messages=[]) 应产出合法 JSON
+        assert!(
+            kp.starts_with('{') || kp.starts_with('<'),
+            "kiro_payload 应是 JSON 对象或错误占位,实际: {kp}"
+        );
+    }
+
+    #[test]
+    fn write_request_log_non_kiro_family_skips_kiro_payload() {
+        // family="claude-dario" 时 kiro_payload 必须为空串
+        // (不应把 Kiro 格式强行渲染给 dario/其他 provider)。
+        let kp = log_kiro_payload_with_family("claude-dario");
+        assert!(
+            kp.is_empty(),
+            "family=claude-dario 时 kiro_payload 应为空串,实际: {kp}"
+        );
     }
 }

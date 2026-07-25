@@ -128,6 +128,22 @@ pub struct AccountQuota {
     pub percent_used: f64,
     /// 订阅/单位标签(如 "KIRO PRO"),admin 悬浮展示,可空。
     pub currency: Option<String>,
+    /// 多窗口利用率(如 Anthropic/Claude OAuth 的 5h / 7d 滚动窗口)。**空 = 基于积分的
+    /// provider(Kiro)**,前端走 remaining/limit 显示;非空则前端逐窗口渲染利用率%。
+    /// Anthropic OAuth/Max 没有只读用量接口、也不给积分上限,只在 `/v1/messages` 响应头
+    /// (`anthropic-ratelimit-unified-5h/7d-utilization`)给利用率,故用本字段承载。
+    pub windows: Vec<QuotaWindow>,
+}
+
+/// 单个用量窗口(5h / 7d 等滚动窗口的利用率快照)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuotaWindow {
+    /// 窗口标签,如 `"5h"` / `"7d"`。
+    pub label: String,
+    /// 已用利用率(0–100+,可超 100 表示已进入 overage)。
+    pub percent_used: f64,
+    /// 该窗口重置的 unix 秒(可空;Anthropic 只给统一的 `reset`,各窗口共用)。
+    pub reset_at: Option<i64>,
 }
 
 impl AccountQuota {
@@ -141,6 +157,22 @@ impl AccountQuota {
             remaining,
             percent_used,
             currency: None,
+            windows: Vec::new(),
+        }
+    }
+
+    /// 由多窗口利用率构造(Anthropic OAuth/Max:5h/7d 只给利用率%,无积分上限)。
+    /// 积分字段(used/limit/remaining)留 0;`percent_used` 取各窗口最大值作单值摘要,
+    /// `windows` 承载逐窗口明细供前端渲染。
+    pub fn from_windows(windows: Vec<QuotaWindow>, label: Option<String>) -> Self {
+        let percent_used = windows.iter().map(|w| w.percent_used).fold(0.0, f64::max);
+        Self {
+            used: 0.0,
+            limit: 0.0,
+            remaining: 0.0,
+            percent_used,
+            currency: label,
+            windows,
         }
     }
 }
@@ -255,6 +287,15 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// `account_quota` 是否为**本地廉价读**(无上游往返)。默认 `false`:像 Kiro 那样每次
+    /// 走 `getUsageLimits` 上游查询,gw-app 用 TTL 缓存节流(含失败节流)。返回 `true` 的
+    /// provider(如 dario:配额从实时聊天流量的响应头捕获、`account_quota` 只读内存快照)
+    /// 告诉 gw-app **不要**把它压在"昂贵调用"的 TTL 后——尤其别让一条陈旧的 `None` 把刚
+    /// 从流量捕获到的快照挡住 ~60s(否则面板首次出数据要等一个 TTL,体感"不实时")。
+    fn quota_is_local(&self) -> bool {
+        false
+    }
+
     /// 发现该账号缺失的 profileArn(如 Kiro 的 `ListAvailableProfiles`)。
     ///
     /// 返回 `Ok(Some(arn))` = 发现到一个新 profileArn(gw-app 负责持久化进账号 extra,
@@ -266,6 +307,32 @@ pub trait Provider: Send + Sync {
         _account: &Account,
     ) -> Result<Option<String>, UpstreamError> {
         Ok(None)
+    }
+
+    /// 强制发现 profileArn(**绕过固定兜底短路**)。付费 builderid 号被免费层共享 ARN
+    /// 短路、拿不到自己的 profile 时,gw-app 在配额 403 兜底里调本方法查真实值。默认无此
+    /// 概念 → `Ok(None)`。**只读发现调用**,绝不发推理包;account 须已带有效 access_token。
+    async fn force_discover_profile_arn(
+        &self,
+        _account: &Account,
+    ) -> Result<Option<String>, UpstreamError> {
+        Ok(None)
+    }
+
+    /// OAuth 上号:`authorization_code` → token set,返回 JSON 对象
+    /// `{access_token, refresh_token, expires_at}`(由 gw-app 并入账号 extra 后入库)。
+    /// 默认 provider 不支持(返回 BadRequest)。
+    ///
+    /// **出口契约(防封铁律)**:实现**必须**让换码出口与该号将来 refresh/chat 同一 egress IP
+    /// (铸 token IP≠发包 IP = 关联封号);`proxy` = 该号 `extra.proxy`(`None`=组默认出口)。
+    /// consent(浏览器登录同意)那一跳由操作员人肉完成,其 IP 不在本契约范围(code 数秒失效)。
+    async fn oauth_exchange(
+        &self,
+        _proxy: Option<&str>,
+        _code: &str,
+        _verifier: &str,
+    ) -> Result<serde_json::Value, UpstreamError> {
+        Err(UpstreamError::bad_request("该 provider 不支持 OAuth 上号"))
     }
 }
 
