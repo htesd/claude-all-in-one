@@ -10,6 +10,9 @@
 //! - 401/403 → TokenInvalid(先刷新同号,失败再换)
 //! - 408 / 5xx → ServerError(瞬时重试或换号)
 //! - 其他 → Other
+//!
+//! 我方在 static_flow 之外多出的一档:**5xx + `MODEL_TEMPORARILY_UNAVAILABLE`** → `Overloaded`
+//! (模型级容量不足:不惩罚账号 + 不换号 + 同号退避重试),见 [`is_model_overloaded`]。
 
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
 
@@ -49,6 +52,22 @@ fn is_invalid_model_id(body: &str) -> bool {
     body.to_ascii_lowercase().contains("invalid_model_id")
 }
 
+/// 5xx 响应体是否为**模型级容量不足**。归 `Overloaded`——不惩罚账号 + 不换号 + 同号退避重试。
+///
+/// 判据取上游明确的 `reason`,而不是宽泛的"所有 5xx":后者里混着上游真内部错误,
+/// 语义不同不应共用策略。2026-07-25 opus-5 实测报文:
+/// ```text
+/// {"message":"Encountered unexpectedly high load when processing the request, please try again.",
+///  "reason":"MODEL_TEMPORARILY_UNAVAILABLE"}
+/// ```
+/// ⚠️ 同期还有 74% 的 5xx 是 `{"message":"Encountered an unexpected error ...","reason":null}`,
+/// **不**命中本判据,仍按 `ServerError`(换号重试 + 记账号失败)处理。若后续证实那批也是容量
+/// 抖动,放宽判据即可——但那是独立决策,别顺手改。
+fn is_model_overloaded(body: &str) -> bool {
+    let b = body.to_ascii_uppercase();
+    b.contains("MODEL_TEMPORARILY_UNAVAILABLE")
+}
+
 /// 把 generateAssistantResponse 的失败响应分类。
 ///
 /// `status` = HTTP 状态码,`body` = 响应体文本(可空)。
@@ -73,6 +92,9 @@ pub fn classify_chat_error(status: u16, body: &str) -> UpstreamError {
         403 if is_account_suspended(body) => UpstreamErrorKind::TemporarilyBlocked,
         403 => UpstreamErrorKind::TokenInvalid,
         408 => UpstreamErrorKind::ServerError,
+        // 5xx + MODEL_TEMPORARILY_UNAVAILABLE:模型级容量不足 → Overloaded(不惩罚账号、
+        // 不换号、同号退避重试)。必须排在下面的通用 5xx 之前。
+        500..=599 if is_model_overloaded(body) => UpstreamErrorKind::Overloaded,
         500..=599 => UpstreamErrorKind::ServerError,
         _ => UpstreamErrorKind::Other,
     };
@@ -140,6 +162,44 @@ mod tests {
     #[test]
     fn server_5xx_is_server_error() {
         assert_eq!(classify_chat_error(503, "unavailable").kind, UpstreamErrorKind::ServerError);
+    }
+
+    /// 2026-07-25 opus-5 事故的真实报文(逐字取自 139 `caio-worker0` 日志)。
+    #[test]
+    fn model_temporarily_unavailable_5xx_is_overloaded() {
+        let e = classify_chat_error(
+            500,
+            r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+        );
+        assert_eq!(e.kind, UpstreamErrorKind::Overloaded);
+        // 三条策略同时成立,少一条就回到事故现场。
+        assert!(e.kind.spares_account_health(), "上游没容量不是账号的错,绝不能记进 failure_count");
+        assert!(!e.kind.worth_switching_account(), "容量是模型级的,换号只是扩散 + 白烧配额");
+        assert!(e.kind.worth_same_account_backoff(), "唯一有效手段是同号退避重试");
+    }
+
+    /// 同期占 74% 的另一种 5xx 报文:`reason` 为 null,**不**命中过载判据。
+    #[test]
+    fn generic_5xx_without_reason_stays_server_error() {
+        let e = classify_chat_error(
+            500,
+            r#"{"message":"Encountered an unexpected error when processing the request, please try again.","reason":null}"#,
+        );
+        assert_eq!(e.kind, UpstreamErrorKind::ServerError);
+        assert!(!e.kind.spares_account_health(), "通用 5xx 仍记账号健康(旧行为不变)");
+        assert!(e.kind.worth_switching_account(), "通用 5xx 仍可换号(旧行为不变)");
+        assert!(!e.kind.worth_same_account_backoff(), "同号退避只给 Overloaded");
+    }
+
+    #[test]
+    fn overload_marker_matched_case_insensitively_across_5xx() {
+        for status in [500u16, 502, 503, 529] {
+            let e = classify_chat_error(status, r#"{"reason":"model_temporarily_unavailable"}"#);
+            assert_eq!(e.kind, UpstreamErrorKind::Overloaded, "status={status}");
+        }
+        // 非 5xx 不因带该串就变过载(429 仍是限流:它要冷却该号,语义不同)。
+        let rl = classify_chat_error(429, r#"{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#);
+        assert_eq!(rl.kind, UpstreamErrorKind::RateLimited);
     }
 
     #[test]
