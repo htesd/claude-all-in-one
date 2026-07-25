@@ -287,11 +287,11 @@ fn test_tool_name_mapping_in_convert_request() {
 }
 
 #[test]
-fn convert_request_does_not_send_agent_continuation_metadata() {
-    // 【真实缓存命中的命门】(2026-06-13 线上 caio 全 miss 实锤,对齐 static_flow 金标准):
-    // 绝不把自造的 agentContinuationId 上 wire——Kiro 会当成"续接它没签发的 agent 上下文"而绕过
-    // conversationId 前缀缓存致每轮冷 miss。agentTaskType 同样不发(vibe 走 header)。只发
-    // chat_trigger_type=MANUAL。这条测试锁死该 wire 形状,谁加回 with_agent_continuation_id 即红。
+fn convert_request_omits_agent_continuation_by_default() {
+    // 【默认行为·开关关】agentContinuationId / agentTaskType 默认**不**上 wire(KIRO_AGENT_CONTINUATION
+    // 未设)——部署零行为变化。开启该 env 后会复刻 kiro.rs proven 配置(稳定 agentContinuationId+vibe),
+    // 在生产做可逆 A/B(见 converter::agent_continuation_enabled 注释)。chat_trigger_type=MANUAL 恒发。
+    // 注:本测试不设 env,故断言默认态;启用态的 wire 形状由 conversation.rs 序列化测试覆盖。
     use crate::anthropic_types::Message as AnthropicMessage;
     let req = MessagesRequest {
         model: "claude-opus-4-8".to_string(),
@@ -311,8 +311,73 @@ fn convert_request_does_not_send_agent_continuation_metadata() {
     };
     let cs = convert_request(&req).unwrap().conversation_state;
     assert_eq!(cs.chat_trigger_type.as_deref(), Some("MANUAL"), "应发 chat_trigger_type=MANUAL");
-    assert!(cs.agent_continuation_id.is_none(), "绝不发 agentContinuationId(Kiro 缓存命门)");
-    assert!(cs.agent_task_type.is_none(), "不发 agentTaskType(vibe 走 header)");
+    // 默认关:不上 wire(env 未设)。
+    assert!(cs.agent_continuation_id.is_none(), "默认(开关关)不发 agentContinuationId");
+    assert!(cs.agent_task_type.is_none(), "默认(开关关)不发 agentTaskType");
+}
+
+#[test]
+fn derive_agent_continuation_id_is_stable_distinct_and_uuid_shaped() {
+    use super::session::derive_agent_continuation_id;
+    let cid = "f43b66ef-5291-4a1b-8c2d-0011223344ff";
+    let a = derive_agent_continuation_id(cid);
+    let b = derive_agent_continuation_id(cid);
+    // 同会话恒等(稳定是命中前提:kiro.rs 实测 fresh/不稳定反而 miss)。
+    assert_eq!(a, b, "同 conversationId 必须派生恒等的 agentContinuationId");
+    // 已知向量:独立(Python)复算 SHA256("agent-continuation:"+cid)[..16] 同款公式得此值。
+    // 锁死与 kiro.rs `converter.rs::derive_agent_continuation_id` **逐字节一致**(否则两端值不同 → 修复失效)。
+    assert_eq!(a, "621628ff-254f-9857-d9ff-8896abccfd4e", "须与 kiro.rs 公式逐字节一致");
+    // 与 conversationId 不相等(加盐区分,避免被 Kiro 当同一标识)。
+    assert_ne!(a, cid, "agentContinuationId 不应等于 conversationId");
+    // 不同会话不同值。
+    assert_ne!(a, derive_agent_continuation_id("other-conversation"));
+    // UUID 形态:8-4-4-4-12 十六进制。
+    let parts: Vec<&str> = a.split('-').collect();
+    assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12], "UUID 形态");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "仅十六进制 + 连字符");
+}
+
+#[test]
+fn with_agent_continuation_metadata_branches() {
+    // 纯函数直接测两个分支(不碰进程级实验全局,避免并行测试污染)。
+    use super::session::derive_agent_continuation_id;
+    use crate::kiro_types::conversation::ConversationState;
+    let cid = "f43b66ef-5291-4a1b-8c2d-0011223344ff";
+
+    // enabled=false:原样,两字段保持 None。
+    let off = with_agent_continuation_metadata(ConversationState::new(cid), false);
+    assert!(off.agent_continuation_id.is_none(), "关:不附 agentContinuationId");
+    assert!(off.agent_task_type.is_none(), "关:不附 agentTaskType");
+
+    // enabled=true:附稳定 agentContinuationId(从 state.conversation_id 派生)+ vibe。
+    let on = with_agent_continuation_metadata(ConversationState::new(cid), true);
+    assert_eq!(
+        on.agent_continuation_id.as_deref(),
+        Some(derive_agent_continuation_id(cid).as_str()),
+        "开:agentContinuationId 须 = derive(conversationId)"
+    );
+    assert_eq!(on.agent_task_type.as_deref(), Some("vibe"), "开:agentTaskType=vibe");
+}
+
+#[test]
+fn agent_continuation_serialization_boundary() {
+    // 序列化边界(真正发往 Kiro 的 JSON)双向断言:
+    use crate::kiro_types::conversation::ConversationState;
+    let cid = "f43b66ef-5291-4a1b-8c2d-0011223344ff";
+
+    // 关(默认):skip_serializing_if 使两 key **完全不出现** → 部署零 wire 变化(A/B 对照组干净)。
+    let off = serde_json::to_value(with_agent_continuation_metadata(ConversationState::new(cid), false)).unwrap();
+    assert!(off.get("agentContinuationId").is_none(), "关:JSON 不含 agentContinuationId");
+    assert!(off.get("agentTaskType").is_none(), "关:JSON 不含 agentTaskType");
+
+    // 开:两 key 出现且值正确(camelCase 命名 + vibe)。
+    let on = serde_json::to_value(with_agent_continuation_metadata(ConversationState::new(cid), true)).unwrap();
+    assert_eq!(
+        on.get("agentContinuationId").and_then(|v| v.as_str()),
+        Some("621628ff-254f-9857-d9ff-8896abccfd4e"),
+        "开:JSON agentContinuationId 须为已知向量(= kiro.rs 公式)"
+    );
+    assert_eq!(on.get("agentTaskType").and_then(|v| v.as_str()), Some("vibe"), "开:JSON agentTaskType=vibe");
 }
 
 #[test]

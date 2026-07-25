@@ -35,15 +35,18 @@ function formatTime(unixSec: number): string {
   return new Date(unixSec * 1000).toLocaleString('zh-CN')
 }
 
-/** 模型上下文窗口(token)。1M:opus 4.6/4.7/4.8 与 sonnet 4.6;其余按 200k。
+/** 模型上下文窗口(token)。1M:opus 5、opus 4.6/4.7/4.8、sonnet 5 与 sonnet 4.6;其余按 200k。
  *  点号/连字符两种写法都归一(`claude-opus-4.8` 与 `claude-opus-4-8` 同窗口,审查 Architect#1),
- *  并兼容 -thinking / 日期快照后缀(子串匹配)。与后端 get_context_window_size 同档。 */
+ *  并兼容 -thinking / 日期快照后缀(子串匹配)。与后端 get_context_window_size 同档。
+ *  ⚠️ 5 系锚定 `opus-5`/`sonnet-5` 邻接串:不能用裸 '5',否则 `claude-3-5-sonnet` 等历史名会被误判。 */
 function contextWindow(model: string): number {
   const m = model.toLowerCase().replace(/\./g, '-')
   if (
+    m.includes('opus-5') ||
     m.includes('opus-4-8') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-6') ||
+    m.includes('sonnet-5') ||
     m.includes('sonnet-4-6')
   ) {
     return 1_000_000
