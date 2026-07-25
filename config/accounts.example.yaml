@@ -30,3 +30,11 @@ groups:
         client_id: "REPLACE_ME"
         client_secret: "REPLACE_ME"
         region: us-east-1
+
+      # API Key 号(app.kiro.dev 生成的 ksk_,官方 headless 凭据)。
+      # 长期有效:无需 refresh_token / machine_id / profileArn / 刷新;发包自动带
+      # TokenType: API_KEY 头。批量导入更方便:admin 面板「导入 → 官方 API Key」粘贴列表。
+      - account_id: kiro-04
+        auth_method: api_key
+        kiro_api_key: "ksk_REPLACE_ME"
+        region: us-east-1

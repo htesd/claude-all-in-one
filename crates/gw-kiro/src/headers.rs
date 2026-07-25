@@ -5,8 +5,10 @@
 //! UA 里嵌的 machineId 与端点指纹,这里集中管理,改动需对照 static_flow。
 //!
 //! 主推理 `generateAssistantResponse`:
-//! - URL `https://runtime.{region}.kiro.dev/generateAssistantResponse`
-//!   (env `KIRO_RUNTIME_UPSTREAM_BASE_URL` / `KIRO_UPSTREAM_BASE_URL` 可覆盖)
+//! - URL `https://runtime.{region}.kiro.dev/generateAssistantResponse`(默认/现状)
+//!   或 `https://q.{region}.amazonaws.com/generateAssistantResponse`(`q_endpoint` 开关开,
+//!   与 kiro.rs 一致、做服务端 prompt 缓存);env `KIRO_RUNTIME_UPSTREAM_BASE_URL` /
+//!   `KIRO_UPSTREAM_BASE_URL` 整串覆盖优先(见 [`runtime_base_url`])
 //! - UA `aws-sdk-js/1.0.34 ua/2.1 os/darwin#24.6.0 lang/js md/nodejs#22.22.0
 //!   api/codewhispererstreaming#1.0.34 KiroIDE-{ver}-{machine}`(**无 `m/E`**)
 //! - 条件头:`TokenType: EXTERNAL_IDP`(auth_method=external_idp)、
@@ -35,16 +37,28 @@ pub(crate) const BUILDER_ID_PROFILE_ARN: &str =
 const RUNTIME_BASE_ENV: &str = "KIRO_RUNTIME_UPSTREAM_BASE_URL";
 const UPSTREAM_BASE_ENV: &str = "KIRO_UPSTREAM_BASE_URL";
 
-/// 主推理上游 base url:env 覆盖优先(对齐 static_flow `configured_upstream_base_url`),
-/// 否则默认 `https://runtime.{region}.kiro.dev`。
+/// 主推理上游 base url。优先级:
+/// 1. env 覆盖(`KIRO_RUNTIME_UPSTREAM_BASE_URL` / `KIRO_UPSTREAM_BASE_URL`,整串含 region,
+///    对齐 static_flow `configured_upstream_base_url`)——最高优先,给显式全 URL 场景留后门;
+/// 2. `q_endpoint` 开关(设置面板/env `KIRO_Q_ENDPOINT`):开 → `https://q.{region}.amazonaws.com`
+///    (kiro.rs 端点,做服务端 prompt 缓存);
+/// 3. 默认 → `https://runtime.{region}.kiro.dev`(现状,防封对齐当前 Kiro 客户端)。
 pub(crate) fn runtime_base_url(region: &str) -> String {
     let env_override = read_base_env(RUNTIME_BASE_ENV).or_else(|| read_base_env(UPSTREAM_BASE_ENV));
-    runtime_base_url_from(region, env_override)
+    runtime_base_url_from(region, env_override, crate::converter::q_endpoint_enabled())
 }
 
-/// 纯逻辑(env 注入便于测试):覆盖值已 trim 去尾斜杠。
-fn runtime_base_url_from(region: &str, env_override: Option<String>) -> String {
-    env_override.unwrap_or_else(|| format!("https://runtime.{region}.kiro.dev"))
+/// 纯逻辑(env 覆盖 + 端点开关注入便于测试)。env 覆盖已 trim 去尾斜杠;env 覆盖存在时
+/// **无视** `q_endpoint`(显式全 URL 优先)。
+fn runtime_base_url_from(region: &str, env_override: Option<String>, q_endpoint: bool) -> String {
+    if let Some(base) = env_override {
+        return base;
+    }
+    if q_endpoint {
+        format!("https://q.{region}.amazonaws.com")
+    } else {
+        format!("https://runtime.{region}.kiro.dev")
+    }
 }
 
 fn read_base_env(name: &str) -> Option<String> {
@@ -116,7 +130,12 @@ pub(crate) fn apply_streaming_headers(
         .header("x-amzn-kiro-agent-mode", "vibe")
         .header("x-amzn-codewhisperer-optout", "true");
     // 条件头(顺序对齐 static_flow:在 UA 之前)。
-    if is_external_idp(account) {
+    // API Key 凭据:`TokenType: API_KEY` —— 官方 Kiro CLI headless 模式的真实客户端形态,
+    // **服务端强制要求**(实测:缺此头则 ksk_ 被当普通 OAuth token,报 400「profileArn is
+    // required」;带此头则免 profileArn、直接放行)。api_key 与 external_idp 互斥。
+    if crate::machine_id::is_api_key_credential(account) {
+        rb = rb.header("TokenType", "API_KEY");
+    } else if is_external_idp(account) {
         rb = rb.header("TokenType", "EXTERNAL_IDP");
     }
     if is_internal_provider(account) {
@@ -131,10 +150,37 @@ pub(crate) fn apply_streaming_headers(
 }
 
 /// 条件头判定:auth_method == "external_idp"(大小写不敏感)。
-fn is_external_idp(account: &Account) -> bool {
+///
+/// `pub(crate)`:token.rs 的刷新分流复用同一判定,避免两处各写一份 easily-diverging
+/// 的字符串比较(此前只有本文件内部用,token.rs 的刷新分流当时压根没读 auth_method)。
+pub(crate) fn is_external_idp(account: &Account) -> bool {
     account
         .extra_str("auth_method")
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("external_idp"))
+}
+
+/// external_idp(Azure AD 企业 SSO)账号:给请求补 `TokenType: EXTERNAL_IDP` 头,否则
+/// 保持原样。**所有** Kiro API 调用(不止 chat)对 external_idp 号都必须带此头——
+/// CodeWhisperer 靠它识别令牌类型并按外部 IdP 校验 Azure JWT,缺了它会静默返回空
+/// profile 列表并拒绝数据面调用(getUsageLimits/ListAvailableProfiles 得到 403)。
+/// 对齐 Kiro-Go `applyKiroBaseHeaders`(其对每次 Kiro 请求统一注入)。streaming 头
+/// 因需保持 static_flow 的严格字段顺序仍内联注入(见 `apply_streaming_headers`);
+/// 顺序不敏感的辅助只读调用(配额/profile 发现)复用此助手,避免判定散落多处。
+///
+/// 位置:调用方在基础头(含 authorization)之后追加本头——与 Kiro-Go
+/// `applyKiroBaseHeaders` 一致(那里 TokenType 也排在 Authorization/UA/optout 之后、
+/// 位于末尾),故非"随手放末尾"的臆测,而是与参考实现的相对顺序对齐。这两条是 AWS
+/// runtime REST 调用(getUsageLimits/ListAvailableProfiles),服务端按 header map 解析,
+/// 不做 data-plane 那种逐字节指纹校验,顺序不影响识别。
+pub(crate) fn apply_external_idp_token_type(
+    rb: reqwest::RequestBuilder,
+    account: &Account,
+) -> reqwest::RequestBuilder {
+    if is_external_idp(account) {
+        rb.header("TokenType", "EXTERNAL_IDP")
+    } else {
+        rb
+    }
 }
 
 /// Kiro 身份 provider(github/google/builderid/internal...)。注意:**不能**用
@@ -168,12 +214,36 @@ pub(crate) fn fixed_profile_arn(account: &Account) -> Option<&'static str> {
 }
 
 /// 解析发包用的 profileArn:账号显式值优先,否则按 idp 取固定兜底。
+///
+/// API Key 凭据**永不带 profileArn**:`TokenType: API_KEY` 让服务端按 key 自身账号解析,
+/// 反而带上(错误的)profileArn 会被拒。apikey 号无 kiro_provider,固定兜底本就返回 None,
+/// 这里再显式短路一次作防御(万一误配了 profile_arn/kiro_provider)。
 pub(crate) fn resolve_profile_arn(account: &Account) -> Option<String> {
+    if crate::machine_id::is_api_key_credential(account) {
+        return None;
+    }
     account
         .extra_str("profile_arn")
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| fixed_profile_arn(account).map(|s| s.to_string()))
+}
+
+/// 发包用的 bearer token(`Authorization: Bearer <token>` 的值)。
+///
+/// **凭据来源随类型分流**(单一事实来源,chat 与配额共用):
+/// - API Key 账号 → `kiro_api_key`(ksk_,长期有效,由 `TokenType: API_KEY` 头激活);
+/// - social / IdC 账号 → `access_token`(运行时刷新换取)。
+///
+/// 之所以不统一读 `access_token`:apikey 账号可能仅从 YAML/admin 建号、只带 `kiro_api_key`
+/// 而无 `access_token`(不该强制用户镜像一份密钥),故按类型取真值。
+pub(crate) fn bearer_token(account: &Account) -> Option<&str> {
+    let field = if crate::machine_id::is_api_key_credential(account) {
+        "kiro_api_key"
+    } else {
+        "access_token"
+    };
+    account.extra_str(field).filter(|s| !s.is_empty())
 }
 
 /// 把 IdC(AWS SSO OIDC)刷新金标准头加到请求上(头集合 + 值逐字对齐 static_flow
@@ -217,21 +287,41 @@ mod tests {
 
     #[test]
     fn runtime_base_url_defaults_to_kiro_dev() {
+        // q_endpoint=false(默认)→ runtime.kiro.dev。
         assert_eq!(
-            runtime_base_url_from("us-east-1", None),
+            runtime_base_url_from("us-east-1", None, false),
             "https://runtime.us-east-1.kiro.dev"
         );
         assert_eq!(
-            runtime_base_url_from("eu-central-1", None),
+            runtime_base_url_from("eu-central-1", None, false),
             "https://runtime.eu-central-1.kiro.dev"
         );
     }
 
     #[test]
-    fn runtime_base_url_honors_env_override() {
+    fn runtime_base_url_q_endpoint_switches_to_amazonaws() {
+        // q_endpoint=true(无 env 覆盖)→ q.{region}.amazonaws.com(与 kiro.rs 一致)。
         assert_eq!(
-            runtime_base_url_from("us-east-1", Some("https://q.us-east-1.amazonaws.com".into())),
+            runtime_base_url_from("us-east-1", None, true),
             "https://q.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            runtime_base_url_from("eu-central-1", None, true),
+            "https://q.eu-central-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn runtime_base_url_env_override_beats_q_endpoint() {
+        // env 覆盖是整串,优先级最高——即便 q_endpoint=true 也用覆盖值(显式全 URL 后门)。
+        let overridden = Some("https://custom.example.com".to_string());
+        assert_eq!(
+            runtime_base_url_from("us-east-1", overridden.clone(), true),
+            "https://custom.example.com"
+        );
+        assert_eq!(
+            runtime_base_url_from("us-east-1", overridden, false),
+            "https://custom.example.com"
         );
     }
 
@@ -363,5 +453,74 @@ mod tests {
         let h = req.headers();
         assert_eq!(h.get("TokenType").unwrap(), "EXTERNAL_IDP");
         assert_eq!(h.get("redirect-for-internal").unwrap(), "true");
+    }
+
+    #[test]
+    fn apply_external_idp_token_type_adds_header_only_for_external_idp() {
+        // external_idp 账号:补 TokenType 头(getUsageLimits/ListAvailableProfiles 都靠它)。
+        // 大小写/写法不敏感(is_external_idp 用 eq_ignore_ascii_case):导入文件里可能是
+        // "External_IDP"/"EXTERNAL_IDP" 等变体,都要命中,否则 Azure 号照样吃 403。
+        for am in [
+            json!({"auth_method": "external_idp"}),
+            json!({"auth_method": "External_IDP"}),
+            json!({"auth_method": "EXTERNAL_IDP"}),
+            json!({"auth_method": "  external_idp  "}),
+        ] {
+            let acc = account_with(am.clone());
+            let rb = reqwest::Client::new().get("https://q.us-east-1.amazonaws.com/x");
+            let req = apply_external_idp_token_type(rb, &acc).build().unwrap();
+            assert_eq!(req.headers().get("TokenType").unwrap(), "EXTERNAL_IDP", "{am} 应命中");
+        }
+
+        // 非 external_idp(social/idc/builderid):绝不加,免得误标令牌类型。
+        for am in [json!({}), json!({"auth_method": "idc"}), json!({"auth_method": "social"})] {
+            let acc = account_with(am);
+            let rb = reqwest::Client::new().get("https://q.us-east-1.amazonaws.com/x");
+            let req = apply_external_idp_token_type(rb, &acc).build().unwrap();
+            assert!(req.headers().get("TokenType").is_none());
+        }
+    }
+
+    #[test]
+    fn api_key_account_sets_tokentype_api_key_header() {
+        // 实测:runtime.kiro.dev 需要 `TokenType: API_KEY` 才免 profileArn。
+        let acc = account_with(json!({"kiro_api_key": "ksk_abc", "auth_method": "api_key"}));
+        let rb = reqwest::Client::new().post("https://runtime.us-east-1.kiro.dev/x");
+        let req = apply_streaming_headers(
+            rb,
+            &acc,
+            "https://runtime.us-east-1.kiro.dev",
+            "ksk_abc", // bearer = 镜像的 ksk_
+            &"a".repeat(64),
+            "0.12.155",
+        )
+        .build()
+        .unwrap();
+        let h = req.headers();
+        assert_eq!(h.get("TokenType").unwrap(), "API_KEY");
+        assert_eq!(h.get("authorization").unwrap(), "Bearer ksk_abc");
+    }
+
+    #[test]
+    fn api_key_account_never_carries_profile_arn() {
+        // 即便误配了 profile_arn / kiro_provider,apikey 也必须省略 profileArn。
+        let acc = account_with(json!({
+            "kiro_api_key": "ksk_abc",
+            "profile_arn": "arn:should:not:be:used",
+            "kiro_provider": "github",
+        }));
+        assert_eq!(resolve_profile_arn(&acc), None);
+    }
+
+    #[test]
+    fn bearer_token_source_by_credential_type() {
+        // apikey:取 kiro_api_key(即便没有 access_token,如 YAML/admin 建号)。
+        let apikey = account_with(json!({"kiro_api_key": "ksk_xyz"}));
+        assert_eq!(bearer_token(&apikey), Some("ksk_xyz"));
+        // social/IdC:取 access_token。
+        let oauth = account_with(json!({"refresh_token": "rt", "access_token": "at-123"}));
+        assert_eq!(bearer_token(&oauth), Some("at-123"));
+        // 缺凭据 → None。
+        assert_eq!(bearer_token(&account_with(json!({"refresh_token": "rt"}))), None);
     }
 }
