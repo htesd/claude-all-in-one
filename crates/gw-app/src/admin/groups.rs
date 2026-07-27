@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use gw_store::DeleteGroupOutcome;
+use gw_store::{DeleteGroupOutcome, MembershipOutcome};
 use serde::Deserialize;
 
 use super::{internal_error, AdminState};
@@ -76,7 +76,10 @@ pub fn router() -> Router<AdminState> {
     Router::new()
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", patch(update_group).delete(delete_group))
-        .route("/groups/{name}/members", get(list_members).post(add_member))
+        .route(
+            "/groups/{name}/members",
+            get(list_members).post(add_member).delete(clear_members),
+        )
         .route("/groups/{name}/members/bulk", post(bulk_add_members))
         .route("/groups/{name}/members/{account_id}", delete(remove_member))
 }
@@ -153,6 +156,14 @@ async fn delete_group(
         Ok(DeleteGroupOutcome::NotFound) => api_error(StatusCode::NOT_FOUND, "分组不存在"),
         // 删组会把 key 的 group_name 清空,而 router 把空组名回落到主组 ——
         // 这些客户当场变成主组的不受限访问,且无任何告警。
+        Ok(DeleteGroupOutcome::IsOwner(n)) => api_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "本组仍是 {n} 个账号的归属(owner)。删组会把这些账号的归属清空,它们会变成\
+                 没有任何 worker 加载的孤儿,而**借用它们的其它组会当场全量 503**。\
+                 请先把账号迁到别的 owner 再删本组"
+            ),
+        ),
         Ok(DeleteGroupOutcome::HasKeys(n)) => api_error(
             StatusCode::CONFLICT,
             &format!(
@@ -183,15 +194,58 @@ async fn list_members(
     }
 }
 
+/// 成员边变更 → 立即捅 worker 同步。不捅的话 worker 最长 30s 才看到新视图,而 router
+/// 的 owner 缓存 15s 就刷新 —— 两个轮询器错配会把请求送到还没有该视图的 worker,
+/// 结果是一段最长约 30 秒的 503 窗口(对抗审查 Architect#3)。
+async fn membership_changed(st: &AdminState) {
+    super::accounts::poke_workers_sync(st).await;
+}
+
+fn membership_error(outcome: MembershipOutcome) -> axum::response::Response {
+    match outcome {
+        // 悬空边不会报错、只会让该组静默少一个号,所以写入侧就要挡住。
+        MembershipOutcome::MissingAccountOrGroup => {
+            api_error(StatusCode::NOT_FOUND, "账号或分组不存在")
+        }
+        MembershipOutcome::CrossOwner { existing, incoming } => api_error(
+            StatusCode::CONFLICT,
+            &format!(
+                "本组现有成员归属 {existing},而该账号归属 {incoming}。一个组的成员必须同属\
+                 一个 owner:跨 owner 时 router 只按会话数选 worker,被选中的 worker 只看得见\
+                 自己那部分成员,可能直接用兜底层而另一个 owner 的主力号正闲着 —— \
+                 「小号优先、压满才溢出」会当场失效"
+            ),
+        ),
+        MembershipOutcome::Ok => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
 async fn add_member(
     State(st): State<AdminState>,
     Path(name): Path<String>,
     Json(body): Json<AddMemberBody>,
 ) -> axum::response::Response {
     match st.store.upsert_membership(&body.account_id, &name, body.priority) {
-        // 悬空边不会报错、只会让该组静默少一个号,所以写入侧就要挡住。
-        Ok(false) => api_error(StatusCode::NOT_FOUND, "账号或分组不存在"),
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(MembershipOutcome::Ok) => {
+            membership_changed(&st).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(other) => membership_error(other),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// 清空本组成员 = **下线本组的正确姿势**:组还在、key 还绑着,但选不出账号 → 立即 503,
+/// 客户不会像 DELETE 整个组那样被打回未分组、回落主组拿到全部账号。
+async fn clear_members(
+    State(st): State<AdminState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    match st.store.clear_group_members(&name) {
+        Ok(n) => {
+            membership_changed(&st).await;
+            Json(serde_json::json!({"removed": n})).into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -201,7 +255,10 @@ async fn remove_member(
     Path((name, account_id)): Path<(String, String)>,
 ) -> axum::response::Response {
     match st.store.remove_membership(&account_id, &name) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            membership_changed(&st).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "该账号不在本组"),
         Err(e) => internal_error(e),
     }
@@ -218,7 +275,11 @@ async fn bulk_add_members(
         body.subscription_title.as_deref(),
         body.priority,
     ) {
-        Ok(n) => Json(serde_json::json!({"added_or_updated": n})).into_response(),
+        Ok(Ok(n)) => {
+            membership_changed(&st).await;
+            Json(serde_json::json!({"added_or_updated": n})).into_response()
+        }
+        Ok(Err(outcome)) => membership_error(outcome),
         Err(e) => internal_error(e),
     }
 }
@@ -423,6 +484,77 @@ mod tests {
             store.list_group_members("LOW").unwrap(),
             vec![("m1".to_string(), 0)],
             "只该加进 PRO MAX,POWER 主力号不得被带进低价组"
+        );
+    }
+
+    /// 一步下线:清空成员边。组还在、key 还绑着,但选不出账号 → 立即 503。
+    /// **必须是一步**——错误信息让运维"清空本组成员",若只有单条 DELETE,220 个成员就要
+    /// 发 220 次请求,中途失败留下半下线状态(对抗审查 Minimalist#1)。
+    #[tokio::test]
+    async fn clear_members_is_one_step() {
+        let (app, store) = app();
+        app.clone().oneshot(req("POST", "/groups", Some(r#"{"name":"G0"}"#))).await.unwrap();
+        app.clone().oneshot(req("POST", "/groups", Some(r#"{"name":"LOW"}"#))).await.unwrap();
+        for id in ["a", "b"] {
+            store.create_account(id, "G0", "kiro", 2, "{}").unwrap();
+            store.upsert_membership(id, "LOW", 0).unwrap();
+        }
+        store.create_api_key("sk-low", None, Some("LOW")).unwrap();
+
+        let resp = app.oneshot(req("DELETE", "/groups/LOW/members", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_body(resp).await["removed"], 2);
+        assert!(store.list_group_members("LOW").unwrap().is_empty());
+        assert_eq!(
+            store.get_api_key("sk-low").unwrap().unwrap().group_name,
+            "LOW",
+            "下线不得把 key 打回未分组(那会让它回落主组拿到全部账号)"
+        );
+    }
+
+    /// 跨 owner 的成员必须被拒:跨 owner 时组内 priority 不再是全局排序,
+    /// router 可能选到只看得见兜底层的 worker,「小号优先、压满才溢出」当场失效。
+    #[tokio::test]
+    async fn member_rejects_cross_owner() {
+        let (app, store) = app();
+        for g in ["G0", "G1", "LOW"] {
+            app.clone()
+                .oneshot(req("POST", "/groups", Some(&format!(r#"{{"name":"{g}"}}"#))))
+                .await
+                .unwrap();
+        }
+        store.create_account("a", "G0", "kiro", 2, "{}").unwrap();
+        store.create_account("b", "G1", "kiro", 2, "{}").unwrap();
+
+        let ok = app
+            .clone()
+            .oneshot(req("POST", "/groups/LOW/members", Some(r#"{"account_id":"a"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+        let bad = app
+            .clone()
+            .oneshot(req("POST", "/groups/LOW/members", Some(r#"{"account_id":"b"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::CONFLICT, "第二个 owner 的号必须被拒");
+        assert_eq!(store.list_group_members("LOW").unwrap().len(), 1, "被拒不得留痕");
+    }
+
+    /// 仍是账号 owner 的组**不得删除**:删组会把归属清空,那些号变成没有 worker 加载的
+    /// 孤儿,而借用它们的别的组当场全量 503,删的人还看不出因果。
+    #[tokio::test]
+    async fn delete_group_that_owns_accounts_conflicts() {
+        let (app, store) = app();
+        app.clone().oneshot(req("POST", "/groups", Some(r#"{"name":"G0"}"#))).await.unwrap();
+        store.create_account("a", "G0", "kiro", 2, "{}").unwrap();
+
+        let resp = app.oneshot(req("DELETE", "/groups/G0", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            store.get_account("a").unwrap().unwrap().group_name,
+            "G0",
+            "被拒的删除绝不能动账号归属"
         );
     }
 

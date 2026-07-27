@@ -1183,7 +1183,7 @@ async fn delete_account(
 
 /// best-effort 捅所有 worker 立即从 DB 同步账号集(导入/删除后消除 30s 生效窗口)。
 /// 失败仅 debug log:worker 自己的 30s 周期 sync 兜底。
-async fn poke_workers_sync(st: &AdminState) {
+pub(super) async fn poke_workers_sync(st: &AdminState) {
     let fanout = st.workers.iter().map(|w| {
         let http = st.http.clone();
         let url = format!("http://{}/sync", w.listen);

@@ -21,17 +21,6 @@ mod logs;
 mod settings;
 mod usage;
 
-/// 可空字段的"部分更新"反序列化:区分**字段缺席**(外层 `None` = 不动)与
-/// **显式传 null**(`Some(None)` = 清除该值)。serde 默认把两者都折成 `None`,
-/// PATCH 语义下就没法表达"把这个可空列改回 NULL"。
-fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: serde::Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    serde::Deserialize::deserialize(de).map(Some)
-}
-
 /// admin 路由共享态:管理密钥 + 控制面存储(keys / usage / groups / accounts / settings)。
 #[derive(Clone)]
 pub struct AdminState {

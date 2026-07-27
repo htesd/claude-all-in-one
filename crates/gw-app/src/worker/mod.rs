@@ -550,38 +550,36 @@ impl WorkerState {
         let _serialized = self.sync_lock.lock().await;
         // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
         flush_dirty_extras(&self.scheduler, &store, &self.refresh_locks, "sync 重试").await;
-        // 成员边与账号集在同一把 sync_lock 内一起换,避免出现"号已进来但还没有任何组
-        // 认领它"(该号对所有客户不可见)或反过来"边指向已被移走的号"的中间态。
-        match store.load_group_memberships(&self.group) {
-            Ok(m) => {
-                let views = m
-                    .into_iter()
-                    .map(|(g, rank)| (g, scheduler::GroupView::new(rank)))
-                    .collect();
-                *self.group_views.write() = views;
+        // 成员边与账号集**先都读出来,两个都成功才发布**(对抗审查 Skeptic#3)。
+        // 分别读、分别发布会留下无限期的撕裂态:membership 成功而账号读失败 → 新视图
+        // 立即生效但账号快照停在上一轮;反过来 membership 读失败而账号成功 → **已被撤销
+        // 的成员边继续授权**,这是提权方向,尤其危险。任一失败就整轮跳过。
+        let (memberships, accounts) = match (
+            store.load_group_memberships(&self.group),
+            store.load_owned_accounts(&self.group),
+        ) {
+            (Ok(m), Ok(a)) => (m, a),
+            (m, a) => {
+                let err = m.err().map(|e| e.to_string()).or_else(|| a.err().map(|e| e.to_string()));
+                tracing::warn!("sync 读库失败,整轮跳过(不发布半份快照): {err:?}");
+                return None;
             }
-            Err(e) => tracing::warn!("成员边 sync 读库失败,沿用上轮快照: {e}"),
+        };
+        // 发布顺序:**先视图后账号**。这样被撤销的成员边立刻失效(安全方向),而新进账号
+        // 至多短暂不可选(仅是暂时不可用,不是提权)。反过来发布会让撤销晚一步生效。
+        *self.group_views.write() = memberships
+            .into_iter()
+            .map(|(g, rank)| (g, scheduler::GroupView::new(rank)))
+            .collect();
+        let accounts =
+            filter_by_provider(accounts.into_iter().map(Arc::new).collect(), self.provider.family());
+        let out = self.scheduler.sync_accounts(accounts);
+        if out.added + out.removed > 0 {
+            tracing::info!(added = out.added, removed = out.removed, "账号集已按 DB 同步");
+            // 新进账号若缺订阅档位,预热配额查询补齐(模型过滤数据源)。
+            self.warm_subscription_titles();
         }
-        match store.load_owned_accounts(&self.group) {
-            Ok(accs) => {
-                let accs = filter_by_provider(
-                    accs.into_iter().map(Arc::new).collect(),
-                    self.provider.family(),
-                );
-                let out = self.scheduler.sync_accounts(accs);
-                if out.added + out.removed > 0 {
-                    tracing::info!(added = out.added, removed = out.removed,
-                        "账号集已按 DB 同步");
-                    // 新进账号若缺订阅档位,预热配额查询补齐(模型过滤数据源)。
-                    self.warm_subscription_titles();
-                }
-                Some((out.added, out.removed))
-            }
-            Err(e) => {
-                tracing::warn!("账号 sync 读库失败,跳过本轮: {e}");
-                None
-            }
-        }
+        Some((out.added, out.removed))
     }
 }
 
@@ -881,8 +879,26 @@ pub async fn run(
         );
     }
 
+    // 成员边**必须在开始接流量之前同步装载**。周期同步的首跳是被跳过的(见下方
+    // `tick.tick().await`,注释"启动时刚加载过"只对账号成立),若在这里留空,启动后
+    // 头 30 秒内每个带组名的请求都会取到空视图 → GroupEmpty/503,等于每次发版打出一个
+    // 30 秒全组不可用窗口(对抗审查 Skeptic#1)。读库失败按空视图起,由周期同步补齐。
+    let initial_views: std::collections::HashMap<String, scheduler::GroupView> = store
+        .as_ref()
+        .map(|s| s.load_group_memberships(&wcfg.account_group))
+        .transpose()
+        .unwrap_or_else(|e| {
+            tracing::error!("启动装载成员边失败,本轮以空视图起(30s 后由周期同步补齐): {e}");
+            None
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(g, rank)| (g, scheduler::GroupView::new(rank)))
+        .collect();
+    tracing::info!(groups = initial_views.len(), "成员边启动装载完成");
+
     let state = Arc::new(WorkerState {
-        group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        group_views: parking_lot::RwLock::new(initial_views),
         instance,
         egress_desc,
         group: wcfg.account_group.clone(),

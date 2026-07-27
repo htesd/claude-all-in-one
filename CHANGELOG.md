@@ -1,5 +1,72 @@
 # Changelog
 
+## [account-group-membership] - 2026-07-27
+
+把 `group` 这一个词承担的**三件事**拆开。这是对同日上线的影子分组(见下一节)的
+**替换**,不是叠加 —— 影子组那套整体删除。
+
+### Features
+
+- **新表 `account_groups(account_id, group_name, priority)`**:账号↔分组的 **N:M 成员边**。
+  `priority` 挂在**边**上,不再挂在账号上 —— 同一个号因此可以在 A 组当主力(0)、
+  在 B 组当兜底(100)。
+- **`accounts.group_name` 语义收窄为「归属」**:哪个 worker 进程独占管理该号的运行态。
+  列名与基数(N:1)都不变,只是不再兼任权限与排序。
+- **调度器改按请求的成员视图**:`TierGuard` → `GroupView{rank}`。`eligible_ids` /
+  `tiered_lru` / `best_available_higher` / `select_id` 里读 `e.priority` 的三处全部改读
+  `view.rank_of(id)`;分层 LRU、会话亲和、向上迁移去抖(`MIGRATE_UP_DEBOUNCE`)语义不变。
+  `acquire_where` 保留为「无视图」的薄封装。
+- **自愈按视图收窄**:`heal_too_many_failures` 只复活**本组成员**。低价组一次全灭不再把
+  正常组刚合法禁用的号一起复活并清零失败计数。
+- **内网头简化**:`x-gw-tier`(档位区间 JSON)→ `x-gw-group`(组名)。worker 用组名从
+  本地 membership 快照取视图;快照与账号集在同一把 `sync_lock` 内一起换。
+- **router 按成员归属选 worker**:`pick_worker` 由「组名 == account_group」改成
+  「owner 覆盖本组成员」(`group_owners()` + 15s TTL 快照)。一个组的成员因此**可以跨多个
+  owner**,router 在其中做亲和/负载 —— 旧模型做不到。
+- **admin 成员边端点**:`GET/POST /groups/{name}/members`、
+  `DELETE /groups/{name}/members/{account_id}`、`POST /groups/{name}/members/bulk`
+  (按 owner / subscription_title 批量加,220 个号手工点不现实)。
+- **删除影子组全套**:`shadow_of`、`tier_min_priority`、`tier_max_priority`、`TierPolicy`、
+  `AcquireError::TierExhausted`(→ 语义更准的 `GroupEmpty`)。
+
+### Design Rationale
+
+- **为什么非拆不可**:归属是物理约束(两个 worker 持有同一个号 → 并发翻倍 + rolling
+  refresh_token 互相覆盖 → `invalid_grant` 报废),而权限与排序是策略。把策略焊死在物理
+  约束上,导致「一个号进两个组」只能造影子组、「同一个号在两组里排序不同」只能拿全局
+  priority 切区间 —— 而单侧区间在数学上表达不了「只要低优先的号」,才有了同日的
+  `tier_min_priority` 补丁。**根因是建模,不是缺一个字段。**
+- **2026-07-27 事故就是这个建模缺陷的代价**:低价档配成「只用小号」后,13 个小号全部
+  上游过载、成功率 71%,却**无法溢出**到主力号(溢出顺序是全局的,改不了),只能硬报错。
+  新模型下这就是一条成员边的事:低价组配 `小号@0 + 主力@100`,小号压满自然溢出。
+- **回填保证逐条等价**:`INSERT OR IGNORE ... SELECT account_id, group_name,
+  COALESCE(extra.priority, 100) FROM accounts` —— 每个号在原组、优先级沿用原值。
+  `OR IGNORE` + 复合主键使其**幂等且只补不覆盖**:运维手工调过的组内优先级不会在
+  下次重启被账号上的旧值冲掉。
+- **查不到组名 → 空视图(503),绝不回落全量池**:回落等于让一个成员边还没同步过来的
+  受限分组瞬间拿到全部账号,是静默提权。头**缺席**才回落全量池(未分组 key / 滚动升级
+  窗口内的旧 router),这两种情况下的全量池本就是升级前的行为。
+- **`delete_group` 护栏收紧**:原先只挡影子组,现在**任何**仍有 key 绑定的组都不许删。
+  删组会把 `api_keys.group_name` 清空,而 router 把空组名回落到主组 —— 这些客户当场
+  拿到全部账号。下线一个组的正确姿势是清空它的成员边(该组随即 503),或先迁走 key。
+
+### Notes & Caveats
+
+- **验收基线**:`cargo test --workspace` 802 绿,其中 **49 条既有 scheduler 测试零改动
+  通过** = G0 行为不变的机械证明。两处变异(非成员回落默认排序、分层比较取反)均被
+  多条测试抓红。
+- **生产数据副本验证**(隔离栈 `/root/caio-next`,222 个号的 `refresh_token` 全部清空):
+  迁移 222 条边、与旧模型**不一致 0 条 / 漏建 0 条**;G0 键 33 请求 100% 落 POWER,
+  低价键 30 请求 100% 落 PRO MAX(两组账号集完全不相交);低价组第一层全灭后
+  12/12 **溢出**到主力号而非硬报错。
+- **`extra.priority` 仍保留**,但只作导入时的默认种子,调度不再读它。改它不影响任何
+  已存在的成员边 —— 这是刻意的,避免"改了账号却不知道改到了哪些组"。
+- **发布顺序不可颠倒:先 worker 后 router**。旧 worker 不认 `x-gw-group`,会忽略它并用
+  全量池。更强的保险是**先上代码、后改成员边**:回填后的成员边与升级前等价,切换那一刻
+  行为零变化。
+- **未做(需要时再说)**:按组的并发预算 / 额度闸门。组内优先级只能保证"先用小号",
+  不能保证"低价最多占主力号 N 个并发槽"——共享账号的并发仍是先到先得。
+
 ## [shadow-group] - 2026-07-27
 
 ### Features

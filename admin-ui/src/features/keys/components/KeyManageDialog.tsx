@@ -117,12 +117,10 @@ export function KeyManageDialog({ open, row, groups, onClose }: KeyManageDialogP
             >
               <option value="">{t('groups.ungrouped')}</option>
               {groups.map((g) => (
-                /* 影子组 = 受限档位。不标出来的话,运维在本页把 key 从 GLOW 改成
-                   未分组/主组时看不出这一步会摘掉客户的价格限制。 */
+                /* 标出成员数:换组 = 换这个客户能用的账号集合。不标的话,运维在本页
+                   把 key 从低价组改到主组时,看不出这一步把客户放进了主力号池。 */
                 <option key={g.name} value={g.name}>
-                  {g.shadow_of !== ''
-                    ? `${g.name} (${t('groups.shadow.badge')} → ${g.shadow_of})`
-                    : g.name}
+                  {`${g.name} (${g.member_count} ${t('groups.unitMembers')})`}
                 </option>
               ))}
             </Select>
