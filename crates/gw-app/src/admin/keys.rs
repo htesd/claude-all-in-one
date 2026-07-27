@@ -294,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn key_group_must_exist() {
         let (app, store) = app();
-        store.create_group("G0", "", "").unwrap();
+        store.create_group("G0", "", "", "", None, None).unwrap();
         // 挂真实组 OK。
         let resp = app
             .clone()

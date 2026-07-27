@@ -19,12 +19,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use gw_core::config::{InstancesConfig, SystemConfig};
 use gw_core::routing::extract_session_from_metadata;
-use gw_core::store::ControlStore;
+use gw_core::store::{ControlStore, TierPolicy};
 use gw_store::SqliteStore;
 use parking_lot::Mutex;
 
 use crate::admin::{self, AdminState};
-use crate::CLIENT_KEY_HEADER;
+use crate::{CLIENT_KEY_HEADER, TIER_HEADER};
 
 /// 一个 worker 的转发目标。
 #[derive(Clone)]
@@ -92,6 +92,47 @@ fn resolve_group<'a>(key_group: Option<&'a str>, default: &'a str) -> &'a str {
         Some(g) if !g.is_empty() => g,
         _ => default,
     }
+}
+
+/// 一次请求的路由决策:**派发到哪个账号组的 worker** + 要不要给 worker 带档位守卫。
+///
+/// 影子组(低价档)不持有账号、也不绑 worker —— 它复用源组的 worker,只是可见的账号
+/// 更少。因此这里必须把影子组**映射成源组**再去 `pick_worker`,否则会撞上"该分组无
+/// 可用 worker"的 503。
+///
+/// 普通组(`tier = None`)返回值与本特性上线前完全一致:原组名 + 不带头。
+fn resolve_route<'a>(
+    key_group: Option<&'a str>,
+    tier: Option<&'a TierPolicy>,
+    default: &'a str,
+) -> (&'a str, Option<String>) {
+    match tier {
+        Some(t) if !t.source_group.is_empty() => {
+            let name = key_group.unwrap_or_default();
+            (t.source_group.as_str(), Some(encode_tier_header(name, t)))
+        }
+        _ => (resolve_group(key_group, default), None),
+    }
+}
+
+/// 档位策略 → 内网头值(紧凑 JSON)。**只由 router 依据 DB 生成**;客户端伪造的同名头
+/// 会被 `send_messages_to_worker` 的白名单直接丢弃(转发只挑固定几个头,不是黑名单)。
+///
+/// 带上影子组名(`group`)不是为了展示:worker 用它给**会话亲和表分命名空间**。
+/// 少了它,低价档会话与正常档会话会共用同一个亲和条目 —— 一个正常客户若恰好被钉在
+/// priority=100 的兜底号上,一个键名碰撞的低价请求会因为守卫把该号判为不合格,触发
+/// "改选并当场转正、永不迁回",**永久改写正常客户的账号钉扎**(上游缓存冷启动)。
+///
+/// ⚠️ 发布顺序:worker 必须先于 router 升级。旧 worker 不认识 `min_priority`,会把只带
+/// 下界的档位解析成"无限制",低价流量将直接打到主力号上。规避办法是**先升级二进制、
+/// 后建影子组**:组不存在时没有任何 key 携带该策略,窗口期内根本发不出这个头。
+fn encode_tier_header(group: &str, t: &TierPolicy) -> String {
+    serde_json::json!({
+        "group": group,
+        "min_priority": t.min_priority,
+        "max_priority": t.max_priority,
+    })
+    .to_string()
 }
 
 /// 亲和表键 = `(group, session_id)` 复合键。同一 session_id 在不同组下是**独立**的
@@ -351,7 +392,8 @@ async fn count_tokens(
     // 一致性契约:与 /v1/messages、/v1/models 一样,该 key 的分组若无对应 worker 就
     // 503,而非给一个会误导探测的 200(审查 Skeptic#4/Architect#5)。本端点仍是纯本地
     // 估算,不选具体 worker、不触账号。
-    let group = resolve_group(authed.group.as_deref(), &st.default_group);
+    // 影子组必须先映射成源组再判有没有 worker —— 影子组自己永远没有 worker。
+    let (group, _tier) = resolve_route(authed.group.as_deref(), authed.tier.as_ref(), &st.default_group);
     if !st.workers.iter().any(|w| w.account_group == group) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -385,7 +427,10 @@ async fn forward(
         Err(resp) => return resp,
     };
     let client_key = authed.key_id;
-    let group = resolve_group(authed.group.as_deref(), &st.default_group);
+    // 影子组(低价档)→ 派发到源组的 worker,并带上档位守卫头;普通组 tier_header=None,
+    // 与本特性上线前逐字节相同。
+    let (group, tier_header) =
+        resolve_route(authed.group.as_deref(), authed.tier.as_ref(), &st.default_group);
 
     // ② 在该分组的 worker 子集内选号(会话亲和)。子集为空 = 该组无对应 worker:
     // 明确 503,而非静默把请求错喂给别组 worker(此前数据面无组逻辑的根因)。
@@ -407,7 +452,8 @@ async fn forward(
     let mut target = target;
     let mut failed_over = false;
     loop {
-        match send_messages_to_worker(&st, &target, &headers, &body, client_key.as_deref()).await
+        match send_messages_to_worker(&st, &target, &headers, &body, client_key.as_deref(), tier_header.as_deref())
+            .await
         {
             Ok(resp) => return proxy_response(resp),
             Err(e) => {
@@ -439,6 +485,7 @@ async fn send_messages_to_worker(
     headers: &HeaderMap,
     body: &Bytes,
     client_key: Option<&str>,
+    tier: Option<&str>,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = format!("{}/v1/messages", target.base_url);
     let mut req = st.http.post(&url).body(body.clone());
@@ -450,6 +497,11 @@ async fn send_messages_to_worker(
     }
     if let Some(k) = client_key {
         req = req.header(CLIENT_KEY_HEADER, k);
+    }
+    // 档位守卫:只在影子组请求上出现。这是**白名单转发**——客户端自己带的
+    // x-gw-tier 到不了 worker,伪造不出低价档以外的权限。
+    if let Some(t) = tier {
+        req = req.header(TIER_HEADER, t);
     }
     req.send().await
 }
@@ -509,6 +561,9 @@ struct Authed {
     key_id: Option<String>,
     /// 客户 key 所属分组(路由派发依据;'' = 未分组 → 回落主组)。
     group: Option<String>,
+    /// 该分组的影子档位策略(`None` = 普通组)。与 group 同一条 SQL 带出,零额外查询;
+    /// 每请求现读 → admin 改配置下一个请求即生效(回退无需重启)。
+    tier: Option<TierPolicy>,
 }
 
 /// 鉴权(forward / forward_models / count_tokens 共用)。
@@ -519,7 +574,7 @@ async fn authorize(
 ) -> Result<Authed, axum::response::Response> {
     let Some(store) = st.store.as_ref() else {
         // P0:无控制面库,放行且无归属/无分组(路由用 default_group)。
-        return Ok(Authed { key_id: None, group: None });
+        return Ok(Authed { key_id: None, group: None, tier: None });
     };
     match extract_bearer(headers) {
         Some(k) => match store.authenticate(&k).await {
@@ -535,6 +590,7 @@ async fn authorize(
             Ok(Some(auth)) => Ok(Authed {
                 key_id: Some(auth.key_id),
                 group: Some(auth.group_name),
+                tier: auth.tier,
             }),
             Ok(None) => Err(unauthorized("无效 API key")),
             Err(e) => {
@@ -559,7 +615,10 @@ async fn forward_models(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let group = resolve_group(authed.group.as_deref(), &st.default_group);
+    // 影子组同样要先映射成源组:漏了这里,低价档 key 探测 /v1/models 会拿 503,
+    // NewAPI / Claude Code 会直接把整条渠道判为不可用。
+    let (group, _tier) =
+        resolve_route(authed.group.as_deref(), authed.tier.as_ref(), &st.default_group);
     // 无 session:在该组子集内取最空 worker(无亲和记忆)。
     let Some(target) = pick_worker(&st, None, group) else {
         return (
@@ -1150,5 +1209,48 @@ mod tests {
         assert!(!is_instances_config_file("instances.yaml.bak"));
         assert!(!is_instances_config_file("docker-compose.yml"));
         assert!(!is_instances_config_file("instances-.yaml"));
+    }
+
+    // ───────── 影子组(低价档)路由 ─────────
+
+    fn glow() -> TierPolicy {
+        TierPolicy { source_group: "G0".into(), min_priority: None, max_priority: Some(0) }
+    }
+
+    /// 影子组请求必须被映射到**源组**去选 worker,并带上档位头;
+    /// 普通组请求必须原样返回且**绝不带头**(这是"不影响现有分组"的关键一半)。
+    #[test]
+    fn resolve_route_maps_shadow_to_source() {
+        let t = glow();
+        let (g, hdr) = resolve_route(Some("GLOW"), Some(&t), "G0");
+        assert_eq!(g, "G0", "影子组要用源组去找 worker");
+        assert_eq!(hdr.as_deref(), Some(r#"{"group":"GLOW","max_priority":0,"min_priority":null}"#));
+
+        let (g, hdr) = resolve_route(Some("DARIO"), None, "G0");
+        assert_eq!((g, hdr), ("DARIO", None), "普通组:原组名 + 不带头");
+        let (g, hdr) = resolve_route(None, None, "G0");
+        assert_eq!((g, hdr), ("G0", None), "未分组:回落主组 + 不带头");
+    }
+
+    /// 机械证明"映射必须发生在 pick_worker 之前":影子组名本身永远选不到 worker。
+    #[test]
+    fn pick_worker_needs_resolution_first() {
+        let st = mk_state_grouped(vec![(0, "G0".to_string())]);
+        assert!(pick_worker(&st, None, "G0").is_some());
+        assert!(
+            pick_worker(&st, None, "GLOW").is_none(),
+            "影子组不绑 worker;不先映射成源组就会 503"
+        );
+        // 先映射再选,就能拿到源组的 worker。
+        let t = glow();
+        let (g, _) = resolve_route(Some("GLOW"), Some(&t), "G0");
+        assert!(pick_worker(&st, None, g).is_some());
+    }
+
+    /// 档位上限为"不限"(NULL)时头里应是 null,worker 侧解析成 max_priority: None。
+    #[test]
+    fn encode_tier_header_handles_unlimited() {
+        let t = TierPolicy { source_group: "G0".into(), min_priority: None, max_priority: None };
+        assert_eq!(encode_tier_header("GLOW", &t), r#"{"group":"GLOW","max_priority":null,"min_priority":null}"#);
     }
 }

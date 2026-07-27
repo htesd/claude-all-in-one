@@ -8,6 +8,19 @@ export interface GroupRow {
   key_count: number
   /** 创建时间，Unix 秒。 */
   created_at: number
+  /**
+   * 影子组：指向真正持有账号的源组（'' = 普通组）。
+   * 影子组自己**不持有账号**，所以 `account_count` 恒为 0 —— 卡片必须据本字段显示
+   * "影子组 → 源组" 徽章，否则运维会以为这个组坏了。
+   */
+  shadow_of: string
+  /** 影子组可见的最高档位（只允许 priority ≤ 此值；null = 不限）。 */
+  tier_max_priority: number | null
+  /**
+   * 影子组可见档位的**下界**（只允许 priority ≥ 此值；null = 不限）。
+   * 数值越小越优先，所以这一侧用来把主力号挡在档位外 —— 低价流量烧不到高价客户的号。
+   */
+  tier_min_priority: number | null
 }
 
 export interface CreateGroupPayload {

@@ -1,5 +1,66 @@
 # Changelog
 
+## [shadow-group] - 2026-07-27
+
+### Features
+
+- **影子分组(低价档)**:新增一类分组,它**不持有账号、不绑 worker**,而是复用源组的
+  worker,只是**可见的账号更少**。典型用法:`GLOW.shadow_of = G0` + `tier_max_priority = 0`
+  → 低价档只看得见 G0 里 priority=0 的主力号,看不见 priority=100 的兜底层。
+  - `groups` 表加 `shadow_of` / `tier_max_priority` 两列(`ensure_column` 增量迁移)。
+  - `authenticate` 的 SQL 加一次 `LEFT JOIN groups`,零额外查询把策略带到 `AuthenticatedKey.tier`;
+    **策略每请求现读** → admin 改完下一个请求即生效(回退无需重启、无需发版)。
+  - router 新增 `resolve_route`:影子组映射到源组再 `pick_worker`,并经内网头 `x-gw-tier`
+    把守卫下发给 worker。`forward` / `forward_models` / `count_tokens` 三个入口全部走它。
+  - scheduler 新增 `TierGuard` + `acquire_tiered`;`acquire_where` 保留为委托 `None` 的薄封装。
+- **`AcquireError::TierExhausted`**(→ 503):档位内账号全冷却/占满时的专用错误。
+- **删组保护**:`delete_group` 返回 `DeleteGroupOutcome`,对「被影子组引用的源组」和
+  「仍有 key 绑定的影子组」返回 409。
+- **转组保护**(对抗审查追加):把一个**仍有客户 key 在用**的普通组就地转成影子组会让
+  那些客户无声降级(丢掉低优兜底层 + 改路由),`validate_shadow` 一并拒绝。反方向
+  (`shadow_of=""`,低价档下线)不受影响 —— 那是解除限制,是标准回退姿势。
+- **写入时兜底**(对抗审查追加):`create_group` / `update_group` 把「源组必须存在且本身
+  非影子」合并进同一条 SQL 语句。admin 层是"先读快照再写"两次独立加锁,并发的
+  `delete_group` 能在窗口里删掉源组 → 写出 `shadow_of` 悬空的行(整组静默 503)。
+- **会话亲和按档位分命名空间**:worker 侧亲和键由请求内容派生、不含档位,两档共用一张表。
+  正常客户的会话若钉在 priority=100 兜底号上,一个键名碰撞的低价请求会因守卫判定该号不合格,
+  触发 `select_id` 的「primary 不可用 → 改选并当场转正、永不迁回」,**永久改写正常客户的
+  钉扎**(上游前缀缓存冷启动)。档位头带上组名,worker 据此给亲和表分区。
+
+### Design Rationale
+
+- **为什么影子组不能有自己的 worker**:`instances.validate` 与 router 启动校验都禁止
+  一个 account_group 绑多个 worker。两个 worker 加载同一批账号 → 并发上限翻倍 +
+  各自刷新 rolling refresh_token 互相覆盖 → 账号 `invalid_grant` 报废。所以"一个号同时
+  属于两个组"只能做成**同一 worker 内的可见性视图**:一份 entry、一个信号量、一个刷新写者。
+- **守卫为何独立于 `supports` 谓词**:塞进 `supports` 的话,过滤后的空集会掉进
+  `!supported_any` 分支 → `NoModelSupport` → **400**「订阅等级不足」。而档位耗尽是运行时
+  状态、稍后可恢复,必须是 **503**;客户端(SDK/NewAPI)对 400 不重试,会误判成请求非法。
+  错误码映射同时从二分 `if` 改成穷尽 `match`,逼后续新增变体做显式决策。
+- **带守卫的请求不触发全灭自愈**:`heal_too_many_failures` 是全局的,会复活所有
+  `TooManyFailures` 账号并清零失败计数。若低价请求也走这条路,正常组刚合法禁用的号会被
+  反复复活,连续失败保护对所有档位一起失效。
+- **守卫判据只收单调量**:`max_priority` 只在 admin 改配置时变,所以会话亲和不会因它反复
+  重钉。`available_permits()` 这类抖动量**不能**进守卫——primary 一失格就会"改选并当场
+  转正、永不迁回",会让会话反复换号、上游缓存冷启动,反而放大额度消耗。
+- **删组为何要拦**:`delete_group` 把成员的 `group_name` 清成 `''`,而 router 的
+  `resolve_group` 把 `''` 回落到 `default_group`(主组)。所以裸删影子组 = 低价客户**静默
+  提权**成主组不受限访问,无任何告警。正确的下线姿势是 `PATCH {"shadow_of":""}`。
+
+### Notes & Caveats
+
+- **默认完全 inert**:DB 里没有 `shadow_of != ''` 的行时,`tier` 恒 `None` → 恒不发头 →
+  `acquire_tiered(.., None)` 与旧 `acquire_where` 逐字节等价(有测试
+  `guard_none_matches_acquire_where_exactly` 机械保证)。开关是一行 DB 数据,不是代码分支。
+- **发布顺序不可颠倒:先 worker,后 router**。新 router + 旧 worker = 发了头没人认 =
+  低价流量无守卫打主力号。更强的保险是代码先上线、影子组后建。
+- **schema 双向兼容**:所有 SELECT 都是显式列名,旧二进制读新库正常 → 回滚二进制不需要
+  回滚 schema。
+- **共享账号 = 共享故障域(本次范围外,需知情)**:低价流量消耗的是主力号同一份月额度;
+  它触发的 `QuotaExhausted`(永久禁用)/ `TemporarilyBlocked`(1h 冷却)会同时把号从正常组
+  踢掉;**封号风险无法隔离**(账号/machineId/profileArn/出口 IP 都共享)。本次只做分组与
+  优先级可见性,未做额度预算、故障归因分层、并发预留。
+
 ## [upstream-overload] - 2026-07-25
 
 ### Features
