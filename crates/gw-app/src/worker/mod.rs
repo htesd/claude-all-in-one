@@ -1426,6 +1426,60 @@ fn switch_cap(kind: UpstreamErrorKind, total: usize, general_cap: usize) -> usiz
     }
 }
 
+/// 解析 router 透传的档位头 → [`TierGuard`]。
+///
+/// - 头缺席 → `Ok(None)`:普通组请求,调用方走与本特性上线前完全相同的路径。
+/// - 头存在但畸形 → `Err`:**必须拒绝而不是忽略**。忽略会让一个本该受档位限制的
+///   低价请求以全量权限跑掉,且没有任何痕迹。头是内网自产的,畸形只可能是版本
+///   不匹配或被篡改,两种情况都该硬失败。
+/// 一次请求所属的档位(影子组)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TierSpec {
+    /// 影子组名。**只用于给会话亲和表分命名空间**,不参与选号。
+    name: String,
+    guard: scheduler::TierGuard,
+}
+
+fn parse_tier_header(headers: &HeaderMap) -> Result<Option<TierSpec>, String> {
+    let Some(raw) = headers.get(crate::TIER_HEADER) else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().map_err(|_| "档位头含非 ASCII 字符".to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("档位头不是合法 JSON: {e}"))?;
+    // 边界字段**缺席 = 该侧不限**(与显式 null 等价)。据此,旧 router 发来的不带
+    // min_priority 的头在新 worker 上仍解析成"只有上界",行为与升级前一致。
+    let bound = |field: &str| -> Result<Option<i64>, String> {
+        match v.get(field) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(x) => Ok(Some(x.as_i64().ok_or_else(|| format!("{field} 不是整数"))?)),
+        }
+    };
+    let min_priority = bound("min_priority")?;
+    let max_priority = bound("max_priority")?;
+    let name = v
+        .get("group")
+        .and_then(|g| g.as_str())
+        .ok_or_else(|| "档位头缺少 group".to_string())?
+        .to_string();
+    Ok(Some(TierSpec { name, guard: scheduler::TierGuard { min_priority, max_priority } }))
+}
+
+/// 会话亲和键**按档位分命名空间**。
+///
+/// 必须这么做的原因:scheduler 的亲和表是全 worker 共用、按会话键索引的,而会话键由
+/// **请求内容**派生(`Provider::affinity_key`),不含档位。两档若共用一个条目:某个正常
+/// 客户的会话若钉在 priority=100 的兜底号上,一个键名碰撞的低价请求会因守卫把该号判为
+/// 不合格 → 落进 `select_id` 的"primary 不可用 → 改选并当场转正、永不迁回"分支 →
+/// **永久改写正常客户的钉扎**,上游前缀缓存冷启动。分了命名空间,低价流量就只能动
+/// 自己那一份条目。组名与会话键都不含 NUL,用 NUL 分隔。
+fn tier_scoped_affinity_key(tier: Option<&TierSpec>, key: Option<String>) -> Option<String> {
+    match (tier, key) {
+        (Some(t), Some(k)) => Some(format!("{}\u{0}{k}", t.name)),
+        (_, k) => k,
+    }
+}
+
 async fn messages(
     State(st): State<Arc<WorkerState>>,
     headers: HeaderMap,
@@ -1436,13 +1490,27 @@ async fn messages(
     // 不在热路径(handler 入口)同步跑(审查 Skeptic#1)。
     let started_at = std::time::Instant::now();
     // 客户 key 归属:router 鉴权后经内网头透传(对外 Authorization 不到 worker)。
+    // 档位守卫(影子组/低价档)。头由 router 依据 DB 生成并经内网白名单转发;
+    // 头缺席 = 普通组请求 → guard=None → 后续路径与本特性上线前逐字节相同。
+    // 畸形头**拒绝而非忽略**:忽略等于把低价请求当全价放行,静默失去档位限制。
+    let tier = match parse_tier_header(&headers) {
+        Ok(t) => t,
+        Err(msg) => {
+            tracing::error!("档位头非法,拒绝请求: {msg}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"type":"error","error":{"message": msg}})),
+            )
+                .into_response();
+        }
+    };
     let client_key = headers
         .get(crate::CLIENT_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
     // 会话亲和键 = provider 派生的 conversationId(Kiro)。None → 无亲和按负载选号。
-    let affinity_key = st.provider.affinity_key(&req);
+    let affinity_key = tier_scoped_affinity_key(tier.as_ref(), st.provider.affinity_key(&req));
 
     // 选号 + 发起 chat 的重试循环:token 失效(403/401)时刷新该号并对账号生命周期上报,
     // 换号重试;首包前的可重试错误最多走 total 个账号。committed(首包已出)后不重试。
@@ -1462,19 +1530,29 @@ async fn messages(
         //    模型的号——否则亲和会反复选中同一不支持的号(ModelNotAvailable 不禁号)死循环。
         let lease = match st
             .scheduler
-            .acquire_where(affinity_key.as_deref(), |a| {
-                st.provider.account_supports_model(a, &req.model)
-                    && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
-            })
+            .acquire_tiered(
+                affinity_key.as_deref(),
+                |a| {
+                    st.provider.account_supports_model(a, &req.model)
+                        && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
+                },
+                tier.as_ref().map(|t| &t.guard),
+            )
             .await
         {
             Ok(l) => l,
             Err(e) => {
-                // NoModelSupport 是客户侧可解(换模型/升级订阅),给 400;其余是池子状态,503。
-                let code = if e == scheduler::AcquireError::NoModelSupport {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
+                // 穷尽 match(**不要改回二分 if**):新增变体时编译器会强制在这里做出
+                // 显式决策,而不是默默落进 503 —— TierExhausted 与 NoModelSupport 的
+                // 状态码差异(可重试 vs 不可重试)正是靠这里区分的。
+                let code = match e {
+                    // 客户侧可解(换模型/升级订阅),重试无用 → 400。
+                    scheduler::AcquireError::NoModelSupport => StatusCode::BAD_REQUEST,
+                    // 池子/档位的运行时状态,稍后可恢复 → 503。
+                    scheduler::AcquireError::TierExhausted
+                    | scheduler::AcquireError::AllDisabled
+                    | scheduler::AcquireError::AllBusy
+                    | scheduler::AcquireError::Empty => StatusCode::SERVICE_UNAVAILABLE,
                 };
                 return (
                     code,
@@ -1914,8 +1992,17 @@ async fn finalize_usage(
 /// 按客户端 `stream` 标志分发:provider 一律产流,这里决定回 SSE 还是折叠成单个
 /// 非流式 Messages 响应(折叠逻辑写一次,见 [`gw_core::fold`])。两条路径都做同一套
 /// 收尾(账号生命周期上报 + usage 落库)。
-/// 请求日志环形保留条数(最新 N 条;`insert_request_log` 按此裁旧)。用户口径"最新 2000 条"。
-const REQUEST_LOG_CAP: u64 = 2000;
+/// 请求日志环形保留条数(最新 N 条;`insert_request_log` 按此裁旧)。
+///
+/// 原为 2000(最初的用户口径"最新 2000 条")。问题不在这个数字,而在流量长大了:
+/// 2026-07-26 实测 **113.6 条/分钟**,2000 条只覆盖 **18 分钟**——用户报障过来时证据
+/// 往往已被轮转掉,排查全靠运气(这次定位流卡死,第一次挑中的样本就是在准备重放时
+/// 被轮转没的)。按实测单条约 181KB(gzip 后:client_payload 110KB + kiro_payload 69KB
+/// + response 2KB)估算,10000 条约 1.7GB、覆盖约 1.5 小时。
+///
+/// ⚠️ 再调大前**先看磁盘**:这台机 2026-07-26 曾到 93%。若需要更长的留证窗口,砍
+/// `kiro_payload`(它是 client_payload 的重渲染,信息冗余却占 38% 体积)比加磁盘划算。
+const REQUEST_LOG_CAP: u64 = 10_000;
 /// 单条报文(client/kiro)入库前的**文本**体积上限(截断兜底)。报文经 gzip 压缩入库
 /// (`gw-store`,文本压 5-10 倍),且图片/文档已抽到去重 blob 表,故**全文存储不再截断**;
 /// 此上限抬到 16MiB 仅作防御性护栏——Kiro 报文体积硬上限 ~6.3MB(`DEFAULT_MAX_BODY_BYTES`),
@@ -2342,6 +2429,80 @@ async fn collect_response(
 /// 关键:`lease`(并发许可)被 move 进流的状态,持有到流耗尽才 Drop → 整个响应期间
 /// 占用该账号一个并发槽,符合 v52 并发语义。流内出现 error 事件 / Err → 上报失败;
 /// 干净结束 → 上报成功。usage 事件不转发客户端(缓存到 `last_usage`,流终态统一落库)。
+/// 上游静默多久后开始发保活帧,并按此间隔重复。必须**远小于**下游客户端的空闲判定
+/// 阈值:2026-07-26 取证四次卡死的静默时长为 120.5/123.3/124.8/126.0 秒,可推定客户端
+/// 阈值约 120s,取 20s 留 6 倍余量。
+const STREAM_IDLE_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+/// 上游连续静默的硬上限:超过即主动中止,按 `upstream_idle_abort` 收尾。
+///
+/// 它的意义是让本机制在**两种尚未证实的情形下都正确**:上游只是慢 → 保活已让客户端
+/// 等得起,在本窗口内恢复即救回;上游已经死了 → 客户端拿到明确错误,而不是像现在这样
+/// 静默两分钟被客户端自己砍断、库里还记成 200 成功。上线后两类日志的占比,即可回答
+/// "慢还是死"——这是不额外消耗上游配额就能拿到该答案的唯一途径。
+const STREAM_IDLE_ABORT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 当前开着的内容块种类(带块索引)。保活帧必须**贴合当前块类型**:Anthropic SSE 里
+/// 往 tool_use 块塞 text_delta 是非法的,客户端解析器会错乱。只跟踪这三种能安全附加
+/// 零增量的块;其余(如 redacted_thinking,它没有增量形态)一律视为"无可附着的块"。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpenBlock {
+    Text(u64),
+    Thinking(u64),
+    ToolUse(u64),
+}
+
+/// 据**已转发给客户端**的事件维护"当前开着哪个块"。只认 content_block_start/stop
+/// 与 message_stop,其余事件不改变状态。
+fn track_open_block(cur: Option<OpenBlock>, ev: &SseEvent) -> Option<OpenBlock> {
+    match ev.event.as_str() {
+        "content_block_start" => {
+            let Some(idx) = ev.data.get("index").and_then(serde_json::Value::as_u64) else {
+                return cur;
+            };
+            match ev
+                .data
+                .get("content_block")
+                .and_then(|b| b.get("type"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("text") => Some(OpenBlock::Text(idx)),
+                Some("thinking") => Some(OpenBlock::Thinking(idx)),
+                Some("tool_use") => Some(OpenBlock::ToolUse(idx)),
+                // 其余块类型没有可安全附加的零增量形态 → 视为无块可附着。
+                _ => None,
+            }
+        }
+        "content_block_stop" | "message_stop" => None,
+        _ => cur,
+    }
+}
+
+/// 构造一个语义为 no-op 的保活帧(客户端把增量逐段拼接,拼空串等于没拼)。
+///
+/// **为什么不发 Anthropic 官方的 `ping`**:本链路下游是 NewAPI,其 Claude→OpenAI 转换器
+/// 只识别 message_start / content_block_{start,delta} / message_{delta,stop} 五种事件,
+/// 且**没有 default 兜底**(实测 `to_oai_chat_resp.go`)——`ping` 到那里直接消失,不会变成
+/// 任何下游事件,客户端照样判定空闲。故改用"空增量":它属于上述五种之一,能被转换成一个
+/// 真实的下游 chunk,从而重置客户端的空闲计时。
+fn keepalive_frame(open: Option<OpenBlock>) -> SseEvent {
+    let delta = match open {
+        Some(OpenBlock::ToolUse(i)) => {
+            (i, serde_json::json!({"type":"input_json_delta","partial_json":""}))
+        }
+        Some(OpenBlock::Text(i)) => (i, serde_json::json!({"type":"text_delta","text":""})),
+        Some(OpenBlock::Thinking(i)) => {
+            (i, serde_json::json!({"type":"thinking_delta","thinking":""}))
+        }
+        // 没有开着的块时零增量无处附着,只能退回官方 ping。下游可能吃掉它,但此刻
+        // 确实没有任何合法帧可发——总比什么都不发强,且对原生 Anthropic 客户端有效。
+        None => return SseEvent::new("ping", serde_json::json!({"type":"ping"})),
+    };
+    SseEvent::new(
+        "content_block_delta",
+        serde_json::json!({"type":"content_block_delta","index":delta.0,"delta":delta.1}),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     st: Arc<WorkerState>,
@@ -2375,6 +2536,21 @@ fn stream_response(
         // 防超长/超大回复无界占内存(触顶后停止累积,折叠仍尽力而为;正常回复远低于此)。
         resp_events: Vec<SseEvent>,
         resp_bytes: usize,
+        /// 流是否走到了 `message_stop`(= 客户端拿到了完整响应)。
+        saw_message_stop: bool,
+        /// 是否因上游静默超过 [`STREAM_IDLE_ABORT`] 被我方主动中止。
+        ///
+        /// ⚠️ 它与 `saw_error` **必须严格分开**:`saw_error` 驱动账号健康上报
+        /// (report_failure → failure_count → 撞 max_failures 就禁号)。而"流没收完"的成因
+        /// 既可能是上游静默、也可能是客户端主动断开(用户 Ctrl-C),拿它去扣账号健康会重演
+        /// 2026-07-25 那场 35 秒禁光 7 个号的事故——上游抖动时所有账号会一起中招。
+        /// 故本标志与 `saw_message_stop` **只**影响请求日志的 success/error_kind,
+        /// 绝不参与账号生命周期上报。
+        idle_aborted: bool,
+        /// 当前开着的内容块(决定保活帧的形态)。
+        open_block: Option<OpenBlock>,
+        /// 最近一次收到上游事件的时刻(空闲时长的基准)。
+        last_event_at: std::time::Instant,
     }
 
     // 收尾(账号生命周期上报 + usage 落库)统一放 Drop:无论流跑到 None 正常结束,
@@ -2385,14 +2561,17 @@ fn stream_response(
     impl Drop for StreamCtx {
         fn drop(&mut self) {
             // 账号生命周期上报(一次)。Err 分支可能已按具体 kind 上报过(reported=true)。
+            // ⚠️ **仍然只看 `saw_error`**:流没收完(客户端断开 / 上游静默中止)不扣账号健康,
+            // 理由见 `idle_aborted` 字段注释——那会在上游抖动时把所有账号一起打死。
+            let account_ok = !self.saw_error;
             if !self.reported {
                 self.reported = true;
-                if self.saw_error {
+                if account_ok {
+                    self.st.scheduler.report_success(&self.account_id);
+                } else {
                     self.st
                         .scheduler
                         .report_failure(&self.account_id, UpstreamErrorKind::ServerError);
-                } else {
-                    self.st.scheduler.report_success(&self.account_id);
                 }
             }
             // detach 到当前运行时,做 usage 落库(#130)+ 请求日志落库(#③)。
@@ -2400,14 +2579,39 @@ fn stream_response(
             // finalize_usage / finalize_request_log 各自对 None 降级。无运行时上下文
             // (理论上不会:SSE body 总在 tokio 内 drop)则跳过。guard 跟随任务存活:
             // 停机排空经 pending_writes.wait_idle 等这批落库收尾(审查 Skeptic#1/Architect#1)。
-            let success = !self.saw_error;
+            // 请求日志的成败判定比账号健康**更严**:上游没报错、**且**流确实走到了
+            // message_stop,才算客户端拿到了完整响应。此前这类"中途卡死"一律记成 200 成功,
+            // 在 admin UI 和告警里完全隐形——2026-07-26 排查用户报障就栽在这:错误日志
+            // 一片干净,故障却真实存在,只能靠翻 `success=1 AND output_tokens=0` 的空流才发现。
+            let incomplete = if self.idle_aborted {
+                Some("upstream_idle_abort")
+            } else if !self.saw_message_stop {
+                Some("incomplete_stream")
+            } else {
+                None
+            };
+            let success = account_ok && incomplete.is_none();
             let duration_ms = Some(self.started_at.elapsed().as_millis() as i64);
             let ttfb_ms = self
                 .first_byte_at
                 .map(|t| t.duration_since(self.started_at).as_millis() as i64);
-            let status_code: Option<i64> = if success { Some(200) } else { None };
+            if let Some(kind) = incomplete {
+                tracing::warn!(
+                    account = %self.account_id,
+                    model = %self.model,
+                    duration_ms = ?duration_ms,
+                    kind,
+                    "流未走到 message_stop,按未完成收尾(**不**影响账号健康)"
+                );
+            }
+            // status_code 记的是**实际发出过的 HTTP 状态**,故仍按 account_ok 判定——
+            // 卡死那次的响应头确实是 200,新增信息由 success/error_kind 承载。
+            let status_code: Option<i64> = if account_ok { Some(200) } else { None };
             let usage = self.last_usage.take();
-            let error_kind = self.error_kind.take();
+            let error_kind = self
+                .error_kind
+                .take()
+                .or_else(|| incomplete.map(str::to_string));
             // usage 落库(#130):async,detach 到运行时(sink.record 是 async)。
             if let (Some(sink), Some(u)) = (self.st.usage_sink.clone(), usage.clone()) {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -2423,7 +2627,10 @@ fn stream_response(
                             &model,
                             &client_key,
                             Some(&u),
-                            success,
+                            // 计量口径**不动**:仍用 account_ok 而非更严的 success。
+                            // 流没收完但上游已产出的 token 该计还得计,把它改成失败会
+                            // 悄悄改变历史统计与计费语义,不属于本次改动的范围。
+                            account_ok,
                         )
                         .await;
                     });
@@ -2468,12 +2675,65 @@ fn stream_response(
         error_kind: None,
         resp_events: Vec::new(),
         resp_bytes: 0,
+        saw_message_stop: false,
+        idle_aborted: false,
+        open_block: None,
+        last_event_at: std::time::Instant::now(),
     };
 
     let sse = futures::stream::unfold(init, |mut ctx| async move {
         // 单步内循环跳过 usage 事件,直到拿到一个可转发事件或流结束(避免递归类型膨胀)。
         loop {
-            match ctx.inner.next().await {
+            // 上一轮已因静默撞上硬上限并发过错误事件 → 结束流。返回 None 会 drop ctx,
+            // 连带 drop `inner` 从而真正切断上游连接(不留悬挂请求)。
+            if ctx.idle_aborted {
+                return None;
+            }
+            // 取上游事件带空闲超时:静默超过 [`STREAM_IDLE_KEEPALIVE`] 就先给客户端补一个
+            // 保活帧再回来继续等。`StreamExt::next` 是取消安全的(元素只在 Poll::Ready 时
+            // 取走),超时丢弃这个 future 不会吞掉任何事件。
+            let item = match tokio::time::timeout(STREAM_IDLE_KEEPALIVE, ctx.inner.next()).await {
+                Ok(item) => {
+                    ctx.last_event_at = std::time::Instant::now();
+                    item
+                }
+                Err(_) => {
+                    let idle = ctx.last_event_at.elapsed();
+                    if idle >= STREAM_IDLE_ABORT {
+                        // 静默到硬上限:主动中止并给客户端一个**明确错误**,而不是让它继续
+                        // 空等、最后自己超时——那条老路我方还会记成 200 成功(见 Drop 注释)。
+                        ctx.idle_aborted = true;
+                        tracing::warn!(
+                            account = %ctx.account_id,
+                            model = %ctx.model,
+                            idle_secs = idle.as_secs(),
+                            "上游静默超过硬上限,主动中止本次流"
+                        );
+                        let out = Event::default().event("error").data(
+                            serde_json::json!({"type":"error","error":{
+                                "type":"api_error",
+                                "message": format!(
+                                    "upstream stalled: no event for {}s",
+                                    idle.as_secs()
+                                )}})
+                            .to_string(),
+                        );
+                        return Some((Ok::<Event, std::convert::Infallible>(out), ctx));
+                    }
+                    tracing::debug!(
+                        account = %ctx.account_id,
+                        model = %ctx.model,
+                        idle_secs = idle.as_secs(),
+                        "上游静默,发保活帧维持下游空闲计时"
+                    );
+                    // 保活帧**不**进 resp_events:它不是模型回复内容,且对折叠是 no-op,
+                    // 混进去只会平白占掉 RESPONSE_LOG_MAX_BYTES 预算。
+                    let ka = keepalive_frame(ctx.open_block);
+                    let out = Event::default().event(ka.event.clone()).data(ka.data.to_string());
+                    return Some((Ok::<Event, std::convert::Infallible>(out), ctx));
+                }
+            };
+            match item {
                 Some(Ok(StreamItem::Sse(ev))) => {
                     // 首个转发事件时刻 = TTFB(请求日志 #③)。
                     if ctx.first_byte_at.is_none() {
@@ -2485,6 +2745,12 @@ fn stream_response(
                             ctx.error_kind = Some("stream_error".to_string());
                         }
                     }
+                    // 完整性判据:只有真的收到 message_stop 才算客户端拿到完整响应。
+                    if ev.event == "message_stop" {
+                        ctx.saw_message_stop = true;
+                    }
+                    // 跟踪当前开着的块,供保活帧选形态(必须在转发前更新:下一轮静默时要用)。
+                    ctx.open_block = track_open_block(ctx.open_block, &ev);
                     let out = match ev.to_wire() {
                         Ok(_) => {
                             // 转发本就要把 data 序列化成字符串,这里复用它:既当字节预算度量,又喂给下游,
@@ -3247,5 +3513,217 @@ mod tests {
             .sum();
         assert!(worst <= 5_000, "最坏总退避 {worst}ms 超过 5s");
         assert!(seen.len() > 1, "抖动没起作用(200 次采样只有一个值),并发请求会同步重撞");
+    }
+
+    // ───────── 影子组档位头解析 ─────────
+
+    fn hdrs(v: Option<&str>) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        if let Some(v) = v {
+            h.insert(crate::TIER_HEADER, v.parse().unwrap());
+        }
+        h
+    }
+
+    /// 头缺席 = 普通组:必须是 None,调用方据此走与本特性上线前完全相同的路径。
+    #[test]
+    fn tier_header_absent_is_none() {
+        assert_eq!(parse_tier_header(&hdrs(None)).unwrap(), None);
+    }
+
+    /// 合法头解析出档位;`null` = 不限档位(而不是解析失败)。
+    #[test]
+    fn tier_header_parses_priority_and_null() {
+        assert_eq!(
+            parse_tier_header(&hdrs(Some(r#"{"group":"GLOW","max_priority":0}"#))).unwrap(),
+            Some(TierSpec {
+                name: "GLOW".into(),
+                guard: scheduler::TierGuard { min_priority: None, max_priority: Some(0) }
+            })
+        );
+        assert_eq!(
+            parse_tier_header(&hdrs(Some(r#"{"group":"GLOW","max_priority":null}"#)))
+                .unwrap()
+                .unwrap()
+                .guard,
+            scheduler::TierGuard { min_priority: None, max_priority: None }
+        );
+    }
+
+    /// 下界字段解析;且**字段缺席 = 该侧不限**——旧 router 发来的不带 `min_priority`
+    /// 的头必须仍按"只有上界"处理,而不是解析失败把整档打成 400。
+    #[test]
+    fn tier_header_parses_min_priority_and_tolerates_absence() {
+        assert_eq!(
+            parse_tier_header(&hdrs(Some(r#"{"group":"GECO","min_priority":1,"max_priority":null}"#)))
+                .unwrap()
+                .unwrap()
+                .guard,
+            scheduler::TierGuard { min_priority: Some(1), max_priority: None }
+        );
+        // 两端同时给出 = 闭区间,原样透传给守卫。
+        assert_eq!(
+            parse_tier_header(&hdrs(Some(r#"{"group":"G","min_priority":10,"max_priority":60}"#)))
+                .unwrap()
+                .unwrap()
+                .guard,
+            scheduler::TierGuard { min_priority: Some(10), max_priority: Some(60) }
+        );
+        // 旧格式(无 min 字段)向前兼容。
+        assert_eq!(
+            parse_tier_header(&hdrs(Some(r#"{"group":"GLOW","max_priority":0}"#)))
+                .unwrap()
+                .unwrap()
+                .guard,
+            scheduler::TierGuard { min_priority: None, max_priority: Some(0) },
+            "旧 router 的头必须仍解析成只有上界,不能失败"
+        );
+        // 类型错误仍须拒绝(与 max 一致)。
+        assert!(parse_tier_header(&hdrs(Some(r#"{"group":"G","min_priority":"low"}"#))).is_err());
+    }
+
+    /// 会话亲和键必须按档位分命名空间,否则低价流量能改写正常客户的账号钉扎
+    /// (`select_id` 的"primary 不合格 → 改选并当场转正、永不迁回")。
+    #[test]
+    fn affinity_key_is_namespaced_per_tier() {
+        let t = TierSpec {
+            name: "GLOW".into(),
+            guard: scheduler::TierGuard { min_priority: None, max_priority: Some(0) },
+        };
+        let plain = tier_scoped_affinity_key(None, Some("sess-1".into()));
+        let scoped = tier_scoped_affinity_key(Some(&t), Some("sess-1".into()));
+        assert_eq!(plain.as_deref(), Some("sess-1"), "普通组的亲和键必须原样不变");
+        assert_ne!(plain, scoped, "同一会话键在两档下必须落到不同的亲和条目");
+        assert_eq!(scoped.as_deref(), Some("GLOW\u{0}sess-1"));
+        // 无会话键(无亲和记忆)时两档都是 None,不得凭空造出一个键。
+        assert_eq!(tier_scoped_affinity_key(Some(&t), None), None);
+    }
+
+    /// 畸形头必须**报错而不是当成普通请求忽略** —— 忽略等于把本该受限的低价请求
+    /// 以全量权限放行,且没有任何痕迹。
+    #[test]
+    fn tier_header_malformed_is_error_not_ignored() {
+        for bad in [r#"not json"#, r#"{"group":"G","max_priority":"high"}"#, r#"["#, r#"{"max_priority":0}"#] {
+            assert!(
+                parse_tier_header(&hdrs(Some(bad))).is_err(),
+                "畸形档位头 {bad} 必须拒绝,绝不能静默按普通请求放行"
+            );
+        }
+    }
+
+    /// 保活帧必须**始终**用 `content_block_delta` 这个事件名。
+    ///
+    /// 这是整个保活机制成立的前提,单独锁一个测试:下游 NewAPI 的 Claude→OpenAI 转换器
+    /// 只识别 message_start / content_block_{start,delta} / message_{delta,stop} 五种事件,
+    /// **且没有 default 兜底**。谁要是"顺手简化"成官方的 `ping`,保活帧会在 NewAPI 处
+    /// 静默消失、一个下游事件都不产生,客户端照样卡死——而且不会有任何报错提示你。
+    #[test]
+    fn keepalive_frames_use_an_event_newapi_can_convert() {
+        for open in [
+            OpenBlock::Text(0),
+            OpenBlock::Thinking(3),
+            OpenBlock::ToolUse(7),
+        ] {
+            let f = keepalive_frame(Some(open));
+            assert_eq!(
+                f.event, "content_block_delta",
+                "{open:?} 的保活帧事件名必须是 content_block_delta,否则会被下游丢弃"
+            );
+        }
+    }
+
+    #[test]
+    fn keepalive_frame_matches_open_block_kind_and_is_a_noop() {
+        // 帧形态必须贴合当前块类型:往 tool_use 块塞 text_delta 是非法 SSE,客户端会错乱。
+        // 且承载的增量一律是空串 —— 客户端逐段拼接,拼空串等于没拼,对内容零影响。
+        let cases = [
+            (OpenBlock::Text(0), "text_delta", "text"),
+            (OpenBlock::Thinking(3), "thinking_delta", "thinking"),
+            (OpenBlock::ToolUse(7), "input_json_delta", "partial_json"),
+        ];
+        for (open, delta_type, field) in cases {
+            let f = keepalive_frame(Some(open));
+            let idx = match open {
+                OpenBlock::Text(i) | OpenBlock::Thinking(i) | OpenBlock::ToolUse(i) => i,
+            };
+            assert_eq!(f.data["index"], idx, "保活帧必须打在当前块的索引上");
+            assert_eq!(f.data["delta"]["type"], delta_type);
+            // 字段必须**存在且为字符串**。NewAPI 的转换器对 input_json_delta 是
+            // `*claudeResponse.Delta.PartialJson` 直接解引用、**不做 nil 检查**——
+            // 缺字段或给 null 会让下游网关 panic,不是只丢一帧那么简单。
+            assert_eq!(
+                f.data["delta"][field].as_str(),
+                Some(""),
+                "{delta_type} 的 {field} 必须是空字符串(不能缺失、更不能是 null)"
+            );
+        }
+    }
+
+    #[test]
+    fn keepalive_without_open_block_falls_back_to_ping() {
+        // 没有开着的块时零增量无处附着,只能退回官方 ping(对原生 Anthropic 客户端有效)。
+        let f = keepalive_frame(None);
+        assert_eq!(f.event, "ping");
+        assert_eq!(f.data["type"], "ping");
+    }
+
+    #[test]
+    fn track_open_block_follows_block_lifecycle() {
+        let start = |idx: u64, ty: &str| {
+            SseEvent::new(
+                "content_block_start",
+                serde_json::json!({"type":"content_block_start","index":idx,
+                    "content_block":{"type":ty}}),
+            )
+        };
+        let plain = |name: &str| SseEvent::new(name, serde_json::json!({"type":name}));
+
+        assert_eq!(
+            track_open_block(None, &start(0, "text")),
+            Some(OpenBlock::Text(0))
+        );
+        assert_eq!(
+            track_open_block(None, &start(1, "tool_use")),
+            Some(OpenBlock::ToolUse(1))
+        );
+        assert_eq!(
+            track_open_block(None, &start(2, "thinking")),
+            Some(OpenBlock::Thinking(2))
+        );
+        // 没有安全零增量形态的块(如 redacted_thinking)→ 视为无块可附着,回退 ping。
+        assert_eq!(track_open_block(None, &start(3, "redacted_thinking")), None);
+        // 关块 / 整条消息结束都要清状态,否则会往已关闭的块发 delta(非法 SSE)。
+        let open = Some(OpenBlock::ToolUse(1));
+        assert_eq!(track_open_block(open, &plain("content_block_stop")), None);
+        assert_eq!(track_open_block(open, &plain("message_stop")), None);
+        // 无关事件不改变状态(delta 期间必须保持当前块)。
+        assert_eq!(track_open_block(open, &plain("content_block_delta")), open);
+        assert_eq!(track_open_block(open, &plain("message_delta")), open);
+    }
+
+    #[test]
+    fn idle_thresholds_leave_margin_under_the_observed_client_timeout() {
+        // 2026-07-26 取证:四次卡死的静默时长 120.5/123.3/124.8/126.0 秒 → 客户端阈值约 120s。
+        const OBSERVED_CLIENT_IDLE_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(120);
+        assert!(
+            STREAM_IDLE_KEEPALIVE * 4 <= OBSERVED_CLIENT_IDLE_TIMEOUT,
+            "保活间隔 {:?} 对客户端 {:?} 的阈值余量不足 4 倍,上游抖动稍变就又会被砍",
+            STREAM_IDLE_KEEPALIVE,
+            OBSERVED_CLIENT_IDLE_TIMEOUT
+        );
+        // 硬上限必须显著大于保活间隔,否则还没来得及保活就先中止了。
+        assert!(
+            STREAM_IDLE_ABORT >= STREAM_IDLE_KEEPALIVE * 4,
+            "硬上限 {:?} 太接近保活间隔 {:?}",
+            STREAM_IDLE_ABORT,
+            STREAM_IDLE_KEEPALIVE
+        );
+        // 上限也要大于观察到的客户端阈值,否则"上游只是慢"的情形永远等不到恢复,
+        // 也就永远回答不了"慢还是死"。
+        assert!(
+            STREAM_IDLE_ABORT > OBSERVED_CLIENT_IDLE_TIMEOUT,
+            "硬上限不该早于客户端自己的阈值,那样这次改动等于没做"
+        );
     }
 }

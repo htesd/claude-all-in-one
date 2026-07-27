@@ -117,8 +117,12 @@ export function KeyManageDialog({ open, row, groups, onClose }: KeyManageDialogP
             >
               <option value="">{t('groups.ungrouped')}</option>
               {groups.map((g) => (
+                /* 影子组 = 受限档位。不标出来的话,运维在本页把 key 从 GLOW 改成
+                   未分组/主组时看不出这一步会摘掉客户的价格限制。 */
                 <option key={g.name} value={g.name}>
-                  {g.name}
+                  {g.shadow_of !== ''
+                    ? `${g.name} (${t('groups.shadow.badge')} → ${g.shadow_of})`
+                    : g.name}
                 </option>
               ))}
             </Select>

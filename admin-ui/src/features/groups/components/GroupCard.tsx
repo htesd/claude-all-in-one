@@ -89,6 +89,21 @@ export function GroupCard({ group, busy, onEdit, onDelete }: GroupCardProps) {
               </Button>
             </div>
           </div>
+        ) : group.shadow_of !== '' ? (
+          /* 影子组不持有账号（account_count 恒 0），显示账号数会让人以为组坏了；
+             改成说明它复用哪个源组、卡在哪一档。 */
+          <p className="text-xs text-muted-foreground">
+            <span className="rounded bg-muted px-1 py-0.5 font-medium">
+              {t('groups.shadow.badge')} → {group.shadow_of}
+            </span>{' '}
+            {group.tier_min_priority !== null && (
+              <>· {t('groups.shadow.minPriority')} ≥ {group.tier_min_priority} </>
+            )}
+            {group.tier_max_priority !== null && (
+              <>· {t('groups.shadow.maxPriority')} ≤ {group.tier_max_priority} </>
+            )}
+            · {group.key_count} {t('groups.unitKeys')}
+          </p>
         ) : (
           <p className="text-xs text-muted-foreground">
             {group.account_count} {t('groups.unitAccounts')} · {group.key_count}{' '}
