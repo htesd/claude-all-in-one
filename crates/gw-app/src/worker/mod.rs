@@ -62,6 +62,12 @@ struct WorkerState {
     /// 并发跑 `sync_accounts_from_db` 时,若不串行"读 DB 快照 → 应用 scheduler",
     /// 旧快照可能最后应用,把刚导入的账号从内存移掉(等下轮才回来)。
     sync_lock: tokio::sync::Mutex<()>,
+    /// **分组成员视图快照**:组名 → 该组在本 worker 名下的成员集与组内优先级。
+    /// 与账号集同一轮同步(同一把 `sync_lock`),admin 改完可用 `/sync` 立即推送。
+    ///
+    /// 查不到的组名一律当**空视图**处理(→ 503),**绝不回落成全量池** —— 那等于
+    /// 把一个受限分组的请求以全量权限放行,是静默提权。
+    group_views: parking_lot::RwLock<std::collections::HashMap<String, scheduler::GroupView>>,
     /// worker 的 egress client(provider 已持有同一个;此处保留供诊断)。
     _client: reqwest::Client,
 }
@@ -544,7 +550,19 @@ impl WorkerState {
         let _serialized = self.sync_lock.lock().await;
         // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
         flush_dirty_extras(&self.scheduler, &store, &self.refresh_locks, "sync 重试").await;
-        match store.load_group_accounts(&self.group) {
+        // 成员边与账号集在同一把 sync_lock 内一起换,避免出现"号已进来但还没有任何组
+        // 认领它"(该号对所有客户不可见)或反过来"边指向已被移走的号"的中间态。
+        match store.load_group_memberships(&self.group) {
+            Ok(m) => {
+                let views = m
+                    .into_iter()
+                    .map(|(g, rank)| (g, scheduler::GroupView::new(rank)))
+                    .collect();
+                *self.group_views.write() = views;
+            }
+            Err(e) => tracing::warn!("成员边 sync 读库失败,沿用上轮快照: {e}"),
+        }
+        match store.load_owned_accounts(&self.group) {
             Ok(accs) => {
                 let accs = filter_by_provider(
                     accs.into_iter().map(Arc::new).collect(),
@@ -710,7 +728,7 @@ pub async fn run(
     // 账号集:DB 优先(admin 可管理),无库时退回 yaml。
     let accounts: Vec<Arc<Account>> = match &store {
         Some(store) => store
-            .load_group_accounts(&wcfg.account_group)?
+            .load_owned_accounts(&wcfg.account_group)?
             .into_iter()
             .map(Arc::new)
             .collect(),
@@ -864,6 +882,7 @@ pub async fn run(
     }
 
     let state = Arc::new(WorkerState {
+        group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
         instance,
         egress_desc,
         group: wcfg.account_group.clone(),
@@ -1426,56 +1445,35 @@ fn switch_cap(kind: UpstreamErrorKind, total: usize, general_cap: usize) -> usiz
     }
 }
 
-/// 解析 router 透传的档位头 → [`TierGuard`]。
+/// 解析 router 透传的**分组名**头。
 ///
-/// - 头缺席 → `Ok(None)`:普通组请求,调用方走与本特性上线前完全相同的路径。
-/// - 头存在但畸形 → `Err`:**必须拒绝而不是忽略**。忽略会让一个本该受档位限制的
-///   低价请求以全量权限跑掉,且没有任何痕迹。头是内网自产的,畸形只可能是版本
-///   不匹配或被篡改,两种情况都该硬失败。
-/// 一次请求所属的档位(影子组)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TierSpec {
-    /// 影子组名。**只用于给会话亲和表分命名空间**,不参与选号。
-    name: String,
-    guard: scheduler::TierGuard,
-}
-
-fn parse_tier_header(headers: &HeaderMap) -> Result<Option<TierSpec>, String> {
-    let Some(raw) = headers.get(crate::TIER_HEADER) else {
+/// - 头缺席 → `Ok(None)`:worker 用全量账号池(未分组请求 / 旧 router 滚动升级期间),
+///   行为与本次重构之前逐字节相同。
+/// - 头存在但为空 → `Err`:**必须拒绝而不是当成缺席**。当成缺席等于把一个本该受成员集
+///   限制的请求以全量权限放行,且没有任何痕迹。头是内网自产的,畸形只可能是版本不匹配
+///   或被篡改,两种情况都该硬失败。
+fn parse_group_header(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(raw) = headers.get(crate::GROUP_HEADER) else {
         return Ok(None);
     };
-    let raw = raw.to_str().map_err(|_| "档位头含非 ASCII 字符".to_string())?;
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| format!("档位头不是合法 JSON: {e}"))?;
-    // 边界字段**缺席 = 该侧不限**(与显式 null 等价)。据此,旧 router 发来的不带
-    // min_priority 的头在新 worker 上仍解析成"只有上界",行为与升级前一致。
-    let bound = |field: &str| -> Result<Option<i64>, String> {
-        match v.get(field) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(x) => Ok(Some(x.as_i64().ok_or_else(|| format!("{field} 不是整数"))?)),
-        }
-    };
-    let min_priority = bound("min_priority")?;
-    let max_priority = bound("max_priority")?;
-    let name = v
-        .get("group")
-        .and_then(|g| g.as_str())
-        .ok_or_else(|| "档位头缺少 group".to_string())?
-        .to_string();
-    Ok(Some(TierSpec { name, guard: scheduler::TierGuard { min_priority, max_priority } }))
+    let name = raw.to_str().map_err(|_| "分组头含非 ASCII 字符".to_string())?.trim();
+    if name.is_empty() {
+        return Err("分组头为空".into());
+    }
+    Ok(Some(name.to_string()))
 }
 
-/// 会话亲和键**按档位分命名空间**。
+/// 会话亲和键**按分组分命名空间**。
 ///
 /// 必须这么做的原因:scheduler 的亲和表是全 worker 共用、按会话键索引的,而会话键由
-/// **请求内容**派生(`Provider::affinity_key`),不含档位。两档若共用一个条目:某个正常
-/// 客户的会话若钉在 priority=100 的兜底号上,一个键名碰撞的低价请求会因守卫把该号判为
-/// 不合格 → 落进 `select_id` 的"primary 不可用 → 改选并当场转正、永不迁回"分支 →
-/// **永久改写正常客户的钉扎**,上游前缀缓存冷启动。分了命名空间,低价流量就只能动
-/// 自己那一份条目。组名与会话键都不含 NUL,用 NUL 分隔。
-fn tier_scoped_affinity_key(tier: Option<&TierSpec>, key: Option<String>) -> Option<String> {
-    match (tier, key) {
-        (Some(t), Some(k)) => Some(format!("{}\u{0}{k}", t.name)),
+/// **请求内容**派生(`Provider::affinity_key`),不含分组。两组若共用一个条目:某个正常
+/// 客户的会话若钉在只属于正常组的号上,一个键名碰撞的低价请求会因该号不是自己组的成员
+/// 而把它判为不合格 → 落进 `select_id` 的"primary 不可用 → 改选并当场转正、永不迁回"
+/// 分支 → **永久改写正常客户的钉扎**,上游前缀缓存冷启动。分了命名空间,低价流量就只能
+/// 动自己那一份条目。组名与会话键都不含 NUL,用 NUL 分隔。
+fn group_scoped_affinity_key(group: Option<&str>, key: Option<String>) -> Option<String> {
+    match (group, key) {
+        (Some(g), Some(k)) => Some(format!("{g}\u{0}{k}")),
         (_, k) => k,
     }
 }
@@ -1490,13 +1488,13 @@ async fn messages(
     // 不在热路径(handler 入口)同步跑(审查 Skeptic#1)。
     let started_at = std::time::Instant::now();
     // 客户 key 归属:router 鉴权后经内网头透传(对外 Authorization 不到 worker)。
-    // 档位守卫(影子组/低价档)。头由 router 依据 DB 生成并经内网白名单转发;
-    // 头缺席 = 普通组请求 → guard=None → 后续路径与本特性上线前逐字节相同。
-    // 畸形头**拒绝而非忽略**:忽略等于把低价请求当全价放行,静默失去档位限制。
-    let tier = match parse_tier_header(&headers) {
-        Ok(t) => t,
+    // 请求所属分组:头由 router 依据 key 的分组生成、经内网白名单转发(客户端伪造的
+    // 同名头在白名单转发时被丢弃)。头缺席 = 未分组请求 → 全量池,与重构前逐字节相同。
+    // 畸形头**拒绝而非忽略**:忽略等于把受限分组的请求当全量放行,静默提权。
+    let group = match parse_group_header(&headers) {
+        Ok(g) => g,
         Err(msg) => {
-            tracing::error!("档位头非法,拒绝请求: {msg}");
+            tracing::error!("分组头非法,拒绝请求: {msg}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"type":"error","error":{"message": msg}})),
@@ -1504,13 +1502,18 @@ async fn messages(
                 .into_response();
         }
     };
+    // 组名 → 成员视图。**查不到的组给空视图**(→ GroupEmpty/503),绝不回落全量池:
+    // 那等于让一个成员边还没同步过来的分组瞬间拿到全部账号。
+    let view = group
+        .as_deref()
+        .map(|g| st.group_views.read().get(g).cloned().unwrap_or_default());
     let client_key = headers
         .get(crate::CLIENT_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
     // 会话亲和键 = provider 派生的 conversationId(Kiro)。None → 无亲和按负载选号。
-    let affinity_key = tier_scoped_affinity_key(tier.as_ref(), st.provider.affinity_key(&req));
+    let affinity_key = group_scoped_affinity_key(group.as_deref(), st.provider.affinity_key(&req));
 
     // 选号 + 发起 chat 的重试循环:token 失效(403/401)时刷新该号并对账号生命周期上报,
     // 换号重试;首包前的可重试错误最多走 total 个账号。committed(首包已出)后不重试。
@@ -1530,26 +1533,26 @@ async fn messages(
         //    模型的号——否则亲和会反复选中同一不支持的号(ModelNotAvailable 不禁号)死循环。
         let lease = match st
             .scheduler
-            .acquire_tiered(
+            .acquire_in_group(
                 affinity_key.as_deref(),
                 |a| {
                     st.provider.account_supports_model(a, &req.model)
                         && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
                 },
-                tier.as_ref().map(|t| &t.guard),
+                view.as_ref(),
             )
             .await
         {
             Ok(l) => l,
             Err(e) => {
                 // 穷尽 match(**不要改回二分 if**):新增变体时编译器会强制在这里做出
-                // 显式决策,而不是默默落进 503 —— TierExhausted 与 NoModelSupport 的
+                // 显式决策,而不是默默落进 503 —— GroupEmpty 与 NoModelSupport 的
                 // 状态码差异(可重试 vs 不可重试)正是靠这里区分的。
                 let code = match e {
                     // 客户侧可解(换模型/升级订阅),重试无用 → 400。
                     scheduler::AcquireError::NoModelSupport => StatusCode::BAD_REQUEST,
-                    // 池子/档位的运行时状态,稍后可恢复 → 503。
-                    scheduler::AcquireError::TierExhausted
+                    // 池子/分组的配置或运行时状态,稍后可恢复 → 503。
+                    scheduler::AcquireError::GroupEmpty
                     | scheduler::AcquireError::AllDisabled
                     | scheduler::AcquireError::AllBusy
                     | scheduler::AcquireError::Empty => StatusCode::SERVICE_UNAVAILABLE,
@@ -3515,100 +3518,59 @@ mod tests {
         assert!(seen.len() > 1, "抖动没起作用(200 次采样只有一个值),并发请求会同步重撞");
     }
 
-    // ───────── 影子组档位头解析 ─────────
+    // ───────── 分组头解析 ─────────
 
     fn hdrs(v: Option<&str>) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
         if let Some(v) = v {
-            h.insert(crate::TIER_HEADER, v.parse().unwrap());
+            h.insert(crate::GROUP_HEADER, v.parse().unwrap());
         }
         h
     }
 
-    /// 头缺席 = 普通组:必须是 None,调用方据此走与本特性上线前完全相同的路径。
+    /// 头缺席 = 未分组请求:必须是 None,调用方据此走与本次重构之前完全相同的路径
+    /// (全量池)。滚动升级期间旧 router 不发这个头,靠的就是这条。
     #[test]
-    fn tier_header_absent_is_none() {
-        assert_eq!(parse_tier_header(&hdrs(None)).unwrap(), None);
+    fn group_header_absent_is_none() {
+        assert_eq!(parse_group_header(&hdrs(None)).unwrap(), None);
     }
 
-    /// 合法头解析出档位;`null` = 不限档位(而不是解析失败)。
+    /// 正常解析:组名原样取出,首尾空白裁掉。
     #[test]
-    fn tier_header_parses_priority_and_null() {
-        assert_eq!(
-            parse_tier_header(&hdrs(Some(r#"{"group":"GLOW","max_priority":0}"#))).unwrap(),
-            Some(TierSpec {
-                name: "GLOW".into(),
-                guard: scheduler::TierGuard { min_priority: None, max_priority: Some(0) }
-            })
-        );
-        assert_eq!(
-            parse_tier_header(&hdrs(Some(r#"{"group":"GLOW","max_priority":null}"#)))
-                .unwrap()
-                .unwrap()
-                .guard,
-            scheduler::TierGuard { min_priority: None, max_priority: None }
-        );
+    fn group_header_parses_name() {
+        assert_eq!(parse_group_header(&hdrs(Some("GECO"))).unwrap().as_deref(), Some("GECO"));
+        assert_eq!(parse_group_header(&hdrs(Some("  G0 "))).unwrap().as_deref(), Some("G0"));
     }
 
-    /// 下界字段解析;且**字段缺席 = 该侧不限**——旧 router 发来的不带 `min_priority`
-    /// 的头必须仍按"只有上界"处理,而不是解析失败把整档打成 400。
+    /// 空头必须**报错而不是当成缺席** —— 当成缺席等于把一个本该受成员集限制的请求
+    /// 以全量池放行,静默提权且无任何痕迹。
     #[test]
-    fn tier_header_parses_min_priority_and_tolerates_absence() {
-        assert_eq!(
-            parse_tier_header(&hdrs(Some(r#"{"group":"GECO","min_priority":1,"max_priority":null}"#)))
-                .unwrap()
-                .unwrap()
-                .guard,
-            scheduler::TierGuard { min_priority: Some(1), max_priority: None }
-        );
-        // 两端同时给出 = 闭区间,原样透传给守卫。
-        assert_eq!(
-            parse_tier_header(&hdrs(Some(r#"{"group":"G","min_priority":10,"max_priority":60}"#)))
-                .unwrap()
-                .unwrap()
-                .guard,
-            scheduler::TierGuard { min_priority: Some(10), max_priority: Some(60) }
-        );
-        // 旧格式(无 min 字段)向前兼容。
-        assert_eq!(
-            parse_tier_header(&hdrs(Some(r#"{"group":"GLOW","max_priority":0}"#)))
-                .unwrap()
-                .unwrap()
-                .guard,
-            scheduler::TierGuard { min_priority: None, max_priority: Some(0) },
-            "旧 router 的头必须仍解析成只有上界,不能失败"
-        );
-        // 类型错误仍须拒绝(与 max 一致)。
-        assert!(parse_tier_header(&hdrs(Some(r#"{"group":"G","min_priority":"low"}"#))).is_err());
-    }
-
-    /// 会话亲和键必须按档位分命名空间,否则低价流量能改写正常客户的账号钉扎
-    /// (`select_id` 的"primary 不合格 → 改选并当场转正、永不迁回")。
-    #[test]
-    fn affinity_key_is_namespaced_per_tier() {
-        let t = TierSpec {
-            name: "GLOW".into(),
-            guard: scheduler::TierGuard { min_priority: None, max_priority: Some(0) },
-        };
-        let plain = tier_scoped_affinity_key(None, Some("sess-1".into()));
-        let scoped = tier_scoped_affinity_key(Some(&t), Some("sess-1".into()));
-        assert_eq!(plain.as_deref(), Some("sess-1"), "普通组的亲和键必须原样不变");
-        assert_ne!(plain, scoped, "同一会话键在两档下必须落到不同的亲和条目");
-        assert_eq!(scoped.as_deref(), Some("GLOW\u{0}sess-1"));
-        // 无会话键(无亲和记忆)时两档都是 None,不得凭空造出一个键。
-        assert_eq!(tier_scoped_affinity_key(Some(&t), None), None);
-    }
-
-    /// 畸形头必须**报错而不是当成普通请求忽略** —— 忽略等于把本该受限的低价请求
-    /// 以全量权限放行,且没有任何痕迹。
-    #[test]
-    fn tier_header_malformed_is_error_not_ignored() {
-        for bad in [r#"not json"#, r#"{"group":"G","max_priority":"high"}"#, r#"["#, r#"{"max_priority":0}"#] {
+    fn group_header_empty_is_error_not_ignored() {
+        for bad in ["", "   "] {
             assert!(
-                parse_tier_header(&hdrs(Some(bad))).is_err(),
-                "畸形档位头 {bad} 必须拒绝,绝不能静默按普通请求放行"
+                parse_group_header(&hdrs(Some(bad))).is_err(),
+                "空分组头 {bad:?} 必须拒绝,绝不能静默按未分组放行"
             );
         }
+    }
+
+    /// 会话亲和键必须按分组分命名空间,否则低价流量能改写正常客户的账号钉扎
+    /// (`select_id` 的"primary 不合格 → 改选并当场转正、永不迁回")。
+    #[test]
+    fn affinity_key_is_namespaced_per_group() {
+        let plain = group_scoped_affinity_key(None, Some("sess-1".into()));
+        let scoped = group_scoped_affinity_key(Some("GECO"), Some("sess-1".into()));
+        assert_eq!(plain.as_deref(), Some("sess-1"), "未分组请求的亲和键必须原样不变");
+        assert_ne!(plain, scoped, "同一会话键在两个组下必须落到不同的亲和条目");
+        assert_eq!(scoped.as_deref(), Some("GECO\u{0}sess-1"));
+        // 两个不同的组也必须互不干扰。
+        assert_ne!(
+            group_scoped_affinity_key(Some("G0"), Some("sess-1".into())),
+            scoped,
+            "不同分组的同名会话不得共用一个钉扎"
+        );
+        // 无会话键(无亲和记忆)时都是 None,不得凭空造出一个键。
+        assert_eq!(group_scoped_affinity_key(Some("GECO"), None), None);
     }
 
     /// 保活帧必须**始终**用 `content_block_delta` 这个事件名。

@@ -82,30 +82,6 @@ pub struct UsageRecord {
     pub success: bool,
 }
 
-/// 影子组档位策略:该组不持有账号,而是**复用源组的 worker**,只是可见的账号更少。
-///
-/// 存在的理由:一个 account_group 只能绑一个 worker(见 `config.rs` 与 router 启动校验)——
-/// 两个 worker 加载同批账号会让并发上限翻倍、且各自刷新 rolling refresh_token 互相覆盖,
-/// 账号直接 `invalid_grant` 报废。所以"一个号同时属于两个组"只能做成**同一 worker 内的
-/// 可见性视图**:同一份 scheduler entry、同一个并发信号量、同一个 token 刷新写者。
-///
-/// 档位是一个**闭区间** `[min_priority, max_priority]`(数值越小越优先),两端各自可空:
-/// - 只给 `max`(如 `<=0`)= 只看主力号。低价档共享主力号,限流了也认。
-/// - 只给 `min`(如 `>=1`)= **只看小号**,主力号对本档不存在 →
-///   低价流量烧不到高价客户的主力号,这是"保证高价用户稳定"的那一档。
-/// - 两端都空 = 不限(影子组退化成源组的别名)。
-#[derive(Debug, Clone, PartialEq)]
-pub struct TierPolicy {
-    /// 真正持有账号、绑定 worker 的源组(如 "G0")。路由按它选 worker。
-    pub source_group: String,
-    /// 只允许 `priority >= min_priority` 的账号(即**排除**比它更优先的号)。
-    /// `None` = 下界不限。
-    pub min_priority: Option<i64>,
-    /// 只允许 `priority <= max_priority` 的账号(数值越小越优先)。
-    /// `None` = 上界不限。
-    pub max_priority: Option<i64>,
-}
-
 /// 客户端 API key 鉴权结果。
 #[derive(Debug, Clone)]
 pub struct AuthenticatedKey {
@@ -117,9 +93,6 @@ pub struct AuthenticatedKey {
     /// 客户 key 所属分组('' = 未分组)。router 据此把请求派发到对应账号组的
     /// worker(G0→kiro / DARIO→dario);未分组回落到 router 自身主组。
     pub group_name: String,
-    /// 该分组的影子档位策略(`None` = 普通组,行为与本特性上线前**逐字节相同**)。
-    /// 与 `over_quota` 同样在鉴权那一条 SQL 里 LEFT JOIN 带出,零额外查询。
-    pub tier: Option<TierPolicy>,
 }
 
 /// 一条客户端 API key 元数据(admin 管理页 / CRUD 用)。
@@ -164,15 +137,10 @@ pub struct GroupRow {
     pub account_count: u64,
     pub key_count: u64,
     pub created_at: i64,
-    /// 影子组:指向真正持有账号的源组('' = 普通组)。见 [`TierPolicy`]。
-    /// 影子组**自己不持有账号**,所以列表里它的 `account_count` 恒为 0——前端需要
-    /// 据本字段显示"影子组 → 源组"徽章,否则运维会以为该组坏了。
-    pub shadow_of: String,
-    /// 影子组可见档位的**下界**(只允许 `priority >= 此值`;NULL = 不限)。
-    /// 用它把主力号挡在档位外,见 [`TierPolicy`]。
-    pub tier_min_priority: Option<i64>,
-    /// 影子组可见档位的**上界**(只允许 `priority <= 此值`;NULL = 不限)。
-    pub tier_max_priority: Option<i64>,
+    /// 组内成员数(成员边条数)。与 `account_count`(**归属**本组的账号数)是两件事:
+    /// 一个号可以归属 G0、同时是低价组的成员,那时它只计入 G0 的 account_count,
+    /// 但同时出现在两个组的 member_count 里。
+    pub member_count: u64,
 }
 
 /// 一个上游账号(配置态;运行态由 worker 调度器快照提供)。
