@@ -275,11 +275,11 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
     })
 }
 
-/// 账号的目标组必须**存在**且**不是影子组**。
+/// 账号的**归属**组必须存在(防"幽灵分组":typo 的组名会让账号不被任何 worker 加载,
+/// groups 页也看不见它)。
 ///
-/// - 存在:防"幽灵分组"——typo 的组名会让账号永远不被任何 worker 服务,groups 页也看不见。
-/// - 非影子:影子组不绑 worker(它只是源组的可见性视图),分进去的账号同样永远不会被
-///   任何 scheduler 加载,但 admin 列表还会显示 account_count > 0,更具迷惑性。
+/// 注意这里校验的是归属(`accounts.group_name` = 哪个 worker 独占管它的运行态),
+/// 不是可见性 —— 后者由成员边决定,一个号可以同时是多个组的成员。
 ///
 /// `Ok(())` = 放行(含空组名 = 未分组);`Err(resp)` = 已构造好的 400/500 响应。
 fn require_real_group(st: &AdminState, group: &str) -> Result<(), axum::response::Response> {
@@ -287,14 +287,8 @@ fn require_real_group(st: &AdminState, group: &str) -> Result<(), axum::response
         return Ok(());
     }
     match st.store.list_groups() {
-        Ok(rows) => match rows.iter().find(|g| g.name == group) {
-            None => Err(api_error(StatusCode::BAD_REQUEST, "分组不存在")),
-            Some(g) if !g.shadow_of.is_empty() => Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "目标是影子组(低价档),它不持有账号;请分到其源组",
-            )),
-            Some(_) => Ok(()),
-        },
+        Ok(rows) if rows.iter().any(|g| g.name == group) => Ok(()),
+        Ok(_) => Err(api_error(StatusCode::BAD_REQUEST, "分组不存在")),
         Err(e) => Err(internal_error(e)),
     }
 }
@@ -1425,8 +1419,8 @@ mod tests {
     #[tokio::test]
     async fn account_crud_roundtrip_with_redaction() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("G1", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
+        store.create_group("G1", "", "").unwrap();
         // 创建(带敏感 extra)。
         let body = r#"{"account_id":"kiro-01","group":"G0","max_concurrency":2,
             "extra":{"refresh_token":"rt-secret-12345678","region":"us-east-1"}}"#;
@@ -1492,7 +1486,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_nonexistent_group() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         // 创建账号挂不存在的组 → 400(防幽灵分组)。
         let resp = app
             .clone()
@@ -1574,7 +1568,7 @@ mod tests {
     #[tokio::test]
     async fn import_creates_account_with_machine_id() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         // KiroManager 导出(单 Enterprise 号),json 以字符串形式传入。
         let export = serde_json::json!({
             "version": "1.7.5",
@@ -1611,7 +1605,7 @@ mod tests {
     #[tokio::test]
     async fn import_with_batch_proxy_sets_proxy_on_new_account() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let export = serde_json::json!({
             "accounts": [{
                 "email": "proxied@example.com",
@@ -1638,7 +1632,7 @@ mod tests {
     #[tokio::test]
     async fn update_proxy_url_merges_without_touching_credentials() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         store
             .create_account(
                 "acc1",
@@ -1675,7 +1669,7 @@ mod tests {
     #[tokio::test]
     async fn update_priority_merges_without_touching_credentials() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         store
             .create_account(
                 "acc1",
@@ -1704,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn view_defaults_priority_to_100_when_absent() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         store
             .create_account("acc1", "G0", "kiro", 2, r#"{"refresh_token":"rt"}"#)
             .unwrap();
@@ -1727,7 +1721,7 @@ mod tests {
         // 硬编码在整块替换【之后】,即便 extra 里带的是打开弹窗时的旧 priority 快照,最终也应是
         // 新值 —— 锁定这个顺序不变量(审查 Low#3),防未来重排三段顺序静默退化。
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         store
             .create_account("acc1", "G0", "kiro", 2, r#"{"refresh_token":"rt-old","priority":100}"#)
             .unwrap();
@@ -1801,7 +1795,7 @@ mod tests {
     #[tokio::test]
     async fn import_smart_merge_backfills_machine_id_keeps_server_token() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         // 已存在账号:有服务器已 roll 的 rt,但无 machineId(正是待修复的老号)。
         store
             .create_account(
@@ -1838,7 +1832,7 @@ mod tests {
     #[tokio::test]
     async fn import_collision_does_not_merge_two_real_accounts() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         // 两个不同真号(不同 userId),email 清洗后撞同一 account_id "a-b-x.com"。
         let export = serde_json::json!({
             "accounts": [
@@ -1863,7 +1857,7 @@ mod tests {
     #[tokio::test]
     async fn import_merge_never_overwrites_server_token_even_if_missing() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         // 已存在号:有 machineId,但 access_token 为空(待刷新)。
         store
             .create_account(
@@ -1895,7 +1889,7 @@ mod tests {
     #[tokio::test]
     async fn import_rejects_nonexistent_group_and_bad_json() {
         let (app, store) = app();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         // 不存在的组 → 400。
         let body = serde_json::json!({"group_name": "GHOST", "json": "{}"}).to_string();
         let resp = app.clone().oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
@@ -2169,7 +2163,7 @@ mod tests {
     async fn oauth_start_returns_authorize_url_for_dario_group() {
         let w = spawn_fake_worker("G0", "claude-dario", 200, serde_json::json!({})).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (status, v) = start(&app, "dario-ok", "G0").await;
         assert_eq!(status, StatusCode::OK);
         let url = v["authorize_url"].as_str().unwrap();
@@ -2183,7 +2177,7 @@ mod tests {
     async fn oauth_start_rejects_non_dario_group() {
         let w = spawn_fake_worker("G0", "kiro", 200, serde_json::json!({})).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (status, _v) = start(&app, "k-1", "G0").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "非 dario 组应拒");
     }
@@ -2196,7 +2190,7 @@ mod tests {
         });
         let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (_s, v) = start(&app, "dario-mm", "G0").await;
         let state = v["state"].as_str().unwrap().to_string();
         // 贴回 code 带错误的 #state → 400,会话保留。
@@ -2218,7 +2212,7 @@ mod tests {
         });
         let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (_s, v) = start(&app, "dario-new", "G0").await;
         let state = v["state"].as_str().unwrap().to_string();
         let (status, _v) = complete(&app, &state, "validcode").await;
@@ -2242,7 +2236,7 @@ mod tests {
         });
         let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (_s, v) = start(&app, "dario-once", "G0").await;
         let state = v["state"].as_str().unwrap().to_string();
         let (s1, _) = complete(&app, &state, "code-1").await;
@@ -2261,7 +2255,7 @@ mod tests {
         });
         let w = spawn_fake_worker("G0", "claude-dario", 200, tokens).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (_s, v) = start(&app, "dario-dup", "G0").await;
         let state = v["state"].as_str().unwrap().to_string();
         // start 之后、complete 之前,另一路创建了同名账号(模拟并发)。
@@ -2283,7 +2277,7 @@ mod tests {
         let err = serde_json::json!({"error": {"message": "invalid_grant"}});
         let w = spawn_fake_worker("G0", "claude-dario", 400, err).await;
         let (app, store) = app_with_workers(vec![w]);
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         let (_s, v) = start(&app, "dario-rej", "G0").await;
         let state = v["state"].as_str().unwrap().to_string();
         let (s1, _) = complete(&app, &state, "expiredcode").await;

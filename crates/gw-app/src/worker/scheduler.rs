@@ -115,8 +115,12 @@ struct CredentialState {
     account: Arc<Account>,
     /// 单号并发上限信号量(容量 = account.max_concurrency)。
     semaphore: Arc<Semaphore>,
-    /// 优先级(数值越小越优先);来自 account.extra.priority,缺省 100。
-    priority: i64,
+    /// **无视图时**的兜底排序(数值越小越优先);来自 account.extra.priority,缺省 100。
+    ///
+    /// ⚠️ 组内优先级的事实源是**成员边**(`account_groups.priority`),经 [`GroupView`]
+    /// 按请求传入 —— 同一个号在 A 组可以是主力、在 B 组是兜底,这是本字段表达不了的。
+    /// 生产路径每个请求都带分组,恒有视图;本字段只服务于未分组 key 与单元测试。
+    default_rank: i64,
     /// 是否禁用(冷却中也算禁用,到期自愈)。
     disabled: bool,
     /// 禁用原因(决定自愈)。
@@ -143,14 +147,14 @@ struct CredentialState {
 impl CredentialState {
     fn new(account: Arc<Account>) -> Self {
         let concurrency = account.max_concurrency.max(1) as usize;
-        let priority = account
+        let default_rank = account
             .extra
             .get("priority")
             .and_then(|v| v.as_i64())
             .unwrap_or(100);
         Self {
             semaphore: Arc::new(Semaphore::new(concurrency)),
-            priority,
+            default_rank,
             disabled: account.disabled,
             config_disabled: account.disabled,
             extra_dirty: false,
@@ -246,14 +250,13 @@ pub enum AcquireError {
     /// 组内没有任何账号支持请求的模型(如全 FREE 订阅请求 opus)。
     /// 与 AllDisabled 区分:这不是故障,是订阅能力不足,换时间重试也无济于事。
     NoModelSupport,
-    /// 影子组(低价档)的档位守卫过滤后无可用账号:高优层此刻全被冷却/占满,
-    /// 而低优兜底层**按设计**对本档不可见。
+    /// 本组没有任何能服务该模型的**成员**(组里一条成员边都没配,或配的号都不支持该模型)。
     ///
     /// 必须与 [`AcquireError::NoModelSupport`] 严格区分:后者被映射成 **400**
-    /// (客户侧可解:换模型/升级订阅),而本变体是**运行时状态**、稍后重试即可恢复,
-    /// 必须是 **503**。若把档位过滤混进 `supports` 谓词就会退化成 NoModelSupport→400,
+    /// (客户侧可解:换模型/升级订阅),而本变体是**配置态**、运维加条成员边即恢复,
+    /// 必须是 **503**。若把成员过滤混进 `supports` 谓词就会退化成 NoModelSupport→400,
     /// 客户端(SDK/NewAPI 对 400 不重试)会当成自己请求非法而放弃。
-    TierExhausted,
+    GroupEmpty,
 }
 
 impl std::fmt::Display for AcquireError {
@@ -269,47 +272,59 @@ impl std::fmt::Display for AcquireError {
                      或该模型在账号区域/档位未上线)"
                 )
             }
-            AcquireError::TierExhausted => {
-                write!(f, "本档位可用账号此刻全部繁忙或冷却中,请稍后重试")
+            AcquireError::GroupEmpty => {
+                write!(f, "本分组未配置任何可服务该模型的账号,请检查分组成员")
             }
         }
     }
 }
 
-/// 影子组(低价档)的档位守卫:限制**本次请求可见的账号子集**。
+/// 一次请求所属分组的**成员视图**:哪些号可见 + 它们在这个组里排第几。
 ///
-/// 设计要点(改动前先读):
-/// 1. **必须独立于 `supports` 谓词**。`supports` 表达的是"账号能否服务该模型"(近乎静态、
-///    客户侧可解),守卫表达的是"本档位准不准用这个号"(运行时状态、稍后可恢复)。
-///    合并二者会让守卫过滤后的空集退化成 `NoModelSupport` → 400,语义完全错误。
-/// 2. **只用于挑号,不参与自愈**。见 `acquire_tiered` 里 `heal_too_many_failures` 的处理:
-///    守卫导致的空集提前 return,绝不触发全灭自愈——否则每个被守卫挡下的低价请求都会把
-///    正常组刚合法禁用的号复活并清零失败计数,连续失败保护对所有人失效。
-/// 3. **判据必须是单调/稳定量**。两个边界只在 admin 改配置时变,所以会话亲和不会
-///    因它反复重钉。**不要**把 `available_permits()` 这类抖动量塞进来:primary 一失格就会
-///    走"改选并当场转正、永不迁回"(见 `select_id`),抖动量会让会话反复换号、缓存冷启动,
-///    反而放大额度消耗。
+/// 来自成员边表 `account_groups`(worker 每轮同步快照)。**不在视图里的号,对本次请求
+/// 根本不存在** —— 不是"被过滤掉的可用号",而是压根不属于这个组。
 ///
-/// 准入区间是**闭区间** `[min_priority, max_priority]`,两端各自可空。数值越小越优先,
-/// 所以两个方向是两种截然不同的档位:
-/// - `max = Some(0)`:只看主力号(与主力共享额度,限流了也认)。
-/// - `min = Some(1)`:**只看小号**——主力号对本档根本不存在,低价流量烧不到它们。
+/// 为什么排序要挂在视图上而不是账号上:同一个号可以在正常组当主力(rank 0)、在低价组
+/// 当兜底(rank 100)。旧模型把 priority 挂在账号上,所有组被迫共用一套排序,于是低价组
+/// 要么抢主力号、要么完全够不着主力号(压满了只能硬报错),没有中间态。
+///
+/// 设计约束(改动前先读):
+/// 1. **必须独立于 `supports` 谓词**。`supports` 表达"账号能否服务该模型"(近乎静态、
+///    客户侧可解),视图表达"这个号属不属于本组"(配置态)。合并二者会让视图过滤后的
+///    空集退化成 `NoModelSupport` → 400,语义完全错误。
+/// 2. **rank 必须是稳定量**。成员边只在 admin 改配置时变,所以会话亲和不会因它反复重钉。
+///    **不要**把 `available_permits()` 这类抖动量塞进来:primary 一失格就会走"改选并当场
+///    转正、永不迁回"(见 `select_id`),抖动量会让会话反复换号、缓存冷启动,反而放大额度消耗。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TierGuard {
-    /// 只允许 `priority >= min_priority` 的账号(**排除**比它更优先的号)。
-    /// `None` = 下界不限。
-    pub min_priority: Option<i64>,
-    /// 只允许 `priority <= max_priority` 的账号(数值越小越优先)。
-    /// `None` = 上界不限。
-    pub max_priority: Option<i64>,
+pub struct GroupView {
+    /// account_id → 组内优先级(数值越小越优先)。键集即成员集。
+    rank: std::collections::HashMap<String, i64>,
 }
 
-impl TierGuard {
-    /// 本账号是否被本档位准入(两端边界都满足才算)。
-    fn admits(&self, e: &CredentialState) -> bool {
-        self.min_priority.is_none_or(|floor| e.priority >= floor)
-            && self.max_priority.is_none_or(|cap| e.priority <= cap)
+impl GroupView {
+    pub fn new(rank: std::collections::HashMap<String, i64>) -> Self {
+        Self { rank }
     }
+}
+
+/// 本次请求下该账号的排序值;`None` = **不属于本组**,对本请求不存在。
+///
+/// 无视图(未分组 key / 单元测试)时回落到账号自带的 `default_rank`,行为与本次重构
+/// 之前逐字节相同 —— 这是「既有 49 条调度测试零改动通过」的依据。
+fn rank_of(view: Option<&GroupView>, e: &CredentialState) -> Option<i64> {
+    match view {
+        None => Some(e.default_rank),
+        Some(v) => v.rank.get(&e.account.account_id).copied(),
+    }
+}
+
+/// 同上,但按 id 从 entries 里取;取不到 entry 视为不可见。
+fn rank_by_id(
+    view: Option<&GroupView>,
+    entries: &HashMap<String, CredentialState>,
+    id: &str,
+) -> Option<i64> {
+    entries.get(id).and_then(|e| rank_of(view, e))
 }
 
 /// worker 组内账号调度器:会话亲和选号 + 并发控制 + 冷却/禁用生命周期。
@@ -394,13 +409,13 @@ impl AccountScheduler {
         }
     }
 
-    /// 合格账号 id 集:未禁用 + 不在 exclude(busy)内 + 支持本次模型 + 通过档位守卫。
-    /// `guard = None`(普通组)时与本特性上线前逐字节等价。
+    /// 合格账号 id 集:未禁用 + 不在 exclude(busy)内 + 支持本次模型 + **是本组成员**。
+    /// `view = None`(未分组请求)时与本次重构之前逐字节等价。
     fn eligible_ids(
         entries: &HashMap<String, CredentialState>,
         exclude: &HashSet<String>,
         supports: &dyn Fn(&Account) -> bool,
-        guard: Option<&TierGuard>,
+        view: Option<&GroupView>,
     ) -> Vec<String> {
         entries
             .values()
@@ -408,22 +423,26 @@ impl AccountScheduler {
                 !e.disabled
                     && !exclude.contains(&e.account.account_id)
                     && supports(&e.account)
-                    && guard.is_none_or(|g| g.admits(e))
+                    && rank_of(view, e).is_some()
             })
             .map(|e| e.account.account_id.clone())
             .collect()
     }
 
-    /// 分层 LRU:在合格集合里取**最高优先级层**(priority 最小),层内选 last_selected_at
+    /// 分层 LRU:在合格集合里取**最高优先级层**(组内 rank 最小),层内选 last_selected_at
     /// 最旧者(None 视为最久未用,平局按 id)。返回选中 id。调用方保证 ids 非空。
-    fn tiered_lru(entries: &HashMap<String, CredentialState>, ids: &[String]) -> String {
+    fn tiered_lru(
+        entries: &HashMap<String, CredentialState>,
+        ids: &[String],
+        view: Option<&GroupView>,
+    ) -> String {
         let top_priority = ids
             .iter()
-            .filter_map(|id| entries.get(id).map(|e| e.priority))
+            .filter_map(|id| rank_by_id(view, entries, id))
             .min()
             .unwrap_or(i64::MAX);
         ids.iter()
-            .filter(|id| entries.get(*id).map(|e| e.priority == top_priority).unwrap_or(false))
+            .filter(|id| rank_by_id(view, entries, id) == Some(top_priority))
             .min_by(|a, b| {
                 let ea = entries.get(*a).and_then(|e| e.last_selected_at);
                 let eb = entries.get(*b).and_then(|e| e.last_selected_at);
@@ -452,44 +471,46 @@ impl AccountScheduler {
         entries: &HashMap<String, CredentialState>,
         ids: &[String],
         worse_than: i64,
+        view: Option<&GroupView>,
     ) -> Option<String> {
         let cands: Vec<String> = ids
             .iter()
             .filter(|id| {
-                entries
-                    .get(*id)
-                    .is_some_and(|e| e.priority < worse_than && e.semaphore.available_permits() > 0)
+                rank_by_id(view, entries, id).is_some_and(|r| r < worse_than)
+                    && entries
+                        .get(*id)
+                        .is_some_and(|e| e.semaphore.available_permits() > 0)
             })
             .cloned()
             .collect();
         if cands.is_empty() {
             None
         } else {
-            Some(Self::tiered_lru(entries, &cands))
+            Some(Self::tiered_lru(entries, &cands, view))
         }
     }
 
     /// 按会话亲和选一个账号 id(v52「落在哪个号就认哪个号」),并更新亲和表 + last_selected。
     /// `session_key = None` 时退化为分层 LRU(无亲和记忆)。`exclude` = 本轮已 busy 的号。
     /// `supports` = 模型能力过滤:primary 不支持本次模型时同样走「改选 + 当场转正」。
-    /// `guard` = 影子组档位过滤(`None` = 普通组,行为不变)。
+    /// `view` = 本次请求所属分组的成员视图(`None` = 未分组请求,行为不变)。
     fn select_id(
         &self,
         session_key: Option<&str>,
         exclude: &HashSet<String>,
         now: Instant,
         supports: &dyn Fn(&Account) -> bool,
-        guard: Option<&TierGuard>,
+        view: Option<&GroupView>,
     ) -> Option<String> {
         let mut entries = self.entries.lock();
         Self::heal_cooldowns(&mut entries, now);
-        let eligible = Self::eligible_ids(&entries, exclude, supports, guard);
+        let eligible = Self::eligible_ids(&entries, exclude, supports, view);
         if eligible.is_empty() {
             return None;
         }
 
         let chosen = match session_key {
-            None => Self::tiered_lru(&entries, &eligible),
+            None => Self::tiered_lru(&entries, &eligible, view),
             Some(key) => {
                 let affinity_ttl = self.tuning.read().affinity_ttl;
                 let mut map = self.affinity.lock();
@@ -497,7 +518,7 @@ impl AccountScheduler {
                 let eligible_set: HashSet<&String> = eligible.iter().collect();
                 match map.get_mut(key) {
                     None => {
-                        let id = Self::tiered_lru(&entries, &eligible);
+                        let id = Self::tiered_lru(&entries, &eligible, view);
                         map.insert(
                             key.to_string(),
                             AffinityEntry { primary: id.clone(), last_access: now, last_upgrade: None },
@@ -513,15 +534,18 @@ impl AccountScheduler {
                             // 去抖:距上次向上迁移不足 MIGRATE_UP_DEBOUNCE 则**不再迁**(cooled=false
                             // 时连 best_available_higher 扫描都跳过),把跨层横跳频率硬上限到
                             // 1 次/窗口/会话,防高层饱和线附近的橡皮筋抖动(见该常量注释)。
-                            let primary_priority = entries
-                                .get(&ent.primary)
-                                .map(|e| e.priority)
-                                .unwrap_or(i64::MAX);
+                            let primary_priority =
+                                rank_by_id(view, &entries, &ent.primary).unwrap_or(i64::MAX);
                             let cooled = ent
                                 .last_upgrade
                                 .map_or(true, |t| now.duration_since(t) >= MIGRATE_UP_DEBOUNCE);
                             let target = if cooled {
-                                Self::best_available_higher(&entries, &eligible, primary_priority)
+                                Self::best_available_higher(
+                                    &entries,
+                                    &eligible,
+                                    primary_priority,
+                                    view,
+                                )
                             } else {
                                 None
                             };
@@ -535,7 +559,7 @@ impl AccountScheduler {
                             }
                         } else {
                             // primary 不可用 → 立即改选并当场转正,永不迁回(下沉/同层横切同理)。
-                            let id = Self::tiered_lru(&entries, &eligible);
+                            let id = Self::tiered_lru(&entries, &eligible, view);
                             ent.primary = id.clone();
                             id
                         }
@@ -592,23 +616,23 @@ impl AccountScheduler {
     where
         F: Fn(&Account) -> bool,
     {
-        self.acquire_tiered(session_key, supports, None).await
+        self.acquire_in_group(session_key, supports, None).await
     }
 
-    /// [`Self::acquire_where`] + 影子组档位守卫。`guard = None` 时与前者**逐字节等价**
-    /// (这是"新增低价档不影响现有分组"的机械保证,见测试
-    /// `guard_none_matches_acquire_where_exactly`)。
+    /// [`Self::acquire_where`] + 按分组的成员视图。`view = None` 时与前者**逐字节等价**
+    /// (这是"重构不改变现有分组行为"的机械保证,见测试
+    /// `view_none_matches_acquire_where_exactly`)。
     ///
-    /// 守卫与 `supports` 的两点关键差异,别合并二者(见 [`TierGuard`] 文档):
-    /// - 守卫过滤后的空集报 [`AcquireError::TierExhausted`](503,可重试),
+    /// 视图与 `supports` 的两点关键差异,别合并二者(见 [`GroupView`] 文档):
+    /// - 视图过滤后的空集报 [`AcquireError::GroupEmpty`](503,可重试),
     ///   而非 `NoModelSupport`(400,客户端不重试);
-    /// - **带守卫的请求绝不触发全灭自愈**:否则每个被守卫挡下的低价请求都会把正常组
-    ///   刚合法禁用的号复活并清零失败计数,连续失败保护对所有档位一起失效。
-    pub async fn acquire_tiered<F>(
+    /// - **自愈按视图收窄**:全灭自愈只复活本组成员,绝不把别的组刚合法禁用的号一起
+    ///   复活并清零失败计数(否则连续失败保护对所有组一起失效)。
+    pub async fn acquire_in_group<F>(
         &self,
         session_key: Option<&str>,
         supports: F,
-        guard: Option<&TierGuard>,
+        view: Option<&GroupView>,
     ) -> Result<AccountLease, AcquireError>
     where
         F: Fn(&Account) -> bool,
@@ -631,15 +655,15 @@ impl AccountScheduler {
             }
             let now = Instant::now();
 
-            let Some(id) = self.select_id(session_key, &busy, now, &supports, guard) else {
-                // 无合格号:区分"没号支持该模型" vs "本档位无号" vs "全 busy(有可用但
+            let Some(id) = self.select_id(session_key, &busy, now, &supports, view) else {
+                // 无合格号:区分"没号支持该模型" vs "本组无成员" vs "全 busy(有可用但
                 // 占满)" vs "全禁用"。计数都只看**支持该模型**的号——不支持的号既救不了
                 // busy 等待,也不该让错误从 NoModelSupport 误报成 AllDisabled。
-                // `tier_any`/`avail_*` 额外过一遍守卫:守卫外的号对本档不存在。
-                let (supported_any, tier_any, avail_total, avail_not_busy) = {
+                // `member_any`/`avail_*` 额外过一遍视图:非成员对本组不存在。
+                let (supported_any, member_any, avail_total, avail_not_busy) = {
                     let entries = self.entries.lock();
                     let mut any = false;
-                    let mut tier_any = false;
+                    let mut member_any = false;
                     let mut avail = 0usize;
                     let mut not_busy = 0usize;
                     for e in entries.values() {
@@ -647,10 +671,10 @@ impl AccountScheduler {
                             continue;
                         }
                         any = true;
-                        if !guard.is_none_or(|g| g.admits(e)) {
+                        if rank_of(view, e).is_none() {
                             continue;
                         }
-                        tier_any = true;
+                        member_any = true;
                         if e.disabled {
                             continue;
                         }
@@ -659,16 +683,16 @@ impl AccountScheduler {
                             not_busy += 1;
                         }
                     }
-                    (any, tier_any, avail, not_busy)
+                    (any, member_any, avail, not_busy)
                 };
                 if !supported_any {
                     return Err(AcquireError::NoModelSupport);
                 }
-                // 本档位一个号都没有(配置错/档位卡太严):是配置态而非瞬时故障,但仍
-                // 报可重试的 TierExhausted——运维改一下 tier_max_priority 就恢复,
-                // 不该让客户端拿到"换模型才能解决"的 400。
-                if !tier_any {
-                    return Err(AcquireError::TierExhausted);
+                // 本组一个能服务该模型的成员都没有(组没配号/配的号都不支持该模型):
+                // 是配置态而非瞬时故障,但仍报可重试的 GroupEmpty —— 运维加条成员边就
+                // 恢复,不该让客户端拿到"换模型才能解决"的 400。
+                if !member_any {
+                    return Err(AcquireError::GroupEmpty);
                 }
                 if avail_total > 0 && avail_not_busy == 0 && !busy.is_empty() {
                     // 有可用号但全 busy → 等并发释放后重试。
@@ -677,16 +701,11 @@ impl AccountScheduler {
                     attempts += 1;
                     continue;
                 }
-                // 带守卫(低价档)到此为止:高优层此刻全冷却/占满,而低优兜底层按设计
-                // 对本档不可见。**绝不下探、也绝不触发全灭自愈**(自愈是全局的,会把正常组
-                // 刚合法禁用的号一起复活)。稍后重试即可恢复 → 503。
-                if guard.is_some() {
-                    return Err(AcquireError::TierExhausted);
-                }
                 // 全禁用:若有 TooManyFailures,做一次全灭自愈(等价重启)再试。
-                // 只复活**支持本次模型**的号:opus 请求不该顺手复活无关 FREE 失败号
-                // (与上方"计数只看支持该模型"同语义,审查②R Skeptic#4)。
-                if !self_healed && self.heal_too_many_failures(&supports) {
+                // 只复活**支持本次模型、且属于本组**的号:opus 请求不该顺手复活无关 FREE
+                // 失败号(审查②R Skeptic#4);低价组的请求也不该把正常组刚合法禁用的号
+                // 一起复活并清零失败计数——那会让连续失败保护对所有组一起失效。
+                if !self_healed && self.heal_too_many_failures(&supports, view) {
                     self_healed = true;
                     attempts += 1;
                     continue;
@@ -706,11 +725,22 @@ impl AccountScheduler {
     }
 
     /// 全灭自愈:若存在 TooManyFailures 禁用的号,清其禁用 + 失败计数(等价重启)。
-    /// 只动 `supports` 通过(支持本次模型)的号。返回是否实际恢复了至少一个号。
-    fn heal_too_many_failures(&self, supports: &dyn Fn(&Account) -> bool) -> bool {
+    /// 只动 `supports` 通过(支持本次模型)**且属于本组**(在 `view` 内)的号。
+    /// 返回是否实际恢复了至少一个号。
+    ///
+    /// 按视图收窄是必须的:自愈由"本组全灭"触发,若复活范围是全局,低价组一次全灭就会
+    /// 把正常组刚合法禁用的号一起复活并清零失败计数,连续失败保护对所有组一起失效。
+    fn heal_too_many_failures(
+        &self,
+        supports: &dyn Fn(&Account) -> bool,
+        view: Option<&GroupView>,
+    ) -> bool {
         let mut entries = self.entries.lock();
         let mut healed = false;
         for e in entries.values_mut() {
+            if rank_of(view, e).is_none() {
+                continue;
+            }
             if e.disabled
                 && e.disabled_reason == Some(DisabledReason::TooManyFailures)
                 && supports(&e.account)
@@ -778,7 +808,7 @@ impl AccountScheduler {
                         e.semaphore =
                             Arc::new(Semaphore::new(acc.max_concurrency.max(1) as usize));
                     }
-                    e.priority = acc
+                    e.default_rank = acc
                         .extra
                         .get("priority")
                         .and_then(|v| v.as_i64())
@@ -854,7 +884,7 @@ impl AccountScheduler {
                 };
                 AccountStatusSnapshot {
                     account_id: e.account.account_id.clone(),
-                    priority: e.priority,
+                    priority: e.default_rank,
                     disabled: e.disabled,
                     reason: reason.to_string(),
                     cooldown_remaining_secs: e
@@ -1717,234 +1747,159 @@ mod tests {
         let b = snap.iter().find(|x| x.account_id == "b").unwrap();
         assert_eq!(b.available_permits, 0, "持有租约期间并发槽占用");
     }
+    // ───────── 按分组的成员视图(账号↔分组 N:M) ─────────
 
-    // ───────── 影子组档位守卫(低价档 GLOW) ─────────
-
-    /// 只允许高优层的守卫(GLOW 的典型配置:POWER 主力 priority=0,小号 100)。
-    fn hi_tier() -> TierGuard {
-        TierGuard { min_priority: None, max_priority: Some(0) }
+    /// 造一张视图:`(account_id, 组内优先级)` 列表。
+    fn view(pairs: &[(&str, i64)]) -> GroupView {
+        GroupView::new(pairs.iter().map(|(id, p)| ((*id).to_string(), *p)).collect())
     }
 
-    /// **只允许低优层**的守卫:把主力号挡在档位外(priority >= 1)。
-    /// 这是"保证高价用户稳定"的那一档 —— 低价流量烧不到 priority=0 的主力号。
-    fn lo_tier() -> TierGuard {
-        TierGuard { min_priority: Some(1), max_priority: None }
-    }
-
-    /// 下界守卫必须把**更优先**的号排除在外。
-    /// 反向断言证明主力号本来就是首选 —— 否则"没选中主力号"可能只是构造得巧。
+    /// **「重构不改变现有分组行为」的机械证明**:同一批号、同一串会话,带 `None` 视图与
+    /// 走老路径 `acquire_where` 必须选出**完全相同**的账号序列。
     #[tokio::test]
-    async fn tier_min_priority_never_selects_mainstay() {
-        // 主力号 id 字典序靠前且优先级更高:无守卫时必被首选,能证明过滤真实生效。
-        let s = sched(vec![acct("a-main", 4, Some(0)), acct("b-backup", 4, Some(100))]);
-        for i in 0..6 {
-            let lease =
-                s.acquire_tiered(Some(&format!("s{i}")), |_| true, Some(&lo_tier())).await.unwrap();
-            assert_eq!(lease.account_id(), "b-backup", "低价档绝不能落到 priority=0 主力号");
-        }
-        // 反向:无守卫的正常请求确实首选主力号。
-        let lease = s.acquire(Some("normal")).await.unwrap();
-        assert_eq!(lease.account_id(), "a-main", "正常组本来就该优先用主力号");
-    }
-
-    /// 只有主力号时,下界档位报 `TierExhausted`(503 可重试)而**不是**偷偷用主力号。
-    /// 这条一旦回归,低价流量会直接打到高价客户的号上 —— 正是本特性要防的事。
-    #[tokio::test]
-    async fn tier_min_exhausted_rather_than_falling_back_to_mainstay() {
-        let s = sched(vec![acct("a-main", 4, Some(0))]);
-        assert_eq!(
-            s.acquire_tiered(Some("s"), |_| true, Some(&lo_tier())).await.err(),
-            Some(AcquireError::TierExhausted),
-            "档位内无号必须报 TierExhausted,绝不许下探到主力号"
-        );
-        assert!(s.acquire(Some("s2")).await.is_ok(), "同一时刻正常组仍可用(号是好的)");
-    }
-
-    /// 两端同时给出 = 闭区间。中间层被选中,两侧都被排除。
-    #[tokio::test]
-    async fn tier_bounds_form_closed_interval() {
-        let s = sched(vec![
-            acct("a-top", 4, Some(0)),
-            acct("b-mid", 4, Some(50)),
-            acct("c-low", 4, Some(100)),
-        ]);
-        let g = TierGuard { min_priority: Some(10), max_priority: Some(60) };
-        for i in 0..6 {
-            let lease = s.acquire_tiered(Some(&format!("s{i}")), |_| true, Some(&g)).await.unwrap();
-            assert_eq!(lease.account_id(), "b-mid", "只有落在 [10,60] 内的号可被选中");
-        }
-        // 边界是闭的:等于端点的号必须准入。
-        let s2 = sched(vec![acct("edge", 4, Some(10))]);
-        let g2 = TierGuard { min_priority: Some(10), max_priority: Some(10) };
-        assert!(
-            s2.acquire_tiered(Some("s"), |_| true, Some(&g2)).await.is_ok(),
-            "priority 恰等于上下界时必须准入(闭区间)"
-        );
-    }
-
-    /// 下界守卫同样不得触发全灭自愈:低价请求不能把正常组刚合法禁用的主力号复活。
-    #[tokio::test]
-    async fn tier_min_guard_does_not_heal_disabled_mainstay() {
-        let s = sched(vec![acct("a-main", 4, Some(0))]);
-        s.report_failure("a-main", UpstreamErrorKind::RateLimited);
-        assert_eq!(
-            s.acquire_tiered(Some("s"), |_| true, Some(&lo_tier())).await.err(),
-            Some(AcquireError::TierExhausted)
-        );
-        // 自愈若被触发,冷却会被清掉、这里就能选出号了。
-        assert!(
-            s.acquire(Some("n")).await.is_err(),
-            "低价档的空集绝不能顺手把主力号的冷却/禁用清零"
-        );
-    }
-
-    /// **"不影响现有分组"的机械证明**:同一批号、同一串会话,带 `None` 守卫与走老
-    /// `acquire_where` 必须选出**逐个相同**的账号序列。这条挂了就说明改动泄漏到了普通组。
-    #[tokio::test]
-    async fn guard_none_matches_acquire_where_exactly() {
+    async fn view_none_matches_acquire_where_exactly() {
         let mk = || sched(vec![acct("a", 2, Some(0)), acct("b", 2, Some(0)), acct("c", 2, Some(100))]);
         let (old, new) = (mk(), mk());
         let (mut seq_old, mut seq_new) = (Vec::new(), Vec::new());
         for i in 0..12 {
             let sess = format!("s{}", i % 5);
             seq_old.push(old.acquire_where(Some(&sess), |_| true).await.unwrap().account_id().to_string());
-            seq_new.push(new.acquire_tiered(Some(&sess), |_| true, None).await.unwrap().account_id().to_string());
+            seq_new
+                .push(new.acquire_in_group(Some(&sess), |_| true, None).await.unwrap().account_id().to_string());
         }
-        assert_eq!(seq_old, seq_new, "guard=None 必须与老路径逐个选号完全一致");
+        assert_eq!(seq_old, seq_new, "view=None 必须与老路径逐个选号完全一致");
     }
 
-    /// 守卫生效:低优兜底层对本档不可见。反向断言证明兜底层**本来是活的**——
-    /// 否则"没选中 c"可能只是测试构造得巧,而非过滤真的起作用。
+    /// 非成员对本组**不存在**。反向断言证明那个号本来是首选 —— 否则「没选中它」
+    /// 可能只是测试构造得巧,而非成员过滤真的起作用。
     #[tokio::test]
-    async fn tier_max_priority_never_selects_lower_tier() {
-        // 兜底号 id 字典序最靠前:无过滤时平局会先选它,能证明过滤真实生效。
-        let s = sched(vec![acct("a-backup", 4, Some(100)), acct("b-main", 4, Some(0))]);
+    async fn account_not_in_group_is_invisible() {
+        // 主力号 id 字典序靠前且优先级更高:无视图时必被首选。
+        let s = sched(vec![acct("a-main", 4, Some(0)), acct("b-backup", 4, Some(100))]);
+        let only_backup = view(&[("b-backup", 0)]);
         for i in 0..6 {
-            let lease = s.acquire_tiered(Some(&format!("s{i}")), |_| true, Some(&hi_tier())).await.unwrap();
-            assert_eq!(lease.account_id(), "b-main", "低价档绝不能落到 priority=100 兜底层");
+            let lease = s
+                .acquire_in_group(Some(&format!("s{i}")), |_| true, Some(&only_backup))
+                .await
+                .unwrap();
+            assert_eq!(lease.account_id(), "b-backup", "不在成员集里的号绝不能被选中");
         }
-        // 反向:主力号全禁用后,**无守卫**的请求会正常下探到兜底层(兜底层确实可用)。
-        s.report_failure("b-main", UpstreamErrorKind::RateLimited);
-        let lease = s.acquire(Some("normal")).await.unwrap();
-        assert_eq!(lease.account_id(), "a-backup", "正常组该下探兜底层时必须能下探");
-    }
-
-    /// 主力层全冷却时,低价档报 `TierExhausted`(503 可重试),**不下探**。
-    /// 同一状态下无守卫的请求仍应成功落到兜底层 —— 证明隔离是单向的。
-    #[tokio::test]
-    async fn tier_exhausted_when_high_tier_all_disabled() {
-        let s = sched(vec![acct("a-backup", 4, Some(100)), acct("b-main", 4, Some(0))]);
-        s.report_failure("b-main", UpstreamErrorKind::RateLimited);
         assert_eq!(
-            s.acquire_tiered(Some("s"), |_| true, Some(&hi_tier())).await.err(),
-            Some(AcquireError::TierExhausted),
-            "高优层全冷却 → 低价档报 TierExhausted,而不是悄悄下探烧兜底号"
+            s.acquire(Some("normal")).await.unwrap().account_id(),
+            "a-main",
+            "反向:无视图的请求本来就该首选主力号"
         );
-        assert!(s.acquire(Some("s2")).await.is_ok(), "同一时刻正常组仍可用");
     }
 
-    /// **头号陷阱**:档位过滤后的空集绝不能报成 `NoModelSupport`(那会被映射成 400,
-    /// 客户端认为"换模型才能解决"而停止重试);而真正的模型能力不足仍须报 NoModelSupport。
+    /// **本次重构的核心能力**:同一个号在两个组里可以排到不同的层。
+    /// 旧模型 priority 挂在账号上,所有组共用一套排序,这条根本表达不了。
     #[tokio::test]
-    async fn tier_exhausted_is_never_no_model_support() {
-        let s = sched(vec![acct("a-backup", 4, Some(100))]); // 档位内一个号都没有
-        let e = s.acquire_tiered(Some("s"), |_| true, Some(&hi_tier())).await.err();
-        assert_eq!(e, Some(AcquireError::TierExhausted));
-        assert_ne!(e, Some(AcquireError::NoModelSupport), "档位空集不是订阅能力问题");
+    async fn same_account_ranks_differently_per_group() {
+        let s = sched(vec![acct("power", 4, Some(0)), acct("promax", 4, Some(100))]);
+        // 正常组:主力优先。低价组:小号优先、主力号当兜底。
+        let normal = view(&[("power", 0), ("promax", 100)]);
+        let low = view(&[("promax", 0), ("power", 100)]);
+        assert_eq!(
+            s.acquire_in_group(Some("n1"), |_| true, Some(&normal)).await.unwrap().account_id(),
+            "power"
+        );
+        assert_eq!(
+            s.acquire_in_group(Some("l1"), |_| true, Some(&low)).await.unwrap().account_id(),
+            "promax",
+            "同一个号在低价组必须排到主力号前面"
+        );
+    }
 
-        // 反向:真的没号支持该模型时,语义不能被守卫改写。
+    /// **2026-07-27 事故的反面**:低价组的小号压满/冷却后应当**溢出**到主力号,
+    /// 而不是硬报错。旧模型只能硬报错(档位区间把主力号完全挡在外面)。
+    #[tokio::test]
+    async fn low_tier_group_spills_to_mainstay_when_saturated() {
+        let s = sched(vec![acct("power", 4, Some(0)), acct("promax", 4, Some(100))]);
+        let low = view(&[("promax", 0), ("power", 100)]);
+        // 小号冷却 → 本组仍有兜底层(主力号),必须溢出过去而不是 503。
+        s.report_failure("promax", UpstreamErrorKind::RateLimited);
+        let lease = s.acquire_in_group(Some("s"), |_| true, Some(&low)).await.unwrap();
+        assert_eq!(lease.account_id(), "power", "小号不可用时必须溢出到组内下一层");
+
+        // 反向:组里**只有**小号时,没有下一层可溢出 → 报可重试的错,绝不越界取非成员。
+        let only_low = view(&[("promax", 0)]);
+        assert!(
+            s.acquire_in_group(Some("s2"), |_| true, Some(&only_low)).await.is_err(),
+            "组里没有别的成员时不得偷偷用非成员的号"
+        );
+    }
+
+    /// 组里一个成员都没有(或成员都不支持该模型)→ `GroupEmpty`(503,运维加条边就好),
+    /// **绝不能**是 `NoModelSupport`(400,客户端不重试,且提示"换模型"完全误导)。
+    #[tokio::test]
+    async fn group_empty_is_never_no_model_support() {
+        let s = sched(vec![acct("a", 4, Some(0))]);
+        let empty = view(&[]);
+        let e = s.acquire_in_group(Some("s"), |_| true, Some(&empty)).await.err();
+        assert_eq!(e, Some(AcquireError::GroupEmpty));
+        assert_ne!(e, Some(AcquireError::NoModelSupport), "组没配号不是订阅能力问题");
+
+        // 反向:真的没号支持该模型时,语义不能被视图改写。
         let s2 = sched(vec![acct_sub("a-free", 4, "KIRO FREE")]);
         assert_eq!(
-            s2.acquire_tiered(Some("s"), opus_pred, None).await.err(),
+            s2.acquire_in_group(Some("s"), opus_pred, None).await.err(),
             Some(AcquireError::NoModelSupport),
             "全 FREE 请求 opus 仍应是 NoModelSupport"
         );
     }
 
-    /// 低价流量不得污染**兜底层**的 LRU 游标:GLOW 从不选中兜底号,所以在它跑过之后,
-    /// 兜底层对普通请求必须仍是"全部未用过"的初始状态、按 id 依次轮转。
-    ///
-    /// 若守卫实现哪天退化成"先选中再拒绝",兜底号的 `last_selected_at` 会被写脏,
-    /// 下面的轮转顺序就会乱 —— 这条测试正是为捕捉那种退化而写。
+    /// 自愈必须**按视图收窄**:低价组一次全灭,不得把别的组刚合法禁用的号一起复活
+    /// 并清零失败计数 —— 那会让连续失败保护对所有组一起失效。
     #[tokio::test]
-    async fn guard_blocked_account_keeps_lru_cursor() {
-        let s = sched(vec![
-            acct("c1-backup", 4, Some(100)),
-            acct("c2-backup", 4, Some(100)),
-            acct("m-main", 4, Some(0)),
-        ]);
-        for i in 0..10 {
-            let l = s
-                .acquire_tiered(Some(&format!("glow{i}")), |_| true, Some(&hi_tier()))
-                .await
-                .unwrap();
-            assert_eq!(l.account_id(), "m-main", "低价档只能落主力号");
+    async fn heal_is_scoped_to_group_members() {
+        let s = sched(vec![acct("mine", 4, Some(0)), acct("theirs", 4, Some(0))]);
+        // 两个号都因连续失败被禁用。
+        for _ in 0..10 {
+            s.report_failure("mine", UpstreamErrorKind::ServerError);
+            s.report_failure("theirs", UpstreamErrorKind::ServerError);
         }
-        // 主力号退场,普通流量下探兜底层:两个兜底号都该是"从未被选中",
-        // 于是平局按 id → 先 c1 后 c2。GLOW 若写脏了游标,这个顺序会变。
-        s.report_failure("m-main", UpstreamErrorKind::RateLimited);
-        let first = s.acquire(None).await.unwrap().account_id().to_string();
-        let second = s.acquire(None).await.unwrap().account_id().to_string();
-        assert_eq!(
-            (first.as_str(), second.as_str()),
-            ("c1-backup", "c2-backup"),
-            "兜底层的 LRU 游标必须未被低价流量污染"
-        );
+        // 前提用快照断言:**不能**用 acquire(None) —— 那本身就是全量视图,
+        // 会当场触发自愈把两个号都救活,前提就被自己的探测破坏了。
+        let disabled = |s: &AccountScheduler, id: &str| {
+            s.status_snapshot().iter().find(|a| a.account_id == id).map(|a| a.disabled)
+        };
+        assert_eq!((disabled(&s, "mine"), disabled(&s, "theirs")), (Some(true), Some(true)));
+
+        // 只含 mine 的组发起请求 → 自愈只该复活 mine。
+        let only_mine = view(&[("mine", 0)]);
+        let lease = s.acquire_in_group(Some("s"), |_| true, Some(&only_mine)).await.unwrap();
+        assert_eq!(lease.account_id(), "mine", "本组成员应被自愈复活");
+        drop(lease);
+        assert_eq!(disabled(&s, "theirs"), Some(true), "别的组的号绝不能被顺手复活");
+
+        // 轮到它自己的组请求时才复活 —— 证明保护不是永久锁死。
+        let only_theirs = view(&[("theirs", 0)]);
+        assert!(s.acquire_in_group(Some("s2"), |_| true, Some(&only_theirs)).await.is_ok());
     }
 
-    /// **带守卫的请求绝不触发全灭自愈**:否则每个被挡下的低价请求都会把正常组刚合法
-    /// 禁用的号复活并清零失败计数,连续失败保护对所有档位一起失效。
+    /// 视图变化不得扰动**别的组**的分层 LRU 游标:低价组把某个号选走后,
+    /// 正常组的轮转顺序必须和没发生过这件事一样。
     #[tokio::test]
-    async fn heal_ignores_shadow_tier() {
-        let s = sched(vec![acct("a-main", 2, Some(0))]);
-        for _ in 0..max_failures() {
-            s.report_failure("a-main", UpstreamErrorKind::ServerError);
+    async fn group_selection_keeps_lru_cursor_stable() {
+        let mk = || sched(vec![acct("a", 4, Some(0)), acct("b", 4, Some(0)), acct("c", 4, Some(100))]);
+        let (base, mixed) = (mk(), mk());
+        let low = view(&[("c", 0)]);
+        let mut seq_base = Vec::new();
+        let mut seq_mixed = Vec::new();
+        for i in 0..8 {
+            let sess = format!("n{i}");
+            seq_base.push(base.acquire(Some(&sess)).await.unwrap().account_id().to_string());
+            // 每轮先让低价组打一次(只会落到 c),再让正常请求打一次。
+            let _ = mixed.acquire_in_group(Some(&format!("l{i}")), |_| true, Some(&low)).await.unwrap();
+            seq_mixed.push(mixed.acquire(Some(&sess)).await.unwrap().account_id().to_string());
         }
-        // 低价档请求:应直接 TierExhausted,且**不得**顺手把 a-main 复活。
-        assert_eq!(
-            s.acquire_tiered(Some("glow"), |_| true, Some(&hi_tier())).await.err(),
-            Some(AcquireError::TierExhausted)
-        );
-        let snap = s.status_snapshot();
-        let a = snap.iter().find(|x| x.account_id == "a-main").unwrap();
-        assert!(a.disabled, "低价档请求不得触发全灭自愈复活账号");
-        // 反向:普通组请求仍能自愈(保护只对影子层收紧,不改变现有行为)。
-        assert!(s.acquire(Some("normal")).await.is_ok(), "正常组的全灭自愈必须照常工作");
+        assert_eq!(seq_base, seq_mixed, "低价组的流量不得改变正常请求的轮转顺序");
     }
 
-    /// 会话亲和在档位内正常工作(缓存热度不因为加了守卫就丢)。
-    #[tokio::test]
-    async fn tier_guard_preserves_affinity() {
-        let s = sched(vec![acct("a", 4, Some(0)), acct("b", 4, Some(0)), acct("c", 4, Some(100))]);
-        let first = s.acquire_tiered(Some("glow-1"), |_| true, Some(&hi_tier())).await.unwrap()
-            .account_id().to_string();
-        for _ in 0..6 {
-            let l = s.acquire_tiered(Some("glow-1"), |_| true, Some(&hi_tier())).await.unwrap();
-            assert_eq!(l.account_id(), first, "同会话必须钉同一个号,否则上游缓存全冷");
-        }
-    }
-
-    /// 守卫对普通流量零副作用:两档交替跑,普通请求照常选中被守卫拒绝的号。
-    #[tokio::test]
-    async fn guard_has_no_side_effect_on_unguarded_traffic() {
-        let s = sched(vec![acct("a-backup", 4, Some(100)), acct("b-main", 4, Some(0))]);
-        for i in 0..5 {
-            s.acquire_tiered(Some(&format!("glow{i}")), |_| true, Some(&hi_tier())).await.unwrap();
-            let n = s.acquire(Some(&format!("norm{i}"))).await.unwrap();
-            assert!(
-                ["a-backup", "b-main"].contains(&n.account_id()),
-                "普通请求可用全部账号"
-            );
-        }
-        // 普通请求确实能选到被守卫拒绝的那个号(共享池、单份 entry)。
-        s.report_failure("b-main", UpstreamErrorKind::RateLimited);
-        assert_eq!(s.acquire(Some("norm-x")).await.unwrap().account_id(), "a-backup");
-    }
-
-    /// `TierExhausted` 的文案必须能与 `NoModelSupport` 区分(运维看日志要能分辨)。
+    /// `GroupEmpty` 的文案必须能与 `NoModelSupport` 区分(运维看日志要能分辨)。
     #[test]
-    fn acquire_error_display_distinguishes_tier() {
-        let t = AcquireError::TierExhausted.to_string();
+    fn acquire_error_display_distinguishes_group_empty() {
+        let t = AcquireError::GroupEmpty.to_string();
         assert!(!t.is_empty());
         assert_ne!(t, AcquireError::NoModelSupport.to_string());
     }

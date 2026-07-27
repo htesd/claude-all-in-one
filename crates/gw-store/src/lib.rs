@@ -4,6 +4,7 @@
 //! 多进程(router + 多 worker)并发读、控制面写少。
 //! usage / 状态机 / request_cache 在 P2/P4 按 IMPROVEMENTS.md 补。
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use gw_core::account::Account;
 use gw_core::config::AccountsConfig;
 use gw_core::store::{
     AccountPatch, AccountRow, ApiKeyPatch, ApiKeyRow, AuthenticatedKey, ControlStore, GroupRow,
-    LogBlob, RequestLog, RequestLogDetail, RequestLogFilter, RequestLogRow, TierPolicy, UsageByKey,
+    LogBlob, RequestLog, RequestLogDetail, RequestLogFilter, RequestLogRow, UsageByKey,
     UsageByModel, UsageFilter, UsageRecord, UsageSink, UsageSummary,
 };
 use rusqlite::types::Value;
@@ -29,10 +30,8 @@ use rusqlite::Connection;
 pub enum DeleteGroupOutcome {
     Deleted,
     NotFound,
-    /// 有影子组以本组为源组(附影子组名);删了会让它们的 shadow_of 悬空。
-    HasShadowChildren(Vec<String>),
-    /// 本组是影子组且仍有 N 把 key 绑定;删了这些客户会静默提权到主组。
-    ShadowHasKeys(u64),
+    /// 本组仍有 N 把 key 绑定;删了这些客户会静默提权到主组(见 `delete_group`)。
+    HasKeys(u64),
 }
 
 const SCHEMA: &str = r#"
@@ -66,17 +65,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_records(account_id, create
 CREATE INDEX IF NOT EXISTS idx_usage_client  ON usage_records(client_key_id, created_at);
 
 -- 分组(账号组,同时用于 key 归类)。name 即 accounts.yaml 的组名(G0/G1...)。
--- shadow_of 非空 = 影子组:不持有账号、不绑 worker,复用源组的 worker,但只看得见
--- priority 落在 [tier_min_priority, tier_max_priority] 闭区间内的账号(两端各自可 NULL
--- 表示不限;数值越小越优先,故 min 用来把主力号挡在档位外。见 gw_core::store::TierPolicy)。
+-- 组的成员由 account_groups 定义(N:M),本表只存组自身的元数据。
 CREATE TABLE IF NOT EXISTS groups (
-    name              TEXT PRIMARY KEY,
-    color             TEXT NOT NULL DEFAULT '',
-    note              TEXT NOT NULL DEFAULT '',
-    created_at        INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    shadow_of         TEXT NOT NULL DEFAULT '',
-    tier_max_priority INTEGER,
-    tier_min_priority INTEGER
+    name       TEXT PRIMARY KEY,
+    color      TEXT NOT NULL DEFAULT '',
+    note       TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 
 -- 上游账号(配置态;运行态在 worker 调度器内存里,经 /status 暴露)。
@@ -92,6 +86,22 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_group ON accounts(group_name);
+
+-- 账号↔分组的**成员边**(N:M)。与 accounts.group_name 是两件事,别混:
+--   accounts.group_name = **归属**:哪个 worker 进程独占管理该号的运行态
+--     (并发信号量/冷却/连续失败计数/rolling refresh_token 单飞刷新)。
+--     必须唯一 —— 两个进程持有同一个号会让并发上限翻倍、且各自刷新出的
+--     token 互相覆盖,账号直接 invalid_grant 报废。这是物理约束。
+--   account_groups     = **权限 + 组内排序**:哪些客户能用它、在那个组里排第几。
+-- priority 挂在**边**上而不是账号上,所以同一个号可以在 A 组当主力(0)、
+-- 在 B 组当兜底(100)。低价档「小号优先、压满才溢出到主力号」就是这么配的。
+CREATE TABLE IF NOT EXISTS account_groups (
+    account_id TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    priority   INTEGER NOT NULL DEFAULT 100,
+    PRIMARY KEY (account_id, group_name)
+);
+CREATE INDEX IF NOT EXISTS idx_acctgrp_group ON account_groups(group_name);
 
 -- 系统热调设置(单行 key='system',value=SystemSettings JSON overlay)。
 -- 字段级覆盖叠在 system.yaml 基线之上;router 写、worker 30s 轮询热应用,无需重启。
@@ -270,11 +280,6 @@ impl SqliteStore {
             "metering_credit",
             "metering_credit REAL NOT NULL DEFAULT 0",
         )?;
-        // groups 影子组列(存量库热升级:旧表无此列则补)。默认值使既有组全部是普通组,
-        // 即 `authenticate` 带出的 tier 恒为 None → 行为与本特性上线前逐字节相同。
-        Self::ensure_column(conn, "groups", "shadow_of", "shadow_of TEXT NOT NULL DEFAULT ''")?;
-        Self::ensure_column(conn, "groups", "tier_max_priority", "tier_max_priority INTEGER")?;
-        Self::ensure_column(conn, "groups", "tier_min_priority", "tier_min_priority INTEGER")?;
         // 账号累计成功/失败请求计数(监控用,非计费)。additive:老库升级即补 0,现有号从 0 起算。
         Self::ensure_column(
             conn,
@@ -288,6 +293,28 @@ impl SqliteStore {
             "failure_count",
             "failure_count INTEGER NOT NULL DEFAULT 0",
         )?;
+        Self::backfill_account_groups(conn)?;
+        Ok(())
+    }
+
+    /// 把「账号 → 归属组」回填成成员边,让新模型的起点与旧行为**逐条等价**。
+    ///
+    /// 每个号在自己原来的组里、组内优先级还是它原来的 `extra.priority`(缺省 100,
+    /// 与 `CredentialState` 的历史默认一致)→ 迁移后 G0 的选号序列与迁移前完全相同。
+    ///
+    /// `INSERT OR IGNORE` + 复合主键使其**幂等**且**只补不覆盖**:运维后来手工调过的
+    /// 组内优先级不会在下次启动时被账号上的旧值冲掉。跨进程并发 open 也安全。
+    fn backfill_account_groups(conn: &Connection) -> anyhow::Result<()> {
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO account_groups (account_id, group_name, priority) \
+             SELECT account_id, group_name, \
+                    COALESCE(CAST(json_extract(extra, '$.priority') AS INTEGER), 100) \
+             FROM accounts WHERE group_name <> ''",
+            [],
+        )?;
+        if n > 0 {
+            tracing::info!(edges = n, "account_groups 回填:按账号归属组建立成员边");
+        }
         Ok(())
     }
 
@@ -447,7 +474,7 @@ impl SqliteStore {
             "SELECT g.name, g.color, g.note, g.created_at, \
              (SELECT COUNT(*) FROM accounts a WHERE a.group_name = g.name), \
              (SELECT COUNT(*) FROM api_keys k WHERE k.group_name = g.name), \
-             g.shadow_of, g.tier_max_priority, g.tier_min_priority \
+             (SELECT COUNT(*) FROM account_groups m WHERE m.group_name = g.name) \
              FROM groups g ORDER BY g.created_at ASC, g.name ASC",
         )?;
         let rows = stmt
@@ -459,54 +486,30 @@ impl SqliteStore {
                     created_at: r.get(3)?,
                     account_count: r.get::<_, i64>(4)? as u64,
                     key_count: r.get::<_, i64>(5)? as u64,
-                    shadow_of: r.get(6)?,
-                    tier_max_priority: r.get(7)?,
-                    tier_min_priority: r.get(8)?,
+                    member_count: r.get::<_, i64>(6)? as u64,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// 严格新增分组;已存在返回 `false`。
-    /// `shadow_of` 空字符串 = 普通组(合法性校验在 admin 层,见 `admin::groups`)。
-    pub fn create_group(
-        &self,
-        name: &str,
-        color: &str,
-        note: &str,
-        shadow_of: &str,
-        tier_min_priority: Option<i64>,
-        tier_max_priority: Option<i64>,
-    ) -> anyhow::Result<bool> {
+    /// 严格新增分组;已存在返回 `false`。新组是空的,成员由 `upsert_membership` /
+    /// `bulk_add_members` 单独加 —— 没有成员的组服务不了任何请求(503)。
+    pub fn create_group(&self, name: &str, color: &str, note: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        // `WHERE` 子句把"源组必须存在且本身不是影子组"和插入合并成**一条原子语句**:
-        // admin 层的 `validate_shadow` 是"先读快照再写"两次独立加锁,中间存在窗口——
-        // 并发的 `delete_group` 可以在窗口里删掉源组,于是写出一条 shadow_of 悬空的行
-        // (整组静默 503)。这里兜底:源组在写入那一刻不合法就写 0 行。
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO groups (name, color, note, shadow_of, tier_min_priority, tier_max_priority) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE ?4 = '' \
-             OR EXISTS (SELECT 1 FROM groups WHERE name = ?4 AND shadow_of = '')",
-            (name, color, note, shadow_of, tier_min_priority, tier_max_priority),
+            "INSERT OR IGNORE INTO groups (name, color, note) VALUES (?1, ?2, ?3)",
+            (name, color, note),
         )?;
         Ok(changed == 1)
     }
 
-    /// 部分更新 color/note/影子配置(`None` 不动);`false` = 组不存在。
-    ///
-    /// `shadow_of = Some("")` = 取消影子身份(**低价档的正确下线姿势**:该组随即
-    /// 没有任何 worker → 全 503,而绑在它上面的 key 仍留在组内。用 DELETE 会把 key
-    /// 打回未分组、进而回落 default_group,等于给低价客户静默提权,见 `delete_group`)。
-    /// `tier_min_priority`/`tier_max_priority = Some(None)` = 清除该侧档位边界(不限)。
+    /// 部分更新 color/note(`None` 不动);`false` = 组不存在。
     pub fn update_group(
         &self,
         name: &str,
         color: Option<&str>,
         note: Option<&str>,
-        shadow_of: Option<&str>,
-        tier_min_priority: Option<Option<i64>>,
-        tier_max_priority: Option<Option<i64>>,
     ) -> anyhow::Result<bool> {
         let mut sets: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
@@ -518,29 +521,6 @@ impl SqliteStore {
             sets.push("note = ?");
             params.push(Value::Text(n.to_string()));
         }
-        // 同 `create_group`:把源组合法性并进同一条 UPDATE,堵住"校验后、写入前源组被删"
-        // 的窗口。谓词恒真时退化为普通赋值,不影响非影子组的 PATCH。
-        let mut shadow_guard = String::new();
-        if let Some(s) = shadow_of {
-            sets.push("shadow_of = ?");
-            params.push(Value::Text(s.to_string()));
-            if !s.is_empty() {
-                // 必须按 shadow_of 的**实际绑定位序**引用(params 是按 sets 顺序 push 的,
-                // 写死 ?1 会绑到 color 上)。rusqlite 位序从 1 起。
-                let idx = params.len();
-                shadow_guard = format!(
-                    " AND EXISTS (SELECT 1 FROM groups g2 WHERE g2.name = ?{idx} AND g2.shadow_of = '')"
-                );
-            }
-        }
-        if let Some(p) = tier_min_priority {
-            sets.push("tier_min_priority = ?");
-            params.push(p.map_or(Value::Null, Value::Integer));
-        }
-        if let Some(p) = tier_max_priority {
-            sets.push("tier_max_priority = ?");
-            params.push(p.map_or(Value::Null, Value::Integer));
-        }
         let conn = self.conn.lock();
         if sets.is_empty() {
             let exists: bool = conn
@@ -549,11 +529,7 @@ impl SqliteStore {
             return Ok(exists);
         }
         params.push(Value::Text(name.to_string()));
-        let sql = format!(
-            "UPDATE groups SET {} WHERE name = ?{}",
-            sets.join(", "),
-            shadow_guard
-        );
+        let sql = format!("UPDATE groups SET {} WHERE name = ?", sets.join(", "));
         let changed = conn.execute(&sql, rusqlite::params_from_iter(params))?;
         Ok(changed == 1)
     }
@@ -561,14 +537,12 @@ impl SqliteStore {
     /// 删除分组,并把引用它的账号/key 的 group_name 清为 ''(未分组);
     /// 四条语句包成事务(含依赖检查),避免删组成功但引用残留、或检查与删除之间被插队。
     ///
-    /// ## 两道拒绝(**安全护栏,别当成多余的校验删掉**)
+    /// ## 仍有 key 绑定时必须拒绝(**安全护栏,别当成多余的校验删掉**)
     /// `group_name = ''` 会被 router 的 `resolve_group` 回落到 `default_group`(= 主组 G0)。
-    /// 因此裸删组等于把该组的 key **静默提权**成主组的不受限访问,且无任何告警:
-    /// - **本组是影子组且仍有 key 绑定** → 低价客户当场变成全价无档位限制客户;
-    /// - **本组被别的影子组引用为源组** → 那些影子组的 `shadow_of` 悬空,路由到不存在的
-    ///   组 → 整组静默 503。
+    /// 因此裸删一个还有客户在用的组,等于把这些 key **静默提权**成主组的不受限访问,
+    /// 且无任何告警 —— 低价客户当场变成能用全部主力号。
     ///
-    /// 下线一个影子组的正确姿势是 `update_group(shadow_of = Some(""))`,不是删。
+    /// 下线一个组的正确姿势是把它的成员边清空(该组随即 503),或先把 key 迁走再删。
     pub fn delete_group(&self, name: &str) -> anyhow::Result<DeleteGroupOutcome> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -577,28 +551,15 @@ impl SqliteStore {
         if !exists {
             return Ok(DeleteGroupOutcome::NotFound);
         }
-        let children: Vec<String> = tx
-            .prepare_cached("SELECT name FROM groups WHERE shadow_of = ?1 ORDER BY name")?
-            .query_map([name], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !children.is_empty() {
-            return Ok(DeleteGroupOutcome::HasShadowChildren(children));
-        }
-        let is_shadow: bool = tx
-            .prepare_cached("SELECT 1 FROM groups WHERE name = ?1 AND shadow_of <> ''")?
-            .exists([name])?;
-        if is_shadow {
-            let bound: i64 = tx.prepare_cached(
-                "SELECT COUNT(*) FROM api_keys WHERE group_name = ?1",
-            )?
+        let bound: i64 = tx
+            .prepare_cached("SELECT COUNT(*) FROM api_keys WHERE group_name = ?1")?
             .query_row([name], |r| r.get(0))?;
-            if bound > 0 {
-                return Ok(DeleteGroupOutcome::ShadowHasKeys(bound as u64));
-            }
+        if bound > 0 {
+            return Ok(DeleteGroupOutcome::HasKeys(bound as u64));
         }
         tx.execute("DELETE FROM groups WHERE name = ?1", [name])?;
+        tx.execute("DELETE FROM account_groups WHERE group_name = ?1", [name])?;
         tx.execute("UPDATE accounts SET group_name = '' WHERE group_name = ?1", [name])?;
-        tx.execute("UPDATE api_keys SET group_name = '' WHERE group_name = ?1", [name])?;
         tx.commit()?;
         Ok(DeleteGroupOutcome::Deleted)
     }
@@ -653,6 +614,10 @@ impl SqliteStore {
 
     /// 严格新增账号;已存在返回 `false`。`extra_json` 须是合法 JSON 对象文本
     /// (调用方校验;此处只管落库)。
+    ///
+    /// 同时给归属组建一条成员边(组内优先级取 `extra.priority`,缺省 100)。
+    /// **不建边的新号对所有客户都不可见**——账号在 `accounts` 里、却不在任何组的成员
+    /// 集里,导入完看着一切正常但永远不会被选中,是最难查的一类"配了没生效"。
     pub fn create_account(
         &self,
         account_id: &str,
@@ -668,6 +633,13 @@ impl SqliteStore {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (account_id, group_name, provider, max_concurrency.max(1), extra_json),
         )?;
+        if changed == 1 && !group_name.is_empty() {
+            conn.execute(
+                "INSERT OR IGNORE INTO account_groups (account_id, group_name, priority) \
+                 VALUES (?1, ?2, COALESCE(CAST(json_extract(?3, '$.priority') AS INTEGER), 100))",
+                (account_id, group_name, extra_json),
+            )?;
+        }
         Ok(changed == 1)
     }
 
@@ -1012,10 +984,14 @@ impl SqliteStore {
         Ok(exists)
     }
 
-    /// 取某组账号并转换为运行时 [`Account`](gw_core::account::Account)
+    /// 取**归属**于 `owner` 的全部账号并转换为运行时 [`Account`](gw_core::account::Account)
     /// (extra JSON 解码回字段表;含已禁用账号,调度器自行处理 disabled)。
     /// 单行 extra 损坏时跳过该账号并告警,不拖垮整组。
-    pub fn load_group_accounts(&self, group: &str) -> anyhow::Result<Vec<Account>> {
+    ///
+    /// 这里查的是 `accounts.group_name` = **归属**(哪个 worker 独占管它的运行态),
+    /// 不是成员边。可见性/组内排序由 [`Self::load_group_memberships`] 单独给出:
+    /// worker 装载它名下**全部**账号的运行态,再按请求所属分组过滤出可见子集。
+    pub fn load_owned_accounts(&self, owner: &str) -> anyhow::Result<Vec<Account>> {
         let rows = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare_cached(&format!(
@@ -1023,7 +999,7 @@ impl SqliteStore {
                 Self::ACCOUNT_COLS
             ))?;
             let collected = stmt
-                .query_map([group], Self::row_to_account)?
+                .query_map([owner], Self::row_to_account)?
                 .collect::<Result<Vec<_>, _>>()?;
             collected
         };
@@ -1046,6 +1022,142 @@ impl SqliteStore {
             });
         }
         Ok(accounts)
+    }
+
+    /// 取 `owner` 名下账号参与的**全部成员边**,按组聚成视图:`组名 → {账号 → 组内优先级}`。
+    ///
+    /// worker 每轮同步一次,选号时按请求所属分组现取一张视图 —— 不在视图里的号对该
+    /// 请求**不存在**,在视图里的号按 priority 分层(数值越小越优先)。
+    ///
+    /// 只回本 owner 名下的边:跨 owner 的成员边由对应 worker 各自持有,谁也不越界管
+    /// 别人的号(单一持有者约束)。
+    pub fn load_group_memberships(
+        &self,
+        owner: &str,
+    ) -> anyhow::Result<HashMap<String, HashMap<String, i64>>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.group_name, m.account_id, m.priority \
+             FROM account_groups m JOIN accounts a ON a.account_id = m.account_id \
+             WHERE a.group_name = ?1",
+        )?;
+        let mut out: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let rows = stmt.query_map([owner], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        for row in rows {
+            let (group, account, priority) = row?;
+            out.entry(group).or_default().insert(account, priority);
+        }
+        Ok(out)
+    }
+
+    /// 组名 → **持有该组成员的 owner 集合**(即请求该组时可以派发到哪些 worker)。
+    ///
+    /// router 据此选 worker:旧模型里「组」与「worker」一一对应,现在一个组的成员可以
+    /// 分散在多个 owner 名下,router 在其中做亲和/负载即可。没有成员的组不会出现在结果
+    /// 里 —— 那种组本来也服务不了任何请求,让它 503 比静默回落到主组安全得多。
+    pub fn group_owners(&self) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT m.group_name, a.group_name FROM account_groups m \
+             JOIN accounts a ON a.account_id = m.account_id \
+             WHERE a.group_name <> '' ORDER BY 1, 2",
+        )?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (group, owner) = row?;
+            out.entry(group).or_default().push(owner);
+        }
+        Ok(out)
+    }
+
+    /// 建/改一条成员边(存在则改组内优先级)。`false` = 账号或分组不存在。
+    ///
+    /// 外键在写入侧校验而非靠 SQLite FK:悬空边不会报错,只会让该组静默少一个号 ——
+    /// 比起立即失败,那种"配了但不生效"更难排查。
+    pub fn upsert_membership(
+        &self,
+        account_id: &str,
+        group_name: &str,
+        priority: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "INSERT INTO account_groups (account_id, group_name, priority) \
+             SELECT ?1, ?2, ?3 \
+             WHERE EXISTS (SELECT 1 FROM accounts WHERE account_id = ?1) \
+               AND EXISTS (SELECT 1 FROM groups WHERE name = ?2) \
+             ON CONFLICT(account_id, group_name) DO UPDATE SET priority = excluded.priority",
+            rusqlite::params![account_id, group_name, priority],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 删一条成员边;`false` = 边不存在。
+    pub fn remove_membership(&self, account_id: &str, group_name: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "DELETE FROM account_groups WHERE account_id = ?1 AND group_name = ?2",
+            [account_id, group_name],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// 列一个组的成员边(账号 id → 组内优先级),按优先级再按 id 排序,便于前端分层展示。
+    pub fn list_group_members(&self, group_name: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT account_id, priority FROM account_groups WHERE group_name = ?1 \
+             ORDER BY priority ASC, account_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([group_name], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 列一个账号参与的全部组(组名 → 组内优先级)。账号编辑页的多选回显用。
+    pub fn list_account_groups(&self, account_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT group_name, priority FROM account_groups WHERE account_id = ?1 \
+             ORDER BY group_name ASC",
+        )?;
+        let rows = stmt
+            .query_map([account_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// **批量**按条件加成员:220 个号手工点不现实。
+    ///
+    /// `subscription_title` / `owner` 任一为 `None` = 该维度不筛。返回新建或改动的边数。
+    /// 与 `upsert_membership` 同语义(已存在的边会被改成新的组内优先级)。
+    pub fn bulk_add_members(
+        &self,
+        group_name: &str,
+        owner: Option<&str>,
+        subscription_title: Option<&str>,
+        priority: i64,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        if !conn
+            .prepare_cached("SELECT 1 FROM groups WHERE name = ?1")?
+            .exists([group_name])?
+        {
+            return Ok(0);
+        }
+        let n = conn.execute(
+            "INSERT INTO account_groups (account_id, group_name, priority) \
+             SELECT a.account_id, ?1, ?2 FROM accounts a \
+             WHERE (?3 IS NULL OR a.group_name = ?3) \
+               AND (?4 IS NULL OR json_extract(a.extra, '$.subscription_title') = ?4) \
+             ON CONFLICT(account_id, group_name) DO UPDATE SET priority = excluded.priority",
+            rusqlite::params![group_name, priority, owner, subscription_title],
+        )?;
+        Ok(n)
     }
 
     /// 幂等导入 accounts.yaml(组 + 账号,INSERT OR IGNORE,已有行不覆盖——
@@ -1076,6 +1188,12 @@ impl SqliteStore {
                         acc.disabled as i64,
                         extra_json,
                     ],
+                )?;
+                // 与 create_account 同理:没有成员边的号对所有客户不可见。
+                tx.execute(
+                    "INSERT OR IGNORE INTO account_groups (account_id, group_name, priority) \
+                     VALUES (?1, ?2, COALESCE(CAST(json_extract(?3, '$.priority') AS INTEGER), 100))",
+                    rusqlite::params![acc.account_id, gname, extra_json],
                 )?;
             }
         }
@@ -1194,30 +1312,15 @@ impl ControlStore for SqliteStore {
         let mut stmt = conn.prepare_cached(
             "SELECT k.key, k.disabled, \
              (k.quota_tokens IS NOT NULL AND k.used_tokens >= k.quota_tokens), \
-             k.group_name, g.shadow_of, g.tier_max_priority, g.tier_min_priority \
-             FROM api_keys k LEFT JOIN groups g ON g.name = k.group_name \
-             WHERE k.key = ?1",
+             k.group_name FROM api_keys k WHERE k.key = ?1",
         )?;
         let row = stmt
             .query_row([api_key], |r| {
-                // shadow_of 为 NULL(无组行)或 '' (普通组)→ 无档位策略。
-                let shadow_of: Option<String> = r.get(4)?;
-                let tier = shadow_of
-                    .filter(|s| !s.is_empty())
-                    .map(|source_group| -> rusqlite::Result<TierPolicy> {
-                        Ok(TierPolicy {
-                            source_group,
-                            min_priority: r.get(6)?,
-                            max_priority: r.get(5)?,
-                        })
-                    })
-                    .transpose()?;
                 Ok(AuthenticatedKey {
                     key_id: r.get::<_, String>(0)?,
                     disabled: r.get::<_, i64>(1)? != 0,
                     over_quota: r.get::<_, i64>(2)? != 0,
                     group_name: r.get::<_, String>(3)?,
-                    tier,
                 })
             })
             .ok();
@@ -1682,9 +1785,9 @@ mod tests {
     #[test]
     fn groups_crud_lifecycle() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert!(store.create_group("G0", "#7c6cf6", "主组", "", None, None).unwrap());
-        assert!(!store.create_group("G0", "", "", "", None, None).unwrap(), "重名返回 false");
-        assert!(store.create_group("G1", "", "", "", None, None).unwrap());
+        assert!(store.create_group("G0", "#7c6cf6", "主组").unwrap());
+        assert!(!store.create_group("G0", "", "").unwrap(), "重名返回 false");
+        assert!(store.create_group("G1", "", "").unwrap());
 
         // 计数:G0 挂 1 账号 + 2 key;G1 空。
         store
@@ -1704,17 +1807,27 @@ mod tests {
         assert_eq!((g1.account_count, g1.key_count), (0, 0));
 
         // 部分更新:只改 color,note 不动。
-        assert!(store.update_group("G0", Some("#ff0000"), None, None, None, None).unwrap());
+        assert!(store.update_group("G0", Some("#ff0000"), None).unwrap());
         let g0 = store.list_groups().unwrap().into_iter().find(|g| g.name == "G0").unwrap();
         assert_eq!(g0.color, "#ff0000");
         assert_eq!(g0.note, "主组");
-        assert!(!store.update_group("GX", Some("#000"), None, None, None, None).unwrap());
+        assert!(!store.update_group("GX", Some("#000"), None).unwrap());
 
-        // 删除:引用方 group_name 清空,而非级联删除。
+        // 仍有 key 绑定时**必须拒绝**:删组会把 key 的 group_name 清空,而 router 把空组名
+        // 回落到主组 —— 等于把这些客户静默提权成主组的不受限访问。
+        assert_eq!(store.delete_group("G0").unwrap(), DeleteGroupOutcome::HasKeys(2));
+        assert!(store.get_api_key("sk-g0-a").unwrap().unwrap().group_name == "G0", "被拒的删除不得留痕");
+
+        // key 迁走之后才允许删;账号归属清空,成员边一并清理(不留悬空边)。
+        for k in ["sk-g0-a", "sk-g0-b"] {
+            store
+                .update_api_key(k, &ApiKeyPatch { group_name: Some("G1".into()), ..Default::default() })
+                .unwrap();
+        }
         assert_eq!(store.delete_group("G0").unwrap(), DeleteGroupOutcome::Deleted);
         assert_eq!(store.delete_group("G0").unwrap(), DeleteGroupOutcome::NotFound, "二次删除报 NotFound");
         assert_eq!(store.get_account("kiro-01").unwrap().unwrap().group_name, "");
-        assert_eq!(store.get_api_key("sk-g0-a").unwrap().unwrap().group_name, "");
+        assert!(store.list_group_members("G0").unwrap().is_empty(), "成员边必须一并删掉");
     }
 
     // ───────── 账号 CRUD ─────────
@@ -1823,13 +1936,13 @@ mod tests {
     #[test]
     fn group_exists_checks() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
+        store.create_group("G0", "", "").unwrap();
         assert!(store.group_exists("G0").unwrap());
         assert!(!store.group_exists("G0-typo").unwrap());
     }
 
     #[test]
-    fn load_group_accounts_converts_to_runtime_account() {
+    fn load_owned_accounts_converts_to_runtime_account() {
         let store = SqliteStore::open_in_memory().unwrap();
         store
             .create_account(
@@ -1847,7 +1960,7 @@ mod tests {
             .update_account("kiro-03", &AccountPatch { disabled: Some(true), ..Default::default() })
             .unwrap();
 
-        let accounts = store.load_group_accounts("G0").unwrap();
+        let accounts = store.load_owned_accounts("G0").unwrap();
         assert_eq!(accounts.len(), 2, "只取 G0,含禁用账号");
         let a1 = accounts.iter().find(|a| a.account_id == "kiro-01").unwrap();
         assert_eq!(a1.provider, "kiro");
@@ -2210,37 +2323,53 @@ groups:
         assert_eq!(limited.len(), 1);
     }
 
-    // ───────── 影子组(低价档)持久层 ─────────
+    // ───────── 分组归属与鉴权 ─────────
 
-    /// 存量库热升级:旧 schema 的 groups 表(无影子列)+ 已有数据 → 建表流程补列,
-    /// 且既有行取到"普通组"默认值。生产库是老库,这条挂了就等于上线即炸。
+    /// 存量库热升级:旧 schema(无 account_groups 表)+ 已有账号 → 建表流程补表并回填,
+    /// 且 groups 元数据原样保留。生产库是老库,这条挂了就等于上线即炸。
     #[test]
-    fn groups_columns_migrate_on_legacy_db() {
+    fn schema_upgrade_creates_membership_table_on_legacy_db() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE groups (name TEXT PRIMARY KEY, color TEXT NOT NULL DEFAULT '', \
              note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);
-             INSERT INTO groups (name, color, note) VALUES ('G0', '#111', '主组');",
+             INSERT INTO groups (name, color, note) VALUES ('G0', '#111', '主组');
+             CREATE TABLE accounts (account_id TEXT PRIMARY KEY, group_name TEXT NOT NULL DEFAULT '', \
+             provider TEXT NOT NULL DEFAULT 'kiro', max_concurrency INTEGER NOT NULL DEFAULT 2, \
+             disabled INTEGER NOT NULL DEFAULT 0, extra TEXT NOT NULL DEFAULT '{}', \
+             created_at INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO accounts (account_id, group_name, extra) \
+             VALUES ('power', 'G0', '{\"priority\":0}'), ('promax', 'G0', '{\"priority\":100}');",
         )
         .unwrap();
         SqliteStore::setup_schema(&conn).unwrap();
-        let (shadow, prio): (String, Option<i64>) = conn
-            .query_row("SELECT shadow_of, tier_max_priority FROM groups WHERE name='G0'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+        let color: String = conn
+            .query_row("SELECT color FROM groups WHERE name='G0'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(shadow, "", "存量组升级后必须是普通组");
-        assert_eq!(prio, None, "存量组不得凭空获得档位限制");
+        assert_eq!(color, "#111", "升级不得动既有组元数据");
+        let mut stmt = conn
+            .prepare("SELECT account_id, priority FROM account_groups WHERE group_name='G0' ORDER BY 1")
+            .unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("power".to_string(), 0), ("promax".to_string(), 100)],
+            "回填后组内排序必须与升级前的 extra.priority 一致"
+        );
     }
 
-    /// key 未分组 / 分组行不存在时 tier 必须是 None 且**鉴权不失败**
-    /// (LEFT JOIN 若写成 JOIN,这类 key 会直接 401,是最容易踩的回归)。
+    /// key 未分组 / 分组行不存在时**鉴权不得失败**(写成 JOIN 会让这类 key 直接 401,
+    /// 是最容易踩的回归)。
     #[tokio::test]
-    async fn authenticate_null_tier_when_group_absent() {
+    async fn authenticate_tolerates_missing_group() {
         let store = SqliteStore::open_in_memory().unwrap();
         store.add_api_key("sk-nogroup", None).unwrap();
         let a = store.authenticate("sk-nogroup").await.unwrap().unwrap();
-        assert!(a.tier.is_none(), "未分组 key 无档位策略");
+        assert_eq!(a.group_name, "", "未分组 key 照常通过鉴权");
 
         // 分组名指向一个并不存在的组行(历史脏数据):同样不得报错。
         store
@@ -2250,206 +2379,167 @@ groups:
             )
             .unwrap();
         let a = store.authenticate("sk-nogroup").await.unwrap().unwrap();
-        assert_eq!(a.group_name, "GHOST");
-        assert!(a.tier.is_none(), "悬空组名不得让鉴权失败,只是没有档位策略");
+        assert_eq!(a.group_name, "GHOST", "悬空组名不得让鉴权失败");
     }
 
-    /// 影子组的 key 鉴权时带出完整策略;普通组的 key 不带。
-    #[tokio::test]
-    async fn authenticate_carries_shadow_policy() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GLOW", "", "低价档", "G0", None, Some(0)).unwrap();
-        store.add_api_key("sk-glow", None).unwrap();
-        store
-            .update_api_key(
-                "sk-glow",
-                &ApiKeyPatch { group_name: Some("GLOW".into()), ..Default::default() },
-            )
-            .unwrap();
-        let a = store.authenticate("sk-glow").await.unwrap().unwrap();
-        assert_eq!(
-            a.tier,
-            Some(TierPolicy { source_group: "G0".into(), min_priority: None, max_priority: Some(0) })
-        );
+    // ───────── 成员边(账号↔分组 N:M) ─────────
 
-        store.add_api_key("sk-normal", None).unwrap();
-        store
-            .update_api_key(
-                "sk-normal",
-                &ApiKeyPatch { group_name: Some("G0".into()), ..Default::default() },
-            )
-            .unwrap();
-        let n = store.authenticate("sk-normal").await.unwrap().unwrap();
-        assert!(n.tier.is_none(), "普通组的 key 绝不能带档位策略");
-    }
-
-    /// 两个边界必须各归各列、各自往返。**用不相等的值**是刻意的:min/max 是相邻的
-    /// 同类型参数,写反了编译器抓不到,只有断言值不同才能暴露。
-    #[tokio::test]
-    async fn tier_bounds_roundtrip_without_transposition() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GECO", "", "低价档", "G0", Some(1), Some(77)).unwrap();
-        let g = store
-            .list_groups()
-            .unwrap()
-            .into_iter()
-            .find(|g| g.name == "GECO")
-            .unwrap();
-        assert_eq!((g.tier_min_priority, g.tier_max_priority), (Some(1), Some(77)));
-
-        // 鉴权路径也必须两端都带出(worker 少拿一端就等于闸门半开)。
-        store.add_api_key("sk-geco", None).unwrap();
-        store
-            .update_api_key(
-                "sk-geco",
-                &ApiKeyPatch { group_name: Some("GECO".into()), ..Default::default() },
-            )
-            .unwrap();
-        let a = store.authenticate("sk-geco").await.unwrap().unwrap();
-        assert_eq!(
-            a.tier,
-            Some(TierPolicy {
-                source_group: "G0".into(),
-                min_priority: Some(1),
-                max_priority: Some(77)
-            })
-        );
-
-        // 单侧清除只影响那一侧。
-        store.update_group("GECO", None, None, None, None, Some(None)).unwrap();
-        let a = store.authenticate("sk-geco").await.unwrap().unwrap();
-        assert_eq!(
-            a.tier.map(|t| (t.min_priority, t.max_priority)),
-            Some((Some(1), None)),
-            "清上界不得动下界"
-        );
-    }
-
-    /// 老库(只有 tier_max_priority 列)升级后必须能读:新列走 ensure_column 补齐,
-    /// 既有行的下界为 NULL = 不限,行为与升级前逐字节一致。
+    /// 建号即建边。**没有成员边的号对所有客户都不可见** —— 号在 accounts 表里躺着、
+    /// 导入日志一切正常,却永远不会被选中,是最难查的一类"配了没生效"。
     #[test]
-    fn tier_min_column_migrates_on_legacy_db() {
+    fn creating_account_also_creates_owner_membership() {
         let store = SqliteStore::open_in_memory().unwrap();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account("a", "G0", "kiro", 2, r#"{"priority":0}"#)
+            .unwrap();
+        store.create_account("b", "G0", "kiro", 2, "{}").unwrap();
+        assert_eq!(
+            store.list_group_members("G0").unwrap(),
+            vec![("a".to_string(), 0), ("b".to_string(), 100)],
+            "组内优先级取自 extra.priority,缺省 100(与调度器历史默认一致)"
+        );
+    }
+
+    /// 同一个号在两个组里可以排到**不同的层** —— 这正是旧模型(priority 挂在账号上)
+    /// 做不到、进而逼出影子组和档位区间的那件事。
+    #[test]
+    fn same_account_ranks_differently_per_group() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for g in ["G0", "LOW"] {
+            store.create_group(g, "", "").unwrap();
+        }
+        store
+            .create_account("power", "G0", "kiro", 2, r#"{"priority":0}"#)
+            .unwrap();
+        store
+            .create_account("promax", "G0", "kiro", 2, r#"{"priority":100}"#)
+            .unwrap();
+        // 低价组:小号当主力(0)、主力号当兜底(100)—— 与 G0 完全相反。
+        assert!(store.upsert_membership("promax", "LOW", 0).unwrap());
+        assert!(store.upsert_membership("power", "LOW", 100).unwrap());
+
+        let views = store.load_group_memberships("G0").unwrap();
+        assert_eq!(views["G0"], HashMap::from([("power".into(), 0), ("promax".into(), 100)]));
+        assert_eq!(views["LOW"], HashMap::from([("promax".into(), 0), ("power".into(), 100)]));
+        // 反向:两张视图的排序必须真的相反,而不是恰好都一样。
+        assert_ne!(views["G0"]["power"], views["LOW"]["power"]);
+    }
+
+    /// upsert 是"存在即改优先级";悬空边(账号或组不存在)必须写不进去 ——
+    /// 悬空边不报错,只会让该组静默少一个号,比立即失败难查得多。
+    #[test]
+    fn membership_upsert_updates_and_rejects_dangling() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_group("G0", "", "").unwrap();
+        store.create_account("a", "G0", "kiro", 2, "{}").unwrap();
+
+        assert!(store.upsert_membership("a", "G0", 7).unwrap());
+        assert_eq!(store.list_group_members("G0").unwrap(), vec![("a".to_string(), 7)]);
+
+        assert!(!store.upsert_membership("ghost", "G0", 0).unwrap(), "账号不存在不得建边");
+        assert!(!store.upsert_membership("a", "NOPE", 0).unwrap(), "分组不存在不得建边");
+        assert_eq!(store.list_group_members("G0").unwrap().len(), 1, "被拒的写入不得留痕");
+
+        assert!(store.remove_membership("a", "G0").unwrap());
+        assert!(!store.remove_membership("a", "G0").unwrap(), "重复删返回 false");
+        assert!(store.list_group_members("G0").unwrap().is_empty());
+    }
+
+    /// worker 只拿**自己名下**账号的边:跨 owner 的号由对应 worker 各自持有,
+    /// 谁也不越界管别人的号(单一持有者约束)。
+    #[test]
+    fn memberships_are_scoped_to_owner() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for g in ["G0", "G1", "SHARED"] {
+            store.create_group(g, "", "").unwrap();
+        }
+        store.create_account("mine", "G0", "kiro", 2, "{}").unwrap();
+        store.create_account("theirs", "G1", "kiro", 2, "{}").unwrap();
+        store.upsert_membership("mine", "SHARED", 0).unwrap();
+        store.upsert_membership("theirs", "SHARED", 0).unwrap();
+
+        let g0 = store.load_group_memberships("G0").unwrap();
+        assert_eq!(g0["SHARED"], HashMap::from([("mine".into(), 0)]), "只该看到自己名下的号");
+        assert!(!g0.contains_key("G1"));
+        let g1 = store.load_group_memberships("G1").unwrap();
+        assert_eq!(g1["SHARED"], HashMap::from([("theirs".into(), 0)]));
+    }
+
+    /// 220 个号手工点不现实,批量按条件加成员必须能用;且筛选维度要真的起作用。
+    #[test]
+    fn bulk_add_members_filters_by_subscription_and_owner() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for g in ["G0", "G1", "LOW"] {
+            store.create_group(g, "", "").unwrap();
+        }
+        store
+            .create_account("p1", "G0", "kiro", 2, r#"{"subscription_title":"KIRO POWER"}"#)
+            .unwrap();
+        store
+            .create_account("m1", "G0", "kiro", 2, r#"{"subscription_title":"KIRO PRO MAX"}"#)
+            .unwrap();
+        store
+            .create_account("m2", "G1", "kiro", 2, r#"{"subscription_title":"KIRO PRO MAX"}"#)
+            .unwrap();
+
+        // 只要 G0 名下的 PRO MAX:订阅维度和 owner 维度都必须生效。
+        let n = store
+            .bulk_add_members("LOW", Some("G0"), Some("KIRO PRO MAX"), 0)
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.list_group_members("LOW").unwrap(), vec![("m1".to_string(), 0)]);
+
+        // 不筛订阅 → G0 名下两个号都进来,且已存在的边被改成新优先级。
+        store.bulk_add_members("LOW", Some("G0"), None, 55).unwrap();
+        assert_eq!(
+            store.list_group_members("LOW").unwrap(),
+            vec![("m1".to_string(), 55), ("p1".to_string(), 55)]
+        );
+        assert_eq!(store.bulk_add_members("NOPE", None, None, 0).unwrap(), 0, "组不存在=0 边");
+    }
+
+    /// 老库升级:回填必须让新模型的起点与旧行为**逐条等价**(每个号在原组、
+    /// 优先级还是 extra.priority),且**幂等 + 只补不覆盖** —— 否则运维手工调过的
+    /// 组内优先级会在下次重启时被账号上的旧值悄悄冲掉。
+    #[test]
+    fn backfill_reproduces_legacy_layout_and_never_overwrites() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_group("G0", "", "").unwrap();
         {
+            // 模拟老库:账号在,但成员边表是空的。
             let conn = store.conn.lock();
-            conn.execute("DROP TABLE groups", []).unwrap();
+            conn.execute("DELETE FROM account_groups", []).unwrap();
             conn.execute(
-                "CREATE TABLE groups (name TEXT PRIMARY KEY, color TEXT NOT NULL DEFAULT '', \
-                 note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0, \
-                 shadow_of TEXT NOT NULL DEFAULT '', tier_max_priority INTEGER)",
+                "INSERT INTO accounts (account_id, group_name, extra) VALUES \
+                 ('power','G0','{\"priority\":0}'), ('promax','G0','{\"priority\":100}'), \
+                 ('nopri','G0','{}'), ('orphan','','{}')",
                 [],
             )
             .unwrap();
-            conn.execute("INSERT INTO groups (name, shadow_of, tier_max_priority) VALUES ('GLOW','G0',0)", [])
-                .unwrap();
-            SqliteStore::ensure_column(&conn, "groups", "tier_min_priority", "tier_min_priority INTEGER")
-                .unwrap();
+            SqliteStore::backfill_account_groups(&conn).unwrap();
         }
-        let g = store.list_groups().unwrap().into_iter().find(|g| g.name == "GLOW").unwrap();
         assert_eq!(
-            (g.tier_min_priority, g.tier_max_priority),
-            (None, Some(0)),
-            "迁移后旧行的下界应为不限,上界原样保留"
+            store.list_group_members("G0").unwrap(),
+            vec![("power".to_string(), 0), ("nopri".to_string(), 100), ("promax".to_string(), 100)],
+            "回填后每个号在原组、优先级沿用 extra.priority(缺省 100)"
+        );
+        assert!(
+            store.list_account_groups("orphan").unwrap().is_empty(),
+            "未分组的号不该被凭空塞进任何组"
+        );
+
+        // 运维手工把 promax 提成主力,再触发一次回填(重启)——不得被冲回 100。
+        store.upsert_membership("promax", "G0", 0).unwrap();
+        {
+            let conn = store.conn.lock();
+            SqliteStore::backfill_account_groups(&conn).unwrap();
+        }
+        assert_eq!(
+            store.list_account_groups("promax").unwrap(),
+            vec![("G0".to_string(), 0)],
+            "回填只补不覆盖:重启不得冲掉手工调整"
         );
     }
 
-    /// 删影子组会把它的 key 打回未分组 → router 回落主组 → 低价客户静默提权。
-    /// 必须拒绝;把 key 移走之后才允许删。
-    #[test]
-    fn delete_shadow_with_bound_keys_conflicts() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GLOW", "", "", "G0", None, Some(0)).unwrap();
-        store.add_api_key("sk-glow", None).unwrap();
-        store
-            .update_api_key(
-                "sk-glow",
-                &ApiKeyPatch { group_name: Some("GLOW".into()), ..Default::default() },
-            )
-            .unwrap();
-        assert_eq!(
-            store.delete_group("GLOW").unwrap(),
-            DeleteGroupOutcome::ShadowHasKeys(1),
-            "有 key 绑定的影子组不得直接删除(会静默提权)"
-        );
-        // key 移出后可以删 —— 保护不是永久锁死。
-        store
-            .update_api_key(
-                "sk-glow",
-                &ApiKeyPatch { group_name: Some("".into()), ..Default::default() },
-            )
-            .unwrap();
-        assert_eq!(store.delete_group("GLOW").unwrap(), DeleteGroupOutcome::Deleted);
-    }
-
-    /// 源组被删 → 影子组的 shadow_of 悬空 → 整组静默 503。必须拒绝。
-    #[test]
-    fn delete_source_with_shadow_children_conflicts() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GLOW", "", "", "G0", None, Some(0)).unwrap();
-        assert_eq!(
-            store.delete_group("G0").unwrap(),
-            DeleteGroupOutcome::HasShadowChildren(vec!["GLOW".into()])
-        );
-        // 先摘掉影子身份,源组即可删。
-        assert!(store.update_group("GLOW", None, None, Some(""), None, None).unwrap());
-        assert_eq!(store.delete_group("G0").unwrap(), DeleteGroupOutcome::Deleted);
-    }
-
-    /// PATCH 的部分更新语义:只传 note 不动影子配置;`Some(None)` 能把档位清回不限。
-    #[test]
-    fn update_group_patches_shadow_fields_partially() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GLOW", "", "", "G0", None, Some(0)).unwrap();
-        assert!(store.update_group("GLOW", None, Some("改备注"), None, None, None).unwrap());
-        let g = store.list_groups().unwrap().into_iter().find(|g| g.name == "GLOW").unwrap();
-        assert_eq!((g.shadow_of.as_str(), g.tier_max_priority), ("G0", Some(0)), "只改 note 不得动影子配置");
-
-        assert!(store.update_group("GLOW", None, None, None, None, Some(None)).unwrap());
-        let g = store.list_groups().unwrap().into_iter().find(|g| g.name == "GLOW").unwrap();
-        assert_eq!(g.tier_max_priority, None, "Some(None) 应把档位上限清成不限");
-    }
-
-    /// 把某组改成影子组时,源组必须在**写入那一刻**仍然合法(存在且本身非影子)。
-    /// 这条谓词是并发窗口的兜底:admin 的校验与写入是两次独立加锁。
-    /// 同时锁住一个易犯的实现错误:谓词必须按 shadow_of 的实际绑定位序引用参数,
-    /// 写死 `?1` 会绑到 color 上,导致这条守卫恒假/恒真。
-    #[test]
-    fn update_group_shadow_target_validated_at_write_time() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GLOW", "", "", "", None, None).unwrap();
-        store.create_group("CHAIN", "", "", "", None, None).unwrap();
-
-        // 正常路径:同时改 color(占住 ?1)+ shadow_of,谓词仍须命中正确的参数。
-        assert!(store.update_group("GLOW", Some("#abc"), None, Some("G0"), None, None).unwrap());
-        let g = store.list_groups().unwrap().into_iter().find(|g| g.name == "GLOW").unwrap();
-        assert_eq!((g.shadow_of.as_str(), g.color.as_str()), ("G0", "#abc"));
-
-        // 源组不存在 → 写 0 行(不产生 shadow_of 悬空的组)。
-        assert!(!store.update_group("CHAIN", None, None, Some("GONE"), None, None).unwrap());
-        // 源组本身是影子组 → 同样拒绝(链式影子只解一层,会路由到没有 worker 的组)。
-        assert!(!store.update_group("CHAIN", None, None, Some("GLOW"), None, None).unwrap());
-        let c = store.list_groups().unwrap().into_iter().find(|g| g.name == "CHAIN").unwrap();
-        assert_eq!(c.shadow_of, "", "被拒绝的更新不得留下任何痕迹");
-    }
-
-    /// create 侧同一条兜底:源组不合法时不插入,而不是插入一条悬空的影子组。
-    #[test]
-    fn create_group_shadow_target_validated_at_write_time() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        store.create_group("G0", "", "", "", None, None).unwrap();
-        store.create_group("GLOW", "", "", "G0", None, Some(0)).unwrap();
-
-        assert!(!store.create_group("X1", "", "", "GONE", None, Some(0)).unwrap(), "源组不存在应写 0 行");
-        assert!(!store.create_group("X2", "", "", "GLOW", None, Some(0)).unwrap(), "链式影子应写 0 行");
-        let names: Vec<String> = store.list_groups().unwrap().into_iter().map(|g| g.name).collect();
-        assert!(!names.contains(&"X1".to_string()) && !names.contains(&"X2".to_string()));
-        // 普通组(shadow_of='')不受该谓词影响。
-        assert!(store.create_group("G1", "", "", "", None, None).unwrap());
-    }
 }

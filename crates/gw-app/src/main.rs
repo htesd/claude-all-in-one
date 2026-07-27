@@ -18,11 +18,13 @@ use clap::{Parser, ValueEnum};
 /// 仅在 router→worker 的 localhost 内网跳使用(对外 Authorization 不透传给 worker)。
 pub const CLIENT_KEY_HEADER: &str = "x-gw-client-key";
 
-/// 内网头:影子组(低价档)的档位守卫策略,紧凑 JSON(如 `{"max_priority":0}`)。
-/// **只由 router 依据 DB 里的组配置生成**;`send_messages_to_worker` 是白名单转发,
-/// 客户端自带的同名头到不了 worker,因此无法伪造/绕过档位。
-/// 头缺席 = 普通组请求(worker 走与本特性上线前完全相同的路径)。
-pub const TIER_HEADER: &str = "x-gw-tier";
+/// 内网头:本次请求所属的**分组名**。worker 据此取该组的成员视图(哪些号可见 +
+/// 组内优先级),不在成员集里的号对本次请求不存在。
+///
+/// **只由 router 依据客户 key 的分组生成**;`send_messages_to_worker` 是白名单转发,
+/// 客户端自带的同名头到不了 worker,因此无法伪造/绕过分组。
+/// 头缺席 = 未分组请求(worker 用全量池,与本次重构之前逐字节相同)。
+pub const GROUP_HEADER: &str = "x-gw-group";
 
 /// 优雅停机信号:SIGTERM(docker stop / systemd)或 Ctrl-C。
 /// 触发后 axum 停止接收新连接,在途请求(含流式 SSE)自然跑完;不设排空上限——
