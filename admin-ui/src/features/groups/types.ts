@@ -4,23 +4,37 @@ export interface GroupRow {
   /** 颜色（hex）；空串 = 未设置，展示时取 DEFAULT_GROUP_COLOR 兜底。 */
   color: string
   note: string
+  /**
+   * **归属**本组的账号数（accounts.group_name = 本组，即哪个 worker 独占管它们的运行态）。
+   * 与 `member_count` 是两件事：一个号只归属一个组，却可以是多个组的成员。
+   */
   account_count: number
   key_count: number
   /** 创建时间，Unix 秒。 */
   created_at: number
   /**
-   * 影子组：指向真正持有账号的源组（'' = 普通组）。
-   * 影子组自己**不持有账号**，所以 `account_count` 恒为 0 —— 卡片必须据本字段显示
-   * "影子组 → 源组" 徽章，否则运维会以为这个组坏了。
+   * 本组的**成员数**（account_groups 里的边数）= 本组的客户能用到多少个号。
+   * 卡片必须展示它：一个只借用别组账号的分组，`account_count` 恒为 0，
+   * 光看账号数会让运维以为这个组坏了。
    */
-  shadow_of: string
-  /** 影子组可见的最高档位（只允许 priority ≤ 此值；null = 不限）。 */
-  tier_max_priority: number | null
-  /**
-   * 影子组可见档位的**下界**（只允许 priority ≥ 此值；null = 不限）。
-   * 数值越小越优先，所以这一侧用来把主力号挡在档位外 —— 低价流量烧不到高价客户的号。
-   */
-  tier_min_priority: number | null
+  member_count: number
+}
+
+/** GET /groups/{name}/members 的单行。 */
+export interface GroupMember {
+  account_id: string
+  /** 该号**在本组内**的优先级（数值越小越优先）。同一个号在别的组里可以是另一个值。 */
+  priority: number
+}
+
+/** POST /groups/{name}/members/bulk:字段缺省 = 该维度不筛。 */
+export interface BulkAddMembersPayload {
+  /** 只加归属于该 owner 的号。 */
+  owner?: string
+  /** 只加该订阅档位的号,如 "KIRO POWER" / "KIRO PRO MAX"。 */
+  subscription_title?: string
+  /** 这批号在本组内的优先级(数值越小越优先)。 */
+  priority: number
 }
 
 export interface CreateGroupPayload {

@@ -103,22 +103,43 @@ fn resolve_group<'a>(key_group: Option<&'a str>, default: &'a str) -> &'a str {
 const GROUP_OWNERS_TTL: Duration = Duration::from_secs(15);
 
 fn owners_for(st: &RouterState, group: &str) -> Vec<String> {
-    let mut cache = st.group_owners.lock();
-    let stale = cache
-        .1
-        .map_or(true, |t| Instant::now().duration_since(t) >= GROUP_OWNERS_TTL);
-    if stale {
-        match st.store.as_ref().map(|s| s.group_owners()) {
-            Some(Ok(m)) => {
-                cache.0 = m;
-                cache.1 = Some(Instant::now());
-            }
-            Some(Err(e)) => tracing::warn!("读取分组 owner 映射失败,沿用上轮快照: {e}"),
-            // 无库(stub 模式):回落到"组名即 owner",与重构前的拓扑假设一致。
-            None => return vec![group.to_string()],
+    // 无库(stub 模式):回落到"组名即 owner",与重构前的拓扑假设一致。
+    let Some(store) = st.store.as_ref() else {
+        return vec![group.to_string()];
+    };
+    // 先只在锁内判新鲜度并取快照,**绝不在锁内查 SQLite**:查询握着全局锁会让一次控制面
+    // 抖动变成整个数据面的队头阻塞(对抗审查 Architect#4)。
+    {
+        let cache = st.group_owners.lock();
+        if cache.1.is_some_and(|t| Instant::now().duration_since(t) < GROUP_OWNERS_TTL) {
+            return cache.0.get(group).cloned().unwrap_or_default();
         }
     }
-    cache.0.get(group).cloned().unwrap_or_default()
+    match store.group_owners() {
+        Ok(m) => {
+            let owners = m.get(group).cloned().unwrap_or_default();
+            let mut cache = st.group_owners.lock();
+            cache.0 = m;
+            cache.1 = Some(Instant::now());
+            owners
+        }
+        Err(e) => {
+            let cache = st.group_owners.lock();
+            match cache.1 {
+                // 已有快照:沿用旧的继续服务,别让控制面抖动打穿数据面。
+                Some(_) => {
+                    tracing::warn!("读取分组 owner 映射失败,沿用上轮快照: {e}");
+                    cache.0.get(group).cloned().unwrap_or_default()
+                }
+                // **冷启动**首次就失败:空映射会让每一个组都 503。回落到"组名即 owner"
+                // ——那正是本次重构之前的拓扑假设,对单 owner 部署(现状)完全正确。
+                None => {
+                    tracing::error!("冷启动读取 owner 映射失败,暂按'组名即 owner'服务: {e}");
+                    vec![group.to_string()]
+                }
+            }
+        }
+    }
 }
 
 /// 亲和表键 = `(group, session_id)` 复合键。同一 session_id 在不同组下是**独立**的

@@ -705,7 +705,15 @@ impl AccountScheduler {
                 // 只复活**支持本次模型、且属于本组**的号:opus 请求不该顺手复活无关 FREE
                 // 失败号(审查②R Skeptic#4);低价组的请求也不该把正常组刚合法禁用的号
                 // 一起复活并清零失败计数——那会让连续失败保护对所有组一起失效。
-                if !self_healed && self.heal_too_many_failures(&supports, view) {
+                //
+                // ⚠️ 自愈是**最后手段**,触发条件必须是"整个 worker 池也没救了",不能只看
+                // 本组视图(对抗审查 Skeptic#4)。否则一个只含单个坏号的小组,即使 worker
+                // 里还有大量健康号,也能每个请求触发一次"全灭"自愈 → 该号被反复复活、
+                // 连续失败保护对它彻底失效;而它可能同时属于别的组,污染面不止本组。
+                if !self_healed
+                    && self.whole_pool_exhausted(&supports)
+                    && self.heal_too_many_failures(&supports, view)
+                {
                     self_healed = true;
                     attempts += 1;
                     continue;
@@ -722,6 +730,15 @@ impl AccountScheduler {
                 }
             }
         }
+    }
+
+    /// 整个 worker 池(**不看分组视图**)是否已无任何可服务本模型的启用号。
+    ///
+    /// 这是自愈的前置闸门:自愈语义是"等价重启的最后手段",必须由**全池**告罄触发。
+    /// 只看本组视图会让小组把它变成常规操作,见 `acquire_in_group` 里的说明。
+    fn whole_pool_exhausted(&self, supports: &dyn Fn(&Account) -> bool) -> bool {
+        let entries = self.entries.lock();
+        !entries.values().any(|e| !e.disabled && supports(&e.account))
     }
 
     /// 全灭自愈:若存在 TooManyFailures 禁用的号,清其禁用 + 失败计数(等价重启)。
@@ -1872,13 +1889,66 @@ mod tests {
         drop(lease);
         assert_eq!(disabled(&s, "theirs"), Some(true), "别的组的号绝不能被顺手复活");
 
-        // 轮到它自己的组请求时才复活 —— 证明保护不是永久锁死。
+        // 此刻 mine 已healthy → **全池不再告罄** → 自愈闸门关闭,theirs 组拿不到自愈。
+        // 这是刻意的:自愈是"等价重启"的最后手段,只能由全池告罄触发。否则一个只含单个
+        // 坏号的小组每个请求都能触发一次自愈,该号被反复复活,连续失败保护对它彻底失效
+        // (对抗审查 Skeptic#4)。
         let only_theirs = view(&[("theirs", 0)]);
-        assert!(s.acquire_in_group(Some("s2"), |_| true, Some(&only_theirs)).await.is_ok());
+        assert_eq!(
+            s.acquire_in_group(Some("s2"), |_| true, Some(&only_theirs)).await.err(),
+            Some(AcquireError::AllDisabled),
+            "池里还有健康号时,小组不得靠自愈把自己的坏号捞回来"
+        );
     }
 
-    /// 视图变化不得扰动**别的组**的分层 LRU 游标:低价组把某个号选走后,
-    /// 正常组的轮转顺序必须和没发生过这件事一样。
+    /// 自愈闸门:**全池告罄**才允许自愈。小组视图为空但池里仍有健康号时,绝不触发 ——
+    /// 否则连续失败保护会被"每请求自愈一次"架空。
+    #[tokio::test]
+    async fn heal_requires_whole_pool_exhausted() {
+        let s = sched(vec![acct("bad", 4, Some(0)), acct("good", 4, Some(0))]);
+        for _ in 0..10 {
+            s.report_failure("bad", UpstreamErrorKind::ServerError);
+        }
+        let only_bad = view(&[("bad", 0)]);
+        assert_eq!(
+            s.acquire_in_group(Some("s"), |_| true, Some(&only_bad)).await.err(),
+            Some(AcquireError::AllDisabled),
+            "池里 good 还健康,只含坏号的小组不得触发自愈"
+        );
+        // 反向:池子真的全灭时,自愈照常兜底(保护不是永久锁死)。
+        for _ in 0..10 {
+            s.report_failure("good", UpstreamErrorKind::ServerError);
+        }
+        assert!(
+            s.acquire_in_group(Some("s2"), |_| true, Some(&only_bad)).await.is_ok(),
+            "全池告罄时自愈必须仍然生效"
+        );
+    }
+
+    /// **已知且刻意保留的耦合**(对抗审查 Skeptic#5):`last_selected_at` 挂在账号上、
+    /// 全 worker 共享,所以两个组若共享同一层里的号,一个组选走它会改变另一个组在**同层内**
+    /// 的轮转顺序。
+    ///
+    /// 保留而不修的理由:分层(哪一层可见、先用哪层)才是隔离语义,已由成员边严格保证;
+    /// 而层内 LRU 只影响"同层里先用谁",不影响可见性、不影响溢出顺序、不会让流量落到
+    /// 非成员上。要做到层内 LRU 也按组独立,得给每个组维护一份 last_selected_at ——
+    /// 那会让"同一个号被多个组用"的负载统计彼此看不见,反而更容易把号打爆。
+    #[tokio::test]
+    async fn shared_account_lru_is_coupled_across_groups_by_design() {
+        let s = sched(vec![acct("a", 4, Some(0)), acct("b", 4, Some(0))]);
+        let big = view(&[("a", 0), ("b", 0)]);
+        let small = view(&[("a", 0)]);
+        // 先让 small 组用掉 a(平局时 tiered_lru 按 id 选,首选就是 a)。
+        let first = s.acquire_in_group(None, |_| true, Some(&small)).await.unwrap();
+        assert_eq!(first.account_id(), "a");
+        drop(first);
+        // big 组的首个请求因此改选 b —— 这是共享 LRU 的直接后果,不是 bug。
+        let next = s.acquire_in_group(None, |_| true, Some(&big)).await.unwrap();
+        assert_eq!(next.account_id(), "b", "同层共享号的 LRU 是跨组耦合的(已知取舍)");
+    }
+
+    /// 隔离语义的真正保证:低价组的流量**不会让正常组选到非成员**,也不会改变正常组
+    /// 的分层顺序(哪一层先用)。层内先用谁的耦合见上一条测试。
     #[tokio::test]
     async fn group_selection_keeps_lru_cursor_stable() {
         let mk = || sched(vec![acct("a", 4, Some(0)), acct("b", 4, Some(0)), acct("c", 4, Some(100))]);
