@@ -28,7 +28,9 @@ mod tool_id;
 mod tools;
 
 // 重导出子模块项,使本文件(及测试)无需逐一限定路径即可调用。
-pub use model_map::{advertised_models, get_context_window_size, map_model, AdvertisedModel};
+pub use model_map::{
+    advertised_models, clamp_effort_for_model, get_context_window_size, map_model, AdvertisedModel,
+};
 pub use shed::{shed_history_media, MediaShed};
 /// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
 pub(crate) use cache_point::set_experimental_flags;

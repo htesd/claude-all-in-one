@@ -87,6 +87,97 @@ fn raise_low_thinking_budget(req: &mut MessagesRequest) -> bool {
     true
 }
 
+/// `enabled` 模式的 budget → effort 档位映射。
+///
+/// 1.0.212 的线缆里**没有 budget 概念了** —— 思考强度只有档位(`additionalModelRequestFields`)。
+/// 但客户端(Claude Code / opencode)仍按 Anthropic 语义发 `budget_tokens`,得翻译过去。
+/// 分界取客户端实际发的值:opencode 1024、Claude Code 2048 / 25600 / 52428。
+///
+/// 产出的是**全集**档位,可能该模型并不支持(如 4.6 系没有 `xhigh`);
+/// 按模型的夹取统一在 [`effective_effort`] 出口做一次,这里不管。
+fn budget_to_effort(budget: i32) -> &'static str {
+    match budget {
+        b if b < 2048 => "low",
+        b if b < 8192 => "medium",
+        b if b < 24576 => "high",
+        _ => "xhigh",
+    }
+}
+
+/// 请求**期望**的档位(未按模型夹取)。`None` = 不发该字段。
+fn desired_effort(req: &MessagesRequest) -> Option<&'static str> {
+    let t = req.thinking.as_ref()?;
+    match t.thinking_type.as_str() {
+        // 客户端明确不要思考 → 不发字段(与 1.0.212 的 undefined 同形)。
+        "disabled" => None,
+        // 档位制:直接取 effort(白名单归一 + 非法回退)。
+        "adaptive" => {
+            let raw = req.output_config.as_ref().and_then(|c| c.effort.as_deref());
+            let (effort, fell_back) = crate::anthropic_types::normalize_effort(raw);
+            if fell_back {
+                tracing::warn!(
+                    requested = ?raw,
+                    valid = ?crate::anthropic_types::VALID_EFFORTS,
+                    fallback = effort,
+                    "非法 thinking effort，已回退默认档位"
+                );
+            }
+            Some(effort)
+        }
+        // 预算制:翻译成档位(上游已不认 budget)。
+        "enabled" => Some(budget_to_effort(t.budget_tokens)),
+        _ => None,
+    }
+}
+
+/// 本次请求的**有效思考档位** —— `additionalModelRequestFields` 的唯一来源。
+///
+/// `None` = 不发该字段(等价于让上游按默认走)。三种情形都归到这里,因为真客户端
+/// 在这三种情形下发的都是 `additionalModelRequestFields: undefined`:
+/// 1. 客户端明确 `thinking.type=disabled`;
+/// 2. 该模型上游没有 effort schema(4.5 系 / haiku —— `extension.js:223145` 的
+///    `effortLevel && effortSchemaPath` 短路);
+/// 3. 模型名压根不在权威表里(未知模型,宁可不发也不猜)。
+///
+/// 注意本函数须在 [`override_thinking_from_model_name`] **之后**调用:那步会给未配置的
+/// Opus 请求补上 adaptive + 默认档。
+pub fn effective_effort(req: &MessagesRequest) -> Option<&'static str> {
+    let want = desired_effort(req)?;
+    let got = crate::converter::clamp_effort_for_model(&req.model, want)?;
+    if got != want {
+        tracing::debug!(
+            model = %req.model,
+            wanted = want,
+            used = got,
+            "该模型不支持所请求的思考档位，已按上游 schema 回落"
+        );
+    }
+    Some(got)
+}
+
+/// 把有效档位包成 Kiro 的 `additionalModelRequestFields`。
+///
+/// **形态逐字对齐真客户端的生成函数**(`extension.js:222579` 的 `qe8`),它整个函数体就是:
+/// ```js
+/// switch (schemaPath) {
+///   case "output_config": return { output_config: { effort } };
+///   case "reasoning":     return { reasoning:     { effort } };
+/// }
+/// ```
+/// caio 服务的模型全是 Anthropic 系,`schemaPath` 恒为 `output_config`
+/// (gpt-5.6 系才走 `reasoning`,caio 不转发它们)。
+///
+/// ⚠️ **不要补 `thinking` / `max_tokens`。** 上游 schema 里确实声明了这两个属性,但客户端
+/// **从不填** —— `qe8` 只产 `effort` 一个键。补了就是比真客户端多发字段,与做这件事的
+/// 初衷(消除可规则化的形态差异)正好相反。
+///
+/// 2026-07-28 真机 A/B 验证 `output_config.effort` 确实生效(claude-opus-5,同一道题):
+/// low 137 帧 reasoning / 33s,xhigh 1406 帧 / 169s。
+pub fn additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
+    let effort = effective_effort(req)?;
+    Some(serde_json::json!({ "output_config": { "effort": effort } }))
+}
+
 /// 按模型名覆写 thinking 配置。在 converter 之前调用,直接 mutate 请求。
 pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
     let model_lower = req.model.to_lowercase();
@@ -343,18 +434,140 @@ mod tests {
         assert_eq!(r.thinking.unwrap().budget_tokens, DEFAULT_MIN_THINKING_BUDGET);
     }
 
+    // ── 对齐 Kiro 1.0.212:结构化思考字段 ───────────────────────────────────
+    // 2026-07-28 真机 A/B(claude-opus-5,同一道证明题):
+    //   新字段 low  → 137  个 reasoningContentEvent 帧 / 33s
+    //   新字段 xhigh→ 1406 个                         / 169s
+    // 证明 schemaPath=output_config 对 Anthropic 系模型生效。
+
     #[test]
-    fn max_effort_alias_maps_to_xhigh_without_warning() {
-        use crate::anthropic_types::normalize_effort;
-        // 生产 30 分钟 103 次 `max` 被当非法值回退并刷告警。它是同义词,不是脏值。
-        let (eff, fell_back) = normalize_effort(Some("max"));
-        assert_eq!(eff, "xhigh");
-        assert!(!fell_back, "max 是同义翻译,不该报'非法回退'告警");
-        // 大小写不敏感。
-        assert_eq!(normalize_effort(Some("MAX")), ("xhigh", false));
+    fn adaptive_effort_lands_in_output_config() {
+        let mut r = req_mt("claude-opus-5", None, 32000);
+        r.output_config = Some(OutputConfig { effort: Some("high".into()), format: None });
+        override_thinking_from_model_name(&mut r);
+        let v = additional_model_request_fields(&r).unwrap();
+        assert_eq!(v, serde_json::json!({"output_config":{"effort":"high"}}));
+    }
+
+    #[test]
+    fn disabled_emits_no_field_at_all() {
+        // 与真实客户端在无 effortLevel 时 `additionalModelRequestFields: undefined` 同形。
+        let dis = Thinking { thinking_type: "disabled".into(), display: None, budget_tokens: 0 };
+        let mut r = req_mt("claude-opus-5", Some(dis), 32000);
+        override_thinking_from_model_name(&mut r);
+        assert!(additional_model_request_fields(&r).is_none(), "disabled 不该发该字段");
+    }
+
+    #[test]
+    fn budget_is_translated_to_effort_tier() {
+        // 上游 1.0.212 线缆已无 budget 概念,必须翻译成档位,否则客户端的强度意图全丢。
+        // 这里测**纯映射**:走完整路径会先被预算下限抬一手(见下面那条组合用例)。
+        for (budget, want) in [(1024, "low"), (2048, "medium"), (8192, "high"), (25600, "xhigh")] {
+            assert_eq!(budget_to_effort(budget), want, "budget={budget}");
+        }
+        // 单调性:客户端调高预算绝不该反而变浅。
+        let tiers: Vec<&str> = [1024, 4096, 16384, 65536].iter().map(|b| budget_to_effort(*b)).collect();
+        let rank = |e: &str| crate::anthropic_types::VALID_EFFORTS.iter().position(|v| *v == e).unwrap();
+        assert!(
+            tiers.windows(2).all(|w| rank(w[0]) < rank(w[1])),
+            "映射必须严格单调递增,实际={tiers:?}"
+        );
+    }
+
+    #[test]
+    fn full_path_respects_client_budget_above_floor() {
+        // 高于下限的预算走完整路径:不被抬,按原值翻译。
+        let mut r = req_mt("claude-opus-5", Some(enabled(25600)), 64000);
+        override_thinking_from_model_name(&mut r);
+        let v = additional_model_request_fields(&r).unwrap();
+        assert_eq!(v["output_config"]["effort"], "xhigh", "实际={v}");
+    }
+
+    #[test]
+    fn opencode_shape_after_floor_lands_on_high() {
+        // opencode 实际形状 budget=1024:先被下限抬到 8192,再翻译成 high。
+        // 两个策略叠起来的净效果 —— 这条把它钉死,免得日后改了下限却没人发现档位跟着变。
+        let mut r = req_mt("claude-opus-5", Some(enabled(1024)), 32000);
+        override_thinking_from_model_name(&mut r);
+        assert_eq!(r.thinking.as_ref().unwrap().budget_tokens, DEFAULT_MIN_THINKING_BUDGET);
+        let v = additional_model_request_fields(&r).unwrap();
+        assert_eq!(v["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn client_max_effort_reaches_the_wire_undowngraded() {
+        // 生产每 300 条约 33 条发 `max`。它是**上游 enum 里的最高档**,不是同义词 ——
+        // 曾被当非法值映射成 xhigh,等于把顶格请求静默降一级。
+        let mut r = req_mt("claude-opus-5", None, 32000);
+        r.output_config = Some(OutputConfig { effort: Some("max".into()), format: None });
+        override_thinking_from_model_name(&mut r);
+        let v = additional_model_request_fields(&r).unwrap();
+        assert_eq!(v["output_config"]["effort"], "max", "max 必须原样上 wire,实际={v}");
+
         // 反向:真正的脏值仍要回退且报警,别把闸门放开了。
-        let (eff2, fb2) = normalize_effort(Some("ludicrous"));
-        assert_eq!(eff2, DEFAULT_EFFORT);
-        assert!(fb2, "未知档位必须仍走回退+告警");
+        use crate::anthropic_types::normalize_effort;
+        let (eff, fb) = normalize_effort(Some("ludicrous"));
+        assert_eq!(eff, DEFAULT_EFFORT);
+        assert!(fb, "未知档位必须仍走回退+告警");
+    }
+
+    // ── 按模型夹取档位(2026-07-28,依据真实 ListAvailableModels schema)──────────
+
+    #[test]
+    fn model_without_xhigh_falls_back_to_its_schema_default() {
+        // opus-4.6 的 enum 是 [low,medium,high,max] —— **没有 xhigh**。
+        // caio 对 Opus 的默认档正是 xhigh,不夹的话就会发一个上游不认的值。
+        let mut r = req_mt("claude-opus-4-6", None, 32000);
+        override_thinking_from_model_name(&mut r);
+        assert_eq!(
+            r.output_config.as_ref().unwrap().effort.as_deref(),
+            Some("xhigh"),
+            "策略层仍按 caio 默认写 xhigh,夹取只发生在 wire 出口"
+        );
+        let v = additional_model_request_fields(&r).unwrap();
+        assert_eq!(
+            v["output_config"]["effort"], "high",
+            "4.6 系无 xhigh，须回落到它 schema 的 default=high(对齐客户端 A7),实际={v}"
+        );
+        // 反向:同一个 xhigh 打到支持它的模型上必须原样保留,别夹过头。
+        let mut r2 = req_mt("claude-opus-4-8", None, 32000);
+        override_thinking_from_model_name(&mut r2);
+        let v2 = additional_model_request_fields(&r2).unwrap();
+        assert_eq!(v2["output_config"]["effort"], "xhigh", "4.8 有 xhigh，不该被夹,实际={v2}");
+    }
+
+    #[test]
+    fn model_without_effort_schema_emits_no_field() {
+        // opus-4.5 / sonnet-4.5 / haiku-4.5 上游没有 additionalModelRequestFieldsSchema,
+        // 真客户端此时 `additionalModelRequestFields: undefined`(extension.js:223145 短路)。
+        for model in ["claude-opus-4-5", "claude-sonnet-4-5-thinking", "claude-haiku-4-5"] {
+            let mut r = req_mt(model, Some(enabled(25600)), 64000);
+            override_thinking_from_model_name(&mut r);
+            assert!(
+                additional_model_request_fields(&r).is_none(),
+                "{model} 上游无 effort schema，一个字段都不该发"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_model_emits_no_field() {
+        // 不在权威表里的模型:档位表未知 → 宁可不发,也不猜一个可能非法的值。
+        let mut r = req_mt("some-vendor/unknown-model", Some(enabled(25600)), 64000);
+        override_thinking_from_model_name(&mut r);
+        assert!(additional_model_request_fields(&r).is_none(), "未知模型不该猜档位");
+    }
+
+    #[test]
+    fn max_survives_on_models_lacking_xhigh() {
+        // 4.6 系虽无 xhigh,但**有** max。客户端顶格请求必须完整送达,不能被"没有 xhigh"
+        // 连累成 high —— 这正是 max 当初被当同义词的连锁伤害。
+        // sonnet 非 Opus,策略层不会替它注入 thinking,所以这里显式给 adaptive(模拟客户端自带)。
+        let adaptive = Thinking { thinking_type: "adaptive".into(), display: None, budget_tokens: 0 };
+        let mut r = req_mt("claude-sonnet-4-6", Some(adaptive), 32000);
+        r.output_config = Some(OutputConfig { effort: Some("max".into()), format: None });
+        override_thinking_from_model_name(&mut r);
+        let v = additional_model_request_fields(&r).unwrap();
+        assert_eq!(v["output_config"]["effort"], "max", "实际={v}");
     }
 }

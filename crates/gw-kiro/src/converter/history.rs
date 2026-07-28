@@ -8,8 +8,28 @@ use super::{normalized_client_system, request_has_chunked_tools, process_message
 use crate::kiro_types::conversation::{AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserInputMessageContext, UserMessage};
 use crate::kiro_types::tool::{ToolResult, ToolUseEntry};
 
-/// 生成thinking标签前缀
+/// 生成 thinking 标签前缀 —— **已随 Kiro 1.0.212 退役,默认不再注入**。
+///
+/// 2026-07-28 拆包 1.0.212(`extensions/kiro.kiro-agent/dist/extension.js`):
+/// `thinking_mode` / `thinking_effort` / `max_thinking_length` **全 app 树零命中**,
+/// 真实客户端已改用 `additionalModelRequestFields`(见 `thinking_policy`)。继续发这些
+/// 文本标签 = 发一串真客户端不会发的东西,是明确的指纹。
+///
+/// **服务端目前仍然认旧标签**(同日实测:旧标签 xhigh 出 2651 个 reasoning 帧,比新字段的
+/// 1406 还深),但对齐客户端形态优先于那点深度差 —— 长期不同步的封号代价更大。
+///
+/// `KIRO_LEGACY_THINKING_TAGS=1` 可切回旧行为(新字段与旧标签同时发过实测:2052 帧,
+/// 介于两者之间,不会互相顶掉,所以回退开关是安全的)。
 pub(super) fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+    if std::env::var("KIRO_LEGACY_THINKING_TAGS").is_err() {
+        return None;
+    }
+    build_thinking_prefix(req)
+}
+
+/// 旧标签的**纯**构造(不读 env)。拆出来是为了让回退路径仍可被测试直接覆盖 ——
+/// 用 env 开关的测试会与并行用例互相污染。
+fn build_thinking_prefix(req: &MessagesRequest) -> Option<String> {
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
@@ -654,7 +674,8 @@ mod strip_tests {
 
 #[cfg(test)]
 mod thinking_prefix_tests {
-    use super::generate_thinking_prefix;
+    // 测回退路径的**纯**构造:generate_thinking_prefix 需 env 开关,并行用例下会互相污染。
+    use super::build_thinking_prefix as generate_thinking_prefix;
     use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking};
 
     fn adaptive_req(effort: Option<&str>) -> MessagesRequest {

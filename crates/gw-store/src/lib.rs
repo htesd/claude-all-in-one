@@ -760,30 +760,42 @@ impl SqliteStore {
         Ok(true)
     }
 
-    /// 读系统设置 overlay(单行 key='system')。无行 = `None`(用 YAML 默认)。
-    pub fn get_settings(&self) -> anyhow::Result<Option<String>> {
+    /// `settings` 表里模型目录快照(`ListAvailableModels` 结果)的键名。
+    /// 与 `'system'` 同表不同键 —— 复用现成的表意味着**零 schema 变更、零迁移**。
+    pub const KEY_MODEL_CATALOG: &'static str = "model_catalog";
+
+    /// 读 `settings` 表的任意键。无行 = `None`。
+    pub fn get_kv(&self, key: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock();
-        match conn.query_row(
-            "SELECT value FROM settings WHERE key = 'system'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
+        match conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get::<_, String>(0)
+        }) {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// 写系统设置 overlay(整段 JSON 覆盖单行 key='system')。
-    pub fn upsert_settings(&self, json: &str) -> anyhow::Result<()> {
+    /// 写 `settings` 表的任意键(整值覆盖)。
+    pub fn upsert_kv(&self, key: &str, value: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('system', ?1)
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
              updated_at = strftime('%s','now')",
-            [json],
+            [key, value],
         )?;
         Ok(())
+    }
+
+    /// 读系统设置 overlay(单行 key='system')。无行 = `None`(用 YAML 默认)。
+    pub fn get_settings(&self) -> anyhow::Result<Option<String>> {
+        self.get_kv("system")
+    }
+
+    /// 写系统设置 overlay(整段 JSON 覆盖单行 key='system')。
+    pub fn upsert_settings(&self, json: &str) -> anyhow::Result<()> {
+        self.upsert_kv("system", json)
     }
 
     // === 请求日志(调试用,环形保留最新 N 条)===
@@ -1468,6 +1480,31 @@ mod tests {
             store.get_settings().unwrap().as_deref(),
             Some(r#"{"max_failures":1}"#)
         );
+    }
+
+    /// 模型目录与系统设置同表不同键,**互不影响** —— 复用 settings 表是为了不动 schema,
+    /// 但两个键必须完全隔离,否则写目录会把热调设置抹掉。
+    #[test]
+    fn model_catalog_kv_is_isolated_from_system_settings() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.upsert_settings(r#"{"max_failures":3}"#).unwrap();
+        assert_eq!(store.get_kv(SqliteStore::KEY_MODEL_CATALOG).unwrap(), None);
+
+        store
+            .upsert_kv(SqliteStore::KEY_MODEL_CATALOG, r#"{"models":[]}"#)
+            .unwrap();
+        assert_eq!(
+            store.get_kv(SqliteStore::KEY_MODEL_CATALOG).unwrap().as_deref(),
+            Some(r#"{"models":[]}"#)
+        );
+        // 反向:写目录不得影响 system 键。
+        assert_eq!(
+            store.get_settings().unwrap().as_deref(),
+            Some(r#"{"max_failures":3}"#),
+            "写模型目录把系统设置冲掉了"
+        );
+        // 未知键读回 None,不是空串。
+        assert_eq!(store.get_kv("nonexistent").unwrap(), None);
     }
 
     #[tokio::test]

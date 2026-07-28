@@ -287,6 +287,19 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// 拉取上游**模型目录**(只读;Kiro 的 `ListAvailableModels`)。返回 `Ok(None)` =
+    /// 该 provider 不支持(默认)。**安全契约**与 [`Provider::account_quota`] 相同:
+    /// 只发只读请求,绝不触发计费/发包。
+    ///
+    /// 返回原样 JSON 而非强类型,是为了让 gw-core 不依赖任一 provider 的目录形态 ——
+    /// 调用方只负责落库与透出,解释权归各 provider。
+    async fn model_catalog(
+        &self,
+        _account: &Account,
+    ) -> Result<Option<serde_json::Value>, UpstreamError> {
+        Ok(None)
+    }
+
     /// `account_quota` 是否为**本地廉价读**(无上游往返)。默认 `false`:像 Kiro 那样每次
     /// 走 `getUsageLimits` 上游查询,gw-app 用 TTL 缓存节流(含失败节流)。返回 `true` 的
     /// provider(如 dario:配额从实时聊天流量的响应头捕获、`account_quota` 只读内存快照)
