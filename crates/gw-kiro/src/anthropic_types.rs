@@ -161,10 +161,18 @@ pub const DEFAULT_EFFORT: &str = "xhigh";
 /// 才透传上游;非空但非法的值会被回退到 [`DEFAULT_EFFORT`],避免脏 effort 串打到 Kiro 触发 400。
 pub const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
+/// 客户端常用但 Kiro 不认的**同义档位** → 映射到等价的合法档位。
+///
+/// `max`:多家客户端(实测 139 生产 30 分钟内 103 次)用它表达"顶格思考"。Kiro 的档位到
+/// `xhigh` 为止,语义上就是顶格,直接对齐即可。**这不是"非法值回退"**,所以不该告警——
+/// 之前把它当非法值,日志里每分钟刷三条噪音,还掩盖了真正的脏 effort。
+const EFFORT_ALIASES: &[(&str, &str)] = &[("max", "xhigh")];
+
 /// 归一客户端 effort 到合法档位。返回 `(归一后的 &'static str, 是否因非法而回退)`:
 /// - `None` / 纯空白:未指定 → `(DEFAULT_EFFORT, false)`(默认,非告警情形);
 /// - 命中白名单(大小写不敏感):`(该档, false)`;
-/// - 非空但不在白名单:`(DEFAULT_EFFORT, true)`(调用方据 bool 决定是否告警)。
+/// - 命中 [`EFFORT_ALIASES`](如 `max`):`(等价档, false)`——**是翻译不是回退,不告警**;
+/// - 非空且都不命中:`(DEFAULT_EFFORT, true)`(调用方据 bool 决定是否告警)。
 pub fn normalize_effort(raw: Option<&str>) -> (&'static str, bool) {
     let s = match raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s,
@@ -173,6 +181,16 @@ pub fn normalize_effort(raw: Option<&str>) -> (&'static str, bool) {
     for v in VALID_EFFORTS {
         if v.eq_ignore_ascii_case(s) {
             return (*v, false);
+        }
+    }
+    for (alias, target) in EFFORT_ALIASES {
+        if alias.eq_ignore_ascii_case(s) {
+            // target 取自 VALID_EFFORTS 的 'static 串,保证返回值仍是 'static。
+            for v in VALID_EFFORTS {
+                if v == target {
+                    return (*v, false);
+                }
+            }
         }
     }
     (DEFAULT_EFFORT, true)
