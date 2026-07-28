@@ -1434,7 +1434,11 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
             }))
             .into_response()
         }
-        Err(e) => upstream_error_response(&e),
+        Err(e) => {
+            // 目录当前是本地生成、恒 Ok;一旦改成真实上游查询,原文只剩这一条日志路。
+            tracing::warn!(kind = ?e.kind, "模型目录获取失败: {e}");
+            upstream_error_response(&e)
+        }
     }
 }
 
@@ -1997,6 +2001,33 @@ fn sse_error_payload(e: &gw_core::error::UpstreamError) -> serde_json::Value {
     serde_json::json!({"type":"error","error":{"message": e.client_message()}})
 }
 
+/// 把**上游自己发来的** Anthropic 形状 error 载荷改写成中性版本。
+///
+/// 与 [`UpstreamError`] 那条路不同:这条路上错误已经是"合法 SSE 事件"了,provider 没把它
+/// 转成 `Err`(dario 直透 Anthropic 流即如此),`fold_sse_to_message` 也会把它原样当作
+/// 非流式的错误体回给客户。两处都得过这个函数。
+///
+/// **保留 `error.type`,只换 `message`**:客户端 SDK(Claude Code / NewAPI)按 type 判是否
+/// 重试、是否把渠道判死,动它就等于改重试语义 —— 本次明确不做。type 本身是 Anthropic
+/// 协议里的公开常量,不含厂商线索。
+fn sanitize_upstream_error_payload(data: &serde_json::Value) -> serde_json::Value {
+    use UpstreamErrorKind as K;
+    let ty = data.pointer("/error/type").and_then(|v| v.as_str());
+    // type → 语义最接近的 kind,借用同一套中性文案,避免两处口径漂移。
+    let msg = match ty {
+        Some("overloaded_error") => K::Overloaded,
+        Some("rate_limit_error") => K::RateLimited,
+        Some("invalid_request_error") | Some("not_found_error") => K::BadRequest,
+        Some("authentication_error") | Some("permission_error") => K::TokenInvalid,
+        _ => K::ServerError,
+    }
+    .client_message();
+    match ty {
+        Some(t) => serde_json::json!({"type":"error","error":{"type": t, "message": msg}}),
+        None => serde_json::json!({"type":"error","error":{"message": msg}}),
+    }
+}
+
 /// 把 [`UpstreamError`] 映射为**运维面**响应 —— 与 [`upstream_error_response`] 的唯一
 /// 区别是 message 带全量诊断(上游原文/接口名/刷新失败原因)。
 ///
@@ -2489,7 +2520,17 @@ async fn collect_response(
     match outcome {
         Outcome::Ok(msg) => (StatusCode::OK, Json(msg)).into_response(),
         Outcome::Upstream(e) => upstream_error_response(&e),
-        Outcome::Bad(data) => (StatusCode::BAD_GATEWAY, Json(data)).into_response(),
+        // 折叠失败体有两个来源:我方的折叠诊断,以及 `fold_sse_to_message` 对上游 error
+        // 事件的**原样回传**(fold.rs:49)。后者是上游报文,不能直发客户 —— 与流式路径
+        // 同一个闸门,原文落日志。
+        Outcome::Bad(data) => {
+            tracing::warn!(account = %account_id, "非流式折叠失败,回中性错误: {data}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(sanitize_upstream_error_payload(&data)),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2804,7 +2845,7 @@ fn stream_response(
                 }
             };
             match item {
-                Some(Ok(StreamItem::Sse(ev))) => {
+                Some(Ok(StreamItem::Sse(mut ev))) => {
                     // 首个转发事件时刻 = TTFB(请求日志 #③)。
                     if ctx.first_byte_at.is_none() {
                         ctx.first_byte_at = Some(std::time::Instant::now());
@@ -2814,6 +2855,15 @@ fn stream_response(
                         if ctx.error_kind.is_none() {
                             ctx.error_kind = Some("stream_error".to_string());
                         }
+                        // provider 把上游的 error 帧当**普通 SSE 事件**产出时(dario 直透
+                        // Anthropic 流即如此),这条路绕开 UpstreamError,原样转发就等于
+                        // 把上游报文发给客户。此处落原文 + 改写载荷,是这条路的唯一闸门。
+                        tracing::warn!(
+                            account = %ctx.account_id,
+                            model = %ctx.model,
+                            "上游流内 error 事件: {}", ev.data
+                        );
+                        ev.data = sanitize_upstream_error_payload(&ev.data);
                     }
                     // 完整性判据:只有真的收到 message_stop 才算客户端拿到完整响应。
                     if ev.event == "message_stop" {
@@ -3623,6 +3673,46 @@ mod tests {
             admin_body.contains("generateAssistantResponse") && admin_body.contains("kiro"),
             "运维面不该脱敏: {admin_body}"
         );
+    }
+
+    /// 上游把错误当**普通 SSE 事件**发来时(dario 直透 Anthropic 流),这条路绕开
+    /// `UpstreamError`。对抗评审两个镜头都点了它 —— 闸门必须也盖在这里。
+    #[test]
+    fn upstream_error_event_payload_is_rewritten_but_keeps_retry_type() {
+        let leaky = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": r#"kiro generateAssistantResponse 失败: {"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+            }
+        });
+        let out = sanitize_upstream_error_payload(&leaky);
+        let s = out.to_string();
+        for fp in ["kiro", "generateAssistantResponse", "MODEL_TEMPORARILY_UNAVAILABLE"] {
+            assert!(!s.contains(fp), "上游 error 事件仍泄露 `{fp}`: {s}");
+        }
+        // **type 必须原样保留**:客户端 SDK 按它判可重试,改了就是改重试语义(本次不做)。
+        assert_eq!(out["error"]["type"], "overloaded_error");
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["message"], "服务繁忙,请稍后重试");
+
+        // 没有 type 的载荷:不凭空造一个(造错反而误导客户端重试),只换 message。
+        let untyped = serde_json::json!({"error":{"message":"kiro boom"}});
+        let out2 = sanitize_upstream_error_payload(&untyped);
+        assert!(out2["error"]["type"].is_null(), "不该凭空造 error.type");
+        assert!(!out2.to_string().contains("kiro"));
+
+        // 各 type 映射到语义相符的中性文案(反向:别全塞同一句)。
+        let by_type = |t: &str| {
+            sanitize_upstream_error_payload(&serde_json::json!({"error":{"type":t,"message":"x"}}))
+                ["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(by_type("rate_limit_error"), "请求过于频繁,请稍后重试");
+        assert_eq!(by_type("invalid_request_error"), "请求无效,请检查请求体后重试");
+        assert_ne!(by_type("rate_limit_error"), by_type("overloaded_error"));
     }
 
     /// 登记过的本地文案要照发到客户端 —— 脱敏不能把"你请求体太大"这类可自助的信息也吃掉。

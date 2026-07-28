@@ -369,25 +369,18 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
     Ok(())
 }
 
-async fn health(State(st): State<Arc<RouterState>>) -> impl IntoResponse {
-    // 聚合各 worker 的 /health。
-    let mut worker_status = Vec::new();
-    for w in &st.workers {
-        let url = format!("{}/health", w.base_url);
-        let status = match st.http.get(&url).timeout(Duration::from_secs(3)).send().await {
-            Ok(r) if r.status().is_success() => r
-                .json::<serde_json::Value>()
-                .await
-                .unwrap_or_else(|_| serde_json::json!({"status": "bad_json"})),
-            Ok(r) => serde_json::json!({"status": format!("http_{}", r.status().as_u16())}),
-            Err(_) => serde_json::json!({"instance": w.instance, "status": "unreachable"}),
-        };
-        worker_status.push(status);
-    }
-    Json(serde_json::json!({
-        "role": "router",
-        "workers": worker_status,
-    }))
+/// `GET /health` —— **公网**存活探针,只回存活。
+///
+/// 原实现把各 worker 的 `/health` 原样聚合下发。那份 JSON(生产实测 65 KB)含
+/// `provider: kiro`、分组名(= 价格档)、出口 IP,以及 **220 个账号 ID(真实邮箱)**
+/// 连同各自的配额、优先级、禁用态 —— 无鉴权、公网可达。报错文案再怎么脱敏,
+/// 一次 `curl /health` 就把渠道来源和整个账号池抖干净了,比任何一条报错泄露得都多。
+///
+/// 明细一条没少:`GET /admin/api/accounts/runtime`(admin 鉴权)返回同样的逐账号运行态,
+/// 面板本来走的就是那条,不依赖这里。顺带去掉了「每次公网探针扇出 N 个内网请求」的
+/// 放大面(旧实现每请求最多等 N×3s)。
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({"role": "router", "status": "ok"}))
 }
 
 /// `POST /v1/messages/count_tokens` —— 本地估算,零上游调用(对齐 kiro.rs 默认路径)。
@@ -884,6 +877,23 @@ mod tests {
             );
         }
         h
+    }
+
+    /// 公网 `/health` 只回存活。
+    ///
+    /// 它此前无鉴权吐 65 KB:`provider: kiro`、分组名(= 价格档)、出口 IP,以及 220 个
+    /// 账号 ID(真实邮箱)+ 配额/优先级。报错文案脱敏得再干净,这一条 `curl` 就全抖出去了。
+    #[tokio::test]
+    async fn public_health_exposes_nothing_but_liveness() {
+        let resp = health().await.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        for fp in ["kiro", "provider", "accounts", "egress", "group", "instance", "@"] {
+            assert!(!s.contains(fp), "公网 /health 泄露 `{fp}`: {s}");
+        }
+        // 反向:探针要的是"活着"这一个信号,不能连它也删了(监控会误判宕机)。
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["status"], "ok");
     }
 
     #[test]

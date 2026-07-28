@@ -21,6 +21,18 @@
   `CLIENT_UNAVAILABLE`。分组名就是价格档,`worker` 就是账号池形态。
 - **补日志**:非流式抽干与流中硬错误此前**没有**任何一处记录上游原文(唯一的去处就是
   发给客户端)。脱敏前先把这两处的 `tracing::warn` 加上,否则排查会变瞎。
+- **公网 `GET /health` 收成纯存活探针**(对抗评审 high,两个镜头一致):旧实现无鉴权
+  返回 65 KB —— `provider: kiro`、分组名(= 价格档)、出口 IP,以及 **220 个账号 ID
+  (真实邮箱)** 连同配额/优先级/禁用态。报错文案脱敏得再干净,一条 `curl /health`
+  就把渠道来源和整个账号池抖干净。明细在 `GET /admin/api/accounts/runtime`(admin 鉴权)
+  里一条不少,面板走的本就是那条。顺带去掉「每次公网探针扇出 N 个内网请求」的放大面。
+- **上游自发的 SSE `error` 事件也过闸**(对抗评审 high):provider 把错误当**普通 SSE
+  事件**产出时(dario 直透 Anthropic 流即如此)绕开 `UpstreamError`,流式会原样转发、
+  非流式经 `fold_sse_to_message` 原样回传。新增 `sanitize_upstream_error_payload`:
+  **保留 `error.type`**(客户端按它判重试,动它就是改重试语义)**只换 `message`**,原文落日志。
+- **`client_detail` 收成私有 + 删掉公开的 `with_client_detail`**(对抗评审三镜头一致):
+  只留 `bad_request_visible` 一个入口。留着「把任意 String 登记为对外文案」的公开 API,
+  fail-closed 早晚退化成靠自觉。
 
 ### Design Rationale
 
@@ -39,9 +51,19 @@
 - `bad_request_visible` 登记的四处是有意为之(客户可自助):请求体超限 ×2、Anthropic
   报文解析失败、模型不支持 / 消息为空。新增登记前请自问文案里有没有厂商名、接口名、
   上游报文、账号标识。
-- **`GET /health` 未在本次范围内**:它无鉴权、公网可达,且返回全部账号 ID(真实邮箱)、
-  禁用态、优先级、配额 —— 泄露面远大于报错文案。admin 面板走的是内网 worker `/health`
-  聚合,不依赖公网这一个,收紧成本很低。待单独决策。
+- **`/health` 的返回体变了**:任何依赖它拿 worker/账号明细的外部脚本会失效(面板不依赖)。
+  监控只看 `status == "ok"` 的不受影响。**worker 自己的 `/health` 未动**(内网 127.0.0.1,
+  admin 面板与 `accounts/runtime` 都靠它)。
+- **对抗评审驳回的两条**:①「按端点是否公网可达来划脱敏边界不够结构化,应拆成两个
+  Router / 统一 PublicError renderer」—— 方向对,但那是一次协议层重构,不该搭在本次
+  上线路径上;当前边界有注释 + 测试钉住。②「客户看到中性文案后无法与内部日志关联,
+  应引入 request_id」—— 真缺口,但属新增特性,单列。
+
+### 待办(评审提出、本次未做)
+
+- 对外错误带一个不泄密的 `request_id`,与 router/worker/SSE 日志贯通,客服据此定位。
+- `gw-claude-subprocess` 的本地请求校验文案(缺 messages / 无用户文本)目前退化成中性
+  文案;该 provider 未部署,待启用前再逐条登记 `bad_request_visible`。
 
 ## [account-group-membership] - 2026-07-27
 
