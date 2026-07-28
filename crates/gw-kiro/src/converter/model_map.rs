@@ -159,7 +159,10 @@ pub const KIRO_MODELS: &[KiroModel] = &[
     },
 ];
 
-/// 把一个**已归一**的 effort 档位夹到该模型实际支持的档位上。
+/// 把一个 effort 档位夹到该模型实际支持的档位上。
+///
+/// `requested = None` 表示「**没有可用的请求档位**」—— 调用方拿到的是脏值/未知值,
+/// 此时应当落到该模型 schema 的 `default`,而不是先替它猜一个全局默认。
 ///
 /// 返回 `None` = 该模型上游没有 effort schema → 调用方**不得**发
 /// `additionalModelRequestFields`(与真客户端 `additionalModelRequestFields: undefined` 同形)。
@@ -171,22 +174,65 @@ pub const KIRO_MODELS: &[KiroModel] = &[
 /// 唯一的自主决定:回落时若 `default` 反而比请求的**更弱**(如 4.6 系请求 `xhigh`
 /// 回落到 `high`),我们仍照客户端来 —— 宁可少一档,也不擅自升到 `max` 制造
 /// 真客户端不会出现的形态。
-pub fn clamp_effort_for_model(model: &str, requested: &str) -> Option<&'static str> {
+pub fn clamp_effort_for_model(model: &str, requested: Option<&str>) -> Option<&'static str> {
     let m = lookup_model(model)?;
     if m.effort_levels.is_empty() {
         return None;
     }
-    if let Some(hit) = m
-        .effort_levels
-        .iter()
-        .find(|lv| lv.eq_ignore_ascii_case(requested))
-    {
-        return Some(*hit);
+    if let Some(req) = requested {
+        if let Some(hit) = m.effort_levels.iter().find(|lv| lv.eq_ignore_ascii_case(req)) {
+            return Some(*hit);
+        }
     }
-    // 不可用 → 回落 schema default;default 也不在表里(不该发生)时取最低档。
+    // 请求缺席或该模型不支持 → 回落**本模型** schema 的 default;
+    // default 也不在表里(不该发生)时取最低档。
     m.default_effort
         .and_then(|d| m.effort_levels.iter().find(|lv| **lv == d).copied())
         .or_else(|| m.effort_levels.first().copied())
+}
+
+/// 静态表与上游实际目录的一处不一致。
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct EffortDrift {
+    /// 上游的 `modelId`。
+    pub model: String,
+    /// 静态表里的档位(该模型不在表里时为 `None`)。
+    pub table: Option<Vec<String>>,
+    /// 上游当下的档位。
+    pub upstream: Vec<String>,
+    /// 静态表里的 default。
+    pub table_default: Option<String>,
+    /// 上游当下的 default。
+    pub upstream_default: Option<String>,
+}
+
+/// 拿一份上游目录,逐条比对静态表,报出**会导致我们发错档位**的漂移。
+///
+/// 为什么需要它:热路径的档位来自本文件的静态表(编译期常量),而上游随时可能给某个模型
+/// 增删档位。两个事实源之间没有自动同步 —— 这个函数不负责同步,只负责**让漂移可见**,
+/// 免得下一次协议变动又变成线上发出上游不认的值才被发现。
+///
+/// 只报静态表**认识**的模型(`kiro_model` 能对上的),上游新增的模型不算漂移(那是"待接入",
+/// 不是"发错值");上游**下线**了我们表里还有的模型也不报(那会体现为请求直接失败,不是静默错档)。
+pub fn effort_drift(upstream: &[(String, Vec<String>, Option<String>)]) -> Vec<EffortDrift> {
+    let mut out = Vec::new();
+    for (model_id, levels, default) in upstream {
+        let Some(m) = KIRO_MODELS.iter().find(|m| m.kiro_model == model_id) else {
+            continue; // 上游新增,静态表还没有 —— 不是漂移。
+        };
+        let table: Vec<String> = m.effort_levels.iter().map(|s| s.to_string()).collect();
+        let table_default = m.default_effort.map(str::to_string);
+        if &table != levels || &table_default != default {
+            out.push(EffortDrift {
+                model: model_id.clone(),
+                table: Some(table),
+                upstream: levels.clone(),
+                table_default,
+                upstream_default: default.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// 按对外名找权威表行:先精确归一([`resolve_base`]),再走子串兜底反查 `kiro_model`。
@@ -503,27 +549,74 @@ mod tests {
     #[test]
     fn clamp_effort_matches_upstream_schema() {
         // 支持的档位原样返回。
-        assert_eq!(clamp_effort_for_model("claude-opus-5", "max"), Some("max"));
-        assert_eq!(clamp_effort_for_model("claude-opus-5", "xhigh"), Some("xhigh"));
+        assert_eq!(clamp_effort_for_model("claude-opus-5", Some("max")), Some("max"));
+        assert_eq!(clamp_effort_for_model("claude-opus-5", Some("xhigh")), Some("xhigh"));
         // 4.6 系没有 xhigh → 回落到它 schema 的 default(high),而不是硬发 xhigh。
-        assert_eq!(clamp_effort_for_model("claude-opus-4-6", "xhigh"), Some("high"));
-        assert_eq!(clamp_effort_for_model("claude-sonnet-4-6", "xhigh"), Some("high"));
+        assert_eq!(clamp_effort_for_model("claude-opus-4-6", Some("xhigh")), Some("high"));
+        assert_eq!(clamp_effort_for_model("claude-sonnet-4-6", Some("xhigh")), Some("high"));
         // 但 4.6 系**有** max,顶格请求不该被连累。
-        assert_eq!(clamp_effort_for_model("claude-sonnet-4-6", "max"), Some("max"));
+        assert_eq!(clamp_effort_for_model("claude-sonnet-4-6", Some("max")), Some("max"));
         // 4.7 是全表唯一 default=xhigh 的模型。
-        assert_eq!(clamp_effort_for_model("claude-opus-4-7", "nonsense"), Some("xhigh"));
+        assert_eq!(clamp_effort_for_model("claude-opus-4-7", None), Some("xhigh"));
         // 无 schema 的模型 → None(调用方据此完全不发该字段)。
-        assert_eq!(clamp_effort_for_model("claude-opus-4-5", "high"), None);
-        assert_eq!(clamp_effort_for_model("claude-haiku-4-5", "low"), None);
+        assert_eq!(clamp_effort_for_model("claude-opus-4-5", Some("high")), None);
+        assert_eq!(clamp_effort_for_model("claude-haiku-4-5", Some("low")), None);
         // 未列名的异名走子串兜底,仍能拿到正确的档位表。
         assert_eq!(
-            clamp_effort_for_model("openrouter/claude-opus-5-preview", "max"),
+            clamp_effort_for_model("openrouter/claude-opus-5-preview", Some("max")),
             Some("max")
         );
         // 完全未知的模型 → None,不猜。
-        assert_eq!(clamp_effort_for_model("gpt-4o", "high"), None);
+        assert_eq!(clamp_effort_for_model("gpt-4o", Some("high")), None);
         // 大小写不敏感(上游只认小写形态,这里归一到表里的静态串)。
-        assert_eq!(clamp_effort_for_model("claude-opus-5", "MAX"), Some("max"));
+        assert_eq!(clamp_effort_for_model("claude-opus-5", Some("MAX")), Some("max"));
+    }
+
+    /// `requested = None`(调用方拿到脏值、没有可用诉求)必须落到**该模型自己的** default,
+    /// 而不是某个全局默认。审查 Architect#6:此前脏值先被归一成全局 `xhigh`,
+    /// 于是支持 xhigh 的模型(opus-5/4.8)会照发 xhigh,而客户端 `A7` 的行为是回落 `high`。
+    #[test]
+    fn absent_request_falls_back_to_each_models_own_default() {
+        assert_eq!(clamp_effort_for_model("claude-opus-5", None), Some("high"));
+        assert_eq!(clamp_effort_for_model("claude-opus-4-8", None), Some("high"));
+        assert_eq!(clamp_effort_for_model("claude-sonnet-4-6", None), Some("high"));
+        // 4.7 的 schema default 就是 xhigh —— 同一段代码对它给出不同答案,才说明是按模型取的。
+        assert_eq!(clamp_effort_for_model("claude-opus-4-7", None), Some("xhigh"));
+        // 无 schema 的模型仍然是"什么都不发",而不是回落到某个档位。
+        assert_eq!(clamp_effort_for_model("claude-haiku-4-5", None), None);
+    }
+
+    #[test]
+    fn effort_drift_flags_only_actionable_mismatches() {
+        // 与静态表一致 → 无漂移。
+        let same = vec![(
+            "claude-opus-5".to_string(),
+            vec!["low".into(), "medium".into(), "high".into(), "xhigh".into(), "max".into()],
+            Some("high".to_string()),
+        )];
+        assert!(effort_drift(&same).is_empty(), "一致时不该报漂移");
+
+        // 上游删掉了 max → 必须报(否则我们会继续发一个它不认的值)。
+        let removed = vec![(
+            "claude-opus-5".to_string(),
+            vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+            Some("high".to_string()),
+        )];
+        let d = effort_drift(&removed);
+        assert_eq!(d.len(), 1, "上游删档位必须报出来");
+        assert_eq!(d[0].model, "claude-opus-5");
+
+        // default 变了也算漂移(会改变回落目标)。
+        let new_default = vec![(
+            "claude-opus-5".to_string(),
+            vec!["low".into(), "medium".into(), "high".into(), "xhigh".into(), "max".into()],
+            Some("xhigh".to_string()),
+        )];
+        assert_eq!(effort_drift(&new_default).len(), 1, "default 变化也要报");
+
+        // 上游新增的模型静态表里没有 → **不是**漂移(是"待接入",不会发错值)。
+        let unknown = vec![("brand-new-model".to_string(), vec!["low".into()], None)];
+        assert!(effort_drift(&unknown).is_empty(), "未接入的新模型不该算漂移");
     }
 
     #[test]

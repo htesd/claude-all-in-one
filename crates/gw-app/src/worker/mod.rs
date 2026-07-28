@@ -1401,13 +1401,14 @@ async fn models_account(
     State(st): State<Arc<WorkerState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    let Some(account) = st.scheduler.account(&id) else {
+    // 预检只为快速 404,**不能**拿这里的副本去刷新 —— 见下方等锁后的复查。
+    if st.scheduler.account(&id).is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"fetched": false, "account_id": id})),
         )
             .into_response();
-    };
+    }
     let _permit = match st.quota_sem.clone().acquire_owned().await {
         Ok(p) => p,
         Err(_) => {
@@ -1418,6 +1419,17 @@ async fn models_account(
                 .into_response();
         }
     };
+    // ⚠️ 等信号量期间账号可能被 `/sync` 移走、由**另一个 worker 接管**。此时若拿等锁前
+    // 的旧副本去 ensure_credentialed,两个进程会同时用同一枚 rolling refresh_token 刷新
+    // —— 一方拿到新 token,另一方 invalid_grant,账号报废(禁用池里 8 个号就是这么死的)。
+    // 故:**拿到 permit 之后重新取**,取不到就交还给真正的持有方。
+    let Some(account) = st.scheduler.account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"fetched": false, "account_id": id})),
+        )
+            .into_response();
+    };
     let account = match st.ensure_credentialed(account).await {
         Ok(a) => a,
         Err(e) => return admin_error_response(&e),
@@ -1426,7 +1438,19 @@ async fn models_account(
     let account = st.ensure_profile_arn(account).await;
     match st.provider.model_catalog(&account).await {
         Ok(Some(catalog)) => {
+            // 空目录**绝不落库**:上游/代理以 200 返回 `{}`、或字段名变更导致解析出空数组时,
+            // 若照写会把上一份好快照(19 个模型 + 倍率)冲掉,而调用方还看到 persisted:true。
+            // 宁可保留旧快照并如实说明没写。
+            let model_count = catalog
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             let persisted = match (&st.store, serde_json::to_string(&catalog)) {
+                _ if model_count == 0 => {
+                    tracing::warn!("模型目录为空，拒绝落库以保护既有快照");
+                    false
+                }
                 (Some(store), Ok(json)) => {
                     match store.upsert_kv(gw_store::SqliteStore::KEY_MODEL_CATALOG, &json) {
                         Ok(()) => true,
@@ -1444,6 +1468,7 @@ async fn models_account(
             Json(serde_json::json!({
                 "fetched": true,
                 "persisted": persisted,
+                "model_count": model_count,
                 "account_id": id,
                 "catalog": catalog,
             }))
@@ -1458,10 +1483,14 @@ async fn models_account(
         }))
         .into_response(),
         Err(e) => {
-            // 与配额路径同口径:只读探测失败只惩罚真死号,瞬时错误不计入失败池。
-            if matches!(e.kind, UpstreamErrorKind::TokenInvalid) {
-                st.scheduler.report_failure(&id, e.kind);
-            }
+            // ⚠️ **绝不 report_failure。** 配额路径那样做是因为它兼职"导入验活",要让死号
+            // 立刻现形;而本端点只是拉一份**全局**目录,与"这个号好不好"无关。
+            //
+            // 若照抄配额的惩罚逻辑,会有一条报废健康账号的路:导入的号没有 `expires_at`,
+            // `has_fresh_token` 误判 token 新鲜 → 不预刷 → 目录调用 401 → 按 TokenInvalid
+            // 永久标 invalid_refresh_token。配额路径为此专门做了"强刷 + 强制发现 profileArn
+            // 再重试一次"的兜底(见 try_fetch_quota),本路径没有,也不该为此把那套复制过来 ——
+            // 一个管理员手点的目录刷新,失败就如实报错,不该有任何禁号副作用。
             admin_error_response(&e)
         }
     }

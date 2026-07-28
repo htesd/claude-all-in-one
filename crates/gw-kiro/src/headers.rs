@@ -109,12 +109,43 @@ pub(crate) fn idc_refresh_user_agents(version: &str) -> (String, String) {
 }
 
 /// 账号的有效 Kiro 客户端版本(extra 覆盖 > 默认)。
+///
+/// ⚠️ **覆盖只改 UA 里自报的版本号,不会把报文形态一起改回去。** body 里的
+/// `agentMode` / `additionalModelRequestFields`、配额走的 control-plane 端点,
+/// 都是 1.0.212 形态且**无条件**发送。所以把某个账号钉到旧版本,得到的是
+/// 「自称 0.12.155、行为却是 1.0.212」的混搭 —— 现实中不存在的组合,比不改更容易被识别。
+///
+/// 保留这个字段是留一条将来支持多形态时的口子;在那之前,不等于默认版本就告警一次。
+/// (2026-07-28 生产实测 222 个账号**无一**设置该字段,故此处只警示不改行为。)
 pub(crate) fn kiro_version(account: &Account) -> String {
-    account
-        .extra_str("kiro_version")
-        .filter(|v| !v.is_empty())
-        .unwrap_or(DEFAULT_KIRO_VERSION)
-        .to_string()
+    match account.extra_str("kiro_version").filter(|v| !v.is_empty()) {
+        Some(v) if v != DEFAULT_KIRO_VERSION => {
+            warn_version_mismatch(v);
+            v.to_string()
+        }
+        Some(v) => v.to_string(),
+        None => DEFAULT_KIRO_VERSION.to_string(),
+    }
+}
+
+/// 每个偏离版本只吼一次,避免逐请求刷屏。
+fn warn_version_mismatch(v: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut g = match seen.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // 告警路径不该因为一次 poison 就哑掉
+    };
+    if g.insert(v.to_string()) {
+        tracing::warn!(
+            account_kiro_version = v,
+            wire_shape_version = DEFAULT_KIRO_VERSION,
+            "账号钉了非默认 kiro_version：UA 自报该版本，但报文形态与端点仍是默认版本的，\
+             这是现实中不存在的组合。除非确知在做什么，否则请清掉该字段。"
+        );
+    }
 }
 
 /// 把主推理金标准头加到请求上(顺序对齐 static_flow `add_kiro_headers`)。

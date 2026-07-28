@@ -1445,23 +1445,58 @@ async fn models_account(
     )
 }
 
-/// `GET /models/catalog` —— 读最近一次落库的模型目录(不打上游)。
+/// `GET /models/catalog` —— 读最近一次落库的模型目录(不打上游),并报出**档位漂移**。
 ///
 /// 从未抓过 → `{"catalog": null}` 而非 404:调用方靠这个字段判断"还没拉过",
 /// 不必把"没数据"和"路由不存在"混在同一个状态码里。
+///
+/// `effort_drift` 是关键增值:热路径的档位表是**编译期常量**,而上游随时会增删档位。
+/// 目录本身只是快照,不参与发包;这个字段让"我们会发出上游不认的档位"这件事在**发生前**
+/// 就能看见,而不是等线上报 400 才发现。非空 = 该改代码里的静态表了。
 async fn model_catalog(State(st): State<AdminState>) -> axum::response::Response {
-    match st.store.get_kv(gw_store::SqliteStore::KEY_MODEL_CATALOG) {
-        Ok(Some(json)) => match serde_json::from_str::<serde_json::Value>(&json) {
-            Ok(v) => Json(serde_json::json!({"catalog": v})).into_response(),
-            // 库里存着但解析不了(手改过 / 旧格式):当没有,别 500 掉整个面板。
-            Err(e) => {
-                tracing::warn!("模型目录解析失败,按未抓取处理: {e}");
-                Json(serde_json::json!({"catalog": serde_json::Value::Null})).into_response()
-            }
-        },
-        Ok(None) => Json(serde_json::json!({"catalog": serde_json::Value::Null})).into_response(),
-        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("读取失败: {e}")),
-    }
+    let json = match st.store.get_kv(gw_store::SqliteStore::KEY_MODEL_CATALOG) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return Json(serde_json::json!({"catalog": serde_json::Value::Null})).into_response()
+        }
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("读取失败: {e}")),
+    };
+    let value = match serde_json::from_str::<serde_json::Value>(&json) {
+        Ok(v) => v,
+        // 库里存着但解析不了(手改过 / 旧格式):当没有,别 500 掉整个面板。
+        Err(e) => {
+            tracing::warn!("模型目录解析失败,按未抓取处理: {e}");
+            return Json(serde_json::json!({"catalog": serde_json::Value::Null})).into_response();
+        }
+    };
+    let drift = gw_kiro::converter::effort_drift(&extract_effort_triples(&value));
+    Json(serde_json::json!({"catalog": value, "effort_drift": drift})).into_response()
+}
+
+/// 从落库的目录 JSON 里抽出 `(modelId, effortLevels, defaultEffortLevel)` 三元组。
+/// 形状对不上的条目直接跳过 —— 漂移检测是辅助信号,不该因为一条脏数据就报错。
+fn extract_effort_triples(catalog: &serde_json::Value) -> Vec<(String, Vec<String>, Option<String>)> {
+    catalog
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("model_id")?.as_str()?.to_string();
+                    let levels = m
+                        .get("effort_levels")
+                        .and_then(|l| l.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    let default = m
+                        .get("default_effort_level")
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string);
+                    Some((id, levels, default))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

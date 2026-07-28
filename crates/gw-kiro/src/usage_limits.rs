@@ -140,7 +140,7 @@ pub(crate) struct QuotaEndpoint {
 /// - bundle 里那份 `AmazonCodeWhispererService.GetUsageLimits`(`:420314`)
 ///   **全树零调用点** —— 老端点只是还没下线,真客户端已经不打了。
 pub(crate) fn quota_endpoint(region: &str) -> QuotaEndpoint {
-    quota_endpoint_from(region, std::env::var("KIRO_LEGACY_QUOTA_ENDPOINT").is_ok())
+    quota_endpoint_from(region, gw_core::env_flag("KIRO_LEGACY_QUOTA_ENDPOINT"))
 }
 
 /// 纯逻辑(开关注入便于测试;读 env 的测试会与并行用例互相污染)。

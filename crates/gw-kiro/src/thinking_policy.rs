@@ -104,13 +104,29 @@ fn budget_to_effort(budget: i32) -> &'static str {
     }
 }
 
-/// 请求**期望**的档位(未按模型夹取)。`None` = 不发该字段。
-fn desired_effort(req: &MessagesRequest) -> Option<&'static str> {
-    let t = req.thinking.as_ref()?;
+/// 本次请求对档位的诉求。
+enum EffortWish {
+    /// 完全不发 `additionalModelRequestFields`。
+    Omit,
+    /// 明确要这一档(合法值,可能该模型不支持,由夹取决定)。
+    Level(&'static str),
+    /// 客户端给了**脏值**,没有可用诉求 → 交给模型自己的 schema `default`。
+    ///
+    /// 关键:**不能**在这里先替它填一个全局默认(此前填 `xhigh`)。填了之后夹取
+    /// 只看见一个合法值,支持 `xhigh` 的模型(opus-5 / 4.8)就会照发 `xhigh`,
+    /// 而真客户端 `A7` 对未知档位是回落到**该模型的** `default`(= `high`)。
+    /// 把"脏值"这个状态一路带到模型边界再决策,才和客户端一致。
+    ModelDefault,
+}
+
+/// 请求**期望**的档位(未按模型夹取)。
+fn desired_effort(req: &MessagesRequest) -> EffortWish {
+    let Some(t) = req.thinking.as_ref() else {
+        return EffortWish::Omit;
+    };
     match t.thinking_type.as_str() {
         // 客户端明确不要思考 → 不发字段(与 1.0.212 的 undefined 同形)。
-        "disabled" => None,
-        // 档位制:直接取 effort(白名单归一 + 非法回退)。
+        "disabled" => EffortWish::Omit,
         "adaptive" => {
             let raw = req.output_config.as_ref().and_then(|c| c.effort.as_deref());
             let (effort, fell_back) = crate::anthropic_types::normalize_effort(raw);
@@ -118,15 +134,15 @@ fn desired_effort(req: &MessagesRequest) -> Option<&'static str> {
                 tracing::warn!(
                     requested = ?raw,
                     valid = ?crate::anthropic_types::VALID_EFFORTS,
-                    fallback = effort,
-                    "非法 thinking effort，已回退默认档位"
+                    "非法 thinking effort，改用该模型 schema 的默认档位"
                 );
+                return EffortWish::ModelDefault;
             }
-            Some(effort)
+            EffortWish::Level(effort)
         }
         // 预算制:翻译成档位(上游已不认 budget)。
-        "enabled" => Some(budget_to_effort(t.budget_tokens)),
-        _ => None,
+        "enabled" => EffortWish::Level(budget_to_effort(t.budget_tokens)),
+        _ => EffortWish::Omit,
     }
 }
 
@@ -142,14 +158,18 @@ fn desired_effort(req: &MessagesRequest) -> Option<&'static str> {
 /// 注意本函数须在 [`override_thinking_from_model_name`] **之后**调用:那步会给未配置的
 /// Opus 请求补上 adaptive + 默认档。
 pub fn effective_effort(req: &MessagesRequest) -> Option<&'static str> {
-    let want = desired_effort(req)?;
+    let want = match desired_effort(req) {
+        EffortWish::Omit => return None,
+        EffortWish::Level(l) => Some(l),
+        EffortWish::ModelDefault => None,
+    };
     let got = crate::converter::clamp_effort_for_model(&req.model, want)?;
-    if got != want {
+    if want != Some(got) {
         tracing::debug!(
             model = %req.model,
-            wanted = want,
+            wanted = ?want,
             used = got,
-            "该模型不支持所请求的思考档位，已按上游 schema 回落"
+            "所请求的思考档位该模型不支持（或未指定），已按上游 schema 回落"
         );
     }
     Some(got)
