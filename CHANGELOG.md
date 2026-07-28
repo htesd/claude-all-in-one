@@ -13,6 +13,10 @@
 - **thinking 档位改为逐模型夹取**(`clamp_effort_for_model`)。档位表随模型不同:
   `opus-4.6`/`sonnet-4.6` **没有 `xhigh`**;`opus-4.7` 的 schema default 是 `xhigh`
   (全表唯一);`opus-4.5`/`sonnet-4.5`/`haiku-4.5` 压根没有 schema → **一个字段都不发**。
+- **`ListAvailableProfiles` 也迁到 `management.{region}.kiro.dev`**(POST 路径不变)。
+  它属于 `AmazonCodeWhispererService`(UA 仍是 `api/codewhispererruntime`),但 1.0.212
+  构造该 client 时的 endpoint 来自 `cpsConfigs`(`:389260`),值就是 management 域。
+  **`q.{region}.amazonaws.com` 在 1.0.212 全树一次都没出现。**
 - **`getUsageLimits` 迁到 control-plane**:
   `GET https://management.{region}.kiro.dev/Get-Usage-Limits?origin=AI_EDITOR[&profileArn]`,
   UA 换成 `api/kirocontrolplanebearer#1.0.0`,**不再发 `resourceType`**。
@@ -35,9 +39,12 @@
 - **为什么档位不可用时回落 `default` 而不是升到 `max`**:对齐客户端 `A7`
   (`:140071-140076`)与设置面板(`:340057`)的行为。宁可少一档,也不擅自升档制造真客户端
   不会出现的形态。
-- **为什么老配额端点必须换**:`AmazonCodeWhispererService.GetUsageLimits` 的 SDK 代码在
-  1.0.212 里仍在,但**全树零调用点** —— 唯一的 `new yh(`(`:337368`)走的是 control-plane。
-  它是后台**每 20 分钟一轮**的常驻轮询,比偶发请求的信号稳定得多。
+- **为什么老配额端点必须换**(结论不变,但理由要说准):我一度断言
+  `AmazonCodeWhispererService.GetUsageLimits`"全树零调用点" —— **那是错的**,`:493283` 的
+  `fetchUsageLimitsData` 就在调它、还带 `resourceType`(只在"列 profile 顺带查用量"时走)。
+  漏判是因为只搜了控制面的 `new yh(`。真正为零的是**域名**:`q.*.amazonaws.com` 全树不出现,
+  连那个"runtime client"也被 `cpsConfigs` 指到了 management 域。换的是域名,不是"操作没人用了"。
+  配额是后台**每 20 分钟一轮**的常驻轮询,比偶发请求的信号稳定得多,更该对齐。
 - **模型目录复用 `settings` 表**(键 `model_catalog`)而不是新建表:零 schema 变更、零迁移。
   测试钉死了它与 `system` 键互不影响。
 
@@ -50,6 +57,11 @@
   (`:356844-356846`),最终线缆上仍是 `KiroIDE-{ver}-{machineId}`。现有拼法是对的,未改。
 - **上线前真号只读实测**(不发 chat):新旧配额端点返回 **937 字节、6 个解析字段逐字相同**;
   带不带 `resourceType` 返回**完全一致**(breakdown 恒为 `CREDIT`,上游根本不读该参数)。
+  `ListAvailableProfiles` 用一个 **IdC 号**(最依赖这条路径的类型)两端各打一次:
+  均 200、468 字节、**profileArn 逐字段相同**。
+- **隔离栈端到端实测**(独占 2 个号、同出口、12 个请求全 200 零错误):
+  `max` 档位原样上 wire;新配额端点与 `ListAvailableModels` 均真机打通(19 个模型,
+  档位表与静态表逐条一致);前缀击穿护栏按设计只在未设 `KIRO_LEGACY_THINKING_TAGS` 的一侧告警。
 - **`m/N,E` 这一段是沿用**,未从 bundle 中重新推导。它由运行时 feature 检测生成,
   控制面与 runtime 两个 client 的 bearer 认证路径相同,推测一致但未逐字验证。
 - **本批全部前缀安全**,不动 prompt 缓存前缀。移除 `history[0]` 里的 thinking 标签

@@ -128,6 +128,12 @@ pub(crate) struct QuotaEndpoint {
     pub legacy: bool,
 }
 
+/// 控制面主机名。`ListAvailableProfiles`(profiles 模块)与配额查询共用,
+/// 保证两条控制面调用的域名**永远一致**——回退时一起回退,不会一半新一半旧。
+pub(crate) fn control_plane_host(region: &str) -> String {
+    quota_endpoint(region).host
+}
+
 /// 解析配额端点。默认走 1.0.212 真实客户端的 control-plane 形态;
 /// `KIRO_LEGACY_QUOTA_ENDPOINT=1` 切回旧的 `q.*.amazonaws.com`(应急回退,不改镜像)。
 ///
@@ -135,10 +141,17 @@ pub(crate) struct QuotaEndpoint {
 /// - 域名解析器 `bi2` `:217247` → `https://management.${region}.kiro.dev`;
 /// - 操作 schema `:218514` → `{ http: ["GET", "/Get-Usage-Limits", 200] }`
 ///   (注意是**连字符大驼峰**路径,不是 `/getUsageLimits`);
-/// - 唯一调用点 `:337368` `new yh({origin, profileArn})`,走
-///   `KiroControlPlaneBearerService`;
-/// - bundle 里那份 `AmazonCodeWhispererService.GetUsageLimits`(`:420314`)
-///   **全树零调用点** —— 老端点只是还没下线,真客户端已经不打了。
+/// - 调用点 `:337368` `new yh({origin, profileArn})`,走 `KiroControlPlaneBearerService`。
+///
+/// ⚠️ **更正一个先前的错误结论。** 我一度断言 bundle 里那份
+/// `AmazonCodeWhispererService.GetUsageLimits`(`:420314`)"全树零调用点" —— **不对**,
+/// `:493283` 的 `fetchUsageLimitsData` 就在调它,而且**带 `resourceType: "AGENTIC_REQUEST"`**
+/// (只在"列 profile 顺带查用量"时走,caio 没有这条路径)。当初漏判是因为只搜了控制面的
+/// `new yh(`,没搜 import 进来的 `GetUsageLimitsCommand`。
+///
+/// 真正为零的是**域名**:`q.{region}.amazonaws.com` 全树一次都没出现 ——
+/// 连那个"runtime client"也被 `cpsConfigs`(`:389260`)指到了 `management.*.kiro.dev`。
+/// 所以本次迁移的结论不变,只是理由要说准:换的是**域名**,不是"操作没人用了"。
 pub(crate) fn quota_endpoint(region: &str) -> QuotaEndpoint {
     quota_endpoint_from(region, gw_core::env_flag("KIRO_LEGACY_QUOTA_ENDPOINT"))
 }

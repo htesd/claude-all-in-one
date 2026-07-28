@@ -11,10 +11,23 @@
 //!
 //! ## 端点
 //!
-//! `POST https://q.{region}.amazonaws.com/ListAvailableProfiles`,body `{nextToken?}`,
-//! runtime UA(与 getUsageLimits 同 client),响应 `{profiles:[{arn}], nextToken}`。
+//! `POST https://management.{region}.kiro.dev/ListAvailableProfiles`,body `{nextToken?}`,
+//! runtime UA(`api/codewhispererruntime#1.0.0`),响应 `{profiles:[{arn}], nextToken}`。
 //! 跨候选区域查询(IdC 按 auth region 的 partition 过滤;external_idp 查全部标准区),
 //! 取第一个非空 arn。只读发现调用,**不发推理包**,安全。
+//!
+//! ⚠️ **域名与 UA 不是同一件事,别被"runtime client"这个名字骗了**(2026-07-28 拆包更正):
+//! 本操作确实属于 `AmazonCodeWhispererService`(所以 UA 里是 `api/codewhispererruntime`,
+//! `extension.js:415675` 的 `serviceId: "CodeWhispererRuntime"`),但 1.0.212 构造这个 client
+//! 时传的 endpoint 来自 `getCpsConfig` → `cpsConfigs`(`:389260-389264`),值是
+//! **`https://management.{region}.kiro.dev`** —— 不是 SDK 默认的 `*.amazonaws.com`。
+//!
+//! 调用链:`ProfileArnGuard` `:379790` → VS Code 命令 `kiro.profiles.listAvailableProfiles`
+//! → `:493247` `getCodeWhispererRuntimeClient(region)` → `:492580` `getCpsConfig(region)`。
+//! HTTP 形态见 `:419724` `{ http: ["POST", "/ListAvailableProfiles", 200] }`。
+//!
+//! **`q.{region}.amazonaws.com` 这个域名在 1.0.212 全树一次都没出现。** caio 此前打它,
+//! 属于跟着 static_flow 的旧金标准走,已随本次更正。
 
 use gw_core::account::Account;
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
@@ -130,7 +143,9 @@ async fn fetch_first_profile(
     x_amz_ua: &str,
     ua: &str,
 ) -> Result<Option<String>, UpstreamError> {
-    let host = format!("q.{region}.amazonaws.com");
+    // 与 getUsageLimits 共用同一个回退开关:两条控制面调用要么都走新域名、要么都走老的,
+    // 不能一半新一半旧 —— 混搭形态比统一用旧的更容易被规则化识别。
+    let host = crate::usage_limits::control_plane_host(region);
     let url = format!("https://{host}/ListAvailableProfiles");
     let mut next_token: Option<String> = None;
 
