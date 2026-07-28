@@ -1265,7 +1265,8 @@ async fn oauth_exchange(
         .await
     {
         Ok(tokens) => Json(tokens).into_response(),
-        Err(e) => upstream_error_response(&e),
+        // 运维端点:换码失败的原因(上游 OAuth 报文)要原样给面板。
+        Err(e) => admin_error_response(&e),
     }
 }
 
@@ -1306,7 +1307,8 @@ async fn refresh_account(
             // 见死号、不再被路由到;transient(网络/5xx)→ 仅计失败数(救号一键清)。
             // 不在此换号/重试(人工动作就是要看这一次结果)。
             st.scheduler.report_failure(&id, e.kind);
-            upstream_error_response(&e)
+            // 运维端点:人工点"刷新"就是要看这一次的真实失败原因。
+            admin_error_response(&e)
         }
     }
 }
@@ -1377,7 +1379,8 @@ async fn quota_account(
             st.quota_cache
                 .lock()
                 .insert(id.clone(), (None, std::time::Instant::now()));
-            upstream_error_response(&e)
+            // 运维端点:导入对话框要按这段原文区分"死号"与"上游抖动"。
+            admin_error_response(&e)
         }
     }
 }
@@ -1573,9 +1576,18 @@ async fn messages(
                     | scheduler::AcquireError::AllBusy
                     | scheduler::AcquireError::Empty => StatusCode::SERVICE_UNAVAILABLE,
                 };
+                // 内部原因(哪一档耗尽 / 组里压根没成员)只进日志:它描述的是账号池形态,
+                // 对客户既没用又泄底。客户端只拿到"换模型"还是"稍后重试"。
+                tracing::warn!(
+                    group = %group.as_deref().unwrap_or("-"),
+                    model = %req.model,
+                    "选号失败: {e}"
+                );
                 return (
                     code,
-                    Json(serde_json::json!({"type":"error","error":{"message": e.to_string()}})),
+                    Json(
+                        serde_json::json!({"type":"error","error":{"message": e.client_message()}}),
+                    ),
                 )
                     .into_response();
             }
@@ -1954,18 +1966,52 @@ fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
 }
 
 /// 把 [`UpstreamError`] 映射为对外 HTTP 响应(状态码见 [`upstream_status`])。
+///
+/// **message 走 `client_message()` 而不是 `to_string()`**:后者带内部 kind 标签 +
+/// 上游原始报文(接口名 `generateAssistantResponse`、reason 码 …),等于把渠道来源
+/// 印在每条报错上。诊断原文在调用方的 `tracing` 里一字不少。
 fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
     let code = upstream_status(e.kind);
     // 过载走 Anthropic 的 `overloaded_error` 类型,其余保持既有形状(只有 message)。
     let body = if e.kind == UpstreamErrorKind::Overloaded {
         serde_json::json!({
             "type": "error",
-            "error": {"type": "overloaded_error", "message": e.to_string()},
+            "error": {"type": "overloaded_error", "message": e.client_message()},
         })
     } else {
-        serde_json::json!({"type":"error","error":{"message": e.to_string()}})
+        serde_json::json!({"type":"error","error":{"message": e.client_message()}})
     };
     (code, Json(body)).into_response()
+}
+
+/// 流中硬错误 → 对外 SSE `error` 事件。
+///
+/// 与 [`upstream_error_response`] 同口径:**只发中性文案**。首包已出后状态码改不了,
+/// message 是唯一出口 —— 越是这种时候越不能让它带上游指纹。原文在调用处落 `tracing`。
+fn sse_error_event(e: &gw_core::error::UpstreamError) -> Event {
+    Event::default().event("error").data(sse_error_payload(e).to_string())
+}
+
+/// [`sse_error_event`] 的载荷。单独拆出来只为可测:`Event` 没有取回 data 的公开接口。
+fn sse_error_payload(e: &gw_core::error::UpstreamError) -> serde_json::Value {
+    serde_json::json!({"type":"error","error":{"message": e.client_message()}})
+}
+
+/// 把 [`UpstreamError`] 映射为**运维面**响应 —— 与 [`upstream_error_response`] 的唯一
+/// 区别是 message 带全量诊断(上游原文/接口名/刷新失败原因)。
+///
+/// 只给 worker 的**内网**运维端点用(`/oauth/exchange`、`/accounts/{id}/refresh`、
+/// `/accounts/{id}/quota`):它们由 admin 面板扇出调用,listen 在 127.0.0.1,客户到不了。
+/// 导号时"这个号到底是 invalid_grant 还是网络抖"全靠这段原文,脱敏等于把运维眼睛蒙上。
+///
+/// ⚠️ 新增端点前先问一句:客户能打到吗?能 → 用 [`upstream_error_response`]。
+fn admin_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
+    let code = upstream_status(e.kind);
+    (
+        code,
+        Json(serde_json::json!({"type":"error","error":{"message": e.to_string()}})),
+    )
+        .into_response()
 }
 
 /// HTTP 529 —— Anthropic 的过载状态码。`StatusCode` 无对应常量,且 `from_u16` 不是
@@ -2337,8 +2383,13 @@ async fn collect_response(
                 }
                 events.push(ev);
             }
-            Ok(StreamItem::Usage(u)) => last_usage = Some(u),
+            Ok(StreamItem::Usage(u)) => {
+                last_usage = Some(u);
+            }
             Err(e) => {
+                // 对外只发中性文案(见 upstream_error_response),原文必须在这里落日志,
+                // 否则这条路径的上游报文就彻底没人记了。
+                tracing::warn!(account = %account_id, kind = ?e.kind, "非流式抽干时上游错误: {e}");
                 hard_err = Some(e);
                 break;
             }
@@ -2807,6 +2858,14 @@ fn stream_response(
                 }
                 Some(Err(e)) => {
                     ctx.saw_error = true; // 硬错误 → 本次响应失败(usage success=false)。
+                    // 对外只发中性文案,原文只此一处落日志(首包已出,主循环的 chat 失败
+                    // 告警不会再覆盖流中错误)。
+                    tracing::warn!(
+                        account = %ctx.account_id,
+                        model = %ctx.model,
+                        kind = ?e.kind,
+                        "流中上游错误: {e}"
+                    );
                     if ctx.error_kind.is_none() {
                         ctx.error_kind = Some(format!("{:?}", e.kind));
                     }
@@ -2814,11 +2873,7 @@ fn stream_response(
                         ctx.reported = true;
                         ctx.st.scheduler.report_failure(&ctx.account_id, e.kind);
                     }
-                    let out = Event::default().event("error").data(
-                        serde_json::json!({"type":"error","error":{"message": e.to_string()}})
-                            .to_string(),
-                    );
-                    return Some((Ok(out), ctx));
+                    return Some((Ok(sse_error_event(&e)), ctx));
                 }
                 None => {
                     // 流正常结束。收尾(生命周期上报 + usage 落库)由 StreamCtx::drop 统一处理,
@@ -3508,6 +3563,77 @@ mod tests {
         assert_eq!(sresp.status(), StatusCode::BAD_GATEWAY);
         let sv = body_json(sresp).await;
         assert!(sv["error"]["type"].is_null(), "既有错误体形状不应变");
+    }
+
+    /// 上游身份指纹**一个字都不许**出现在对外响应里 —— 客户看不出这条渠道背后是谁,
+    /// 定价才谈得下去。三条对外出口(非流式响应 / 流内 error 事件 / 选号失败)全覆盖。
+    #[tokio::test]
+    async fn client_facing_errors_carry_no_upstream_fingerprint() {
+        /// 真实报文(逐字取自 139 `caio-worker0` 日志)——脱敏前客户就是收到这一串。
+        const REAL: &str = concat!(
+            "kiro generateAssistantResponse 失败: 429 ",
+            r#"{"message":"Too many requests, please wait before trying again.","#,
+            r#""reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        );
+        const FINGERPRINTS: [&str; 5] = [
+            "kiro",
+            "Kiro",
+            "generateAssistantResponse",
+            "USER_REQUEST_RATE_EXCEEDED",
+            "rate_limited", // 内部 kind 标签也别外泄
+        ];
+
+        let e = UpstreamError::new(UpstreamErrorKind::RateLimited, REAL).with_status(429);
+
+        // ① 非流式 / 首包前:HTTP 响应体。
+        let resp = upstream_error_response(&e);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let http_body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // ② 流内:SSE error 事件的 data(与 sse_error_event 下发的是同一份)。
+        let sse_data = sse_error_payload(&e).to_string();
+
+        // ③ 选号失败:AcquireError 的对外文案。
+        let acquire = [
+            scheduler::AcquireError::AllDisabled,
+            scheduler::AcquireError::AllBusy,
+            scheduler::AcquireError::Empty,
+            scheduler::AcquireError::GroupEmpty,
+            scheduler::AcquireError::NoModelSupport,
+        ]
+        .iter()
+        .map(|a| a.client_message())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+        for (label, text) in [("http", &http_body), ("sse", &sse_data), ("acquire", &acquire)] {
+            for fp in FINGERPRINTS {
+                assert!(!text.contains(fp), "{label} 出口泄露了 `{fp}`: {text}");
+            }
+            // 账号池形态同样不外露(分组/账号/worker 这类词是渠道形态的直接线索)。
+            for fp in ["账号", "分组", "worker", "订阅"] {
+                assert!(!text.contains(fp), "{label} 出口泄露了池形态 `{fp}`: {text}");
+            }
+        }
+        // 反向:运维面必须**仍能**看到原文,否则导号/排查就瞎了。
+        let admin = admin_error_response(&e);
+        let ab = axum::body::to_bytes(admin.into_body(), 64 * 1024).await.unwrap();
+        let admin_body = String::from_utf8(ab.to_vec()).unwrap();
+        assert!(
+            admin_body.contains("generateAssistantResponse") && admin_body.contains("kiro"),
+            "运维面不该脱敏: {admin_body}"
+        );
+    }
+
+    /// 登记过的本地文案要照发到客户端 —— 脱敏不能把"你请求体太大"这类可自助的信息也吃掉。
+    #[tokio::test]
+    async fn locally_generated_detail_still_reaches_client() {
+        let e = UpstreamError::bad_request_visible("请求体 100 字节超出体积上限 50 字节");
+        let resp = upstream_error_response(&e);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("超出体积上限"), "本地可见文案被误吞: {body}");
     }
 
     #[test]

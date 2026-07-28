@@ -113,6 +113,35 @@ impl UpstreamErrorKind {
                 | UpstreamErrorKind::QuotaExhausted
         )
     }
+
+    /// **对外**中性文案 —— 按类别给客户端一句可操作的话,不含任何上游厂商 / 接口名 /
+    /// 原始报文 / 账号线索。
+    ///
+    /// 为什么要有这层:上游报错里带着强指纹(接口名 `generateAssistantResponse`、
+    /// reason 码 `USER_REQUEST_RATE_EXCEEDED` 等),原样透传等于把渠道来源告诉客户,
+    /// 定价与渠道选择就没得谈了。诊断信息一条不少地留在 [`UpstreamError::message`],
+    /// 只进日志。
+    ///
+    /// 措辞刻意只区分**客户能做什么**(重试 / 改请求 / 找管理员),不泄露我方内部状态。
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            // 客户改请求即可解。
+            UpstreamErrorKind::BadRequest => "请求无效,请检查请求体后重试",
+            UpstreamErrorKind::ModelNotAvailable => "当前模型不可用,请更换模型后重试",
+            // 稍后重试可能恢复。
+            UpstreamErrorKind::RateLimited => "请求过于频繁,请稍后重试",
+            UpstreamErrorKind::Overloaded => "服务繁忙,请稍后重试",
+            UpstreamErrorKind::Network | UpstreamErrorKind::ServerError => {
+                "服务暂时不可用,请稍后重试"
+            }
+            UpstreamErrorKind::TemporarilyBlocked => "服务暂时不可用,请稍后重试",
+            UpstreamErrorKind::EmptyResponse => "服务未返回内容,请重试",
+            // 要人介入。
+            UpstreamErrorKind::QuotaExhausted => "服务额度已用尽,请联系管理员",
+            UpstreamErrorKind::TokenInvalid => "服务鉴权异常,请联系管理员",
+            UpstreamErrorKind::Other => "服务异常,请稍后重试",
+        }
+    }
 }
 
 impl fmt::Display for UpstreamErrorKind {
@@ -141,9 +170,17 @@ impl fmt::Display for UpstreamErrorKind {
 #[derive(Debug, Clone)]
 pub struct UpstreamError {
     pub kind: UpstreamErrorKind,
+    /// **内部**诊断文本:含上游原始报文、接口名、账号线索。只进日志与 admin,
+    /// **绝不**直接发给客户端 —— 对外一律走 [`Self::client_message`]。
     pub message: String,
     /// 上游 HTTP 状态码(若有)。
     pub status_code: Option<u16>,
+    /// 允许对外展示的详情。`None` = 用 [`UpstreamErrorKind::client_message`] 的中性兜底。
+    ///
+    /// **fail-closed**:默认 `None`,只有**我方本地**产生、且逐条确认不含上游身份线索的
+    /// 文案才用 [`Self::with_client_detail`] 登记。新增错误点忘了登记 = 客户看到中性文案
+    /// (信息略少),而不是 = 泄露渠道来源(不可逆)。
+    pub client_detail: Option<String>,
 }
 
 impl UpstreamError {
@@ -152,6 +189,7 @@ impl UpstreamError {
             kind,
             message: message.into(),
             status_code: None,
+            client_detail: None,
         }
     }
 
@@ -160,14 +198,40 @@ impl UpstreamError {
         self
     }
 
+    /// 登记一段**可对外展示**的详情。调用前请自问:这段文字里有没有上游厂商名、
+    /// 接口名、原始报文、账号标识?有任何一样就别登记。
+    pub fn with_client_detail(mut self, detail: impl Into<String>) -> Self {
+        self.client_detail = Some(detail.into());
+        self
+    }
+
     /// 便捷构造:网络错误。
     pub fn network(message: impl Into<String>) -> Self {
         Self::new(UpstreamErrorKind::Network, message)
     }
 
-    /// 便捷构造:非法请求(不换号)。
+    /// 便捷构造:非法请求(不换号)。文案仅进日志;要对外可见用
+    /// [`Self::bad_request_visible`]。
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(UpstreamErrorKind::BadRequest, message)
+    }
+
+    /// 便捷构造:**我方本地**判定的非法请求,同一句话既进日志也发客户端。
+    ///
+    /// 只用于「客户改请求就能解」且文案由我方完全掌控的场景(体积超限、报文解析失败、
+    /// 模型不支持……)。凡是引用了上游响应体的,一律用 [`Self::bad_request`]。
+    pub fn bad_request_visible(message: impl Into<String>) -> Self {
+        let m = message.into();
+        Self::bad_request(m.clone()).with_client_detail(m)
+    }
+
+    /// 发给客户端的消息 —— 唯一对外出口。
+    ///
+    /// 没登记 `client_detail` 就退回按类别的中性文案:宁可少说,不可说漏。
+    pub fn client_message(&self) -> String {
+        self.client_detail
+            .clone()
+            .unwrap_or_else(|| self.kind.client_message().to_string())
     }
 }
 
@@ -217,5 +281,57 @@ mod tests {
     fn display_includes_status() {
         let e = UpstreamError::new(UpstreamErrorKind::ServerError, "boom").with_status(503);
         assert_eq!(e.to_string(), "[server_error|503] boom");
+    }
+
+    /// 对外文案 **fail-closed**:没显式登记就退回中性文案,内部诊断一个字都不外泄。
+    #[test]
+    fn client_message_defaults_to_neutral_and_hides_internal_detail() {
+        let e = UpstreamError::new(
+            UpstreamErrorKind::ServerError,
+            r#"kiro generateAssistantResponse 失败: 503 {"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+        )
+        .with_status(503);
+        let out = e.client_message();
+        assert_eq!(out, "服务暂时不可用,请稍后重试");
+        // 反向断言:内部 message 必须原样保留,否则日志排查就瞎了。
+        assert!(e.message.contains("generateAssistantResponse"), "内部诊断不该被抹掉");
+    }
+
+    /// 登记过的本地文案照发 —— 客户能据此自己改请求,这类信息不该被中性文案吃掉。
+    #[test]
+    fn registered_client_detail_is_passed_through() {
+        let e = UpstreamError::bad_request_visible("请求体 12 字节超出上限 10 字节");
+        assert_eq!(e.client_message(), "请求体 12 字节超出上限 10 字节");
+        assert_eq!(e.message, e.client_message(), "本地文案两边同源");
+        // 反向:同 kind 但没登记的,仍是中性文案(证明不是按 kind 放行的)。
+        let hidden = UpstreamError::bad_request("Kiro 账号 'foo@bar' 缺少凭据");
+        assert_eq!(hidden.client_message(), "请求无效,请检查请求体后重试");
+        assert!(!hidden.client_message().contains("foo@bar"), "账号标识绝不能外泄");
+    }
+
+    /// 全类别扫一遍:任何 kind 的中性文案都不许带厂商 / 接口指纹。
+    #[test]
+    fn no_kind_leaks_vendor_fingerprint() {
+        use UpstreamErrorKind as K;
+        const KINDS: [K; 11] = [
+            K::TokenInvalid,
+            K::RateLimited,
+            K::TemporarilyBlocked,
+            K::QuotaExhausted,
+            K::Network,
+            K::ServerError,
+            K::Overloaded,
+            K::BadRequest,
+            K::ModelNotAvailable,
+            K::EmptyResponse,
+            K::Other,
+        ];
+        for k in KINDS {
+            let m = k.client_message().to_ascii_lowercase();
+            for bad in ["kiro", "codewhisperer", "amazon", "aws", "generateassistantresponse"] {
+                assert!(!m.contains(bad), "{k} 的对外文案泄露了 `{bad}`: {m}");
+            }
+            assert!(!k.client_message().is_empty(), "{k} 缺对外文案");
+        }
     }
 }

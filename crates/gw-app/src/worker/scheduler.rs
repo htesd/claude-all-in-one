@@ -279,6 +279,25 @@ impl std::fmt::Display for AcquireError {
     }
 }
 
+impl AcquireError {
+    /// **对外**中性文案。上面的 `Display` 是给运维看的(说的是账号池/分组/订阅档,
+    /// 等于把渠道形态告诉客户),只进日志;客户端看这一份。
+    ///
+    /// 与 [`gw_core::error::UpstreamErrorKind::client_message`] 同口径:只区分
+    /// 「客户能做什么」——换模型(400) vs 等一等(503)。
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            // 400:客户侧可解 —— 换个模型就行。
+            AcquireError::NoModelSupport => "当前模型不可用,请更换模型后重试",
+            // 503:我方容量/配置态,客户只能等。
+            AcquireError::AllDisabled
+            | AcquireError::AllBusy
+            | AcquireError::Empty
+            | AcquireError::GroupEmpty => "服务暂时不可用,请稍后重试",
+        }
+    }
+}
+
 /// 一次请求所属分组的**成员视图**:哪些号可见 + 它们在这个组里排第几。
 ///
 /// 来自成员边表 `account_groups`(worker 每轮同步快照)。**不在视图里的号,对本次请求

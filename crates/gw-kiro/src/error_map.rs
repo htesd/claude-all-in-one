@@ -206,4 +206,44 @@ mod tests {
     fn status_preserved() {
         assert_eq!(classify_chat_error(429, "x").status_code, Some(429));
     }
+
+    /// 分类结果的**对外**文案绝不带上游身份 —— `message` 里那串
+    /// `kiro generateAssistantResponse 失败: <原始报文>` 只进日志。
+    ///
+    /// 这里逐档遍历是有意的:将来有人给某一档加 `with_client_detail`(比如想把 402 的
+    /// 额度文案透出去),这条测试会立刻按住他 —— 上游报文一律不外传。
+    #[test]
+    fn classified_errors_never_leak_upstream_identity_to_client() {
+        let cases = [
+            (402, r#"{"message":"Monthly request limit reached"}"#),
+            (429, r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#),
+            (400, r#"{"reason":"INVALID_MODEL_ID"}"#),
+            (400, "Improperly formed request."),
+            (401, "Unauthorized"),
+            (403, r#"{"reason":"TEMPORARILY_SUSPENDED"}"#),
+            (500, r#"{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#),
+            (503, "unavailable"),
+        ];
+        for (status, body) in cases {
+            let e = classify_chat_error(status, body);
+            let out = e.client_message();
+            for fp in [
+                "kiro",
+                "Kiro",
+                "generateAssistantResponse",
+                "USER_REQUEST_RATE_EXCEEDED",
+                "MODEL_TEMPORARILY_UNAVAILABLE",
+                "TEMPORARILY_SUSPENDED",
+                "INVALID_MODEL_ID",
+            ] {
+                assert!(!out.contains(fp), "{status} 的对外文案泄露 `{fp}`: {out}");
+            }
+            // 反向:内部诊断必须完好,否则 139 上的排查就没得看了。
+            assert!(
+                e.message.contains("generateAssistantResponse") && e.message.contains(body),
+                "{status} 的内部诊断被削弱: {}",
+                e.message
+            );
+        }
+    }
 }
