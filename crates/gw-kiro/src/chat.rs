@@ -45,8 +45,9 @@ fn enforce_body_limit(
     let shed = converter::shed_history_media(&mut kiro_req.conversation_state.history, need);
     if shed.dropped_documents + shed.dropped_images == 0 {
         // 没有可剔的历史媒体(超大的是文本/工具/当前消息),无法自动修复
-        return Err(UpstreamError::bad_request(format!(
-            "请求体 {} 字节超出上游体积上限 {} 字节,且无历史媒体可剔除以瘦身;请减少附件或对话历史",
+        // 文案由我方生成、只含字节数,对外可见(客户据此自己减附件)。
+        return Err(UpstreamError::bad_request_visible(format!(
+            "请求体 {} 字节超出体积上限 {} 字节,且无历史媒体可剔除以瘦身;请减少附件或对话历史",
             body.len(),
             max_body_bytes
         )));
@@ -55,8 +56,8 @@ fn enforce_body_limit(
         UpstreamError::new(UpstreamErrorKind::Other, format!("体积护栏重序列化失败: {e}"))
     })?;
     if reshrunk.len() > max_body_bytes {
-        return Err(UpstreamError::bad_request(format!(
-            "请求体剔除历史媒体后仍 {} 字节,超出上游体积上限 {} 字节;请减少当前消息附件",
+        return Err(UpstreamError::bad_request_visible(format!(
+            "请求体剔除历史媒体后仍 {} 字节,超出体积上限 {} 字节;请减少当前消息附件",
             reshrunk.len(),
             max_body_bytes
         )));
@@ -112,7 +113,10 @@ pub async fn chat_stream(
     // 1. 解析 Anthropic body → 强类型 MessagesRequest
     let mut messages_req: crate::anthropic_types::MessagesRequest =
         serde_json::from_value(req.body.clone())
-            .map_err(|e| UpstreamError::bad_request(format!("Anthropic 请求体解析失败: {e}")))?;
+            // serde 报的是 **Anthropic 请求体自身**的字段路径,不涉上游身份 → 对外可见。
+            .map_err(|e| {
+                UpstreamError::bad_request_visible(format!("Anthropic 请求体解析失败: {e}"))
+            })?;
 
     // 1.5 块2a:按模型名覆写 thinking 配置(Opus 全系默认开 adaptive 保智力;
     // 非 Opus -thinking 后缀 enabled;结构化输出与 thinking 互斥)。🔵 kiro.rs 稳定经验。
@@ -120,8 +124,9 @@ pub async fn chat_stream(
 
     // 2. converter:Anthropic → Kiro ConversationState
     let conversion = converter::convert_request(&messages_req).map_err(|e| {
-        // UnsupportedModel / EmptyMessages 都是请求本身问题 → BadRequest(不换号)
-        UpstreamError::bad_request(format!("转换失败: {e}"))
+        // UnsupportedModel / EmptyMessages 都是请求本身问题 → BadRequest(不换号)。
+        // 文案只有「模型不支持: <客户请求的模型名>」/「消息列表为空」→ 对外可见。
+        UpstreamError::bad_request_visible(format!("转换失败: {e}"))
     })?;
     // 工具防御性修复字段表(随流式状态机走到收尾解包双编码参数)。在 conversation_state
     // 被移入 KiroRequest 前先取出。
@@ -163,8 +168,8 @@ pub async fn chat_stream(
     // 本地 BadRequest 拦截,不再打上游。兜住无视 400 仍重试的客户端(本次事故上游即此类)。
     let poison_fp = crate::poison_memo::fingerprint(&body);
     if crate::poison_memo::is_poisoned(&poison_fp) {
-        return Err(UpstreamError::bad_request(
-            "该请求体近期已被上游判为非法(HTTP 400)并被本地缓存拦截;重试相同请求不会成功,请修改请求(如减少附件或历史)后重试",
+        return Err(UpstreamError::bad_request_visible(
+            "该请求体近期已被判为非法(HTTP 400)并被拦截;重试相同请求不会成功,请修改请求(如减少附件或历史)后重试",
         ));
     }
 

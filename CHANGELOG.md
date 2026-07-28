@@ -1,5 +1,48 @@
 # Changelog
 
+## [client-error-sanitization] - 2026-07-28
+
+对外错误只说「客户能做什么」,不说「这条渠道背后是谁」。
+
+### Features
+
+- **`UpstreamError` 拆成两份文案**:`message`(内部诊断,含上游原始报文/接口名,只进
+  `tracing` 与运维面)与 `client_message()`(对外)。后者是唯一对外出口。
+- **`client_detail: Option<String>` 且 fail-closed**:默认 `None` → 按 `UpstreamErrorKind`
+  给中性文案。只有我方本地生成、逐条确认过的文案才用 `bad_request_visible` /
+  `with_client_detail` 登记(体积超限、报文解析失败、模型不支持、毒报文拦截)。
+  新增错误点忘了登记 = 客户少看到一点细节,而不是 = 泄露渠道来源。
+- **三条对外出口统一口径**:`upstream_error_response`(非流式/首包前)、
+  `sse_error_event`(流内 error 事件)、`AcquireError::client_message()`(选号失败)。
+- **运维面单独留一条 `admin_error_response`**:worker 的 `/oauth/exchange`、
+  `/accounts/{id}/refresh`、`/accounts/{id}/quota` 仍回全量原文 —— 它们 listen 在
+  127.0.0.1,由 admin 面板扇出调用,客户到不了。
+- **router 侧同步脱敏**:`分组 'GECO' 无可用 worker` / `worker 不可达` → 统一
+  `CLIENT_UNAVAILABLE`。分组名就是价格档,`worker` 就是账号池形态。
+- **补日志**:非流式抽干与流中硬错误此前**没有**任何一处记录上游原文(唯一的去处就是
+  发给客户端)。脱敏前先把这两处的 `tracing::warn` 加上,否则排查会变瞎。
+
+### Design Rationale
+
+- **为什么不是逐个改字符串**:上游响应体是厂商控制的文本,今天是
+  `USER_REQUEST_RATE_EXCEEDED`,明天可能是别的指纹。关键词黑名单迟早漏。所以对外**默认
+  不透传上游任何文字**,要透传的必须显式登记 —— 白名单方向,不是黑名单方向。
+- **为什么状态码一个不动**:429/502/529 的重试语义是客户端(Claude Code / SDK / NewAPI)
+  的行为契约,改了会连带改变重试与「渠道判死」逻辑。本次只动 message。
+- **为什么运维面不脱敏**:导号时「这个号是 invalid_grant 还是网络抖」全靠上游原文,
+  一起脱敏等于把运维的眼睛蒙上。按「客户能不能打到这个端点」分界,不按错误类型分界。
+
+### Notes & Caveats
+
+- 客户端可见文案改为中性后,**客服口径要跟着变**:客户报「服务暂时不可用」时,凭
+  `request_logs.error_kind` + worker 日志定位,不能再让客户把报错原文贴过来。
+- `bad_request_visible` 登记的四处是有意为之(客户可自助):请求体超限 ×2、Anthropic
+  报文解析失败、模型不支持 / 消息为空。新增登记前请自问文案里有没有厂商名、接口名、
+  上游报文、账号标识。
+- **`GET /health` 未在本次范围内**:它无鉴权、公网可达,且返回全部账号 ID(真实邮箱)、
+  禁用态、优先级、配额 —— 泄露面远大于报错文案。admin 面板走的是内网 worker `/health`
+  聚合,不依赖公网这一个,收紧成本很低。待单独决策。
+
 ## [account-group-membership] - 2026-07-27
 
 把 `group` 这一个词承担的**三件事**拆开。这是对同日上线的影子分组(见下一节)的

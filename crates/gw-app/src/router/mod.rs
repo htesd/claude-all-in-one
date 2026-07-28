@@ -102,6 +102,13 @@ fn resolve_group<'a>(key_group: Option<&'a str>, default: &'a str) -> &'a str {
 /// **沿用上一份快照**而不是清空 —— 控制面抖动不该让数据面整体 503。
 const GROUP_OWNERS_TTL: Duration = Duration::from_secs(15);
 
+/// router 侧 5xx 的**对外**中性文案。
+///
+/// 旧文案("分组 'GECO' 无可用 worker" / "worker 不可达")把两样东西直接印给客户:
+/// **分组名就是价格档**,**worker/账号池**就是渠道形态。真正的原因照旧进 `tracing`,
+/// 排查一点没少。与 worker 侧 [`gw_core::error::UpstreamErrorKind::client_message`] 同口径。
+const CLIENT_UNAVAILABLE: &str = "服务暂时不可用,请稍后重试";
+
 fn owners_for(st: &RouterState, group: &str) -> Vec<String> {
     // 无库(stub 模式):回落到"组名即 owner",与重构前的拓扑假设一致。
     let Some(store) = st.store.as_ref() else {
@@ -404,11 +411,8 @@ async fn count_tokens(
     let group = resolve_group(authed.group.as_deref(), &st.default_group);
     let owners = owners_for(&st, group);
     if !st.workers.iter().any(|w| owners.iter().any(|o| o == &w.account_group)) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("分组 '{group}' 无可用 worker"),
-        )
-            .into_response();
+        tracing::warn!(group, "count_tokens 命中无可用 worker 的分组,拒绝");
+        return (StatusCode::SERVICE_UNAVAILABLE, CLIENT_UNAVAILABLE).into_response();
     }
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -447,7 +451,7 @@ async fn forward(
         tracing::warn!(group, "请求命中无可用 worker 的分组,拒绝");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("分组 '{group}' 无可用 worker"),
+            CLIENT_UNAVAILABLE,
         )
             .into_response();
     };
@@ -466,7 +470,7 @@ async fn forward(
             Err(e) => {
                 tracing::error!(instance = target.instance, "转发到 worker 失败: {e}");
                 if failed_over {
-                    return (StatusCode::BAD_GATEWAY, "worker 不可达").into_response();
+                    return (StatusCode::BAD_GATEWAY, CLIENT_UNAVAILABLE).into_response();
                 }
                 match failover_target(&st, session_id.as_deref(), group, target.instance) {
                     Some(t) => {
@@ -476,7 +480,7 @@ async fn forward(
                         failed_over = true;
                     }
                     None => {
-                        return (StatusCode::BAD_GATEWAY, "worker 不可达").into_response()
+                        return (StatusCode::BAD_GATEWAY, CLIENT_UNAVAILABLE).into_response()
                     }
                 }
             }
@@ -627,11 +631,8 @@ async fn forward_models(
     let group = resolve_group(authed.group.as_deref(), &st.default_group);
     // 无 session:在该组子集内取最空 worker(无亲和记忆)。
     let Some(target) = pick_worker(&st, None, group) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("分组 '{group}' 无可用 worker"),
-        )
-            .into_response();
+        tracing::warn!(group, "models 命中无可用 worker 的分组,拒绝");
+        return (StatusCode::SERVICE_UNAVAILABLE, CLIENT_UNAVAILABLE).into_response();
     };
     let url = format!("{}/v1/models", target.base_url);
     match st.http.get(&url).timeout(Duration::from_secs(10)).send().await {
@@ -648,7 +649,7 @@ async fn forward_models(
         }
         Err(e) => {
             tracing::error!(instance = target.instance, "转发 models 到 worker 失败: {e}");
-            (StatusCode::BAD_GATEWAY, "worker 不可达").into_response()
+            (StatusCode::BAD_GATEWAY, CLIENT_UNAVAILABLE).into_response()
         }
     }
 }
