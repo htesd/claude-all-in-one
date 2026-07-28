@@ -93,7 +93,18 @@ impl CurrentMessage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessage {
-    /// 用户输入消息上下文
+    /// 用户输入消息上下文。
+    ///
+    /// **空对象必须省略**(与下方历史 `UserMessage` 同口径)。拆包 Kiro 1.0.212
+    /// `extension.js:228708`:普通 human 消息**根本不带**这个字段,只有工具结果
+    /// (`{toolResults}`,:228717)或末条消息带工具定义(`{tools}`,:228745)时才创建。
+    ///
+    /// caio 此前无条件序列化,于是**每个无工具请求都多发一个 `"userInputMessageContext":{}`**
+    /// —— 真客户端从不产生的稳定多余字段,是比"少发偶发字段"更好统计的指纹。
+    /// 历史消息一直是对的(`is_default_context`),只有当前消息漏了。
+    ///
+    /// 缓存安全:当前消息位于前缀**之后**,改它不动已缓存的 history 前缀。
+    #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,

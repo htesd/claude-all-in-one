@@ -1,5 +1,61 @@
 # Changelog
 
+## [kiro-1.0.212-align] - 2026-07-28
+
+同步到 Kiro 1.0.212 客户端的线缆形态。长期不同步 = 可被规则化识别 = 封号,这是唯一动机。
+依据是拆包 `extensions/kiro.kiro-agent/dist/extension.js`(22 MB / 536,408 行)+ 真号只读实测。
+
+### Features
+
+- **`effort: "max"` 是合法最高档,不再被降级成 `xhigh`。** 真实 enum 为
+  `["low","medium","high","xhigh","max"]`。此前把 `max` 当同义词映射,等于把客户端顶格的
+  请求(生产每 300 条约 33 条)静默降一级。
+- **thinking 档位改为逐模型夹取**(`clamp_effort_for_model`)。档位表随模型不同:
+  `opus-4.6`/`sonnet-4.6` **没有 `xhigh`**;`opus-4.7` 的 schema default 是 `xhigh`
+  (全表唯一);`opus-4.5`/`sonnet-4.5`/`haiku-4.5` 压根没有 schema → **一个字段都不发**。
+- **`getUsageLimits` 迁到 control-plane**:
+  `GET https://management.{region}.kiro.dev/Get-Usage-Limits?origin=AI_EDITOR[&profileArn]`,
+  UA 换成 `api/kirocontrolplanebearer#1.0.0`,**不再发 `resourceType`**。
+  `KIRO_LEGACY_QUOTA_ENDPOINT=1` 可整套切回旧形态。
+- **新增 `ListAvailableModels` 接入**(`models_api.rs`)+ 落库 + 两个 admin 端点:
+  `POST /accounts/{id}/models`(用该号拉一次并落库)、`GET /models/catalog`(读快照)。
+  取回 `rateMultiplier` 供定价、逐模型档位表供上一条夹取。
+- 顺带上线前一批已就绪改动:body 里必发 `agentMode`、无工具时不发空
+  `userInputMessageContext`、UA 版本 → 1.0.212、旧 thinking 文本标签默认关。
+
+### Design Rationale
+
+- **为什么不补 `thinking` / `max_tokens`**:上游 schema 确实声明了这两个属性,但客户端的生成
+  函数 `qe8`(`extension.js:222579`)整个函数体只有两个 `case`,产出恒为
+  `{output_config:{effort}}` —— 补了就是比真客户端**多发**字段,与做这件事的初衷相反。
+  (原计划里有这一条,拆包后撤销。)
+- **为什么不补 `systemPrompt`**:`extractSystemPrompt` 受 A/B 开关
+  `AB_SYSTEM_FIELD_INJECTION` 控制,默认 **false**(`:227082`)。关着时 system 留在
+  `history[0]` —— 正是 caio 现有做法。当初为省积分这么设计是对的。
+- **为什么档位不可用时回落 `default` 而不是升到 `max`**:对齐客户端 `A7`
+  (`:140071-140076`)与设置面板(`:340057`)的行为。宁可少一档,也不擅自升档制造真客户端
+  不会出现的形态。
+- **为什么老配额端点必须换**:`AmazonCodeWhispererService.GetUsageLimits` 的 SDK 代码在
+  1.0.212 里仍在,但**全树零调用点** —— 唯一的 `new yh(`(`:337368`)走的是 control-plane。
+  它是后台**每 20 分钟一轮**的常驻轮询,比偶发请求的信号稳定得多。
+- **模型目录复用 `settings` 表**(键 `model_catalog`)而不是新建表:零 schema 变更、零迁移。
+  测试钉死了它与 `system` 键互不影响。
+
+### Notes & Caveats
+
+- **端点路径大小写和连字符是有意义的**:Smithy `@http` trait 逐字为 `/Get-Usage-Limits` /
+  `/List-Available-Models`,不是 `/getUsageLimits`。
+- **UA 虚惊一场**:客户端源码里 `getCustomUserAgent()` 返回空格分隔的
+  `KiroIDE {ver} {machineId}`,但 SDK 的 `escapeUserAgent` 会把空格转成 `-`
+  (`:356844-356846`),最终线缆上仍是 `KiroIDE-{ver}-{machineId}`。现有拼法是对的,未改。
+- **上线前真号只读实测**(不发 chat):新旧配额端点返回 **937 字节、6 个解析字段逐字相同**;
+  带不带 `resourceType` 返回**完全一致**(breakdown 恒为 `CREDIT`,上游根本不读该参数)。
+- **`m/N,E` 这一段是沿用**,未从 bundle 中重新推导。它由运行时 feature 检测生成,
+  控制面与 runtime 两个 client 的 bearer 认证路径相同,推测一致但未逐字验证。
+- **本批全部前缀安全**,不动 prompt 缓存前缀。移除 `history[0]` 里的 thinking 标签
+  **不在本批** —— 那条会让所有在途会话下一轮全 miss,须低峰单独切,并对着基准
+  (opus-5:0.9584 积分/请求、83.4% 命中)盯两个数。
+
 ## [thinking-budget-floor] - 2026-07-28
 
 客户端可以把按 opus 计费的请求降级成浅思考。给它设个下限。

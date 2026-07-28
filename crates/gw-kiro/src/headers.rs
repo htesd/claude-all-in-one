@@ -19,7 +19,11 @@ use gw_core::account::Account;
 /// AWS SDK 版本(主推理流)。对齐 static_flow `KIRO_PROVIDER_AWS_SDK_VERSION`。
 pub(crate) const AWS_SDK_VERSION: &str = "1.0.34";
 /// 默认 Kiro 客户端版本(可被 account.extra["kiro_version"] 覆盖)。
-pub(crate) const DEFAULT_KIRO_VERSION: &str = "0.12.155";
+///
+/// 2026-07-28 对齐真实客户端:deb `kiro 1.0.212-1784842874`,`product.json` version=1.0.212
+/// (commit 8848ae36,build 2026-07-23)。UA 拼法未变,仍是
+/// `KiroIDE-${kiroVersion}-${machineId}`(`extension.js:374150`)。
+pub(crate) const DEFAULT_KIRO_VERSION: &str = "1.0.212";
 /// UA 里的系统/Node 版本,逐字对齐 static_flow `DEFAULT_SYSTEM_VERSION`/`DEFAULT_NODE_VERSION`。
 pub(crate) const DEFAULT_SYSTEM_VERSION: &str = "darwin#24.6.0";
 pub(crate) const DEFAULT_NODE_VERSION: &str = "22.22.0";

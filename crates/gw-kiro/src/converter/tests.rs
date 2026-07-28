@@ -1856,18 +1856,25 @@ fn test_convert_request_strips_history_thinking_keeps_current_turn() {
     assert!(!history_json.contains("<thinking>"), "历史不应含 thinking 标签");
     // 历史正文保留
     assert!(history_json.contains("历史答案DEF"), "历史正文应保留");
-    // 2) 块2b:thinking 前缀现注入**当前轮**(不再进 system/history),当前轮原文仍保留在末尾
+    // 2) 当前轮原文保留
     let current = &cs.current_message.user_input_message.content;
     assert!(current.contains("当前轮提问GHI"), "当前轮原文应保留,实际={}", current);
+    // 3) **对齐 Kiro 1.0.212**:正文里不再有任何 thinking 文本标签。
+    //    真实客户端已完全不发它们(拆包全树零命中),继续发就是指纹。
     assert!(
-        current.contains("<thinking_mode>"),
-        "开启 thinking 时前缀应注入当前轮(保智力且不毒化缓存前缀),实际={}",
+        !current.contains("<thinking_mode>"),
+        "1.0.212 起正文不该再带 thinking 标签,实际={}",
         current
     );
-    // 3) 块2b:thinking 标签不应再出现在 history(system 折叠块)
-    assert!(
-        !history_json.contains("<thinking_mode>"),
-        "thinking 标签不应进 history(已移至当前轮)"
+    assert!(!history_json.contains("<thinking_mode>"), "history 同样不该带 thinking 标签");
+    // 4) 思考强度改由结构化字段承载 —— 能力没丢,只是换了载体。
+    let amrf = crate::thinking_policy::additional_model_request_fields(&req)
+        .expect("开着 thinking 就该有 additionalModelRequestFields");
+    // 本用例的客户端发的是 enabled + budget_tokens=2000;上游已不认 budget,
+    // 按 budget_to_effort 翻译成档位(2000 < 2048 → low)。
+    assert_eq!(
+        amrf["output_config"]["effort"], "low",
+        "budget=2000 应翻译成 low 档,实际={amrf}"
     );
 }
 
@@ -2230,14 +2237,19 @@ fn test_thinking_prefix_injected_into_current_turn_not_system() {
     };
     let cs = convert_request(&req).unwrap().conversation_state;
     let current = &cs.current_message.user_input_message.content;
-    // 当前轮含 adaptive 前缀 + 原文
-    assert!(current.contains("<thinking_mode>adaptive</thinking_mode>"), "当前轮应含 adaptive 前缀,实际={}", current);
-    assert!(current.contains("<thinking_effort>"), "adaptive 应带 effort,实际={}", current);
+    // **对齐 Kiro 1.0.212**:正文里不再注入任何 thinking 文本标签(当前轮与 system 都不注)。
     assert!(current.contains("用户问题"), "当前轮原文应保留");
-    // system 折叠块(history[0])不含 thinking 标签
+    assert!(
+        !current.contains("<thinking_mode>"),
+        "1.0.212 起当前轮不该再带 thinking 标签,实际={}",
+        current
+    );
     let history_json = serde_json::to_string(&cs.history).unwrap();
     assert!(history_json.contains("You are helpful"), "system 正文应在 history[0]");
     assert!(!history_json.contains("<thinking_mode>"), "thinking 不应进 system 折叠块");
+    // 能力没丢:adaptive 无显式 effort → 默认顶格档,经结构化字段下发。
+    let amrf = crate::thinking_policy::additional_model_request_fields(&req).unwrap();
+    assert_eq!(amrf["output_config"]["effort"], "xhigh");
 }
 
 #[test]

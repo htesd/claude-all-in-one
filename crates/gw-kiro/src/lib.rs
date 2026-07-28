@@ -20,6 +20,7 @@ pub mod image;
 pub mod inline_thinking;
 pub mod kiro_types;
 pub mod machine_id;
+pub mod models_api;
 pub mod parser;
 pub mod poison_memo;
 pub mod profiles;
@@ -331,6 +332,19 @@ impl Provider for KiroProvider {
         usage_limits::get_account_quota(&client, account)
             .await
             .map(Some)
+    }
+
+    /// 拉取模型目录(`ListAvailableModels`,只读控制面)。用于取 `rateMultiplier`
+    /// 定价与逐模型的 thinking 档位表。见 [`models_api`]。
+    async fn model_catalog(
+        &self,
+        account: &Account,
+    ) -> Result<Option<serde_json::Value>, UpstreamError> {
+        let client = self.resolver.client_for(account);
+        let catalog = models_api::list_available_models(&client, account).await?;
+        serde_json::to_value(&catalog)
+            .map(Some)
+            .map_err(|e| UpstreamError::network(format!("模型目录序列化失败: {e}")))
     }
 
     /// 发现 profileArn(`ListAvailableProfiles`):企业/IdC 号 chat 与配额都要求

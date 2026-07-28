@@ -199,6 +199,8 @@ pub fn router() -> Router<AdminState> {
         .route("/accounts/{id}/reset", post(reset_account))
         .route("/accounts/{id}/refresh", post(refresh_account))
         .route("/accounts/{id}/quota", post(quota_account))
+        .route("/accounts/{id}/models", post(models_account))
+        .route("/models/catalog", get(model_catalog))
 }
 
 fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
@@ -1389,6 +1391,77 @@ async fn quota_account(
         StatusCode::NOT_FOUND,
         "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
     )
+}
+
+/// `POST /accounts/{id}/models` —— 用该账号拉一次上游模型目录并落库。
+///
+/// 拿 `rateMultiplier` 定价、拿逐模型的 thinking 档位表。**只读**,不发 chat。
+/// 与 quota 同款顺序扇出:2xx 立即返回,404 问下一个,其余记首个错误后继续。
+async fn models_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let mut first_error: Option<(u16, String)> = None;
+    for w in st.workers.iter() {
+        let url = format!("http://{}/accounts/{}/models", w.listen, id);
+        let resp = match st.http.post(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(instance = w.instance, "models 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status == 404 {
+            continue; // 该 worker 不持有此账号。
+        }
+        let body = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            return Json(
+                body.unwrap_or_else(|| serde_json::json!({"fetched": false, "account_id": id})),
+            )
+            .into_response();
+        }
+        if first_error.is_none() {
+            let msg = body
+                .as_ref()
+                .and_then(|b| b.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("模型目录查询失败")
+                .to_string();
+            first_error = Some((status, msg));
+        }
+    }
+    if let Some((status, msg)) = first_error {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return api_error(code, &msg);
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+    )
+}
+
+/// `GET /models/catalog` —— 读最近一次落库的模型目录(不打上游)。
+///
+/// 从未抓过 → `{"catalog": null}` 而非 404:调用方靠这个字段判断"还没拉过",
+/// 不必把"没数据"和"路由不存在"混在同一个状态码里。
+async fn model_catalog(State(st): State<AdminState>) -> axum::response::Response {
+    match st.store.get_kv(gw_store::SqliteStore::KEY_MODEL_CATALOG) {
+        Ok(Some(json)) => match serde_json::from_str::<serde_json::Value>(&json) {
+            Ok(v) => Json(serde_json::json!({"catalog": v})).into_response(),
+            // 库里存着但解析不了(手改过 / 旧格式):当没有,别 500 掉整个面板。
+            Err(e) => {
+                tracing::warn!("模型目录解析失败,按未抓取处理: {e}");
+                Json(serde_json::json!({"catalog": serde_json::Value::Null})).into_response()
+            }
+        },
+        Ok(None) => Json(serde_json::json!({"catalog": serde_json::Value::Null})).into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("读取失败: {e}")),
+    }
 }
 
 #[cfg(test)]

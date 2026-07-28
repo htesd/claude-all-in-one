@@ -1010,6 +1010,7 @@ pub async fn run(
             .route("/accounts/{id}/reset", post(reset_account))
             .route("/accounts/{id}/refresh", post(refresh_account))
             .route("/accounts/{id}/quota", post(quota_account))
+            .route("/accounts/{id}/models", post(models_account))
             .route("/oauth/exchange", post(oauth_exchange))
             .route("/sync", post(sync_now));
     } else {
@@ -1380,6 +1381,87 @@ async fn quota_account(
                 .lock()
                 .insert(id.clone(), (None, std::time::Instant::now()));
             // 运维端点:导入对话框要按这段原文区分"死号"与"上游抖动"。
+            admin_error_response(&e)
+        }
+    }
+}
+
+/// `POST /accounts/{id}/models` —— 用该账号拉一次上游**模型目录**并落库。
+///
+/// 目的是把 `rateMultiplier`(定价)与逐模型的 thinking 档位表从"代码里写死的印象"
+/// 换成"上游当下的事实"。**全程只读**,与 `/quota` 同为控制面 GET,绝不发 chat
+/// (见 no-chat-test-on-real-accounts 记忆)。
+///
+/// 仅本 worker 持有该账号时命中;不持有 → 404(admin 据此向其余 worker 续问)。
+/// 与配额查询共用 `quota_sem`,不额外突破对上游的并发压力边界。
+///
+/// 目录是**全局**事实(不随账号变),所以落 `settings` 表单键覆盖;`fetched_by`
+/// 记下是哪个号拉的,便于回溯不同订阅档位看到的模型集差异。
+async fn models_account(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(account) = st.scheduler.account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"fetched": false, "account_id": id})),
+        )
+            .into_response();
+    };
+    let _permit = match st.quota_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"fetched": false, "account_id": id})),
+            )
+                .into_response();
+        }
+    };
+    let account = match st.ensure_credentialed(account).await {
+        Ok(a) => a,
+        Err(e) => return admin_error_response(&e),
+    };
+    // 企业/IdC 号的控制面调用同样要求 profileArn,缺则先发现+持久化(与配额路径同款)。
+    let account = st.ensure_profile_arn(account).await;
+    match st.provider.model_catalog(&account).await {
+        Ok(Some(catalog)) => {
+            let persisted = match (&st.store, serde_json::to_string(&catalog)) {
+                (Some(store), Ok(json)) => {
+                    match store.upsert_kv(gw_store::SqliteStore::KEY_MODEL_CATALOG, &json) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            // 落库失败不算整个请求失败:目录本身已经拿到,先透出给调用方,
+                            // 免得一次 DB 抖动就白打一次上游。
+                            tracing::warn!("模型目录落库失败: {e}");
+                            false
+                        }
+                    }
+                }
+                // 无库 = 降级模式(账号只来自 yaml 快照),此时只透出不落库。
+                _ => false,
+            };
+            Json(serde_json::json!({
+                "fetched": true,
+                "persisted": persisted,
+                "account_id": id,
+                "catalog": catalog,
+            }))
+            .into_response()
+        }
+        // provider 不支持(如 dario)——不是错误,如实说明。
+        Ok(None) => Json(serde_json::json!({
+            "fetched": false,
+            "persisted": false,
+            "account_id": id,
+            "reason": "该 provider 不提供模型目录",
+        }))
+        .into_response(),
+        Err(e) => {
+            // 与配额路径同口径:只读探测失败只惩罚真死号,瞬时错误不计入失败池。
+            if matches!(e.kind, UpstreamErrorKind::TokenInvalid) {
+                st.scheduler.report_failure(&id, e.kind);
+            }
             admin_error_response(&e)
         }
     }
