@@ -1,5 +1,41 @@
 # Changelog
 
+## [thinking-budget-floor] - 2026-07-28
+
+客户端可以把按 opus 计费的请求降级成浅思考。给它设个下限。
+
+### Features
+
+- **`enabled` 模式的思考预算下限**:低于 `KIRO_MIN_THINKING_BUDGET`(默认 8192)时抬到下限。
+  抬升被 `max_tokens - 1024` 夹住,夹不下就保持客户端原值(绝不挤掉答案的空间)。
+- **只动 `enabled`**:`adaptive` 的深度由 effort 决定、budget 字段不参与;`disabled` 一律不碰。
+- **`effort: "max"` 作为 `xhigh` 的同义词翻译**,不再当非法值回退。
+
+### Design Rationale
+
+- **为什么要有下限**:生产实测 **opencode 18/18 条请求都发 `budget_tokens=1024`**,签名加密体
+  (真 CoT 的载体)只有 5800 字节 = `xhigh` 21984 的 26%,用户体感"秒回,不像在思考"。
+  我方按 opus 计费,不该让客户端把它降级。
+- **为什么不碰 `disabled`**:抽样 48 条 `disabled` **全是 Claude Code 的内部杂务** ——
+  16 条 `max_tokens=64` 的会话标题生成 + 30 条 haiku 的技能路由。给它们开思考是纯烧钱
+  + 拖慢 UI,对"用户用上聪明的 Claude"零贡献。
+- **这是抬"上限"不是设"目标"**:`max_thinking_length` 是天花板,模型按需取用。上线前后实测
+  同一道题:签名 5800 → **10260(+77%)**、耗时 45s → 68s,但输出只从 1621 → 1722 token
+  (**+6%**)。成本不是按比例涨的。
+- **为什么 `max` 是翻译不是回退**:Kiro 档位到 `xhigh` 为止,`max` 语义上就是顶格。之前当
+  非法值处理,30 分钟刷 103 条告警,还掩盖了真正的脏 effort。
+
+### Notes & Caveats
+
+- **可见 thinking 文本长度不能用来判断思考深度**。实测 `high` 的可见摘要只有 1579 字符
+  (全场最短),而它的签名加密体 15940 比 `low` 的 10744 大 48%。要看深度就看
+  **signature 长度和耗时**,两者随 effort 严格单调。旧注释「high 仅产桩推理」据此推翻。
+- **签名是单向的,这是 Kiro 协议决定的,不是缺陷**:线缆结构 `AssistantMessage{content, tool_uses}`
+  没有 thinking 字段。客户端回传的 thinking 块会被静默丢弃 —— 实测两轮往返 HTTP 200、
+  答案正确、缓存命中 4450 token,**不破坏会话**。副作用反而是正向的:上游收不到历史推理,
+  模型每轮都从头重新思考,不存在"上轮没传回去所以这轮变笨"。
+- 下限调高需评估成本:8192 实测约等于 `adaptive` + `low` 的深度(签名 10260 vs 10744)。
+
 ## [client-error-sanitization] - 2026-07-28
 
 对外错误只说「客户能做什么」,不说「这条渠道背后是谁」。
