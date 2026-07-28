@@ -2249,7 +2249,7 @@ fn test_thinking_prefix_injected_into_current_turn_not_system() {
     assert!(!history_json.contains("<thinking_mode>"), "thinking 不应进 system 折叠块");
     // 能力没丢:adaptive 无显式 effort → 默认顶格档,经结构化字段下发。
     let amrf = crate::thinking_policy::additional_model_request_fields(&req).unwrap();
-    assert_eq!(amrf["output_config"]["effort"], "xhigh");
+    assert_eq!(amrf["output_config"]["effort"], crate::anthropic_types::DEFAULT_EFFORT);
 }
 
 #[test]

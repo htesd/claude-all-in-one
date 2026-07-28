@@ -297,13 +297,15 @@ mod tests {
     }
 
     #[test]
-    fn opus_defaults_to_adaptive_xhigh_without_suffix() {
+    fn opus_defaults_to_adaptive_top_tier_without_suffix() {
         let mut r = req("claude-opus-4-8", None, None);
         override_thinking_from_model_name(&mut r);
         let t = r.thinking.expect("opus 应默认开 thinking");
         assert_eq!(t.thinking_type, "adaptive");
-        // 缺省 effort 应为 xhigh(深推理),非旧的 high(桩推理)。
-        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some("xhigh"));
+        // 缺省 effort = 顶格 `max`。2026-07-28 剂量反应实测 max 比 xhigh 还多约 1.7 倍
+        // 思考量,且 max 走的是真客户端也在用的合规通道(见 DEFAULT_EFFORT 文档)。
+        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some(DEFAULT_EFFORT));
+        assert_eq!(DEFAULT_EFFORT, "max", "默认档若被改动,这里要连同上面的实测依据一起重估");
     }
 
     #[test]
@@ -325,12 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn opus_with_output_config_but_no_effort_defaults_xhigh() {
-        // 客户端带 output_config 但 effort 缺省(None)→ effective_effort 回退 xhigh。
+    fn opus_with_output_config_but_no_effort_defaults_to_top_tier() {
+        // 客户端带 output_config 但 effort 缺省(None)→ 回退 caio 策略默认(顶格)。
         let oc = OutputConfig { effort: None, format: None };
         let mut r = req("claude-opus-4-8", None, Some(oc));
         override_thinking_from_model_name(&mut r);
-        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some("xhigh"));
+        assert_eq!(r.output_config.unwrap().effort.as_deref(), Some(DEFAULT_EFFORT));
     }
 
     #[test]
@@ -536,13 +538,15 @@ mod tests {
     #[test]
     fn model_without_xhigh_falls_back_to_its_schema_default() {
         // opus-4.6 的 enum 是 [low,medium,high,max] —— **没有 xhigh**。
-        // caio 对 Opus 的默认档正是 xhigh,不夹的话就会发一个上游不认的值。
+        // 注意:caio 的策略默认现在是 `max`,而 4.6 恰好**有** max,走默认路径测不到夹取。
+        // 所以这里**显式**请求 xhigh,才真正压到"该模型不支持此档"的分支。
         let mut r = req_mt("claude-opus-4-6", None, 32000);
+        r.output_config = Some(OutputConfig { effort: Some("xhigh".into()), format: None });
         override_thinking_from_model_name(&mut r);
         assert_eq!(
             r.output_config.as_ref().unwrap().effort.as_deref(),
             Some("xhigh"),
-            "策略层仍按 caio 默认写 xhigh,夹取只发生在 wire 出口"
+            "策略层原样保留客户端的 xhigh,夹取只发生在 wire 出口"
         );
         let v = additional_model_request_fields(&r).unwrap();
         assert_eq!(
@@ -551,9 +555,15 @@ mod tests {
         );
         // 反向:同一个 xhigh 打到支持它的模型上必须原样保留,别夹过头。
         let mut r2 = req_mt("claude-opus-4-8", None, 32000);
+        r2.output_config = Some(OutputConfig { effort: Some("xhigh".into()), format: None });
         override_thinking_from_model_name(&mut r2);
         let v2 = additional_model_request_fields(&r2).unwrap();
         assert_eq!(v2["output_config"]["effort"], "xhigh", "4.8 有 xhigh，不该被夹,实际={v2}");
+        // 默认路径:4.6 也有 max,所以策略默认能原样落地,不触发回落。
+        let mut r3 = req_mt("claude-opus-4-6", None, 32000);
+        override_thinking_from_model_name(&mut r3);
+        let v3 = additional_model_request_fields(&r3).unwrap();
+        assert_eq!(v3["output_config"]["effort"], "max", "默认顶格档在 4.6 上也成立,实际={v3}");
     }
 
     #[test]

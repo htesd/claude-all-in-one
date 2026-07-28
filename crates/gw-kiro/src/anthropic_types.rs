@@ -154,8 +154,26 @@ impl OutputConfig {
     }
 }
 
-/// 客户端完全未带 output_config 时的默认思考强度(深推理)。
-pub const DEFAULT_EFFORT: &str = "xhigh";
+/// 客户端完全未带 output_config 时的默认思考强度 —— **顶格**。
+///
+/// 2026-07-28 隔离栈剂量反应实测(claude-opus-5,同一道证明题,只发新字段、不带旧标签,
+/// 数 SSE `thinking_delta` 帧):
+/// | effort | 帧数 | 均值 |
+/// |---|---|---|
+/// | `low`   | 123, 121        | 122  |
+/// | `xhigh` | 894, 509, 529   | 644  |
+/// | `max`   | 1345, 855       | 1100 |
+/// 单调、无重叠 —— `additionalModelRequestFields.effort` 是**真正在起作用的旋钮**,
+/// 且 `max` 比 `xhigh` 还多出约 1.7 倍思考量。
+///
+/// 从 `xhigh` 提到 `max` 是**合规**的加深途径:`max` 就在上游 enum 里、真客户端也发得出,
+/// 不像正文里塞 `<thinking_effort>` 标签那样制造真客户端不会有的指纹。
+///
+/// 注意这是 caio 的**策略默认**(客户端没说话时用什么),与"客户端给了脏值时回落到该模型
+/// schema 的 `default`"是两件事 —— 后者见 `thinking_policy::EffortWish::ModelDefault`。
+/// 也注意档位还要过 `clamp_effort_for_model` 按模型夹一次;`max` 在所有带 schema 的模型
+/// 上都存在(含没有 `xhigh` 的 4.6 系),所以这个默认值对全系模型都能原样落地。
+pub const DEFAULT_EFFORT: &str = "max";
 
 /// Kiro 支持的 thinking effort 档位**全集**,由低到高。客户端传入须命中其一(大小写不敏感)
 /// 才透传上游;非空但非法的值会被回退到 [`DEFAULT_EFFORT`],避免脏 effort 串打到 Kiro 触发 400。
@@ -395,14 +413,14 @@ mod effort_tests {
 
     #[test]
     fn none_is_default_no_fallback_flag() {
-        assert_eq!(normalize_effort(None), ("xhigh", false));
+        assert_eq!(normalize_effort(None), (DEFAULT_EFFORT, false));
     }
 
     #[test]
     fn blank_is_default_no_fallback_flag() {
         // 纯空白视为未指定:默认 xhigh,不算"非法回退"(不告警)。
-        assert_eq!(normalize_effort(Some("")), ("xhigh", false));
-        assert_eq!(normalize_effort(Some("   ")), ("xhigh", false));
+        assert_eq!(normalize_effort(Some("")), (DEFAULT_EFFORT, false));
+        assert_eq!(normalize_effort(Some("   ")), (DEFAULT_EFFORT, false));
     }
 
     #[test]
@@ -437,15 +455,15 @@ mod effort_tests {
     #[test]
     fn illegal_value_falls_back_with_flag() {
         // 非空但不在白名单 → 回退 xhigh 且标记 true(调用方据此告警)。
-        assert_eq!(normalize_effort(Some("ultra")), ("xhigh", true));
-        assert_eq!(normalize_effort(Some("999")), ("xhigh", true));
-        assert_eq!(normalize_effort(Some("high; drop")), ("xhigh", true));
+        assert_eq!(normalize_effort(Some("ultra")), (DEFAULT_EFFORT, true));
+        assert_eq!(normalize_effort(Some("999")), (DEFAULT_EFFORT, true));
+        assert_eq!(normalize_effort(Some("high; drop")), (DEFAULT_EFFORT, true));
     }
 
     #[test]
     fn effective_effort_delegates_to_normalize() {
         let oc = OutputConfig { effort: Some("garbage".to_string()), format: None };
-        assert_eq!(oc.effective_effort(), "xhigh");
+        assert_eq!(oc.effective_effort(), DEFAULT_EFFORT);
         let oc2 = OutputConfig { effort: Some("low".to_string()), format: None };
         assert_eq!(oc2.effective_effort(), "low");
     }

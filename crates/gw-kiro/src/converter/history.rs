@@ -737,16 +737,20 @@ mod thinking_prefix_tests {
     }
 
     #[test]
-    fn illegal_effort_falls_back_to_xhigh_on_wire() {
-        // 脏 effort 串不得透传到 Kiro,统一回退 xhigh(防 400)。
+    fn illegal_effort_falls_back_to_default_on_wire() {
+        // 脏 effort 串不得透传到 Kiro,统一回退策略默认档(防 400)。
         let p = generate_thinking_prefix(&adaptive_req(Some("ultra-mega"))).unwrap();
-        assert!(p.contains("<thinking_effort>xhigh</thinking_effort>"), "实际={p}");
+        let want = format!("<thinking_effort>{}</thinking_effort>",
+                           crate::anthropic_types::DEFAULT_EFFORT);
+        assert!(p.contains(&want), "实际={p}");
         assert!(!p.contains("ultra-mega"), "非法 effort 不应出现在 wire 上:{p}");
     }
 
     #[test]
-    fn absent_effort_defaults_to_xhigh() {
+    fn absent_effort_defaults_to_policy_default() {
         let p = generate_thinking_prefix(&adaptive_req(None)).unwrap();
-        assert!(p.contains("<thinking_effort>xhigh</thinking_effort>"), "实际={p}");
+        let want = format!("<thinking_effort>{}</thinking_effort>",
+                           crate::anthropic_types::DEFAULT_EFFORT);
+        assert!(p.contains(&want), "实际={p}");
     }
 }
