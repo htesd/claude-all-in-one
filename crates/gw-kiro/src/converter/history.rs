@@ -20,11 +20,38 @@ use crate::kiro_types::tool::{ToolResult, ToolUseEntry};
 ///
 /// `KIRO_LEGACY_THINKING_TAGS=1` 可切回旧行为(新字段与旧标签同时发过实测:2052 帧,
 /// 介于两者之间,不会互相顶掉,所以回退开关是安全的)。
+///
+/// ⚠️ **关掉它不是无代价的**:当 `KIRO_THINKING_IN_HISTORY0` 同时开着时,标签落在
+/// `history[0]` —— 那是缓存前缀的**第一块**。从"有标签"切到"无标签"会让所有在途会话
+/// 下一轮从第一个 token 起全部 miss(500k 上下文约 5-6 积分 vs 命中 2-3)。
+/// 所以这个切换必须**低峰单独做**,见 [`warn_if_prefix_breaking`]。
 pub(super) fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if std::env::var("KIRO_LEGACY_THINKING_TAGS").is_err() {
+    if !gw_core::env_flag("KIRO_LEGACY_THINKING_TAGS") {
         return None;
     }
     build_thinking_prefix(req)
+}
+
+/// 启动/首次转换时对**会击穿缓存前缀的 env 组合**大声告警一次。
+///
+/// 危险组合:`KIRO_THINKING_IN_HISTORY0` 开着(标签写进 history[0])但
+/// `KIRO_LEGACY_THINKING_TAGS` 关着(不再生成标签)—— 等于把前缀第一块改了。
+/// 这个组合在升级时**极容易被无声触发**(镜像换了、env 没跟着改),而后果是
+/// 全量会话下一轮缓存未命中,直接体现在积分账单上。宁可日志吵一次。
+fn warn_if_prefix_breaking() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if gw_core::env_flag("KIRO_THINKING_IN_HISTORY0")
+            && !gw_core::env_flag("KIRO_LEGACY_THINKING_TAGS")
+        {
+            tracing::warn!(
+                "KIRO_THINKING_IN_HISTORY0 已开但 KIRO_LEGACY_THINKING_TAGS 未开：\
+                 history[0] 将不再含 thinking 标签，与升级前字节不同 —— \
+                 所有在途会话下一轮 prompt 缓存全部 miss。若非低峰刻意切换，\
+                 请设置 KIRO_LEGACY_THINKING_TAGS=1 保持前缀不变。"
+            );
+        }
+    });
 }
 
 /// 旧标签的**纯**构造(不读 env)。拆出来是为了让回退路径仍可被测试直接覆盖 ——
@@ -250,8 +277,10 @@ pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_
     // (对齐 static_flow;防上游自曝 Kiro 身份)。
     {
         let mut system_content = client_system;
-        // [EXP] thinking 前缀注入 history[0] 最前(kiro.rs 对齐),env 开关
-        if std::env::var("KIRO_THINKING_IN_HISTORY0").is_ok() {
+        // [EXP] thinking 前缀注入 history[0] 最前(kiro.rs 对齐),env 开关。
+        // history[0] = 缓存前缀第一块,这里的字节一变,整条前缀作废 —— 故先查危险组合。
+        warn_if_prefix_breaking();
+        if gw_core::env_flag("KIRO_THINKING_IN_HISTORY0") {
             if let Some(prefix) = generate_thinking_prefix(req) {
                 if !has_thinking_tags(&system_content) {
                     system_content = if system_content.is_empty() { prefix } else { format!("{}\n{}", prefix, system_content) };

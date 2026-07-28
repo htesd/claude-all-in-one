@@ -20,6 +20,35 @@ pub mod fold;
 pub mod model;
 pub mod pricing;
 pub mod provider;
+
+/// 读一个**布尔** env 开关。只有明确的真值才算开:`1` / `true` / `yes` / `on`
+/// (大小写与前后空白不敏感)。
+///
+/// 为什么不用 `env::var(..).is_ok()`:部署系统常用 `FOO=0` / `FOO=false` 表达"关",
+/// 而"存在即开"会把它读成开。对回退开关来说,这意味着**以为关着其实开着** ——
+/// 比如配额端点会静默切回旧域名、旧 UA 并多发一个参数,正好造出我们要消除的形态。
+pub fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| truthy(&v)).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    #[test]
+    fn only_explicit_truthy_values_enable() {
+        for v in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(super::truthy(v), "{v:?} 应当被视为开");
+        }
+        // 关键:这些都必须是**关**。此前 `is_ok()` 会把它们全读成开。
+        for v in ["0", "false", "no", "off", "", "  ", "2", "enabled"] {
+            assert!(!super::truthy(v), "{v:?} 不该被视为开");
+        }
+    }
+}
+
+/// `env_flag` 的纯判定部分(不读 env,便于测试;env 用例并行时会互相污染)。
+fn truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
 pub mod routing;
 pub mod store;
 
