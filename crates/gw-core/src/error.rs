@@ -177,10 +177,11 @@ pub struct UpstreamError {
     pub status_code: Option<u16>,
     /// 允许对外展示的详情。`None` = 用 [`UpstreamErrorKind::client_message`] 的中性兜底。
     ///
-    /// **fail-closed**:默认 `None`,只有**我方本地**产生、且逐条确认不含上游身份线索的
-    /// 文案才用 [`Self::with_client_detail`] 登记。新增错误点忘了登记 = 客户看到中性文案
-    /// (信息略少),而不是 = 泄露渠道来源(不可逆)。
-    pub client_detail: Option<String>,
+    /// **私有,且只有 [`Self::bad_request_visible`] 一个入口。** 对抗评审三个镜头一致指出:
+    /// 只要留一个「把任意 String 登记为对外文案」的公开 API,迟早有人顺手把上游响应体
+    /// 传进去,fail-closed 就退化成靠自觉。收窄到单一构造器后,任何新的对外展示需求都得
+    /// 显式改这里 —— 改动可见,才评审得动。
+    client_detail: Option<String>,
 }
 
 impl UpstreamError {
@@ -198,13 +199,6 @@ impl UpstreamError {
         self
     }
 
-    /// 登记一段**可对外展示**的详情。调用前请自问:这段文字里有没有上游厂商名、
-    /// 接口名、原始报文、账号标识?有任何一样就别登记。
-    pub fn with_client_detail(mut self, detail: impl Into<String>) -> Self {
-        self.client_detail = Some(detail.into());
-        self
-    }
-
     /// 便捷构造:网络错误。
     pub fn network(message: impl Into<String>) -> Self {
         Self::new(UpstreamErrorKind::Network, message)
@@ -218,11 +212,14 @@ impl UpstreamError {
 
     /// 便捷构造:**我方本地**判定的非法请求,同一句话既进日志也发客户端。
     ///
-    /// 只用于「客户改请求就能解」且文案由我方完全掌控的场景(体积超限、报文解析失败、
-    /// 模型不支持……)。凡是引用了上游响应体的,一律用 [`Self::bad_request`]。
+    /// **这是把文案送到客户端的唯一入口。** 只用于「客户改请求就能解」且文案由我方完全
+    /// 掌控的场景(体积超限、报文解析失败、模型不支持……)。凡是引用了上游响应体、
+    /// 上游接口名、账号标识的,一律用 [`Self::bad_request`] —— 那条路只进日志。
     pub fn bad_request_visible(message: impl Into<String>) -> Self {
         let m = message.into();
-        Self::bad_request(m.clone()).with_client_detail(m)
+        let mut e = Self::bad_request(m.clone());
+        e.client_detail = Some(m);
+        e
     }
 
     /// 发给客户端的消息 —— 唯一对外出口。
