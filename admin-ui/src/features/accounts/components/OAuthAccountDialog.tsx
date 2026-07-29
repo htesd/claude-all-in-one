@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { CheckCircle2, Copy, ExternalLink, Info, Loader2 } from 'lucide-react'
+import { CheckCircle2, ChevronRight, Copy, ExternalLink, Info, Loader2 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
@@ -8,8 +8,9 @@ import { useGroups } from '@/features/groups/hooks'
 import { useSettings } from '@/features/settings/hooks'
 import { extractErrorMessage, getErrorStatus } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
+import { cn } from '@/lib/utils'
 
-import { useOAuthComplete, useOAuthStart } from '../hooks'
+import { useCreateAccount, useOAuthComplete, useOAuthStart } from '../hooks'
 import { parseConcurrency } from '../lib'
 import { ACCOUNT_ID_PATTERN } from '../types'
 
@@ -36,6 +37,9 @@ interface OAuthAccountDialogProps {
  * 步骤1:填账号信息 → 生成 authorize URL(后端纯本地,不发网络)。
  * 步骤2:操作员浏览器登录同意拿 code → 换码(后端扇给目标组 worker,走该组 egress=该号
  * 将来 refresh/chat 同一出口 IP)→ 落库。consent 浏览器在哪登都行(code 数秒失效)。
+ *
+ * 另有一条**折叠的旁路**:手里已经有 `.credentials.json` 时直接粘贴 → `POST /accounts`
+ * 建号,跳过整个授权流程。这条路原本在已删除的「添加账号」弹窗里。
  */
 export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
   const { t } = useI18n()
@@ -44,6 +48,7 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
   const gateways = settingsQuery.data?.egress_pool ?? []
   const startMutation = useOAuthStart()
   const completeMutation = useOAuthComplete()
+  const createMutation = useCreateAccount()
 
   const [accountId, setAccountId] = useState('')
   const [group, setGroup] = useState('')
@@ -55,6 +60,9 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
   const [code, setCode] = useState('')
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // 旁路:手里已有 .credentials.json 时直接建号,不走授权。
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [credentialsJson, setCredentialsJson] = useState('')
 
   useEffect(() => {
     if (open) {
@@ -67,29 +75,67 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
       setCode('')
       setCopied(false)
       setError(null)
+      setPasteOpen(false)
+      setCredentialsJson('')
     }
   }, [open])
+
+  /** 表单头部三项(账号 ID / 并发)的公共校验;返回 null = 已置错误消息。 */
+  const validateForm = (): { concurrency: number } | null => {
+    if (!ACCOUNT_ID_PATTERN.test(accountId)) {
+      setError(t('accounts.error.invalidId'))
+      return null
+    }
+    const parsedConcurrency = parseConcurrency(concurrency)
+    if (parsedConcurrency === null) {
+      setError(t('accounts.error.invalidConcurrency'))
+      return null
+    }
+    return { concurrency: parsedConcurrency }
+  }
+
+  const handlePasteCreate = () => {
+    if (createMutation.isPending) return
+    const validated = validateForm()
+    if (validated === null) return
+    if (credentialsJson.trim() === '') {
+      setError(t('accounts.error.credentialsJsonRequired'))
+      return
+    }
+    setError(null)
+    createMutation.mutate(
+      {
+        account_id: accountId,
+        provider: 'claude-dario',
+        group: group !== '' ? group : undefined,
+        max_concurrency: validated.concurrency,
+        egress,
+        credentials_json: credentialsJson.trim(),
+      },
+      {
+        onSuccess: onClose,
+        onError: (err) => {
+          const status = getErrorStatus(err)
+          if (status === 409) setError(t('accounts.error.duplicate'))
+          else setError(extractErrorMessage(err))
+        },
+      },
+    )
+  }
 
   const step = authorizeUrl === '' ? 'form' : 'authorize'
 
   const handleGenerate = () => {
     if (startMutation.isPending) return
-    if (!ACCOUNT_ID_PATTERN.test(accountId)) {
-      setError(t('accounts.error.invalidId'))
-      return
-    }
-    const parsedConcurrency = parseConcurrency(concurrency)
-    if (parsedConcurrency === null) {
-      setError(t('accounts.error.invalidConcurrency'))
-      return
-    }
+    const validated = validateForm()
+    if (validated === null) return
     setError(null)
     startMutation.mutate(
       {
         account_id: accountId,
         group: group !== '' ? group : undefined,
         egress,
-        max_concurrency: parsedConcurrency,
+        max_concurrency: validated.concurrency,
       },
       {
         onSuccess: (res) => {
@@ -208,6 +254,55 @@ export function OAuthAccountDialog({ open, onClose }: OAuthAccountDialogProps) {
                 ))}
               </Select>
               <p className="text-xs text-muted-foreground">{t('accounts.oauth.egressHint')}</p>
+            </div>
+
+            {/* 旁路:已有 .credentials.json 就不必再走一遍授权。默认折叠。 */}
+            <div className="space-y-1.5">
+              <button
+                type="button"
+                onClick={() => setPasteOpen((prev) => !prev)}
+                className="inline-flex items-center gap-1 rounded text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              >
+                <ChevronRight
+                  className={cn('h-3.5 w-3.5 transition-transform', pasteOpen && 'rotate-90')}
+                />
+                {t('accounts.oauth.pasteToggle')}
+              </button>
+              {pasteOpen && (
+                <div className="space-y-1.5 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-3">
+                  <label
+                    htmlFor="oauth-cred-json"
+                    className="text-xs font-medium text-muted-foreground"
+                  >
+                    {t('accounts.field.credentialsJson')}
+                  </label>
+                  <textarea
+                    id="oauth-cred-json"
+                    value={credentialsJson}
+                    onChange={(event) => setCredentialsJson(event.target.value)}
+                    placeholder={t('accounts.field.credentialsJsonPlaceholder')}
+                    rows={4}
+                    spellCheck={false}
+                    autoComplete="off"
+                    className={`${inputClass} resize-none font-mono text-xs leading-5`}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('accounts.field.credentialsJsonHint')}
+                  </p>
+                  <div className="flex justify-end pt-0.5">
+                    <Button
+                      variant="outline"
+                      onClick={handlePasteCreate}
+                      disabled={createMutation.isPending}
+                    >
+                      {createMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+                      {createMutation.isPending
+                        ? t('accounts.oauth.pasteCreating')
+                        : t('accounts.oauth.pasteSubmit')}
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {error !== null && <p className="text-sm text-destructive">{error}</p>}

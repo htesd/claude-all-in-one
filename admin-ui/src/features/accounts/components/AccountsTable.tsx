@@ -105,7 +105,7 @@ export function AccountsTable({
                 row={row}
                 runtime={runtimeByAccount.get(row.account_id)}
                 runtimeState={runtimeState}
-                groupColor={groupColors.get(row.group_name)}
+                groupColors={groupColors}
                 quotaKind={quotaKind}
                 busy={busyId === row.account_id}
                 onToggleDisabled={onToggleDisabled}

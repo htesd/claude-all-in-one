@@ -25,8 +25,8 @@ interface AccountTableRowProps {
   /** 按 account_id merge 出的运行态；worker 未上报时为 undefined。 */
   runtime: AccountRuntimeEntry | undefined
   runtimeState: RuntimeQueryState
-  /** 分组颜色（来自 /groups），未命中用默认色。 */
-  groupColor: string | undefined
+  /** 分组名 -> 颜色（来自 /groups）。一个号可属多个组，所以传整张表而不是单个颜色。 */
+  groupColors: Map<string, string>
   /** 配额列口径(随所属 tab):'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario)。 */
   quotaKind: QuotaKind
   /** 本行是否有进行中的 mutation（按钮置灰防连点）。 */
@@ -42,7 +42,7 @@ export function AccountTableRow({
   row,
   runtime,
   runtimeState,
-  groupColor,
+  groupColors,
   quotaKind,
   busy,
   onToggleDisabled,
@@ -64,6 +64,17 @@ export function AccountTableRow({
       failureCount > 0)
   /** 并发列只在 worker 在线上报时显示「空闲/上限」，否则回落到配置值。 */
   const hasLivePermits = runtimeState === 'ready' && runtime !== undefined && runtime.online
+  /**
+   * 成员边（决定谁能用它 + 组内排第几）。
+   * `undefined` = 旧缓存响应还没带这个字段（**未知**，不是"没有"）——此时显示 —，
+   * 绝不能报红"无分组"，那是在拿一次升级窗口期的空档吓运维。
+   */
+  const memberships = row.groups
+  const membershipsUnknown = memberships === undefined
+  const highTierCount = (memberships ?? []).filter(
+    (m) => priorityToTier(m.priority) === 'high',
+  ).length
+  const lowTierCount = (memberships ?? []).length - highTierCount
 
   return (
     <TR>
@@ -74,9 +85,22 @@ export function AccountTableRow({
         </code>
       </TD>
 
-      {/* 分组：色 chip */}
+      {/* 分组：**成员边**（谁能用到它），一个号可属多个组。归属组见编辑弹窗。
+          一条边都没有 = 库里有号但永远选不中，必须一眼可见。 */}
       <TD>
-        <GroupChip name={row.group_name} color={groupColor} />
+        {membershipsUnknown ? (
+          <span className="text-muted-foreground">—</span>
+        ) : memberships.length === 0 ? (
+          <span className="text-xs font-medium text-destructive" title={t('table.groupNoneHint')}>
+            {t('table.groupNone')}
+          </span>
+        ) : (
+          <span className="flex flex-wrap items-center gap-1">
+            {memberships.map((m) => (
+              <GroupChip key={m.name} name={m.name} color={groupColors.get(m.name)} />
+            ))}
+          </span>
+        )}
       </TD>
 
       {/* provider */}
@@ -160,16 +184,26 @@ export function AccountTableRow({
         )}
       </TD>
 
-      {/* 调度优先级:两档(高/低)。高层号被优先·积极调度。 */}
+      {/* 调度优先级:**按组**两档(高/低) —— 同一个号在 A 组可以是主力、B 组是兜底,
+          所以这里只给个汇总,逐组明细在 title 里(以及编辑弹窗)。 */}
       <TD className="text-right">
-        <span
-          className={cn(priorityToTier(row.priority) === 'high' && 'font-medium text-primary')}
-          title={t('table.priorityHint')}
-        >
-          {priorityToTier(row.priority) === 'high'
-            ? t('accounts.priorityTier.high')
-            : t('accounts.priorityTier.low')}
-        </span>
+        {membershipsUnknown || memberships.length === 0 ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <span
+            className={cn(highTierCount > 0 && 'font-medium text-primary')}
+            title={`${t('table.priorityHint')}\n${memberships
+              .map((m) => `${m.name}: ${t(`accounts.priorityTier.${priorityToTier(m.priority)}`)}`)
+              .join('\n')}`}
+          >
+            {[
+              highTierCount > 0 ? `${t('accounts.priorityTier.high')}×${highTierCount}` : null,
+              lowTierCount > 0 ? `${t('accounts.priorityTier.low')}×${lowTierCount}` : null,
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+          </span>
+        )}
       </TD>
 
       {/* 连续失败次数：> 0 才显示 */}
