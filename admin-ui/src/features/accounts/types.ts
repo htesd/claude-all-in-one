@@ -1,17 +1,38 @@
 /**
+ * 该账号在某个分组里的成员边：**决定谁能用它 + 在那个组里排第几**。
+ * 一个号可以同时是多个组的成员，每组一个独立优先级。
+ */
+export interface AccountGroupMembership {
+  name: string
+  /** 组内优先级，数值越小越优先（前端只暴露高=0 / 低=100 两档）。 */
+  priority: number
+}
+
+/**
  * GET /admin/api/accounts 单行。
  * extra 中含 token/secret/password 的字段已由后端脱敏为 `***xxxx`（尾 4 位）。
  */
 export interface AccountRow {
   account_id: string
-  /** 所属分组名；'' = 未分组。 */
+  /**
+   * **归属**分组名；'' = 未分组。只表示哪个 worker 独占管它的运行态，
+   * **不是权限** —— 谁能用它由 `groups`（成员边）决定。
+   */
   group_name: string
   provider: string
   max_concurrency: number
-  /** 调度优先级：数值越小越优先（分层 LRU 先取最小层），缺省 100。 */
+  /**
+   * `extra.priority`，缺省 100。**调度不读它** —— 重构后组内排序在成员边上（见 `groups`），
+   * 这里只是导入时的默认种子。别拿它当排序依据展示。
+   */
   priority: number
   disabled: boolean
   extra: Record<string, unknown>
+  /**
+   * 该号的全部成员边，后端按组名升序返回（顺序稳定，可直接与编辑草稿做差集）。
+   * 旧缓存响应可能缺失 —— 缺失视为“未知”，空数组才是“不在任何组”。
+   */
+  groups?: AccountGroupMembership[]
   /** 创建时间，Unix 秒。 */
   created_at: number
   /** 累计成功请求数（后端新增；旧缓存响应可能缺失，缺省视为 0）。 */

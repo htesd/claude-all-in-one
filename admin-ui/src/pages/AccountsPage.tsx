@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, KeyRound, Plus, Upload } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, KeyRound, Upload } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
@@ -14,7 +14,6 @@ import {
   AccountsPagination,
   type PageSize,
 } from '@/features/accounts/components/AccountsPagination'
-import { CreateAccountDialog } from '@/features/accounts/components/CreateAccountDialog'
 import { EditAccountDialog } from '@/features/accounts/components/EditAccountDialog'
 import { ImportAccountsDialog } from '@/features/accounts/components/ImportAccountsDialog'
 import { OAuthAccountDialog } from '@/features/accounts/components/OAuthAccountDialog'
@@ -51,7 +50,6 @@ export default function AccountsPage() {
   const resetMutation = useResetAccount()
   const refreshMutation = useRefreshAccount()
 
-  const [createOpen, setCreateOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [oauthOpen, setOauthOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -237,10 +235,6 @@ export default function AccountsPage() {
             <KeyRound className="h-4 w-4" />
             {t('accounts.oauth')}
           </Button>
-          <Button onClick={() => setCreateOpen(true)}>
-            <Plus className="h-4 w-4" />
-            {t('accounts.new')}
-          </Button>
         </div>
       </header>
 
@@ -311,7 +305,6 @@ export default function AccountsPage() {
         }}
       />
 
-      <CreateAccountDialog open={createOpen} onClose={() => setCreateOpen(false)} />
       <ImportAccountsDialog open={importOpen} onClose={() => setImportOpen(false)} />
       <OAuthAccountDialog open={oauthOpen} onClose={() => setOauthOpen(false)} />
       <EditAccountDialog

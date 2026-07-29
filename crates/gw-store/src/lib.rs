@@ -48,6 +48,19 @@ pub enum MembershipOutcome {
     CrossOwner { existing: String, incoming: String },
 }
 
+/// 改账号配置的结果。见 [`SqliteStore::update_account`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateAccountOutcome {
+    Ok,
+    NotFound,
+    /// 改**归属**会让 `group` 这个组同时出现两个 owner。
+    ///
+    /// `upsert_membership` 守着"一组一 owner",但改归属是从**另一头**破坏同一个不变量:
+    /// 边一条没动,却把边另一端的 owner 换了。不在这里拦,后端精心维护的约束就有一条
+    /// 绕行通道 —— 而且是运维在 UI 上点一下就能走通的那种。
+    CrossOwner { group: String, existing: String, incoming: String },
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS api_keys (
     key       TEXT PRIMARY KEY,
@@ -679,7 +692,11 @@ impl SqliteStore {
     }
 
     /// 部分更新(见 [`AccountPatch`]);`false` = 账号不存在。
-    pub fn update_account(&self, account_id: &str, patch: &AccountPatch) -> anyhow::Result<bool> {
+    pub fn update_account(
+        &self,
+        account_id: &str,
+        patch: &AccountPatch,
+    ) -> anyhow::Result<UpdateAccountOutcome> {
         let mut sets: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
         if let Some(g) = &patch.group_name {
@@ -698,17 +715,46 @@ impl SqliteStore {
             sets.push("extra = ?");
             params.push(Value::Text(e.clone()));
         }
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         if sets.is_empty() {
             let exists: bool = conn
                 .prepare_cached("SELECT 1 FROM accounts WHERE account_id = ?1")?
                 .exists([account_id])?;
-            return Ok(exists);
+            return Ok(if exists {
+                UpdateAccountOutcome::Ok
+            } else {
+                UpdateAccountOutcome::NotFound
+            });
+        }
+        let tx = conn.transaction()?;
+        // 换归属前先看:这个号参与的每个组里,**别的**成员归属谁?有一个对不上就整单拒绝。
+        // 校验与写入必须同一事务 —— 否则并发的建边请求会插在检查与 UPDATE 之间。
+        if let Some(incoming) = &patch.group_name {
+            let conflict: Option<(String, String)> = tx
+                .prepare_cached(
+                    "SELECT m.group_name, a.group_name FROM account_groups m \
+                     JOIN account_groups other ON other.group_name = m.group_name \
+                     JOIN accounts a ON a.account_id = other.account_id \
+                     WHERE m.account_id = ?1 AND other.account_id <> ?1 \
+                     AND a.group_name <> ?2 ORDER BY m.group_name LIMIT 1",
+                )?
+                .query_row(rusqlite::params![account_id, incoming], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            if let Some((group, existing)) = conflict {
+                return Ok(UpdateAccountOutcome::CrossOwner {
+                    group,
+                    existing,
+                    incoming: incoming.clone(),
+                });
+            }
         }
         params.push(Value::Text(account_id.to_string()));
         let sql = format!("UPDATE accounts SET {} WHERE account_id = ?", sets.join(", "));
-        let changed = conn.execute(&sql, rusqlite::params_from_iter(params))?;
-        Ok(changed == 1)
+        let changed = tx.execute(&sql, rusqlite::params_from_iter(params))?;
+        tx.commit()?;
+        Ok(if changed == 1 { UpdateAccountOutcome::Ok } else { UpdateAccountOutcome::NotFound })
     }
 
     /// 删除账号;`false` = 不存在。usage_records 历史归属不动。
@@ -1097,6 +1143,51 @@ impl SqliteStore {
             out.entry(group).or_default().insert(account, priority);
         }
         Ok(out)
+    }
+
+    /// 账号列表 + 每个账号的成员边,**同一把锁下读完**(单连接 = 同一快照)。
+    ///
+    /// 给 admin 账号列表页用 —— 一次查完,免得前端按组 N 次拉成员再自己做反向索引。
+    /// 与 [`Self::load_group_memberships`] 的区别:那个按 owner 过滤、给 worker 选号用;
+    /// 这个不过滤,是**配置态全景**。
+    ///
+    /// 必须一把锁读完两张表:分两次调用的话,导入正好插在中间就会返回"有账号但没有边"
+    /// 的组合 —— 而 `create_account` 是原子建号+建边的,那个状态从未真实存在过。
+    /// 前端拿这份响应当"无分组"告警依据和编辑差集基线,喂它一个假快照会直接误导运维。
+    ///
+    /// 组名升序只为展示稳定(表格 chip 不跳动);差集比较按组名做 Map 查找,不依赖顺序。
+    pub fn list_accounts_with_memberships(
+        &self,
+    ) -> anyhow::Result<Vec<(AccountRow, Vec<(String, i64)>)>> {
+        let conn = self.conn.lock();
+        let mut edges: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT account_id, group_name, priority FROM account_groups \
+                 ORDER BY account_id ASC, group_name ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for row in rows {
+                let (account, group, priority) = row?;
+                edges.entry(account).or_default().push((group, priority));
+            }
+        }
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {} FROM accounts ORDER BY group_name ASC, account_id ASC",
+            Self::ACCOUNT_COLS
+        ))?;
+        let accounts = stmt
+            .query_map([], Self::row_to_account)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(accounts
+            .into_iter()
+            .map(|row| {
+                let e = edges.remove(&row.account_id).unwrap_or_default();
+                (row, e)
+            })
+            .collect())
     }
 
     /// 组名 → **持有该组成员的 owner 集合**(即请求该组时可以派发到哪些 worker)。
@@ -1999,7 +2090,7 @@ mod tests {
             disabled: Some(true),
             ..Default::default()
         };
-        assert!(store.update_account("kiro-01", &patch).unwrap());
+        assert_eq!(store.update_account("kiro-01", &patch).unwrap(), UpdateAccountOutcome::Ok);
         let a = store.get_account("kiro-01").unwrap().unwrap();
         assert_eq!(a.group_name, "G1");
         assert!(a.disabled);
@@ -2588,6 +2679,122 @@ groups:
         assert!(store.remove_membership("a", "G0").unwrap());
         assert!(!store.remove_membership("a", "G0").unwrap(), "重复删返回 false");
         assert!(store.list_group_members("G0").unwrap().is_empty());
+    }
+
+    /// admin 账号列表页用的**配置态全景**:账号与成员边同一快照,组名升序保证展示稳定。
+    #[test]
+    fn list_accounts_with_memberships_pairs_every_account_with_its_edges() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // 建组顺序故意与字典序相反,证明返回顺序来自 ORDER BY 而不是插入顺序。
+        for g in ["G0", "ZED", "GLOW", "GECO"] {
+            store.create_group(g, "", "").unwrap();
+        }
+        store.create_account("multi", "G0", "kiro", 2, "{}").unwrap();
+        store.create_account("lonely", "G0", "kiro", 2, "{}").unwrap();
+        // 建边同样按反字典序写入。
+        store.upsert_membership("multi", "ZED", 100).unwrap();
+        store.upsert_membership("multi", "GLOW", 0).unwrap();
+        store.upsert_membership("multi", "GECO", 100).unwrap();
+
+        let edges_of = |store: &SqliteStore, id: &str| {
+            store
+                .list_accounts_with_memberships()
+                .unwrap()
+                .into_iter()
+                .find(|(row, _)| row.account_id == id)
+                .map(|(_, edges)| edges)
+        };
+
+        assert_eq!(
+            edges_of(&store, "multi").unwrap(),
+            vec![
+                ("G0".to_string(), 100), // create_account 自动建的归属边
+                ("GECO".to_string(), 100),
+                ("GLOW".to_string(), 0),
+                ("ZED".to_string(), 100),
+            ],
+            "同一账号的边按组名升序,且组内优先级逐条对上"
+        );
+
+        // 归属边是 create_account 自动建的,所以"没有额外成员边"的号仍有 1 条。
+        assert_eq!(edges_of(&store, "lonely").unwrap(), vec![("G0".to_string(), 100)]);
+
+        // 反向断言:删掉一条边后,那个组不得再出现在该账号的列表里。
+        assert!(store.remove_membership("multi", "GLOW").unwrap());
+        let after = edges_of(&store, "multi").unwrap();
+        assert!(
+            !after.iter().any(|(g, _)| g == "GLOW"),
+            "删边后 GLOW 不得再出现,否则前端会显示一个已经不存在的成员关系"
+        );
+        assert_eq!(after.len(), 3);
+
+        // 一条边都没有的账号:**行仍在**,边是空 vec —— 前端据此显示红色"无分组"。
+        // 这正是 2026-07-29 那种"号在库里、不在任何组、谁也用不到"的形态。
+        store.create_account("orphan", "", "kiro", 2, "{}").unwrap();
+        assert_eq!(
+            edges_of(&store, "orphan"),
+            Some(vec![]),
+            "未分组账号必须照样出现在列表里,只是边为空;漏掉这行运维就永远看不见这个号"
+        );
+    }
+
+    /// 改**归属**是从边的另一头破坏"一组一 owner":边一条没动,却把边另一端的 owner
+    /// 换了。`upsert_membership` 拦不住这条路径,必须在 `update_account` 里拦。
+    #[test]
+    fn changing_owner_that_would_split_a_group_is_rejected() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // 归属组叫 OWN(而不是复用 G0),这样"共享的成员组"与"归属组"是两个东西,
+        // 测的就是纯粹的成员边冲突。冲突组按组名升序取第一个 → LOW < OWN。
+        for g in ["OWN", "G1", "LOW"] {
+            store.create_group(g, "", "").unwrap();
+        }
+        store.create_account("a", "OWN", "kiro", 2, "{}").unwrap();
+        store.create_account("b", "OWN", "kiro", 2, "{}").unwrap();
+        // a 与 b 同属 LOW,且都归属 OWN —— 合法。
+        store.upsert_membership("a", "LOW", 0).unwrap();
+        store.upsert_membership("b", "LOW", 100).unwrap();
+
+        // 只改 a 的归属、一条边都不动 → 必须被拒,否则 LOW 立刻横跨 OWN/G1 两个 owner。
+        let outcome = store
+            .update_account(
+                "a",
+                &AccountPatch { group_name: Some("G1".into()), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            UpdateAccountOutcome::CrossOwner {
+                group: "LOW".into(),
+                existing: "OWN".into(),
+                incoming: "G1".into(),
+            }
+        );
+        assert_eq!(
+            store.get_account("a").unwrap().unwrap().group_name,
+            "OWN",
+            "被拒的更新绝不能留下痕迹"
+        );
+
+        // 反向断言一:把 a 的共享边全部拆掉之后,改归属就该放行。
+        assert!(store.remove_membership("a", "LOW").unwrap());
+        assert!(store.remove_membership("a", "OWN").unwrap());
+        assert_eq!(
+            store
+                .update_account(
+                    "a",
+                    &AccountPatch { group_name: Some("G1".into()), ..Default::default() }
+                )
+                .unwrap(),
+            UpdateAccountOutcome::Ok
+        );
+
+        // 反向断言二:不碰归属的 patch 不受这条校验影响。
+        assert_eq!(
+            store
+                .update_account("b", &AccountPatch { disabled: Some(true), ..Default::default() })
+                .unwrap(),
+            UpdateAccountOutcome::Ok
+        );
     }
 
     /// worker 只拿**自己名下**账号的边:跨 owner 的号由对应 worker 各自持有,

@@ -16,6 +16,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use gw_core::config::SystemSettings;
 use gw_core::store::{AccountPatch, AccountRow};
+use gw_store::UpdateAccountOutcome;
 use serde::Deserialize;
 
 use super::{internal_error, redact_proxy_url, validate_proxy_url, AdminState};
@@ -214,7 +215,10 @@ fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
 /// 把 AccountRow 转为对外视图:extra 解析成对象并把含 token/secret/password
 /// 的字段脱敏(保尾 4 位)。凭据只进不出——admin 页展示概要即可,完整值
 /// 留在库里供 worker 用。
-fn redacted_view(row: AccountRow) -> serde_json::Value {
+///
+/// `memberships` = 该账号的成员边 `[(组名, 组内优先级)]`,`None` 则不吐 `groups` 字段
+/// (单条增删改的响应不带,前端那边这些 mutation 只做 invalidate、不回写缓存)。
+fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serde_json::Value {
     let extra: serde_json::Value =
         serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
     let extra = match extra {
@@ -262,7 +266,7 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
     // priority 是普通数值、键名不含 token/secret/password/key,不被上面的脱敏改写,读脱敏后的
     // extra 与读原始值等价。
     let priority = extra.get("priority").and_then(|v| v.as_i64()).unwrap_or(100);
-    serde_json::json!({
+    let mut view = serde_json::json!({
         "account_id": row.account_id,
         "group_name": row.group_name,
         "provider": row.provider,
@@ -274,7 +278,17 @@ fn redacted_view(row: AccountRow) -> serde_json::Value {
         // 累计成功/失败请求计数(监控用,非计费)。前端账号页展示"累计成功/失败"列。
         "success_count": row.success_count,
         "failure_count": row.failure_count,
-    })
+    });
+    // 成员边:决定"谁能用这个号 + 在那个组里排第几"。顶层 `priority`(=extra.priority)
+    // 重构后只是导入种子,**调度不读**,别拿它当排序依据。
+    if let Some(memberships) = memberships {
+        let groups: Vec<serde_json::Value> = memberships
+            .iter()
+            .map(|(name, priority)| serde_json::json!({ "name": name, "priority": priority }))
+            .collect();
+        view["groups"] = serde_json::Value::Array(groups);
+    }
+    view
 }
 
 /// 账号的**归属**组必须存在(防"幽灵分组":typo 的组名会让账号不被任何 worker 加载,
@@ -296,8 +310,15 @@ fn require_real_group(st: &AdminState, group: &str) -> Result<(), axum::response
 }
 
 async fn list_accounts(State(st): State<AdminState>) -> axum::response::Response {
-    match st.store.list_accounts() {
-        Ok(rows) => Json(rows.into_iter().map(redacted_view).collect::<Vec<_>>()).into_response(),
+    // 账号与成员边必须同一快照:分两次查会返回"账号已建、边还没有"这种从未存在过的组合
+    // (create_account 是原子建号+建边),而前端拿它当"无分组"告警和差集基线。
+    match st.store.list_accounts_with_memberships() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|(row, edges)| redacted_view(row, Some(&edges)))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -382,7 +403,7 @@ async fn create_account(
         .create_account(&body.account_id, group, provider, conc, &extra_json)
     {
         Ok(true) => match st.store.get_account(&body.account_id) {
-            Ok(Some(row)) => (StatusCode::CREATED, Json(redacted_view(row))).into_response(),
+            Ok(Some(row)) => (StatusCode::CREATED, Json(redacted_view(row, None))).into_response(),
             Ok(None) => internal_error("创建后读取不到账号"),
             Err(e) => internal_error(e),
         },
@@ -686,7 +707,7 @@ async fn oauth_complete(
                 let _ = st.http.post(&url).send().await;
             }
             match st.store.get_account(&pending.account_id) {
-                Ok(Some(row)) => (StatusCode::CREATED, Json(redacted_view(row))).into_response(),
+                Ok(Some(row)) => (StatusCode::CREATED, Json(redacted_view(row, None))).into_response(),
                 Ok(None) => internal_error("上号后读取不到账号"),
                 Err(e) => internal_error(e),
             }
@@ -1119,8 +1140,21 @@ async fn update_account(
             extra,
         };
         match st.store.update_account(&id, &patch) {
-            Ok(true) => {}
-            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Ok(UpdateAccountOutcome::Ok) => {}
+            Ok(UpdateAccountOutcome::NotFound) => {
+                return api_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+            // 改归属会让某个组同时有两个 owner —— 与建边时的 CrossOwner 是同一条不变量,
+            // 只是从边的另一头被破坏。整单拒绝,不做部分应用。
+            Ok(UpdateAccountOutcome::CrossOwner { group, existing, incoming }) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "改归属会让分组 {group} 同时属于两个 owner({existing} 与 {incoming})\
+                         ——组内优先级将不再是全局排序。请先把该号移出 {group},或连同该组其余成员一起迁移。"
+                    ),
+                )
+            }
             Err(e) => return internal_error(e),
         }
     }
@@ -1161,7 +1195,7 @@ async fn update_account(
         poke_workers_sync(&st).await;
     }
     match st.store.get_account(&id) {
-        Ok(Some(row)) => Json(redacted_view(row)).into_response(),
+        Ok(Some(row)) => Json(redacted_view(row, None)).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "账号不存在"),
         Err(e) => internal_error(e),
     }
@@ -1522,6 +1556,47 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.oneshot(r).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 账号列表必须带上**成员边** —— 前端账号页靠它显示"这个号在哪几个组、各排第几",
+    /// 也是编辑弹窗做差集的基线。少了它就回到 2026-07-29 那种局面:号看着可用,
+    /// 实际只挂在一个没有流量的组里,白放一天没人发现。
+    #[tokio::test]
+    async fn list_accounts_carries_memberships_in_stable_order() {
+        let (app, store) = app();
+        for g in ["G0", "ZED", "GLOW"] {
+            store.create_group(g, "", "").unwrap();
+        }
+        store.create_account("kiro-01", "G0", "kiro", 2, "{}").unwrap();
+        // 反字典序写入,证明返回顺序来自排序而非插入顺序。
+        store.upsert_membership("kiro-01", "ZED", 100).unwrap();
+        store.upsert_membership("kiro-01", "GLOW", 0).unwrap();
+
+        let v = json_body(app.clone().oneshot(req("GET", "/accounts", None)).await.unwrap()).await;
+        let row = &v.as_array().unwrap()[0];
+        assert_eq!(
+            row["groups"],
+            serde_json::json!([
+                { "name": "G0", "priority": 100 },
+                { "name": "GLOW", "priority": 0 },
+                { "name": "ZED", "priority": 100 },
+            ]),
+            "组名升序 + 组内优先级逐条对上"
+        );
+
+        // 反向断言:删掉一条边,那个组不得再出现。
+        assert!(store.remove_membership("kiro-01", "GLOW").unwrap());
+        let v = json_body(app.clone().oneshot(req("GET", "/accounts", None)).await.unwrap()).await;
+        let groups = v[0]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(
+            !groups.iter().any(|g| g["name"] == "GLOW"),
+            "已删的成员边不得继续出现在列表里"
+        );
+
+        // 顶层 priority(=extra.priority)仍在,但只是导入种子;它与成员边的优先级
+        // **不是一回事**,前端不得拿它当排序依据。
+        assert_eq!(v[0]["priority"], 100);
     }
 
     #[tokio::test]

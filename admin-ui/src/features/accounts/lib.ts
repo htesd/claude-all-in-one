@@ -1,5 +1,6 @@
 import type {
   AccountDisplayStatus,
+  AccountGroupMembership,
   AccountRow,
   AccountRuntimeEntry,
   AccountRuntimeInstance,
@@ -111,6 +112,30 @@ export function tierToPriority(tier: PriorityTier): number {
 /** 后端数值 → 两档:< 100 视为「高」(兼容历史 0 及任意 < 100 的值),其余「低」。 */
 export function priorityToTier(priority: number): PriorityTier {
   return priority < LOW_PRIORITY ? 'high' : 'low'
+}
+
+/**
+ * 编辑账号时的成员边差集:草稿 vs 后端当前值。
+ *
+ * - `upserts` —— 新增的组,以及**只改了组内优先级**的组(后端 upsert 语义相同,同一个调用)
+ * - `removals` —— 取消勾选的组名
+ *
+ * 两者都为空 = 没动过成员边,调用方**一个请求都不该发**。
+ */
+export interface MembershipDiff {
+  upserts: AccountGroupMembership[]
+  removals: string[]
+}
+
+export function diffMemberships(
+  original: AccountGroupMembership[],
+  draft: AccountGroupMembership[],
+): MembershipDiff {
+  const before = new Map(original.map((m) => [m.name, m.priority]))
+  const upserts = draft.filter((m) => before.get(m.name) !== m.priority)
+  const draftNames = new Set(draft.map((m) => m.name))
+  const removals = original.filter((m) => !draftNames.has(m.name)).map((m) => m.name)
+  return { upserts, removals }
 }
 
 /** 积分展示格式化:整数千分位。允许负值(超额账号的 remaining=已超出多少)。 */

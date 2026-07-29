@@ -448,26 +448,34 @@ export function ImportAccountsDialog({ open, onClose }: ImportAccountsDialogProp
         </div>
       ) : (
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
-          {/* 导入模式切换:KiroManager JSON / 官方 API Key 列表 */}
-          <div className="inline-flex rounded-2xl bg-muted p-1 text-xs font-medium">
-            <button
-              type="button"
-              onClick={() => setMode('json')}
-              className={`rounded-xl px-3 py-1.5 transition-colors ${
-                mode === 'json' ? 'bg-background shadow-sm' : 'text-muted-foreground'
-              }`}
-            >
-              {t('accounts.import.modeJson')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode('apikeys')}
-              className={`rounded-xl px-3 py-1.5 transition-colors ${
-                mode === 'apikeys' ? 'bg-background shadow-sm' : 'text-muted-foreground'
-              }`}
-            >
-              {t('accounts.import.modeApiKeys')}
-            </button>
+          {/* 导入方式:两栏等宽卡片。以前是个灰底小 tab,用户找不到 API Key 这条路,
+              以为压根没实现 —— 入口显眼程度本身就是功能的一部分。 */}
+          <div className="grid grid-cols-2 gap-2">
+            {(
+              [
+                { value: 'json', label: 'modeJson', desc: 'modeJsonDesc' },
+                { value: 'apikeys', label: 'modeApiKeys', desc: 'modeApiKeysDesc' },
+              ] as const
+            ).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setMode(option.value)}
+                aria-pressed={mode === option.value}
+                className={`rounded-2xl border p-3 text-left transition-colors ${
+                  mode === option.value
+                    ? 'border-primary bg-primary/5 ring-1 ring-primary/40'
+                    : 'hover:bg-muted/60'
+                }`}
+              >
+                <span className="block text-sm font-medium">
+                  {t(`accounts.import.${option.label}`)}
+                </span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  {t(`accounts.import.${option.desc}`)}
+                </span>
+              </button>
+            ))}
           </div>
 
           {/* 目标分组 */}
