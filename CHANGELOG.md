@@ -1,5 +1,95 @@
 # Changelog
 
+## [thinking-effort-default] - 2026-07-30
+
+默认思考档位从 `max` 降到 `high`(用户反馈"太慢了"),并把它从编译期常量变成**设置面板
+可热改**的运行期参数。
+
+### Features
+
+- **`DEFAULT_EFFORT`: `max` → `high`**。唯一事实源移到
+  `gw_core::config::DEFAULT_THINKING_EFFORT`,`gw_kiro::anthropic_types::DEFAULT_EFFORT`
+  改为它的别名 —— 该常量同时是配置 schema 的默认值,两处各写一份字面量必然漂移。
+- **新增 `thinking.default_effort` 配置段 + `default_thinking_effort` overlay 字段**,
+  走既有热更新链路:面板改 → DB overlay → worker 30s 轮询 → `apply_hot_settings` →
+  `anthropic_types::set_default_effort`。**改档位无需重启 worker**。
+- **设置页新增「思维链」区块**:five 档 segmented 选择器,每档给出实测的深度/延迟取舍,
+  选中档位的说明实时显示在下方。
+- **`PUT /settings` 校验档位合法性**:非法值 400 并列出可选档位,归一成小写后才落库。
+
+### Design Rationale
+
+**为什么降档**:2026-07-28 的剂量反应实测确认 `effort` 是真正在起作用的旋钮
+(`low` 122 帧 → `xhigh` 644 → `max` 1100,单调无重叠),当时据此把默认提到顶格。
+但深度不是免费的 —— `max` 约 1.7 倍于 `xhigh` 的思考量,就是约 1.7 倍的等待**和输出计费**。
+`high` 的签名加密体是 `xhigh` 的 73%、耗时 95s vs 124s,是折中点,且恰好是上游多数模型
+schema 自己的 `default`。**唯一例外是 opus-4.7**(schema `default` 是 `xhigh`):对它我们
+现在显式发一个比上游默认更低的档,这是本次降档的本意,专门加了一条用例钉住
+(`opus_4_7_default_request_lands_on_policy_default_not_upstream_xhigh`)。
+
+**为什么用进程级全局而非依赖注入**:转换层(`thinking_policy` / `converter`)是一组自由函数,
+`chat_stream` 与 `render_kiro_payload` 都不持有 provider 句柄,把参数一路穿下去要改到
+gw-app 的请求日志路径。这与 `converter/cache_point.rs` 里 `thinking_signature` 等热控开关
+同款,不新造机制。
+
+**为什么归一逻辑要拆出纯函数版**:`normalize_effort` 现在读可热改的全局,拿它做断言等于让
+用例依赖全局当下的值,并发跑的其它用例一改就互相污染。逻辑全部下沉到
+`normalize_effort_with(fallback, raw)`,单测走这个入口;`set_default_effort` 自己的用例
+只验校验语义(成功用例故意设成**当前值**,可观察状态不变),**本 crate 的测试从不把运行期
+默认档改成别的值**。
+
+**校验为什么做两层**:admin `PUT /settings` 挡住接口路径,`set_default_effort` 挡住手改 DB
+绕过接口的路径。这个值会原样进 wire(`additionalModelRequestFields.effort`),脏值换来的是
+上游 400,而且要等下一次真实请求才暴露。
+
+### Fixes(对抗审查,3 个 lens 各自独立提出)
+
+- **档位改成枚举 `ThinkingEffort`,非法值在配置装载边界不可表示**(3/3 lens 一致,Skeptic 判 high)。
+  原先是无校验的 `String`:`system.yaml` 写 `default_effort: hihg` 能解析成功、`GET /settings`
+  照实返回 `hihg`,而数据面消费点拒收并继续用旧值 —— **控制面显示值与实际生效值永久分叉**,
+  面板上五个档位一个都不高亮,运维每 30 秒收一次告警却看不出该改哪。改枚举后 serde 在
+  配置装载与 `PUT /settings` 两处边界直接拒绝,这个状态不可达。新增用例钉住
+  `VALID_EFFORTS` 与 `ThinkingEffort::ALL` 逐项相等(两份档位表只在一处加档 = 面板能选、
+  wire 拒收)。
+- **`system.yaml` 存在却解析失败时拒绝启动**(Skeptic#1,既有缺陷,本次新增的 `thinking` 段
+  给它添了新触发点)。router 与 worker 原先都是 `unwrap_or_default()` / 双 `.ok()`,而各配置段
+  都带 `deny_unknown_fields` —— 一个拼错的字段名会让**整个** `SystemConfig` 静默换成默认值,
+  上游超时、调度参数、缓存计费、实验开关一起被重置,线上只表现为"行为莫名其妙变了"。
+  现在:文件**缺失**仍用默认值(合法形态),**存在却解析不了**当场报错退出。
+  上线前已用生产 `config/system.yaml` 验过能解析(`upstream_timeout_secs=720` 等真实值),
+  四个容器共用这一份、无人覆盖 `--system`。
+- **补齐"热改真的生效"的端到端测试**(3/3 lens 一致)。原先所有新增用例都刻意不改进程级全局
+  (避免污染同进程并发跑的 865 个用例),后果是**把 `set_default_effort` 里的赋值删掉、
+  或让 `normalize_effort` 回头读编译期常量,单测依然全绿而线上"面板改了不生效"**。
+  新增 `crates/gw-kiro/tests/thinking_effort_hot_reload.rs`:集成测试是独立进程,可以放心改
+  全局(文件内用 `SERIAL` 互斥锁串行)。覆盖 `apply_hot_settings → 全局 → wire payload` 全链路、
+  热改后仍走逐模型夹取(4.6 收到 xhigh 回落 high)、无 schema 的模型一个字段都不发、
+  以及客户端显式档位不被默认值压掉。
+- **`normalize_effort_with` 收回私有**(Minimalist#1)。它的 `fallback` 不校验合法性,公开出去
+  等于给外部一条绕过档位白名单、把任意串送上 wire 的路;crate 内唯一调用方喂的是
+  `default_effort()`,恒合法。
+- **前端 patch 不再无条件携带该字段**(Architect#1)。`buildPatch` 原先拿补过默认值的表单值与
+  **原始**响应比,旧后端不返回该字段时 `'high' !== undefined` 恒成立 —— 用户只改代理也会捎带
+  这个字段,被旧后端的 `deny_unknown_fields` 判 400,整个保存失败。现在比较对象与
+  `settingsToForm` 同口径补默认值。
+- **`high` 的说明从「当前默认」改为「出厂默认」**(Skeptic#4)。它现在是可热改参数,
+  管理员存了 `max` 后再看这句会自相矛盾。
+
+不采纳两条:Architect#3 称"多个 worker 各自轮询、旧快照覆盖新快照",但一个进程只跑一个
+worker(`--mode worker --instance N`),进程内只有一个轮询者写这个全局,前提不成立;
+Minimalist#4 嫌本条目的设计辩护冗长,但项目约定要求 changelog 记 Design Rationale。
+
+### Notes & Caveats
+
+- 热应用时**字段缺失 = 不动当前值**,不回落编译期兜底 —— 轮询响应偶发缺字段不该把面板上
+  设的档位悄悄打回出厂值。非法值只告警不生效。
+- 4.5 系与 haiku 上游没有 `additionalModelRequestFieldsSchema`,这个设置对它们**不起作用**
+  (一个字段都不发),UI 文案里已注明。
+- 按 `budget_tokens` 翻译档位的老客户端(opencode 全量、部分 Claude Code)走
+  `budget_to_effort`,**最高只到 `xhigh`**,到不了 `max`,也不受本设置影响。
+- `OutputConfig::effective_effort()` 仍是仅测试可达的死代码(生产无调用点),本次只让它
+  跟随运行期默认值,没有删。
+
 ## [admin-ui-memberships] - 2026-07-29
 
 07-28 上线的「账号-分组多对多」重构后端全套改完了,admin-ui 一直停在旧模型上。

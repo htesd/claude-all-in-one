@@ -140,6 +140,35 @@ async fn put_settings(
             }
             continue;
         }
+        // default_thinking_effort:必须命中上游档位全集。这个值会**原样进 wire**
+        // (`additionalModelRequestFields.effort`),脏值换来的是上游 400 —— 而且要等到下一次
+        // 真实请求才暴露,所以在写库前就挡住。空串=清除回 YAML 默认。
+        if k == "default_thinking_effort" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => match gw_kiro::anthropic_types::normalize_effort(Some(s)) {
+                    // 归一后存标准小写形态(上游只认小写),而不是原样存用户输入。
+                    (canonical, false) => {
+                        overlay_map.insert(k, serde_json::json!(canonical));
+                    }
+                    (_, true) => {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "default_thinking_effort 不是合法档位: {s};可选 {}",
+                                gw_kiro::anthropic_types::VALID_EFFORTS.join(" / ")
+                            ),
+                        )
+                    }
+                },
+                None => {
+                    return api_error(StatusCode::BAD_REQUEST, "default_thinking_effort 须为字符串")
+                }
+            }
+            continue;
+        }
         overlay_map.insert(k, v);
     }
 
@@ -203,6 +232,76 @@ mod tests {
         let v2 = body_json(resp2).await;
         assert_eq!(v2["rate_limit_cooldown_secs"], 600);
         assert_eq!(v2["default_proxy"], "socks5://h:1080");
+    }
+
+    #[tokio::test]
+    async fn get_exposes_default_thinking_effort() {
+        // 前端要靠它渲染当前生效档位;字段一旦漏了,下拉框就没有初值。
+        let (app, _store) = app();
+        let v = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(
+            v["default_thinking_effort"],
+            gw_core::config::DEFAULT_THINKING_EFFORT.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_default_thinking_effort_stores_canonical_lowercase() {
+        let (app, _store) = app();
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"XHigh"}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        // 归一成小写后存 —— 上游只认小写形态,不能原样把用户输入透过去。
+        assert_eq!(v["default_thinking_effort"], "xhigh");
+        let v2 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["default_thinking_effort"], "xhigh", "应持久");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_illegal_thinking_effort() {
+        // 脏档位会原样进 wire 换来上游 400,且要等下一次真实请求才暴露 —— 必须写库前就挡。
+        let (app, _store) = app();
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"ludicrous"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp).await;
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("ludicrous"), "错误里要点名非法值,实际={msg}");
+        assert!(msg.contains("xhigh"), "错误里要列出可选档位,实际={msg}");
+        // 关键:被拒后库里不该留下任何痕迹,仍是基线默认。
+        let v2 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(
+            v2["default_thinking_effort"],
+            gw_core::config::DEFAULT_THINKING_EFFORT.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_empty_thinking_effort_resets_to_baseline() {
+        let (app, _store) = app();
+        app.clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"low"}"#)))
+            .await
+            .unwrap();
+        // 空串 = 清 overlay 回 YAML 基线(与 default_proxy 同口径)。
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"default_thinking_effort":"  "}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            v["default_thinking_effort"],
+            gw_core::config::DEFAULT_THINKING_EFFORT.as_str()
+        );
     }
 
     #[tokio::test]

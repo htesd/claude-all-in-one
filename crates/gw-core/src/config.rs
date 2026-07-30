@@ -175,6 +175,75 @@ pub struct DarioSidecarConfig {
     pub api_key: String,
 }
 
+/// 思考强度档位。**闭集,由低到高**,序列化为小写串(与上游 enum 逐字一致)。
+///
+/// 为什么是枚举而不是 `String`:这个值会**原样进 wire**
+/// (`additionalModelRequestFields.effort`),上游只认这五个串。做成 `String` 时非法值在
+/// 每一层都是可表示的 —— 对抗审查三个 lens 同时指出后果:`system.yaml` 里写
+/// `default_effort: hihg` 能解析成功、`GET /settings` 照实返回 `hihg`,而数据面的消费点拒收
+/// 并继续用旧值,于是**控制面显示值与实际生效值永久分叉**,面板上五个档位一个都不高亮,
+/// 运维每 30 秒收到一次告警却看不出该改哪里。改成枚举后 serde 在配置装载与
+/// `PUT /settings` 两处的边界上直接拒绝非法值,这个分叉状态不可达。
+///
+/// 档位**全集**在这里;"某个模型有没有这一档"是另一件事,见
+/// `gw_kiro::converter::clamp_effort_for_model`(4.6 系没有 `xhigh`,4.5 系与 haiku 一档都没有)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ThinkingEffort {
+    /// 由低到高的全集。`gw_kiro::anthropic_types::VALID_EFFORTS` 有一条用例钉住两者逐项相等。
+    pub const ALL: [ThinkingEffort; 5] = [
+        ThinkingEffort::Low,
+        ThinkingEffort::Medium,
+        ThinkingEffort::High,
+        ThinkingEffort::Xhigh,
+        ThinkingEffort::Max,
+    ];
+
+    /// wire 形态(小写)。`const` 以便在 const 上下文里取 [`DEFAULT_THINKING_EFFORT`] 的串。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ThinkingEffort::Low => "low",
+            ThinkingEffort::Medium => "medium",
+            ThinkingEffort::High => "high",
+            ThinkingEffort::Xhigh => "xhigh",
+            ThinkingEffort::Max => "max",
+        }
+    }
+}
+
+/// 客户端**未指定** effort 时发给上游的默认思考档位。
+///
+/// **这里是唯一事实源** —— `gw_kiro::anthropic_types::DEFAULT_EFFORT` 是对它的别名。
+/// 放在 gw-core 是因为它同时是**配置 schema 的默认值**([`ThinkingConfig`])和 adapter 的
+/// 兜底档位;两处各写一份必然漂移。
+///
+/// 深度与延迟的取舍依据见 `gw_kiro::anthropic_types::DEFAULT_EFFORT` 的文档表格。
+pub const DEFAULT_THINKING_EFFORT: ThinkingEffort = ThinkingEffort::High;
+
+/// thinking(思维链)策略参数。可经设置面板热控(worker 30s 轮询生效)。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThinkingConfig {
+    /// 客户端未带 `output_config.effort` 时用哪个档位。见 [`DEFAULT_THINKING_EFFORT`]。
+    ///
+    /// 只影响**没说话**的客户端:显式点了档位的请求原样透传(非法值除外)。
+    pub default_effort: ThinkingEffort,
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self { default_effort: DEFAULT_THINKING_EFFORT }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
@@ -187,6 +256,9 @@ pub struct SystemConfig {
     pub image: ImageConfig,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
+    /// thinking(思维链)策略。见 [`ThinkingConfig`]。
+    #[serde(default)]
+    pub thinking: ThinkingConfig,
     /// 上游流式请求总超时(秒)。详见 [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]。
     /// `#[derive(Default)]` 会给 0——build_client 内把 0 视为未设回落默认,故 0 安全。
     #[serde(default = "default_upstream_timeout_secs")]
@@ -556,6 +628,11 @@ pub struct SystemSettings {
     /// 做服务端 prompt 缓存、真实命中 82-92% 省积分)。None=用基线默认。见 [`ExperimentalConfig::q_endpoint`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q_endpoint: Option<bool>,
+    // —— thinking ——
+    /// 客户端未指定 effort 时的默认思考档位。None = 用基线默认([`DEFAULT_THINKING_EFFORT`])。
+    /// 类型是枚举,所以 `PUT /settings` 那步 `from_value::<SystemSettings>` 就会拒掉非法档位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thinking_effort: Option<ThinkingEffort>,
 }
 
 impl SystemSettings {
@@ -585,6 +662,7 @@ impl SystemSettings {
         if let Some(v) = self.agent_continuation { base.experimental.agent_continuation = v; }
         if let Some(v) = self.thinking_signature { base.experimental.thinking_signature = v; }
         if let Some(v) = self.q_endpoint { base.experimental.q_endpoint = v; }
+        if let Some(v) = self.default_thinking_effort { base.thinking.default_effort = v; }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -619,6 +697,7 @@ impl SystemSettings {
             agent_continuation: Some(cfg.experimental.agent_continuation),
             thinking_signature: Some(cfg.experimental.thinking_signature),
             q_endpoint: Some(cfg.experimental.q_endpoint),
+            default_thinking_effort: Some(cfg.thinking.default_effort),
         }
     }
 }
@@ -829,6 +908,86 @@ workers:
         let s_off = SystemSettings { thinking_signature: Some(false), ..Default::default() };
         s_off.apply_to(&mut base);
         assert!(!base.experimental.thinking_signature, "Some(false) 应关掉 thinking 签名");
+    }
+
+    #[test]
+    fn thinking_default_effort_baseline_is_the_shared_constant() {
+        // 基线默认必须来自 DEFAULT_THINKING_EFFORT —— gw-kiro 的 DEFAULT_EFFORT 是它的别名,
+        // 两处若各写一份字面量,改了一处就会静默漂移。
+        assert_eq!(SystemConfig::default().thinking.default_effort, DEFAULT_THINKING_EFFORT);
+        assert_eq!(ThinkingConfig::default().default_effort, DEFAULT_THINKING_EFFORT);
+        assert_eq!(DEFAULT_THINKING_EFFORT.as_str(), "high");
+    }
+
+    #[test]
+    fn yaml_without_thinking_section_gets_the_default_effort() {
+        // 老的 system.yaml 没有 thinking 段 —— 必须回落默认而不是空串(空串会让 adapter
+        // 拿到一个非法档位)。
+        let cfg: SystemConfig = serde_yaml::from_str("upstream_timeout_secs: 900\n").unwrap();
+        assert_eq!(cfg.thinking.default_effort, DEFAULT_THINKING_EFFORT);
+    }
+
+    #[test]
+    fn thinking_section_unknown_field_is_rejected() {
+        // deny_unknown_fields:yaml 里拼错字段名要当场报错,而不是静默用默认档位。
+        let r = serde_yaml::from_str::<SystemConfig>("thinking:\n  defualt_effort: max\n");
+        assert!(r.is_err(), "拼错的 thinking 子字段必须被拒绝");
+    }
+
+    /// 对抗审查(三个 lens 一致)的根因修复:非法档位必须在**配置装载边界**就不可表示,
+    /// 否则控制面显示值与数据面生效值会永久分叉。
+    #[test]
+    fn illegal_effort_in_yaml_is_rejected_at_load_time() {
+        for bad in ["ultra", "hihg", "HIGH", "", "9"] {
+            let r = serde_yaml::from_str::<SystemConfig>(&format!(
+                "thinking:\n  default_effort: \"{bad}\"\n"
+            ));
+            assert!(r.is_err(), "非法档位 {bad:?} 必须在装载时被拒,而不是留到消费点");
+        }
+        // 五个合法档位都要能装载(别把枚举拼错了)。
+        for good in ThinkingEffort::ALL {
+            let cfg: SystemConfig = serde_yaml::from_str(&format!(
+                "thinking:\n  default_effort: {}\n",
+                good.as_str()
+            ))
+            .unwrap_or_else(|e| panic!("合法档位 {} 应能装载: {e}", good.as_str()));
+            assert_eq!(cfg.thinking.default_effort, good);
+        }
+    }
+
+    #[test]
+    fn effort_serializes_to_lowercase_wire_form() {
+        // 序列化形态即 wire 形态,上游只认小写。前端也按这个串比对/高亮。
+        assert_eq!(serde_json::to_string(&ThinkingEffort::Xhigh).unwrap(), "\"xhigh\"");
+        for e in ThinkingEffort::ALL {
+            assert_eq!(serde_json::to_string(&e).unwrap(), format!("\"{}\"", e.as_str()));
+        }
+    }
+
+    #[test]
+    fn settings_default_thinking_effort_apply_to_overrides_and_preserves() {
+        let mut base = SystemConfig::default();
+        SystemSettings::default().apply_to(&mut base);
+        assert_eq!(
+            base.thinking.default_effort, DEFAULT_THINKING_EFFORT,
+            "None 时应保留基线默认(不覆盖)"
+        );
+        let s = SystemSettings {
+            default_thinking_effort: Some(ThinkingEffort::Xhigh),
+            ..Default::default()
+        };
+        s.apply_to(&mut base);
+        assert_eq!(base.thinking.default_effort, ThinkingEffort::Xhigh, "Some 应覆盖基线");
+    }
+
+    #[test]
+    fn from_effective_carries_default_thinking_effort() {
+        // from_effective 必须回灌该字段:否则 GET /settings 拿不到当前生效档位,
+        // 且 worker 30s 轮询会因字段缺失而丢掉这个设置(轮询走的是同一个 from_effective)。
+        let mut cfg = SystemConfig::default();
+        cfg.thinking.default_effort = ThinkingEffort::Medium;
+        let full = SystemSettings::from_effective(&cfg, None);
+        assert_eq!(full.default_thinking_effort, Some(ThinkingEffort::Medium));
     }
 
     #[test]

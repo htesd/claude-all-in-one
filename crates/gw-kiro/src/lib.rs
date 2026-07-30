@@ -452,6 +452,21 @@ impl Provider for KiroProvider {
                 q_endpoint,
             );
         }
+
+        // 默认思考档位(客户端没指定 effort 时用哪档)。字段缺失 = 不动当前值,**不**回落编译期
+        // 兜底:轮询响应偶发缺字段时不该把用户在面板上设的档位悄悄打回出厂值。
+        // 非法值只告警不生效(手改 DB 可以绕过 admin 的校验,脏档位打到上游是 400)。
+        if let Some(raw) = settings.get("default_thinking_effort").and_then(|v| v.as_str()) {
+            match crate::anthropic_types::set_default_effort(raw) {
+                Some(applied) => tracing::debug!(effort = %applied, "默认思考档位已热应用"),
+                None => tracing::warn!(
+                    raw = %raw,
+                    valid = ?crate::anthropic_types::VALID_EFFORTS,
+                    current = %crate::anthropic_types::default_effort(),
+                    "settings 里的 default_thinking_effort 不是合法档位，已忽略"
+                ),
+            }
+        }
     }
 
     /// 订阅能力过滤(对齐 kiro.rs `supports_opus`,credentials.rs:256):

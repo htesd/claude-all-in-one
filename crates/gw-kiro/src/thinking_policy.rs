@@ -15,7 +15,7 @@
 //! 导致 4.7/4.8 带后缀也退化 enabled、effort 传不进、不带后缀完全无思维链。改为"Opus 系列
 //! 默认 adaptive"避免逐版本硬编码过时,也省去客户端配后缀。
 
-use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking, DEFAULT_EFFORT};
+use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking};
 
 const DEFAULT_THINKING_BUDGET: i32 = 20000;
 
@@ -228,7 +228,7 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
         if req.thinking.is_some() {
             return;
         }
-        // effort 客户端传入优先,缺省 xhigh(顶格档)。
+        // effort 客户端传入优先,缺省 [`DEFAULT_EFFORT`](2026-07-30 起 = `high`,为了延迟)。
         //
         // ⚠️ 旧注释说「high 仅产桩推理」——**这是错的**,2026-07-28 实测已推翻:同一道
         // 证明题下 high 的签名加密体(真 CoT 载体)15940 字节、耗时 95s,是 xhigh
@@ -242,7 +242,7 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
             .output_config
             .as_ref()
             .and_then(|c| c.effort.clone())
-            .unwrap_or_else(|| DEFAULT_EFFORT.to_string());
+            .unwrap_or_else(|| crate::anthropic_types::default_effort().to_string());
 
         tracing::info!(
             model = %req.model,
@@ -278,7 +278,8 @@ pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic_types::OutputFormat;
+    // DEFAULT_EFFORT 只有测试用得到(热路径读的是可热改的 `default_effort()`)。
+    use crate::anthropic_types::{OutputFormat, DEFAULT_EFFORT};
 
     fn req(model: &str, thinking: Option<Thinking>, oc: Option<OutputConfig>) -> MessagesRequest {
         MessagesRequest {
@@ -297,15 +298,16 @@ mod tests {
     }
 
     #[test]
-    fn opus_defaults_to_adaptive_top_tier_without_suffix() {
+    fn opus_defaults_to_adaptive_with_policy_default_effort_without_suffix() {
         let mut r = req("claude-opus-4-8", None, None);
         override_thinking_from_model_name(&mut r);
         let t = r.thinking.expect("opus 应默认开 thinking");
         assert_eq!(t.thinking_type, "adaptive");
-        // 缺省 effort = 顶格 `max`。2026-07-28 剂量反应实测 max 比 xhigh 还多约 1.7 倍
-        // 思考量,且 max 走的是真客户端也在用的合规通道(见 DEFAULT_EFFORT 文档)。
         assert_eq!(r.output_config.unwrap().effort.as_deref(), Some(DEFAULT_EFFORT));
-        assert_eq!(DEFAULT_EFFORT, "max", "默认档若被改动,这里要连同上面的实测依据一起重估");
+        // 钉住具体档位:改默认档要连同 DEFAULT_EFFORT 文档里的耗时/深度实测一起重估。
+        // 2026-07-30 从 max 降到 high 是**为了延迟**(max 约 1.7 倍于 xhigh 的思考量),
+        // 不是因为 max 有问题 —— 客户端显式要 max 仍然原样上 wire。
+        assert_eq!(DEFAULT_EFFORT, "high", "默认档若被改动,这里要连同实测依据一起重估");
     }
 
     #[test]
@@ -327,12 +329,27 @@ mod tests {
     }
 
     #[test]
-    fn opus_with_output_config_but_no_effort_defaults_to_top_tier() {
-        // 客户端带 output_config 但 effort 缺省(None)→ 回退 caio 策略默认(顶格)。
+    fn opus_with_output_config_but_no_effort_falls_back_to_policy_default() {
+        // 客户端带 output_config 但 effort 缺省(None)→ 回退 caio 策略默认。
         let oc = OutputConfig { effort: None, format: None };
         let mut r = req("claude-opus-4-8", None, Some(oc));
         override_thinking_from_model_name(&mut r);
         assert_eq!(r.output_config.unwrap().effort.as_deref(), Some(DEFAULT_EFFORT));
+    }
+
+    /// opus-4.7 是全表**唯一** schema `default` 为 `xhigh` 的模型,所以它是策略默认与上游
+    /// 默认唯一分叉的地方:客户端不说话时我们要发比上游默认**更低**的 `high`。
+    /// 这条是 2026-07-30 降档的核心诉求,别让哪次"回落到该模型 default"的重构把它吃掉。
+    #[test]
+    fn opus_4_7_default_request_lands_on_policy_default_not_upstream_xhigh() {
+        let mut r = req("claude-opus-4-7", None, None);
+        override_thinking_from_model_name(&mut r);
+        let v = additional_model_request_fields(&r).expect("4.7 有 effort schema,该字段必须发出");
+        assert_eq!(v["output_config"]["effort"], DEFAULT_EFFORT, "实际={v}");
+        assert_ne!(
+            v["output_config"]["effort"], "xhigh",
+            "4.7 的上游 schema default 是 xhigh,策略默认必须压过它,实际={v}"
+        );
     }
 
     #[test]
@@ -559,11 +576,14 @@ mod tests {
         override_thinking_from_model_name(&mut r2);
         let v2 = additional_model_request_fields(&r2).unwrap();
         assert_eq!(v2["output_config"]["effort"], "xhigh", "4.8 有 xhigh，不该被夹,实际={v2}");
-        // 默认路径:4.6 也有 max,所以策略默认能原样落地,不触发回落。
+        // 默认路径:策略默认档在 4.6 的 4 档表里也存在,能原样落地、不触发回落。
+        // (注:默认档 = high 时它恰好也是 4.6 schema 的 default,这条区分不出"策略默认落地"
+        //  与"回落到模型默认";真正区分二者的是 opus-4.7 那条用例 ——
+        //  `opus_4_7_default_request_lands_on_policy_default_not_upstream_xhigh`。)
         let mut r3 = req_mt("claude-opus-4-6", None, 32000);
         override_thinking_from_model_name(&mut r3);
         let v3 = additional_model_request_fields(&r3).unwrap();
-        assert_eq!(v3["output_config"]["effort"], "max", "默认顶格档在 4.6 上也成立,实际={v3}");
+        assert_eq!(v3["output_config"]["effort"], DEFAULT_EFFORT, "默认档在 4.6 上也成立,实际={v3}");
     }
 
     #[test]

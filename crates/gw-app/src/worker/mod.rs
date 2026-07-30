@@ -697,7 +697,23 @@ pub async fn run(
             None
         }
     };
-    let system: SystemConfig = load_yaml(system_path).unwrap_or_default();
+    // system.yaml **缺失**是合法形态(全用默认值);但**存在却解析不了**必须当场拒绝启动。
+    //
+    // 原先一律 `unwrap_or_default()`:各配置段都带 `deny_unknown_fields`,所以一个拼错的字段名
+    // 会让**整个** SystemConfig 静默换成默认值 —— 上游超时、调度参数、缓存计费、图像压缩、
+    // 实验开关一起被重置,而线上只表现为"行为莫名其妙变了",日志里连一行指向配置的线索都没有。
+    // 对抗审查 Skeptic#1 指出这条,新增 thinking 段又给它添了一个新触发点。
+    let system: SystemConfig = if system_path.exists() {
+        load_yaml(system_path).map_err(|e| {
+            anyhow::anyhow!(
+                "{} 解析失败,拒绝以默认配置启动(默认值会静默重置超时/调度/缓存/实验开关): {e}",
+                system_path.display()
+            )
+        })?
+    } else {
+        tracing::info!("{} 不存在,SystemConfig 全用默认值", system_path.display());
+        SystemConfig::default()
+    };
 
     let wcfg = instances
         .worker(instance)
