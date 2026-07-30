@@ -224,10 +224,21 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
         serde_yaml::from_str(&text)?
     };
     instances.validate()?; // 拓扑约束:同组多 worker 等违规直接拒绝启动。
-    let system: SystemConfig = std::fs::read_to_string(system_path)
-        .ok()
-        .and_then(|t| serde_yaml::from_str(&t).ok())
-        .unwrap_or_default();
+    // 与 worker 同口径:文件缺失 = 用默认值;存在却解析不了 = 拒绝启动。
+    // 原先两个 `.ok()` 把「文件读不到」和「YAML 有语法/字段错」压成同一件事,后者静默回落默认值,
+    // 于是 router 会带着一套跟 system.yaml 完全无关的配置跑起来(对抗审查 Skeptic#1)。
+    let system: SystemConfig = match std::fs::read_to_string(system_path) {
+        Ok(text) => serde_yaml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "{} 解析失败,拒绝以默认配置启动(默认值会静默重置超时/请求体上限等): {e}",
+                system_path.display()
+            )
+        })?,
+        Err(e) => {
+            tracing::info!("{} 读取不到({e}),SystemConfig 全用默认值", system_path.display());
+            SystemConfig::default()
+        }
+    };
 
     // 数据面 worker 列表 = 跨所有 `instances*.yaml` 聚合(含各自 account_group),
     // 而非仅本 router 自己那批 —— 这样单一入口(38991)即可按 key 的分组派发到对应

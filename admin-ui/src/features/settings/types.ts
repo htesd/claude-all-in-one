@@ -54,7 +54,15 @@ export interface SystemSettings {
   /** 主推理上游端点：false=runtime.kiro.dev（默认/现状），true=q.amazonaws.com（kiro.rs 端点，做服务端
    *  prompt 缓存、真实命中 82-92% 省积分；runtime.kiro.dev 端点实测真实缓存 0%、计费 ~2x）。默认关。 */
   q_endpoint: boolean
+  /** 客户端**未指定** effort 时的默认思考档位。只影响没说话的客户端——显式点了档位的请求原样透传。
+   *  档位越高思考越深也越慢：实测 max 的思考量约为 xhigh 的 1.7 倍。默认 high。 */
+  default_thinking_effort: ThinkingEffort
 }
+
+/** 上游 effort 档位全集（由低到高）。与后端 `VALID_EFFORTS` 一致。 */
+export const THINKING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+
+export type ThinkingEffort = (typeof THINKING_EFFORTS)[number]
 
 /**
  * PUT /admin/api/settings 请求体（局部覆写）。

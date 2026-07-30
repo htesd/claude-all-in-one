@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 // === 错误响应 ===
 
@@ -154,26 +155,76 @@ impl OutputConfig {
     }
 }
 
-/// 客户端完全未带 output_config 时的默认思考强度 —— **顶格**。
+/// 默认思考强度的**编译期兜底**。运行期实际用的是 [`default_effort()`](fn@default_effort)
+/// (可经设置面板热改),本常量只是它的初值与锁中毒/脏值时的回退。
 ///
-/// 2026-07-28 隔离栈剂量反应实测(claude-opus-5,同一道证明题,只发新字段、不带旧标签,
-/// 数 SSE `thinking_delta` 帧):
-/// | effort | 帧数 | 均值 |
-/// |---|---|---|
-/// | `low`   | 123, 121        | 122  |
-/// | `xhigh` | 894, 509, 529   | 644  |
-/// | `max`   | 1345, 855       | 1100 |
-/// 单调、无重叠 —— `additionalModelRequestFields.effort` 是**真正在起作用的旋钮**,
-/// 且 `max` 比 `xhigh` 还多出约 1.7 倍思考量。
+/// 定义在 `gw_core::config::DEFAULT_THINKING_EFFORT`,这里只是别名 —— 它同时是配置 schema
+/// 的默认值,两处各写一份字面量必然漂移。
 ///
-/// 从 `xhigh` 提到 `max` 是**合规**的加深途径:`max` 就在上游 enum 里、真客户端也发得出,
-/// 不像正文里塞 `<thinking_effort>` 标签那样制造真客户端不会有的指纹。
+/// **2026-07-30 由 `max` 降到 `high`,原因是延迟 —— 用户反馈"太慢了"。**
+/// 深度不是免费的,同一道证明题下的实测(claude-opus-5,只发新字段、不带旧标签):
+/// | effort | `thinking_delta` 帧数 | 签名加密体 | 端到端耗时 |
+/// |---|---|---|---|
+/// | `low`   | 122(123, 121)      | 10744 B | —    |
+/// | `high`  | —                   | 15940 B | 95s  |
+/// | `xhigh` | 644(894, 509, 529) | 21984 B | 124s |
+/// | `max`   | 1100(1345, 855)    | —       | —    |
+/// 帧数与签名长度都随档位单调,`additionalModelRequestFields.effort` 是**真正在起作用的
+/// 旋钮**;但反过来说 `max` 那约 1.7 倍于 `xhigh` 的思考量,也就是约 1.7 倍的等待与输出计费。
+/// `high` 的加密体是 `xhigh` 的 73%、耗时 95s vs 124s,是深度/延迟的折中点。
 ///
-/// 注意这是 caio 的**策略默认**(客户端没说话时用什么),与"客户端给了脏值时回落到该模型
-/// schema 的 `default`"是两件事 —— 后者见 `thinking_policy::EffortWish::ModelDefault`。
-/// 也注意档位还要过 `clamp_effort_for_model` 按模型夹一次;`max` 在所有带 schema 的模型
-/// 上都存在(含没有 `xhigh` 的 4.6 系),所以这个默认值对全系模型都能原样落地。
-pub const DEFAULT_EFFORT: &str = "max";
+/// ⚠️ **`high` 不是"桩推理"**。旧注释曾断言 high 只产桩,2026-07-28 实测已推翻(见上表)。
+/// 也别拿**可见** thinking 文本长度判断深度:同批实测里 high 的可见摘要只有 1579 字符
+/// (全场最短),而它的加密体反而比 low 大 48%。要看深度就看签名长度和耗时。
+///
+/// 这个值只在**客户端没说话**时用。显式点了 `max` 的请求照原样上 wire、不降级
+/// (见 `thinking_policy` 的 `client_max_effort_reaches_the_wire_undowngraded`)。
+///
+/// 注意这是 caio 的**策略默认**,与"客户端给了脏值时回落到该模型 schema 的 `default`"
+/// 是两件事 —— 后者见 `thinking_policy::EffortWish::ModelDefault`。
+///
+/// 档位还要过 `clamp_effort_for_model` 按模型夹一次。`high` 在**所有**带 schema 的模型上
+/// 都存在(含没有 `xhigh` 的 4.6 系),所以对全系都能原样落地;且它正好等于除 4.7 以外
+/// 所有模型 schema 里的 `default`。**唯一的例外是 opus-4.7**(schema `default` 是 `xhigh`):
+/// 对它我们现在会显式发一个比上游默认**更低**的档 —— 这是本次降档的本意,不是 bug。
+pub const DEFAULT_EFFORT: &str = gw_core::config::DEFAULT_THINKING_EFFORT.as_str();
+
+/// 运行期默认档位。设置面板改 → DB overlay → worker 30s 轮询 →
+/// [`crate::KiroProvider::apply_hot_settings`] → [`set_default_effort`],**无需重启**。
+///
+/// 与 `converter/cache_point.rs` 的实验开关同款进程级全局。为什么不用依赖注入:转换层
+/// (`thinking_policy` / `converter`)是一组自由函数,`chat_stream` 与 `render_kiro_payload`
+/// 都不持有 provider 句柄,把参数一路穿下去要改到 gw-app 的请求日志路径。
+fn runtime_default_effort() -> &'static RwLock<&'static str> {
+    static G: OnceLock<RwLock<&'static str>> = OnceLock::new();
+    G.get_or_init(|| RwLock::new(canonical_effort(DEFAULT_EFFORT).unwrap_or("high")))
+}
+
+/// 在 [`VALID_EFFORTS`] 里找与 `s` 等价(大小写不敏感)的**静态**串。
+/// 不读全局,故可安全用于 [`runtime_default_effort`] 的初始化。
+fn canonical_effort(s: &str) -> Option<&'static str> {
+    VALID_EFFORTS.iter().copied().find(|v| v.eq_ignore_ascii_case(s))
+}
+
+/// 当前生效的默认档位。锁中毒时回退编译期 [`DEFAULT_EFFORT`](保守:维持出厂行为)。
+pub fn default_effort() -> &'static str {
+    runtime_default_effort()
+        .read()
+        .map(|g| *g)
+        .unwrap_or(DEFAULT_EFFORT)
+}
+
+/// 热改默认档位。返回归一后的档位;`raw` 不是合法档位时返回 `None` 且**不改动**当前值。
+///
+/// 校验放在这里是因为 DB overlay 可以被手工改(绕过 admin 的 `PUT /settings` 校验),
+/// 一个脏档位打到上游会换来 400。调用方据 `None` 决定告警。
+pub fn set_default_effort(raw: &str) -> Option<&'static str> {
+    let canonical = canonical_effort(raw.trim())?;
+    if let Ok(mut g) = runtime_default_effort().write() {
+        *g = canonical;
+    }
+    Some(canonical)
+}
 
 /// Kiro 支持的 thinking effort 档位**全集**,由低到高。客户端传入须命中其一(大小写不敏感)
 /// 才透传上游;非空但非法的值会被回退到 [`DEFAULT_EFFORT`],避免脏 effort 串打到 Kiro 触发 400。
@@ -189,22 +240,34 @@ pub const DEFAULT_EFFORT: &str = "max";
 pub const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// 归一客户端 effort 到合法档位。返回 `(归一后的 &'static str, 是否因非法而回退)`:
-/// - `None` / 纯空白:未指定 → `(DEFAULT_EFFORT, false)`(默认,非告警情形);
+/// - `None` / 纯空白:未指定 → `(当前默认档, false)`(默认,非告警情形);
 /// - 命中 [`VALID_EFFORTS`](大小写不敏感):`(该档, false)`;
-/// - 非空且不命中:`(DEFAULT_EFFORT, true)`(调用方据 bool 决定是否告警)。
+/// - 非空且不命中:`(当前默认档, true)`(调用方据 bool 决定是否告警)。
 ///
+/// "当前默认档"取 [`default_effort()`](fn@default_effort)(设置面板可热改),不是编译期常量。
 /// 只管"是不是合法档位",**不管该模型有没有这一档** —— 后者见 `model_effort_levels`。
 pub fn normalize_effort(raw: Option<&str>) -> (&'static str, bool) {
+    normalize_effort_with(default_effort(), raw)
+}
+
+/// [`normalize_effort`] 的**纯函数**版:显式给定"未指定/非法时用哪档",不读全局。
+///
+/// 归一逻辑全在这里,本模块单测走这个入口 —— 否则测试要改进程级全局,与并发跑的其它用例
+/// 互相污染。"热改真的生效"由 `tests/thinking_effort_hot_reload.rs` 覆盖(独立进程,
+/// 可以放心改全局)。
+///
+/// **故意保持私有**:`fallback` 不校验合法性,公开出去等于给外部一条绕过档位白名单、
+/// 把任意串送上 wire 的路(对抗审查 Minimalist#1)。crate 内的唯一调用方是
+/// [`normalize_effort`],它喂进来的是 [`default_effort()`](fn@default_effort),恒为合法档位。
+fn normalize_effort_with(fallback: &'static str, raw: Option<&str>) -> (&'static str, bool) {
     let s = match raw.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s,
-        None => return (DEFAULT_EFFORT, false),
+        None => return (fallback, false),
     };
-    for v in VALID_EFFORTS {
-        if v.eq_ignore_ascii_case(s) {
-            return (*v, false);
-        }
+    match canonical_effort(s) {
+        Some(hit) => (hit, false),
+        None => (fallback, true),
     }
-    (DEFAULT_EFFORT, true)
 }
 
 /// Claude Code 请求中的 metadata
@@ -411,16 +474,22 @@ pub struct CountTokensResponse {
 mod effort_tests {
     use super::*;
 
+    /// 回退档位一律走**纯函数**入口断言。`normalize_effort` 读的是可热改的进程级全局,
+    /// 拿它断言等于让用例依赖全局当下的值 —— 并发跑的其它用例一改就互相污染。
+    const FB: &str = "high";
+
     #[test]
     fn none_is_default_no_fallback_flag() {
+        assert_eq!(normalize_effort_with(FB, None), (FB, false));
+        // 未被热改时,读全局的入口与编译期兜底一致。
         assert_eq!(normalize_effort(None), (DEFAULT_EFFORT, false));
     }
 
     #[test]
     fn blank_is_default_no_fallback_flag() {
-        // 纯空白视为未指定:默认 xhigh,不算"非法回退"(不告警)。
-        assert_eq!(normalize_effort(Some("")), (DEFAULT_EFFORT, false));
-        assert_eq!(normalize_effort(Some("   ")), (DEFAULT_EFFORT, false));
+        // 纯空白视为未指定:用默认档,不算"非法回退"(不告警)。
+        assert_eq!(normalize_effort_with(FB, Some("")), (FB, false));
+        assert_eq!(normalize_effort_with(FB, Some("   ")), (FB, false));
     }
 
     #[test]
@@ -454,17 +523,69 @@ mod effort_tests {
 
     #[test]
     fn illegal_value_falls_back_with_flag() {
-        // 非空但不在白名单 → 回退 xhigh 且标记 true(调用方据此告警)。
-        assert_eq!(normalize_effort(Some("ultra")), (DEFAULT_EFFORT, true));
-        assert_eq!(normalize_effort(Some("999")), (DEFAULT_EFFORT, true));
-        assert_eq!(normalize_effort(Some("high; drop")), (DEFAULT_EFFORT, true));
+        // 非空但不在白名单 → 回退默认档且标记 true(调用方据此告警)。
+        assert_eq!(normalize_effort_with(FB, Some("ultra")), (FB, true));
+        assert_eq!(normalize_effort_with(FB, Some("999")), (FB, true));
+        assert_eq!(normalize_effort_with(FB, Some("high; drop")), (FB, true));
     }
 
     #[test]
     fn effective_effort_delegates_to_normalize() {
         let oc = OutputConfig { effort: Some("garbage".to_string()), format: None };
-        assert_eq!(oc.effective_effort(), DEFAULT_EFFORT);
+        assert_eq!(oc.effective_effort(), default_effort(), "脏值回退当前默认档");
         let oc2 = OutputConfig { effort: Some("low".to_string()), format: None };
         assert_eq!(oc2.effective_effort(), "low");
+    }
+
+    /// 编译期兜底必须与 gw-core 的配置默认值是**同一个**值(前者是后者的别名)。
+    /// 若哪天有人在 gw-kiro 这边写回字面量,这条会立刻挂。
+    #[test]
+    fn compile_time_fallback_is_the_gw_core_constant() {
+        assert_eq!(DEFAULT_EFFORT, gw_core::config::DEFAULT_THINKING_EFFORT.as_str());
+        assert!(
+            canonical_effort(DEFAULT_EFFORT).is_some(),
+            "兜底档位本身必须是合法档位,否则出厂就会发一个上游不认的值"
+        );
+    }
+
+    /// 档位表有两份:本 crate 的 `VALID_EFFORTS`(热路径要 `&'static str`,还要做逐模型夹取)
+    /// 与 gw-core 的 `ThinkingEffort`(配置 schema 的边界校验)。**必须逐项相等** ——
+    /// 只在一处加档位,会变成"面板能选、wire 拒收"或反过来。
+    #[test]
+    fn valid_efforts_matches_gw_core_enum_item_by_item() {
+        let from_enum: Vec<&str> = gw_core::config::ThinkingEffort::ALL
+            .iter()
+            .map(|e| e.as_str())
+            .collect();
+        assert_eq!(
+            VALID_EFFORTS, from_enum.as_slice(),
+            "两份档位表漂了:VALID_EFFORTS={VALID_EFFORTS:?} vs ThinkingEffort::ALL={from_enum:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_effort_maps_to_static_table_entries() {
+        assert_eq!(canonical_effort("max"), Some("max"));
+        assert_eq!(canonical_effort("MAX"), Some("max"), "大小写不敏感");
+        assert_eq!(canonical_effort("XHigh"), Some("xhigh"));
+        assert_eq!(canonical_effort("ultra"), None);
+        assert_eq!(canonical_effort(""), None);
+    }
+
+    /// 热改入口的**校验**语义。故意只用"当前值"做成功用例 —— 真把全局改成别的值会污染
+    /// 并发跑的其它用例(见 [`normalize_effort_with`] 的注释)。
+    #[test]
+    fn set_default_effort_validates_and_leaves_value_untouched_on_garbage() {
+        let before = default_effort();
+
+        // 合法输入:返回归一后的静态串,并落到全局(这里设成当前值,可观察状态不变)。
+        assert_eq!(set_default_effort(before), Some(before));
+        assert_eq!(default_effort(), before);
+
+        // 非法输入:返回 None 且**不得**改动当前值 —— 手改 DB 塞脏档位时的兜底。
+        assert_eq!(set_default_effort("ludicrous"), None);
+        assert_eq!(set_default_effort(""), None);
+        assert_eq!(set_default_effort("   "), None);
+        assert_eq!(default_effort(), before, "非法输入不该动全局");
     }
 }

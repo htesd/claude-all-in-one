@@ -5,7 +5,8 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ErrorNote } from '@/components/ui/error-note'
 import { useSettings, useUpdateSettings } from '@/features/settings/hooks'
-import type { SystemSettings, SystemSettingsPatch } from '@/features/settings/types'
+import type { SystemSettings, SystemSettingsPatch, ThinkingEffort } from '@/features/settings/types'
+import { THINKING_EFFORTS } from '@/features/settings/types'
 import { useI18n } from '@/lib/i18n'
 
 const inputClass =
@@ -40,6 +41,7 @@ interface FormState {
   agent_continuation: boolean
   thinking_signature: boolean
   q_endpoint: boolean
+  default_thinking_effort: ThinkingEffort
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -70,6 +72,8 @@ function settingsToForm(s: SystemSettings): FormState {
     agent_continuation: s.agent_continuation,
     thinking_signature: s.thinking_signature ?? true,
     q_endpoint: s.q_endpoint ?? false,
+    // 后端总会回灌该字段;真缺了(旧版本后端)退回 high,与后端基线一致。
+    default_thinking_effort: s.default_thinking_effort ?? 'high',
   }
 }
 
@@ -148,6 +152,13 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     if (form[k] !== original[k]) {
       ;(patch as Record<string, unknown>)[k] = form[k]
     }
+  }
+
+  // 枚举字段(档位):只在变了才回传。比较对象必须与 settingsToForm 同一口径地补默认值 ——
+  // 直接跟原始响应比，遇到不返回该字段的旧后端就会 `'high' !== undefined` 恒成立，于是
+  // 哪怕用户只改了代理也会捎带这个字段，被旧后端的 deny_unknown_fields 判 400，整个保存失败。
+  if (form.default_thinking_effort !== (original.default_thinking_effort ?? 'high')) {
+    patch.default_thinking_effort = form.default_thinking_effort
   }
 
   return patch
@@ -543,6 +554,47 @@ export default function SettingsPage() {
                   className={inputClass}
                 />
               </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* ── 思维链 ── */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">{t('settings.section.thinking')}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div>
+              <span className="mb-2 block text-sm font-medium">
+                {t('settings.field.defaultThinkingEffort')}
+              </span>
+              <div className="inline-flex flex-wrap gap-1 rounded-2xl border bg-muted p-1">
+                {THINKING_EFFORTS.map((level) => {
+                  const active = (form?.default_thinking_effort ?? 'high') === level
+                  return (
+                    <button
+                      key={level}
+                      type="button"
+                      disabled={isLoading || form === null}
+                      onClick={() => set('default_thinking_effort', level)}
+                      title={t(`settings.effort.${level}Hint`)}
+                      className={`rounded-xl px-3 py-1.5 text-sm transition-colors disabled:opacity-50 ${
+                        active
+                          ? 'bg-background font-medium text-foreground shadow-sm'
+                          : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                    >
+                      {level}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {t('settings.field.defaultThinkingEffortHint')}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t(`settings.effort.${form?.default_thinking_effort ?? 'high'}Hint`)}
+              </p>
             </div>
           </CardContent>
         </Card>

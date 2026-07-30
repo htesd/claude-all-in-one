@@ -285,6 +285,17 @@ const zh = {
   'settings.section.scheduler': '调度',
   'settings.section.image': '图像压缩',
   'settings.section.experimental': '实验性',
+  'settings.section.thinking': '思维链',
+  'settings.field.defaultThinkingEffort': '默认思考强度',
+  'settings.field.defaultThinkingEffortHint':
+    '客户端没指定思考强度时用哪一档。显式点了档位的请求原样透传，不受这里影响。改完约 30 秒内生效，无需重启。注意 4.5 系与 haiku 上游没有档位可调，这个设置对它们不起作用。',
+  'settings.effort.lowHint': '最快、最省积分，思考量约为 xhigh 的 1/5。适合走量的简单请求。',
+  'settings.effort.mediumHint': '偏快。介于 low 与 high 之间，实测数据较少。',
+  'settings.effort.highHint':
+    '出厂默认。深度约为 xhigh 的 73%、耗时 95s vs 124s，是深度与延迟的折中点。也是上游多数模型自己的默认档。',
+  'settings.effort.xhighHint': '较深。opus-4.6 与 sonnet-4.6 没有这一档，对它们会回落到 high。',
+  'settings.effort.maxHint':
+    '最深也最慢：思考量约为 xhigh 的 1.7 倍，等待与输出计费同比例上升。所有带档位的模型都支持。',
   'settings.field.defaultProxy': '默认出口代理',
   'settings.field.defaultProxyPlaceholder': 'socks5://user:pass@host:port 或 http://host:port，留空走默认源 IP',
   'settings.field.egressPool': '出口代理池（每行一个）',
@@ -688,6 +699,19 @@ const en: Record<I18nKey, string> = {
   'settings.section.scheduler': 'Scheduler',
   'settings.section.image': 'Image Compression',
   'settings.section.experimental': 'Experimental',
+  'settings.section.thinking': 'Thinking',
+  'settings.field.defaultThinkingEffort': 'Default thinking effort',
+  'settings.field.defaultThinkingEffortHint':
+    'Which tier to use when the client does not specify one. Requests that name a tier explicitly pass through untouched. Takes effect within ~30s, no restart needed. Note that the 4.5 series and haiku have no effort schema upstream, so this setting does not apply to them.',
+  'settings.effort.lowHint':
+    'Fastest and cheapest — roughly 1/5 the thinking of xhigh. Good for high-volume simple requests.',
+  'settings.effort.mediumHint': 'On the fast side. Between low and high; little measured data.',
+  'settings.effort.highHint':
+    'Factory default. About 73% the depth of xhigh at 95s vs 124s — the depth/latency sweet spot, and the upstream default for most models.',
+  'settings.effort.xhighHint':
+    'Deeper. opus-4.6 and sonnet-4.6 lack this tier and fall back to high.',
+  'settings.effort.maxHint':
+    'Deepest and slowest: about 1.7x the thinking of xhigh, with wait time and output billing rising in proportion. Supported on every model that has tiers.',
   'settings.field.defaultProxy': 'Default egress proxy',
   'settings.field.defaultProxyPlaceholder': 'socks5://user:pass@host:port or http://host:port, leave blank for default source IP',
   'settings.field.egressPool': 'Egress proxy pool (one per line)',
