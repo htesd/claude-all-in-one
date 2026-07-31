@@ -35,6 +35,11 @@
 - 账号页顶部新增**排队实况**横幅:`等待数 / 容量`,以及已开排队的号数。容量口径与
   准入一致(只算开了排队**且当前可服务**的号),所以这个比值是真实拥挤度,不会因为库里
   躺着一堆额度跑干的号而虚高。等待数触到容量时标红。
+- 排队实况新增两个**累计**计数:`queued_total`(进过排队的请求数)、`paced_total`(被节流吸收的
+  429 次数)。理由:`waiting` 是瞬时值且几乎恒为 0(排队只在全组不可用时触发),准确但看不出
+  机制有没有在工作;而节流日志是 `debug!` 级、线上 `RUST_LOG=info` 根本看不到 —— 累计值是
+  这两个机制唯一的可观测面。上线首 4.5 分钟实测 `paced_total=627`(≈140 次/分钟的 429 被吸收)、
+  `queued_total=0`。
 - worker `/health` 与 admin `GET /accounts/runtime` 新增 `queue{waiting,capacity,enabled_accounts}`;
   `accounts_status[]` 新增 `queue_enabled`。旧 worker 不返回该字段时 UI **整块不渲染**,
   而不是显示 `0/0` 误导运维以为队列是空的。
