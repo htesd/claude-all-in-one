@@ -608,8 +608,23 @@ impl Default for CacheConfig {
 ///
 /// `deny_unknown_fields`:PUT 进来的设置若拼错 key(如 `max_failure`)直接拒绝,
 /// 而非静默落库一个永不生效的死 overlay(对抗审查 Skeptic#5/Architect#8/Minimalist#2)。
+///
+/// ⚠️ **这里曾经挂 `#[serde(deny_unknown_fields)]`,2026-07-31 移除。** 原因是它把
+/// 「拼错 key 要拒绝」(写侧诉求)和「不认识的 key 要容忍」(读侧诉求)绑成了同一个开关,
+/// 而 worker 的 30s 轮询是 `from_str(..).ok().unwrap_or_default()` —— **一个不认识的 key
+/// 就让整份 overlay 归零**,静默回落 YAML 基线(`rate_limit_cooldown_secs=300`/`pace=0`),
+/// 企业号几秒内被 300s 冷却全部打下线 → 全量 503,而面板读 router 的 effective 照常显示热值。
+///
+/// 实际后果(实测):`caio-worker-dario` 跑 4 天前的镜像、与主栈共享同一个 SQLite,
+/// 自从 DB 里写入 `rate_limit_pace_ms` 起就一直在用空 overlay 跑,**日志里一条告警都没有**。
+///
+/// 现在改成:**读侧宽容**(未知 key 落进 [`Self::unknown`],其余字段照常生效),
+/// **写侧仍然严格**(`admin/settings.rs` 的 PUT 检查 `unknown` 非空即 400,拼错保护不变)。
+/// 于是同一个类型能同时满足两侧,且**不需要维护一份会漂移的 KNOWN_KEYS 常量**。
+///
+/// ⚠️ 本修复保护不了「回滚到 2026-07-31 之前的镜像」—— 那些镜像仍带 `deny_unknown_fields`。
+/// 该版本铺满生产后即为**回滚地板**,地板铺满前不许给本结构体新增任何字段。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SystemSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_proxy: Option<String>,
@@ -695,6 +710,24 @@ pub struct SystemSettings {
     /// 类型是枚举,所以 `PUT /settings` 那步 `from_value::<SystemSettings>` 就会拒掉非法档位。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_effort: Option<ThinkingEffort>,
+    /// 兜住本版本**不认识**的 overlay key(新镜像写、旧镜像读的滚动升级窗口)。
+    ///
+    /// 存在的唯一理由是让「一个陌生 key」不再作废整份 overlay。它有两个消费者:
+    /// - 读侧(worker 轮询/启动):非空即告警并列出 key 名,其余字段照常生效;
+    /// - 写侧(`PUT /admin/api/settings`):非空即 **400**,取代原先 `deny_unknown_fields`
+    ///   提供的拼错保护 —— 因为这个 map 装的就是「所有没被任何字段认领的 key」。
+    ///
+    /// `skip_serializing_if` 保证 [`Self::from_effective`] 造出来的全量视图不会凭空
+    /// 多出一个空对象(admin 的 GET 直接回显它)。
+    #[serde(flatten, default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unknown: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl SystemSettings {
+    /// 本版本不认识的 overlay key 名(排序、去重后)。空 = 完全认识。
+    pub fn unknown_keys(&self) -> Vec<&str> {
+        self.unknown.keys().map(String::as_str).collect()
+    }
 }
 
 impl SystemSettings {
@@ -766,6 +799,8 @@ impl SystemSettings {
             thinking_signature: Some(cfg.experimental.thinking_signature),
             q_endpoint: Some(cfg.experimental.q_endpoint),
             default_thinking_effort: Some(cfg.thinking.default_effort),
+            // 全量视图由本进程的有效配置构造,按定义不含未知 key。
+            unknown: Default::default(),
         }
     }
 }
@@ -773,6 +808,59 @@ impl SystemSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 复刻 2026-07-31 的生产事故形状:新镜像往 DB 写了一个 key,旧镜像读到它。
+    ///
+    /// 事故时 `SystemSettings` 带 `deny_unknown_fields`,worker 又是
+    /// `from_str(..).ok().unwrap_or_default()` —— 于是整份 overlay 归零、
+    /// `rate_limit_cooldown_secs` 从热值 2 退回 YAML 基线 300,企业号被全部冷却下线。
+    /// 实测受害者:`caio-worker-dario`(4 天前的镜像,与主栈共享同一 SQLite),静默跑了几天。
+    #[test]
+    fn unknown_overlay_key_must_not_void_the_known_ones() {
+        let json = r#"{
+            "rate_limit_cooldown_secs": 2,
+            "queue_wait_ms": 15000,
+            "rate_limit_pace_ms": 250,
+            "a_knob_from_a_newer_build": 42
+        }"#;
+        let s: SystemSettings =
+            serde_json::from_str(json).expect("未知字段不该让整份 overlay 解析失败");
+        assert_eq!(s.unknown_keys(), vec!["a_knob_from_a_newer_build"]);
+
+        let mut base = SystemConfig::default();
+        assert_eq!(
+            base.scheduler.rate_limit_cooldown_secs,
+            default_rate_limit_cooldown_secs(),
+            "前提:YAML 基线的冷却远大于热值,所以 overlay 一旦作废就是事故"
+        );
+        s.apply_to(&mut base);
+        assert_eq!(base.scheduler.rate_limit_cooldown_secs, 2, "已知字段必须照常生效");
+        assert_eq!(base.scheduler.queue_wait_ms, 15000);
+        assert_eq!(base.scheduler.rate_limit_pace_ms, 250);
+    }
+
+    /// 未知字段要**原样保留并回显**:admin 的 GET 不能把它们吃掉,
+    /// 否则运维在面板上看不出「库里还有本进程不认识的东西」。
+    #[test]
+    fn unknown_overlay_keys_round_trip() {
+        let s: SystemSettings =
+            serde_json::from_str(r#"{"max_failures":7,"future_knob":"x"}"#).unwrap();
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v.get("future_knob").and_then(|x| x.as_str()), Some("x"));
+        assert!(
+            v.get("unknown").is_none(),
+            "flatten 的兜底 map 不该以 `unknown` 这个名字出现在线缆上"
+        );
+    }
+
+    /// 全量视图由本进程有效配置构造,按定义不含未知 key —— 不能凭空多出字段。
+    #[test]
+    fn from_effective_carries_no_unknown_keys() {
+        let full = SystemSettings::from_effective(&SystemConfig::default(), None);
+        assert!(full.unknown.is_empty());
+        let v = serde_json::to_value(&full).unwrap();
+        assert!(v.get("unknown").is_none());
+    }
 
     #[test]
     fn dario_config_partial_only_sidecar_url_api_key_defaults_empty() {
