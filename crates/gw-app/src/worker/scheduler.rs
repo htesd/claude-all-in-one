@@ -61,6 +61,13 @@ struct Tuning {
     quota_poll_enabled: bool,
     /// 单请求换号重试硬上限(默认 2)。杜绝一个失败请求走遍全组(2026-06 雪崩防护)。
     max_switch_attempts: u32,
+    /// 「全禁用」时排队等冷却到期的最长时长。`0` = 关闭(与本开关引入前逐字节等价)。
+    /// 详见 [`gw_core::config::SchedulerConfig::queue_wait_ms`]。
+    queue_wait: Duration,
+    /// 限流节流间隔(仅对开了排队的号生效;`0` = 关,走二值冷却)。
+    rate_limit_pace: Duration,
+    /// 节流熔断阈值;`0` = **不熔断**(默认),开了排队的号永远只节流不下线。
+    rate_limit_pace_max_strikes: u32,
 }
 
 impl From<&SchedulerConfig> for Tuning {
@@ -75,6 +82,10 @@ impl From<&SchedulerConfig> for Tuning {
             max_failures: c.max_failures.max(1),
             quota_poll_enabled: c.quota_poll_enabled,
             max_switch_attempts: c.max_switch_attempts.max(1),
+            queue_wait: Duration::from_millis(c.queue_wait_ms),
+            rate_limit_pace: Duration::from_millis(c.rate_limit_pace_ms),
+            // 0 = 不熔断(默认):开了排队的号永远只节流,唯一能让它下线的是真被 suspend。
+            rate_limit_pace_max_strikes: c.rate_limit_pace_max_strikes,
         }
     }
 }
@@ -109,7 +120,31 @@ impl DisabledReason {
     }
 }
 
+/// 排队位守卫:持有期间计入在途等待数,**Drop 即释放**。
+/// 必须是 RAII —— 客户端中途断开会让整个 acquire future 被 drop,
+/// 手写 decrement 在那条路径上不会执行,计数只涨不落,几分钟后队列就永久“满”了。
+struct QueueSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for QueueSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 该账号是否开启「排队等冷却」(`extra.queue_enabled == true`)。
+///
+/// **逐账号**而非全局:企业号的上游并发是跨租户共享的,429 是跟别人抢、等一下就有;
+/// 而社交号的 429 往往伴随额度见底,等待只是把客户多挂几秒后照样报错。所以开关必须
+/// 落到账号粒度,由运维按凭据类型决定,别一刀切。
+fn queue_enabled(a: &Account) -> bool {
+    a.extra
+        .get("queue_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// 单账号运行态(并发槽 + 禁用/冷却 + LRU + 失败计数)。🟢 对齐 kiro.rs CredentialEntry。
+/// 429 节流用的两个字段见 `paced_until` / `rate_limit_strikes`。
 struct CredentialState {
     /// 账号配置(含 extra 凭证字段)。刷新后由调度器整体替换为带新 token 的副本。
     account: Arc<Account>,
@@ -139,6 +174,13 @@ struct CredentialState {
     /// 会话亲和 LRU:最后被选中的时刻(选中即更新,新会话按"最久未用优先"分配)。
     last_selected_at: Option<Instant>,
     /// 空响应固定窗口起点(v58 阈值冷却)。
+    /// **429 节流闸**(仅开了排队的号会被设置):在此时刻前不被选中,但**账号不下线**
+    /// —— 与 `disabled` 的本质区别是它不进 `/health` 的禁用统计、不影响面板"正常"状态,
+    /// 也不会让整组被判 `AllDisabled`。到点自动可选,即"保持一个频率访问"。
+    paced_until: Option<Instant>,
+    /// 连续 429 次数(成功一次即清零)。撞到熔断阈值就放弃节流、退回二值冷却,
+    /// 防止上游真把这个号限死时我们无限定频硬撞(22 分钟送走 5 个号就是这么来的)。
+    rate_limit_strikes: u32,
     empty_window_start: Option<Instant>,
     /// 当前窗口内 empty 次数。
     empty_count_in_window: u32,
@@ -162,6 +204,8 @@ impl CredentialState {
             disabled_until: None,
             failure_count: 0,
             last_selected_at: None,
+            paced_until: None,
+            rate_limit_strikes: 0,
             empty_window_start: None,
             empty_count_in_window: 0,
             account,
@@ -184,6 +228,20 @@ pub struct AccountStatusSnapshot {
     /// 当前空闲并发许可数(max_concurrency - 在途)。
     pub available_permits: usize,
     pub max_concurrency: u32,
+    /// 该号是否开了「排队等冷却」(`extra.queue_enabled`)。面板逐号展示 + 可开关。
+    pub queue_enabled: bool,
+}
+
+/// 全组的排队实况(面板展示用)。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct QueueStats {
+    /// 此刻正在排队等冷却的请求数。
+    pub waiting: usize,
+    /// 队列容量 = 已开排队**且当前可服务**的号的并发之和。跑干/禁用的不计。
+    /// 这就是准入阈值:`waiting` 触到它,新请求立刻 503 而不是排进来陪跑。
+    pub capacity: usize,
+    /// 开了排队开关的号数(不论其当前是否可用)。
+    pub enabled_accounts: usize,
 }
 
 /// [`AccountScheduler::sync_accounts`] 的变更统计(日志用)。
@@ -352,6 +410,11 @@ fn rank_by_id(
 pub struct AccountScheduler {
     /// account_id → 运行态。HashMap 以 id 索引(选号在锁内遍历,组规模小,O(n) 可接受)。
     entries: Mutex<HashMap<String, CredentialState>>,
+    /// 当前正在「排队等冷却」的请求数。上限按**可排队账号的并发之和**动态算(见
+    /// [`Self::queue_probe`]):不设界的话,一波流量会全部堆在同一个号上等,
+    /// 最后集体等到超时 —— 比直接快速失败更糟(客户等更久、结果一样)。
+    /// 用 `Relaxed`:它只是个准入近似阈值,不参与任何同步关系;短暂过冲无害。
+    waiting: std::sync::atomic::AtomicUsize,
     /// 会话亲和映射:session_key → primary。
     affinity: Mutex<HashMap<String, AffinityEntry>>,
     /// 调度参数(可热更:admin 设置面板改后 worker 30s 轮询经 [`Self::update_tuning`] 替换;
@@ -383,6 +446,7 @@ impl AccountScheduler {
         }
         Self {
             entries: Mutex::new(entries),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
             affinity: Mutex::new(HashMap::new()),
             tuning: RwLock::new(Tuning::from(cfg)),
             model_unavailable: Mutex::new(HashMap::new()),
@@ -433,6 +497,7 @@ impl AccountScheduler {
     fn eligible_ids(
         entries: &HashMap<String, CredentialState>,
         exclude: &HashSet<String>,
+        now: Instant,
         supports: &dyn Fn(&Account) -> bool,
         view: Option<&GroupView>,
     ) -> Vec<String> {
@@ -440,6 +505,8 @@ impl AccountScheduler {
             .values()
             .filter(|e| {
                 !e.disabled
+                    // 429 节流窗口内不选它,但它**没下线** —— 到点即恢复,不需要 sweep。
+                    && e.paced_until.map(|t| now >= t).unwrap_or(true)
                     && !exclude.contains(&e.account.account_id)
                     && supports(&e.account)
                     && rank_of(view, e).is_some()
@@ -523,7 +590,7 @@ impl AccountScheduler {
     ) -> Option<String> {
         let mut entries = self.entries.lock();
         Self::heal_cooldowns(&mut entries, now);
-        let eligible = Self::eligible_ids(&entries, exclude, supports, view);
+        let eligible = Self::eligible_ids(&entries, exclude, now, supports, view);
         if eligible.is_empty() {
             return None;
         }
@@ -664,6 +731,12 @@ impl AccountScheduler {
         // 调到 1 时 busy 几乎不等待、全灭自愈后没机会重选(审查 Architect#6/Minimalist#3)。
         const ACQUIRE_ATTEMPTS_PER_ACCOUNT: usize = 5;
         let max_attempts = (total * ACQUIRE_ATTEMPTS_PER_ACCOUNT).max(2);
+        // 排队等冷却的预算(热值)。`started` 是**唯一**的循环边界 —— 等待分支刻意不消耗
+        // `attempts`(那是给 busy 换号用的预算),否则号一多就会在等到冷却前先被判 AllBusy。
+        let queue_wait = self.tuning.read().queue_wait;
+        let started = Instant::now();
+        // 排队位在**首次**进入等待时取,跨轮持有到 acquire 返回(或 future 被 drop)。
+        let mut queue_slot: Option<QueueSlot> = None;
         let mut attempts = 0;
         let mut busy: HashSet<String> = HashSet::new();
         let mut self_healed = false;
@@ -679,12 +752,16 @@ impl AccountScheduler {
                 // 占满)" vs "全禁用"。计数都只看**支持该模型**的号——不支持的号既救不了
                 // busy 等待,也不该让错误从 NoModelSupport 误报成 AllDisabled。
                 // `member_any`/`avail_*` 额外过一遍视图:非成员对本组不存在。
-                let (supported_any, member_any, avail_total, avail_not_busy) = {
+                let (supported_any, member_any, avail_total, avail_not_busy, paced_soonest) = {
                     let entries = self.entries.lock();
                     let mut any = false;
                     let mut member_any = false;
                     let mut avail = 0usize;
                     let mut not_busy = 0usize;
+                    // 处于 429 节流窗口内的号:**没下线**,到点自己就回来。必须单独统计 ——
+                    // 否则它既被 select_id 跳过、又被算进 avail_total,两边都不认领,
+                    // 最后掉进 AllDisabled 分支把 503 抛给客户(本用例抓到的真实缺陷)。
+                    let mut paced: Option<Duration> = None;
                     for e in entries.values() {
                         if !supports(&e.account) {
                             continue;
@@ -698,11 +775,21 @@ impl AccountScheduler {
                             continue;
                         }
                         avail += 1;
+                        if let Some(until) = e.paced_until {
+                            let d = until.saturating_duration_since(now);
+                            if d > Duration::ZERO {
+                                if paced.map(|m| d < m).unwrap_or(true) {
+                                    paced = Some(d);
+                                }
+                                // 节流中的号本轮不可选,不计入"未 busy 的可用号"。
+                                continue;
+                            }
+                        }
                         if !busy.contains(&e.account.account_id) {
                             not_busy += 1;
                         }
                     }
-                    (any, member_any, avail, not_busy)
+                    (any, member_any, avail, not_busy, paced)
                 };
                 if !supported_any {
                     return Err(AcquireError::NoModelSupport);
@@ -717,6 +804,14 @@ impl AccountScheduler {
                     // 有可用号但全 busy → 等并发释放后重试。
                     busy.clear();
                     tokio::time::sleep(Duration::from_millis(50)).await;
+                    attempts += 1;
+                    continue;
+                }
+                // 号只是在 429 节流窗口内(未下线)→ 等窗口过去再选,**与队列开关无关**:
+                // 节流窗口是我方自己设的、几百毫秒量级,不该让它变成客户的 503。
+                if let Some(d) = paced_soonest {
+                    busy.clear();
+                    tokio::time::sleep(d.min(Duration::from_millis(50))).await;
                     attempts += 1;
                     continue;
                 }
@@ -737,6 +832,35 @@ impl AccountScheduler {
                     attempts += 1;
                     continue;
                 }
+                // 全禁用:在报错前先看有没有号只是**冷却中**、且会在预算内到期 ——
+                // 有就等它自愈,把上游限速在网关内部消化掉,客户端只是变慢而不是拿到 503。
+                // 这段等待发生在**响应开始之前**,不涉及协议改动、也不会产生半截流。
+                if !queue_wait.is_zero() {
+                    let elapsed = started.elapsed();
+                    if elapsed < queue_wait {
+                        if let Some((d, cap)) =
+                            self.queue_probe(&supports, view, now, queue_wait - elapsed)
+                        {
+                            // 队列已满则不排,立刻报错 —— 再挤进来只是陪跑到超时,
+                            // 客户等更久、结果一样。容量随可排队号的并发动态变化。
+                            if queue_slot.is_none() {
+                                match self.try_enter_queue(cap) {
+                                    Some(slot) => queue_slot = Some(slot),
+                                    None => return Err(AcquireError::AllBusy),
+                                }
+                            }
+                            // 上限 200ms:期间可能有并发槽先释放,早点回来重选;
+                            // 下限 10ms:d 接近 0 时不空转。
+                            tokio::time::sleep(d.clamp(
+                                Duration::from_millis(10),
+                                Duration::from_millis(200),
+                            ))
+                            .await;
+                            busy.clear();
+                            continue;
+                        }
+                    }
+                }
                 return Err(AcquireError::AllDisabled);
             };
 
@@ -749,6 +873,100 @@ impl AccountScheduler {
                 }
             }
         }
+    }
+
+    /// 全组排队实况(面板用)。容量口径与 [`Self::queue_probe`] 一致:
+    /// 只算**开了排队且当前可服务**的号,跑干/禁用的不计入 —— 否则面板会显示一个
+    /// 根本吃不下的容量,运维照它判断就会误以为还有余量。
+    pub fn queue_stats(&self) -> QueueStats {
+        let entries = self.entries.lock();
+        let mut st = QueueStats {
+            waiting: self.waiting.load(std::sync::atomic::Ordering::Relaxed),
+            ..Default::default()
+        };
+        for e in entries.values() {
+            if !queue_enabled(&e.account) {
+                continue;
+            }
+            st.enabled_accounts += 1;
+            if !e.disabled {
+                st.capacity = st.capacity.saturating_add(e.account.max_concurrency as usize);
+            }
+        }
+        st
+    }
+
+    /// 取一个排队位;已达容量则 `None`(调用方据此**快速失败**,不再堆积)。
+    fn try_enter_queue(&self, cap: usize) -> Option<QueueSlot<'_>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if cap == 0 {
+            return None;
+        }
+        // fetch_add 后回滚的写法在过冲时可能短暂超一点,但不会漏放守卫;
+        // 阈值本身是近似的,不值得为它上 CAS 循环。
+        if self.waiting.fetch_add(1, Relaxed) >= cap {
+            self.waiting.fetch_sub(1, Relaxed);
+            return None;
+        }
+        Some(QueueSlot(&self.waiting))
+    }
+
+    /// 排队准入探测:一把锁里同时算出「还要等多久」和「队列容量」。
+    ///
+    /// 返回 `None` = **没有等得到的号**,此时排队毫无意义,应当立刻报错而不是把客户挂满
+    /// 整个预算(那会把容量问题放大成全站卡死):
+    /// - 账号没开 `extra.queue_enabled` → 不为它等(见 [`queue_enabled`]);
+    /// - **额度跑干**(`QuotaExhausted`)的 `disabled_until` 是 `None`,不构成等待理由;
+    /// - `config` 禁用(DB `disabled=1`)同理;
+    /// - 到期时刻在 `budget` 之外的(如 1h 的 `TemporarilySuspended`)也算等不到。
+    ///
+    /// `Some((d, cap))` 的 `cap` = **本组内已开排队的号的并发之和**。用它当在途等待数的
+    /// 上限:等待者再多也吃不下更多并发,超出部分只是排在后面陪跑到超时。取 1× 而非
+    /// 更大的倍数,是让最坏等待≈一次请求的周转时间,而不是几轮。
+    fn queue_probe(
+        &self,
+        supports: &dyn Fn(&Account) -> bool,
+        view: Option<&GroupView>,
+        now: Instant,
+        budget: Duration,
+    ) -> Option<(Duration, usize)> {
+        let entries = self.entries.lock();
+        let mut soonest: Option<Duration> = None;
+        let mut cap: usize = 0;
+        for e in entries.values() {
+            if !supports(&e.account) || rank_of(view, e).is_none() || !queue_enabled(&e.account) {
+                continue;
+            }
+            if !e.disabled {
+                // 正在服务的号:并发全额计入容量。
+                cap = cap.saturating_add(e.account.max_concurrency as usize);
+                // 号没下线但在 429 节流窗口内:这是**最常见**的"等一下就有"情形,
+                // 必须算作等待理由 —— 否则节流一开,全组恰好都在节流窗口时会误报 503。
+                if let Some(until) = e.paced_until {
+                    let d = until.saturating_duration_since(now);
+                    if d > Duration::ZERO && d <= budget && soonest.map(|m| d < m).unwrap_or(true) {
+                        soonest = Some(d);
+                    }
+                }
+                continue;
+            }
+            // 禁用的号只有在**预算内会自愈**时才算数 —— 额度跑干/config 禁用/1h 封禁
+            // 既不产生等待理由,也**不得计入容量**。否则一堆跑干的号会把 cap 撑大,
+            // 等待者远超真实吞吐,全部排到超时(正是本开关要防的堆积)。
+            if !e.disabled_reason.map(|r| r.is_cooldown()).unwrap_or(false) {
+                continue;
+            }
+            let Some(until) = e.disabled_until else { continue };
+            let d = until.saturating_duration_since(now);
+            if d > budget {
+                continue;
+            }
+            cap = cap.saturating_add(e.account.max_concurrency as usize);
+            if soonest.map(|m| d < m).unwrap_or(true) {
+                soonest = Some(d);
+            }
+        }
+        soonest.map(|d| (d, cap))
     }
 
     /// 整个 worker 池(**不看分组视图**)是否已无任何可服务本模型的启用号。
@@ -930,6 +1148,7 @@ impl AccountScheduler {
                     failure_count: e.failure_count,
                     available_permits: e.semaphore.available_permits(),
                     max_concurrency: e.account.max_concurrency,
+                    queue_enabled: queue_enabled(&e.account),
                 }
             })
             .collect();
@@ -997,6 +1216,10 @@ impl AccountScheduler {
         let mut entries = self.entries.lock();
         if let Some(e) = entries.get_mut(id) {
             e.failure_count = 0;
+            // 成功即清零 429 连击并解除节流闸:熔断只该对**持续**限流生效,
+            // 竞争期间偶发的 429 不该累积到把号打回二值冷却。
+            e.rate_limit_strikes = 0;
+            e.paced_until = None;
         }
     }
 
@@ -1014,11 +1237,31 @@ impl AccountScheduler {
         }
         match kind {
             UpstreamErrorKind::RateLimited => {
-                e.disabled = true;
-                e.disabled_reason = Some(DisabledReason::RateLimited);
-                e.disabled_until = Some(now + tuning.rate_limit_cooldown);
-                tracing::warn!(account = %id, "命中限流,冷却 {}s",
-                    tuning.rate_limit_cooldown.as_secs());
+                e.rate_limit_strikes = e.rate_limit_strikes.saturating_add(1);
+                // 开了排队的号:429 是**跨租户竞争**,不是我方过载 —— 把号整个拉出轮转
+                // 只会让请求转去烧别的号(而企业号往往正握着大部分剩余额度)。
+                // 改成节流:号不下线,只是 pace 毫秒内不被选中,到点继续抢。
+                // 熔断:连续撞太多次说明上游是真把它限死了,退回二值冷却别硬撞。
+                // 熔断阈值 0 = 永不退回冷却。429 只是竞争,真正的下线信号是
+                // 403 TEMPORARILY_SUSPENDED(走 TemporarilyBlocked 分支,1h 冷却)。
+                let paced = queue_enabled(&e.account)
+                    && !tuning.rate_limit_pace.is_zero()
+                    && (tuning.rate_limit_pace_max_strikes == 0
+                        || e.rate_limit_strikes <= tuning.rate_limit_pace_max_strikes);
+                if paced {
+                    e.paced_until = Some(now + tuning.rate_limit_pace);
+                    tracing::debug!(
+                        account = %id, strikes = e.rate_limit_strikes,
+                        "命中限流,节流 {}ms(号不下线)", tuning.rate_limit_pace.as_millis(),
+                    );
+                } else {
+                    e.disabled = true;
+                    e.disabled_reason = Some(DisabledReason::RateLimited);
+                    e.disabled_until = Some(now + tuning.rate_limit_cooldown);
+                    e.paced_until = None;
+                    tracing::warn!(account = %id, strikes = e.rate_limit_strikes,
+                        "命中限流,冷却 {}s", tuning.rate_limit_cooldown.as_secs());
+                }
             }
             UpstreamErrorKind::TemporarilyBlocked => {
                 // 账号被上游临时封禁:较长冷却(默认 1h),到期自愈再试、仍封则再冷却。
@@ -1126,6 +1369,19 @@ impl AccountScheduler {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// 开了 `extra.queue_enabled` 的账号(企业号形态)。
+    fn qacct(id: &str, concurrency: u32) -> Arc<Account> {
+        let mut extra = BTreeMap::new();
+        extra.insert("queue_enabled".to_string(), serde_json::json!(true));
+        Arc::new(Account {
+            account_id: id.to_string(),
+            provider: "kiro".into(),
+            max_concurrency: concurrency,
+            disabled: false,
+            extra,
+        })
+    }
 
     fn acct(id: &str, concurrency: u32, priority: Option<i64>) -> Arc<Account> {
         let mut extra = BTreeMap::new();
@@ -1240,6 +1496,287 @@ mod tests {
         s.report_failure(&id, UpstreamErrorKind::RateLimited);
         let other = s.acquire(Some("s")).await.unwrap().account_id().to_string();
         assert_ne!(other, id, "限流号应被跳过");
+    }
+
+    /// **账号级开关**:没开 `queue_enabled` 的号(社交号形态)即使在冷却里也不为它等 ——
+    /// 那类 429 常伴随额度见底,等待只是把客户多挂几秒后照样报错。
+    #[tokio::test]
+    async fn queue_ignores_accounts_without_the_per_account_flag() {
+        let cfg = SchedulerConfig {
+            rate_limit_cooldown_secs: 1,
+            queue_wait_ms: 5_000,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![acct("plain", 2, None)], &cfg);
+        s.report_failure("plain", UpstreamErrorKind::RateLimited);
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("本用例期望取号失败"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllDisabled), "实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_millis(200), "不该为没开开关的号等待: {:?}", t0.elapsed());
+    }
+
+    /// **队列容量按并发动态定**:容量 = 可排队号的并发之和。超出的请求立刻失败,
+    /// 不堆在同一个号上陪跑到超时。conc=2 的单号 → 最多 2 个在途等待,第 3 个即刻被拒。
+    #[tokio::test]
+    async fn queue_depth_is_capped_by_total_concurrency() {
+        let cfg = SchedulerConfig {
+            rate_limit_cooldown_secs: 3,
+            queue_wait_ms: 5_000,
+            ..SchedulerConfig::default()
+        };
+        let s = Arc::new(AccountScheduler::new(vec![qacct("a", 2)], &cfg));
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+
+        // 先占满 2 个排队位(它们会一直等到冷却到期)。
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let sc = s.clone();
+            waiters.push(tokio::spawn(async move { sc.acquire(Some("s")).await.is_ok() }));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // 第 3 个:队列满 → 立刻 AllBusy,而不是陪等 3 秒。
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("队列已满时不该拿到租约"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllBusy), "队列满应报 AllBusy,实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_millis(200), "满队列应立刻失败: {:?}", t0.elapsed());
+
+        // 守卫是 RAII:等待者结束后位置必须归还,否则队列会永久“满”。
+        for w in waiters {
+            assert!(w.await.unwrap(), "先入队的请求应等到冷却到期并拿到租约");
+        }
+        assert_eq!(s.waiting.load(std::sync::atomic::Ordering::Relaxed), 0, "排队位必须全部归还");
+    }
+
+    /// **容量口径**:额度跑干的号即使开了排队开关,也不得计入队列容量 ——
+    /// 否则一堆跑干的号把 cap 撑大,等待者远超真实吞吐、全部排到超时。
+    /// 这里 a(健康,conc=1)+ b(跑干,conc=10):容量应是 1 而不是 11。
+    #[tokio::test]
+    async fn queue_capacity_excludes_quota_exhausted_accounts() {
+        let cfg = SchedulerConfig {
+            rate_limit_cooldown_secs: 3,
+            queue_wait_ms: 5_000,
+            ..SchedulerConfig::default()
+        };
+        let s = Arc::new(AccountScheduler::new(vec![qacct("a", 1), qacct("b", 10)], &cfg));
+        s.report_failure("b", UpstreamErrorKind::QuotaExhausted);
+        // a 限流冷却中 → 有等待理由;容量只应来自 a(=1)。
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+
+        let sc = s.clone();
+        let w = tokio::spawn(async move { sc.acquire(Some("s")).await.is_ok() });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("容量为 1 时第二个请求不该入队"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllBusy), "实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_millis(200), "应立刻失败: {:?}", t0.elapsed());
+        assert!(w.await.unwrap(), "先入队的应等到 a 冷却到期");
+        assert_eq!(s.waiting.load(std::sync::atomic::Ordering::Relaxed), 0, "排队位必须归还");
+    }
+
+    /// 节流的**本质区别**:429 后账号**不下线**(`disabled=false`,面板仍显示正常),
+    /// 只是 pace 窗口内不被选中,到点自动可选 —— 这就是"保持一个频率访问"。
+    #[tokio::test]
+    async fn paced_account_is_not_disabled_and_returns_by_itself() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 120,
+            rate_limit_cooldown_secs: 600, // 故意设很大:若走了二值冷却,本用例必然超时失败
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+
+        let snap = s.status_snapshot();
+        assert!(!snap[0].disabled, "节流不该把号下线");
+        assert_eq!(snap[0].reason, "", "面板 reason 应仍为正常,而不是 rate_limited");
+
+        // 窗口内不可选。
+        let t0 = Instant::now();
+        let lease = s.acquire(Some("s")).await;
+        assert!(lease.is_ok(), "单号被节流后应等窗口过去再拿到,而不是报错");
+        assert!(t0.elapsed() >= Duration::from_millis(100), "应等过节流窗口: {:?}", t0.elapsed());
+        assert!(t0.elapsed() < Duration::from_secs(5), "不该退化成 600s 冷却: {:?}", t0.elapsed());
+    }
+
+    /// 节流**只对开了排队的号**生效;普通号照旧走二值冷却(行为不变)。
+    #[tokio::test]
+    async fn pacing_only_applies_to_queue_enabled_accounts() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 120,
+            rate_limit_cooldown_secs: 600,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![acct("plain", 2, None)], &cfg);
+        s.report_failure("plain", UpstreamErrorKind::RateLimited);
+        let snap = s.status_snapshot();
+        assert!(snap[0].disabled, "普通号仍应被二值冷却下线");
+        assert_eq!(snap[0].reason, "rate_limited");
+    }
+
+    /// **默认语义**:熔断阈值 0 = 开了排队的号**永远不因 429 下线**,只节流。
+    /// 唯一能让它下线的是真被上游 suspend(走 TemporarilyBlocked 分支)。
+    #[tokio::test]
+    async fn queue_account_never_cools_down_on_429_by_default() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 30,
+            rate_limit_cooldown_secs: 600,
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(
+            SchedulerConfig::default().rate_limit_pace_max_strikes,
+            0,
+            "默认必须是不熔断"
+        );
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        for i in 1..=50 {
+            s.report_failure("a", UpstreamErrorKind::RateLimited);
+            assert!(!s.status_snapshot()[0].disabled, "第 {i} 次 429 也不该下线");
+        }
+        // 但真被 suspend 时必须下线 —— 这是唯一的下线信号。
+        s.report_failure("a", UpstreamErrorKind::TemporarilyBlocked);
+        let snap = s.status_snapshot();
+        assert!(snap[0].disabled, "被 suspend 必须下线");
+        assert_eq!(snap[0].reason, "temporarily_suspended");
+    }
+
+    /// **熔断**:连续 429 撞满阈值后放弃节流、退回二值冷却 —— 上游真把号限死时
+    /// 不能无限定频硬撞(历史上 22 分钟送走 5 个号)。
+    #[tokio::test]
+    async fn pacing_falls_back_to_cooldown_after_consecutive_strikes() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 50,
+            rate_limit_pace_max_strikes: 3,
+            rate_limit_cooldown_secs: 600,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        for i in 1..=3 {
+            s.report_failure("a", UpstreamErrorKind::RateLimited);
+            assert!(!s.status_snapshot()[0].disabled, "第 {i} 次仍应是节流,不下线");
+        }
+        s.report_failure("a", UpstreamErrorKind::RateLimited); // 第 4 次:超阈值
+        let snap = s.status_snapshot();
+        assert!(snap[0].disabled, "撞满连击后应退回二值冷却");
+        assert_eq!(snap[0].reason, "rate_limited");
+    }
+
+    /// 成功一次即清零连击并解除节流闸:竞争期间偶发的 429 不该累积到把号打回冷却。
+    #[tokio::test]
+    async fn success_resets_rate_limit_strikes_and_pace_gate() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 5_000, // 很长:若没被 report_success 解除,下面必然等超时
+            rate_limit_pace_max_strikes: 3,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+        s.report_success("a");
+
+        let t0 = Instant::now();
+        assert!(s.acquire(Some("s")).await.is_ok(), "成功后节流闸应已解除");
+        assert!(t0.elapsed() < Duration::from_millis(300), "不该还在等 5s 节流: {:?}", t0.elapsed());
+
+        // 连击已清零:再撞 3 次仍是节流而非冷却。
+        for _ in 0..3 {
+            s.report_failure("a", UpstreamErrorKind::RateLimited);
+        }
+        assert!(!s.status_snapshot()[0].disabled, "连击清零后不该立刻熔断");
+    }
+
+    /// 排队开关默认关闭:全禁用时立刻报错,与引入本开关前逐字节等价。
+    #[tokio::test]
+    async fn queue_wait_off_by_default_fails_fast_on_all_disabled() {
+        let s = AccountScheduler::new(vec![acct("a", 2, None)], &SchedulerConfig::default());
+        assert_eq!(SchedulerConfig::default().queue_wait_ms, 0, "默认必须是关的");
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("本用例期望取号失败"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllDisabled), "实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_millis(200), "不该等待: {:?}", t0.elapsed());
+    }
+
+    /// 开启后:唯一的号在 429 冷却中,acquire 应等到自愈再返回租约,而不是把 503 透给客户。
+    #[tokio::test]
+    async fn queue_waits_out_rate_limit_cooldown_instead_of_failing() {
+        let cfg = SchedulerConfig {
+            rate_limit_cooldown_secs: 1,
+            queue_wait_ms: 5_000,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+        let t0 = Instant::now();
+        let lease = s.acquire(Some("s")).await.expect("应等到冷却到期后拿到租约");
+        assert_eq!(lease.account_id(), "a");
+        assert!(t0.elapsed() >= Duration::from_millis(900), "应真的等过冷却: {:?}", t0.elapsed());
+    }
+
+    /// **安全闸**:额度跑干(disabled_until = None)不构成等待理由 —— 池子真干时必须
+    /// 立刻失败,否则每个请求都会被挂满整个预算,把容量问题放大成全站卡死。
+    #[tokio::test]
+    async fn queue_does_not_wait_for_quota_exhausted_accounts() {
+        let cfg = SchedulerConfig { queue_wait_ms: 5_000, ..SchedulerConfig::default() };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::QuotaExhausted);
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("本用例期望取号失败"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllDisabled), "实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_millis(200), "不该为跑干的号等待: {:?}", t0.elapsed());
+    }
+
+    /// 冷却到期时刻在预算之外(如 1h 的临时封禁)同样立刻失败,不做无望的等待。
+    #[tokio::test]
+    async fn queue_does_not_wait_when_cooldown_outlasts_budget() {
+        let cfg = SchedulerConfig {
+            suspended_cooldown_secs: 3600,
+            queue_wait_ms: 300,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::TemporarilyBlocked);
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("本用例期望取号失败"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllDisabled), "实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_millis(200), "1h 封禁不该等: {:?}", t0.elapsed());
+    }
+
+    /// 等待有硬预算:冷却比预算长一点点时,超预算即放弃(不会无限等)。
+    #[tokio::test]
+    async fn queue_gives_up_at_budget() {
+        let cfg = SchedulerConfig {
+            rate_limit_cooldown_secs: 5,
+            queue_wait_ms: 400,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct("a", 2)], &cfg);
+        s.report_failure("a", UpstreamErrorKind::RateLimited);
+        let t0 = Instant::now();
+        let err = match s.acquire(Some("s")).await {
+            Ok(_) => panic!("本用例期望取号失败"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, AcquireError::AllDisabled), "实际={err:?}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "不该等满 5s 冷却: {:?}", t0.elapsed());
     }
 
     #[tokio::test]

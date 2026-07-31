@@ -432,10 +432,59 @@ pub struct SchedulerConfig {
     /// 内容/封禁类错误(见 `UpstreamErrorKind::worth_switching_account`)命中首个号即止,更不受影响。
     #[serde(default = "default_max_switch_attempts")]
     pub max_switch_attempts: u32,
+    /// **排队等冷却**的最长等待毫秒数。`0` = 关闭(与本开关引入前逐字节等价)。
+    ///
+    /// 背景(2026-07-31):企业号的上游并发是**跨租户共享**的,一堆人在抢同一个池子,
+    /// 429 是竞争而非我方过载。此时二值冷却是纯亏——我们一退,槽位立刻被别人吃掉,
+    /// 而客户拿到 503。开启后:`acquire` 在「全禁用」时不立刻报错,只要还有号处于
+    /// **冷却态**(429/空响应/临时封禁,即 `disabled_until` 有值)且会在预算内到期,
+    /// 就等它自愈再选,把限速在网关内部消化掉,客户端感知不到。
+    ///
+    /// ⚠️ **额度跑干的号不产生等待**:`QuotaExhausted` 的 `disabled_until` 是 `None`,
+    /// 不构成"等得到"的理由。所以池子真的干了仍然快速失败,不会把客户挂满整个预算。
+    /// 上限必须**远小于**下游客户端的空闲判定(yapi 为 300s 无 event 即中止),
+    /// 且这段等待发生在**响应开始之前**,客户端只是变慢,不会看到半截流。
+    #[serde(default = "default_queue_wait_ms")]
+    pub queue_wait_ms: u64,
+    /// **限流节流间隔**(毫秒),只作用于开了 `extra.queue_enabled` 的号。`0` = 关闭,
+    /// 429 仍走二值冷却(与本开关引入前逐字节等价)。
+    ///
+    /// 背景:企业号的上游并发跨租户共享,429 是**竞争**而非我方过载。二值冷却会把号
+    /// 整个拉出轮转 `rate_limit_cooldown_secs` 秒,期间请求转去烧别的号 —— 在企业号
+    /// 持有大部分剩余额度时,这等于拿稀缺额度替竞争买单。改成节流后:号**不下线**,
+    /// 只是本次 429 后 `pace` 毫秒内不再被选中,到点继续抢 —— 即"保持一个频率访问"。
+    ///
+    /// ⚠️ 定频探测正是历史上 22 分钟送走 5 个号的模式,所以配套有熔断:
+    /// 连续 [`Self::rate_limit_pace_max_strikes`] 次 429 仍未成功,退回二值冷却。
+    #[serde(default = "default_rate_limit_pace_ms")]
+    pub rate_limit_pace_ms: u64,
+    /// 节流熔断阈值:同一账号**连续**这么多次 429 后放弃节流、退回二值冷却。
+    /// **`0` = 不熔断(默认)**:开了排队的号**永远只节流、不因 429 下线**。
+    ///
+    /// 为什么默认不熔断:上游其实给了两种不同的信号 —— 429 是「槽位被别的租户占了」
+    /// (竞争,与本号健康无关),403 `TEMPORARILY_SUSPENDED` 才是「你被惩罚了」。后者走
+    /// 独立分支(1h 冷却 + 不换号),已经是明确的下线信号,不需要再拿 429 的连击去**猜**。
+    /// 用 429 猜的代价是实打实的:号被拉出轮转的那几秒,请求转去烧别的号,而企业号往往
+    /// 正握着大部分剩余额度。无界硬撞的风险由**请求级 180s 总时限** + `pace` 频率上限兜底。
+    ///
+    /// 若日后真的观察到 suspend 增多,把它调回 10 左右即可恢复熔断(热调,不用重启)。
+    #[serde(default = "default_rate_limit_pace_max_strikes")]
+    pub rate_limit_pace_max_strikes: u32,
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
     300
+}
+/// 排队等冷却默认**关闭**(0):新开关不改变既有行为,须显式开启。
+fn default_queue_wait_ms() -> u64 {
+    0
+}
+/// 限流节流默认**关闭**(0 = 仍走二值冷却)。
+fn default_rate_limit_pace_ms() -> u64 {
+    0
+}
+fn default_rate_limit_pace_max_strikes() -> u32 {
+    0
 }
 fn default_suspended_cooldown_secs() -> u64 {
     3600
@@ -474,6 +523,9 @@ impl Default for SchedulerConfig {
             affinity_ttl_secs: default_affinity_ttl_secs(),
             quota_poll_enabled: default_quota_poll_enabled(),
             max_switch_attempts: default_max_switch_attempts(),
+            queue_wait_ms: default_queue_wait_ms(),
+            rate_limit_pace_ms: default_rate_limit_pace_ms(),
+            rate_limit_pace_max_strikes: default_rate_limit_pace_max_strikes(),
         }
     }
 }
@@ -594,6 +646,16 @@ pub struct SystemSettings {
     /// 单请求换号重试硬上限(默认 2;反雪崩,见 [`SchedulerConfig::max_switch_attempts`])。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_switch_attempts: Option<u32>,
+    /// 排队等冷却的最长等待毫秒(None = 用 yaml 基线;0 = 关闭)。详见
+    /// [`SchedulerConfig::queue_wait_ms`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
+    /// 限流节流间隔(毫秒;None = 用 yaml 基线,0 = 关)。详见 [`SchedulerConfig::rate_limit_pace_ms`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_pace_ms: Option<u64>,
+    /// 节流熔断阈值。详见 [`SchedulerConfig::rate_limit_pace_max_strikes`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_pace_max_strikes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_ttl_secs: Option<u64>,
     /// worker 后台配额轮询热开关(None = 用 yaml 基线默认 true)。
@@ -650,6 +712,9 @@ impl SystemSettings {
         if let Some(v) = self.empty_response_threshold { base.scheduler.empty_response_threshold = v; }
         if let Some(v) = self.max_failures { base.scheduler.max_failures = v; }
         if let Some(v) = self.max_switch_attempts { base.scheduler.max_switch_attempts = v; }
+        if let Some(v) = self.queue_wait_ms { base.scheduler.queue_wait_ms = v; }
+        if let Some(v) = self.rate_limit_pace_ms { base.scheduler.rate_limit_pace_ms = v; }
+        if let Some(v) = self.rate_limit_pace_max_strikes { base.scheduler.rate_limit_pace_max_strikes = v; }
         if let Some(v) = self.affinity_ttl_secs { base.scheduler.affinity_ttl_secs = v; }
         if let Some(v) = self.quota_poll_enabled { base.scheduler.quota_poll_enabled = v; }
         if let Some(v) = self.image_enabled { base.image.enabled = v; }
@@ -685,6 +750,9 @@ impl SystemSettings {
             empty_response_threshold: Some(cfg.scheduler.empty_response_threshold),
             max_failures: Some(cfg.scheduler.max_failures),
             max_switch_attempts: Some(cfg.scheduler.max_switch_attempts),
+            queue_wait_ms: Some(cfg.scheduler.queue_wait_ms),
+            rate_limit_pace_ms: Some(cfg.scheduler.rate_limit_pace_ms),
+            rate_limit_pace_max_strikes: Some(cfg.scheduler.rate_limit_pace_max_strikes),
             affinity_ttl_secs: Some(cfg.scheduler.affinity_ttl_secs),
             quota_poll_enabled: Some(cfg.scheduler.quota_poll_enabled),
             image_enabled: Some(cfg.image.enabled),

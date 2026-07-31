@@ -39,6 +39,14 @@ export interface AccountRow {
   success_count?: number
   /** 累计失败请求数（后端新增；旧缓存响应可能缺失，缺省视为 0）。 */
   failure_count?: number
+  /**
+   * 是否开启「排队等冷却」（`extra.queue_enabled`）。
+   * 开了以后，该号在 429 冷却中时请求会**等它自愈**而不是立刻 503。
+   * 逐号开关：企业号的上游并发跨租户共享，429 是跟别人抢、等一下就有；
+   * 社交号的 429 常伴额度见底，等待只会把客户多挂几秒。
+   * 旧缓存响应可能缺失 → 缺省视为 false（关）。
+   */
+  queue_enabled?: boolean
 }
 
 /** POST /accounts 请求体（注意：这里的分组字段叫 `group`，PATCH 才是 `group_name`）。 */
@@ -76,6 +84,8 @@ export interface UpdateAccountPayload {
    * 注意：不要传 null，后端以 null 表示"不修改"。
    */
   proxy_url?: string
+  /** 排队开关。不传=不动；走后端定点合并，绝不碰凭据。 */
+  queue_enabled?: boolean
 }
 
 /** worker 侧账号不可用原因枚举（'' = 无）。 */
@@ -125,6 +135,23 @@ export interface AccountRuntimeStatus {
   max_concurrency: number
   /** 配额(积分);null = 后台查询中/未取到。 */
   quota?: AccountQuota | null
+  /** 该号是否开了排队（worker 侧实时值；旧 worker 可能缺失 → 视为 false）。 */
+  queue_enabled?: boolean
+}
+
+/**
+ * 一个 worker 的排队实况。
+ *
+ * `capacity` 只统计**开了排队且当前可服务**的号的并发之和 —— 额度跑干/禁用的不计入。
+ * 所以 `waiting/capacity` 是真实的拥挤度，不会因为库里躺着一堆跑干的号而虚高。
+ */
+export interface QueueStats {
+  /** 此刻正在排队等冷却的请求数。 */
+  waiting: number
+  /** 队列容量（准入阈值）；`waiting` 触到它，新请求立刻 503 而不是排进来陪跑。 */
+  capacity: number
+  /** 开了排队开关的号数（不论当前是否可用）。 */
+  enabled_accounts: number
 }
 
 /** POST /accounts/import 请求体。 */
@@ -167,6 +194,8 @@ export interface AccountRuntimeInstance {
   group: string
   online: boolean
   accounts_status?: AccountRuntimeStatus[]
+  /** 排队实况；旧 worker 不返回 → null/缺失，UI 需按“未知”降级而不是显示 0。 */
+  queue?: QueueStats | null
 }
 
 /** 按 account_id 合并后的运行态条目。 */

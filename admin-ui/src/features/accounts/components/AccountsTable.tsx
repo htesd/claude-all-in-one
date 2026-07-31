@@ -54,6 +54,7 @@ export function AccountsTable({
     // 配额列头随口径切换:积分(Kiro) ↔ 限额 5h/7d(ccmax/dario)。
     { label: quotaKind === 'windows' ? t('table.quotaWindows') : t('table.credits'), right: true },
     { label: t('table.concurrency'), right: true },
+    { label: t('table.queue'), right: true },
     { label: t('table.priority'), right: true },
     { label: t('table.failures'), right: true },
     { label: t('table.totalSuccessFail'), right: true },

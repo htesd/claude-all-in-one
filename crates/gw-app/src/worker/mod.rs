@@ -1027,6 +1027,7 @@ pub async fn run(
             .route("/accounts/{id}/refresh", post(refresh_account))
             .route("/accounts/{id}/quota", post(quota_account))
             .route("/accounts/{id}/models", post(models_account))
+            .route("/accounts/{id}/probe", post(probe_account))
             .route("/oauth/exchange", post(oauth_exchange))
             .route("/sync", post(sync_now));
     } else {
@@ -1233,6 +1234,8 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "accounts": st.scheduler.total(),
         // 每账号运行态(冷却/封禁/并发占用)+ 配额,admin 账号页经 router 聚合展示。
         "accounts_status": accounts_status,
+        // 排队实况(等待数 / 容量 / 已开号数),admin 账号页展示。
+        "queue": st.scheduler.queue_stats(),
         // usage 是否在落库:库打开失败时为 false(降级,usage 不入库),便于运维发现。
         "usage_persist": st.usage_sink.is_some(),
         "status": "ok"
@@ -1336,6 +1339,142 @@ async fn refresh_account(
 ///
 /// 仅本组持有该账号的 worker 命中;不在本组 → 404(admin 据此向其余 worker 续问)。
 /// 上游失败 → report_failure(与 refresh 同理:死号立即标禁用,导入即见)+ 透出错误。
+/// **人工探针**:钉住指定账号发一次**最小** chat,看上游到底出不出词。
+///
+/// 为什么需要它:`/quota` 的 `verified:true` 只证明**控制面**凭据活着,`/models` 只证明
+/// 目录里有这个模型 —— 两者都不代表数据面能出词。实测过「有额度、有目录,一发 chat
+/// 恒 `ModelNotAvailable`」的号。判定一个停用号能不能复活,只有真的收到 delta 才算数。
+///
+/// 风控约束(见 memory caio-kiro-key-suspend-lesson):`max_tokens=16`、单轮 "hi"、
+/// 非流式语义下只读到首个文本 delta 就断流,走该账号自己的出口。**调用方必须串行 + 限速**,
+/// 短时高频 chat 验号历史上直接导致过 `TEMPORARILY_SUSPENDED`。
+///
+/// **不上报账号健康**:这是人工动作,失败不该计入与真实流量共用的失败池/冷却,
+/// 否则批量探测会把好号探成 `too_many_failures`(与 `/quota` 的取舍一致)。
+async fn probe_account(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use futures::StreamExt;
+
+    let model = q
+        .get("model")
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("claude-haiku-4.5")
+        .to_string();
+
+    let Some(account) = st.scheduler.account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"replied": false, "account_id": id})),
+        )
+            .into_response();
+    };
+    // 与配额探测共用信号量:人工探针不突破既有上游压力边界。
+    let _permit = match st.quota_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"replied": false, "account_id": id})),
+            )
+                .into_response();
+        }
+    };
+
+    let account = match st.ensure_credentialed(account).await {
+        Ok(a) => a,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "replied": false, "account_id": id, "model": model,
+                "stage": "credential", "error_kind": format!("{:?}", e.kind),
+                "error": e.message.clone(),
+            }))
+            .into_response();
+        }
+    };
+    let account = st.ensure_profile_arn(account).await;
+
+    let req = gw_core::provider::ChatRequest::from_anthropic_body(serde_json::json!({
+        "model": model,
+        "max_tokens": 16,
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+    }));
+    let ctx = gw_core::provider::CallCtx {
+        account: account.clone(),
+        session_id: format!("probe-{id}"),
+        cache_key: format!("probe-{id}"),
+    };
+
+    let started = std::time::Instant::now();
+    let stream = match st.provider.chat(req, &ctx).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "replied": false, "account_id": id, "model": model,
+                "stage": "connect", "error_kind": format!("{:?}", e.kind),
+                "error": e.message.clone(),
+            }))
+            .into_response();
+        }
+    };
+
+    // 收到首个文本 delta 即判定"能出词"并断流 —— 不把 16 个 token 读完,少烧一点是一点。
+    let mut stream = stream;
+    let mut text = String::new();
+    let mut err: Option<(String, String)> = None;
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(90));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                err = Some(("Timeout".into(), "探针 90s 未收到任何内容".into()));
+                break;
+            }
+            item = stream.next() => {
+                match item {
+                    None => break,
+                    Some(Err(e)) => {
+                        err = Some((format!("{:?}", e.kind), e.message.clone()));
+                        break;
+                    }
+                    Some(Ok(gw_core::provider::StreamItem::Usage(_))) => {}
+                    Some(Ok(gw_core::provider::StreamItem::Sse(ev))) => {
+                        if let Some(t) = ev
+                            .data
+                            .get("delta")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|t| t.as_str())
+                        {
+                            text.push_str(t);
+                            if !text.trim().is_empty() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(stream);
+
+    let replied = !text.trim().is_empty();
+    Json(serde_json::json!({
+        "replied": replied,
+        "account_id": id,
+        "model": model,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        // 只回显前 40 字符:够判断"是真回复还是拒答模板",又不至于把内容灌进日志。
+        "text": text.chars().take(40).collect::<String>(),
+        "error_kind": err.as_ref().map(|(k, _)| k.clone()),
+        "error": err.as_ref().map(|(_, m)| m.clone()),
+    }))
+    .into_response()
+}
+
 async fn quota_account(
     State(st): State<Arc<WorkerState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1673,6 +1812,12 @@ async fn messages(
     // - 其余可换号错误:守 general_cap(默认 max_switch_attempts=2),防换号雪崩封号
     //   (2026-06 大面积封号根因正是让一个毒请求逐个打爆全池)。
     let general_cap = st.scheduler.max_switch_attempts().min(total).max(1);
+    // **请求级重试总时限**。限流类错误的 switch_cap 是 `total`(全组),配上「排队等冷却」
+    // 后每轮取号还各有一份 queue_wait 预算 —— 两者相乘,一个一直撞 429 的请求理论上能
+    // 循环好几分钟。而下游 yapi 是 **300s 无 event 即中止**,超了客户只会看到一个
+    // 更难查的中断。故在此处硬封顶:到点就把当前错误返回,让客户拿到明确结果。
+    const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+    let retry_started = std::time::Instant::now();
     let mut attempts = 0;
 
     loop {
@@ -1735,6 +1880,7 @@ async fn messages(
                 st.scheduler.report_failure(&account_id, e.kind);
                 drop(lease);
                 if !e.kind.worth_switching_account()
+                    || retry_started.elapsed() >= RETRY_DEADLINE
                     || attempts >= switch_cap(e.kind, total, general_cap)
                 {
                     return upstream_error_response(&e);
@@ -1910,6 +2056,7 @@ async fn messages(
                                 st.scheduler.report_failure(&account_id, e2.kind);
                                 drop(lease);
                                 if !e2.kind.worth_switching_account()
+                                    || retry_started.elapsed() >= RETRY_DEADLINE
                                     || attempts >= switch_cap(e2.kind, total, general_cap)
                                 {
                                     return upstream_error_response(&e2);
@@ -1924,6 +2071,7 @@ async fn messages(
                         st.scheduler.report_failure(&account_id, re.kind);
                         drop(lease);
                         if !re.kind.worth_switching_account()
+                            || retry_started.elapsed() >= RETRY_DEADLINE
                             || attempts >= switch_cap(re.kind, total, general_cap)
                         {
                             return upstream_error_response(&re);
@@ -1942,7 +2090,10 @@ async fn messages(
                     st.scheduler.mark_model_unavailable(&account_id, &req.model);
                 }
                 drop(lease);
-                if !kind.worth_switching_account() || attempts >= switch_cap(kind, total, general_cap) {
+                if !kind.worth_switching_account()
+                    || retry_started.elapsed() >= RETRY_DEADLINE
+                    || attempts >= switch_cap(kind, total, general_cap)
+                {
                     // 终态失败(首包前):落一条失败请求日志,让"失败"筛选能看到上游 400/耗尽
                     // (生产 400 风暴正是此类)。无 usage/ttfb;detach 到 blocking 线程池。
                     // 与客户端实收状态码同源(见 upstream_status):

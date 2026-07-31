@@ -185,6 +185,13 @@ pub struct UpdateAccountBody {
     /// 缺省=不动;走 merge_account_extra 绝不碰凭据(仿 proxy_url)。
     #[serde(default)]
     priority: Option<i64>,
+    /// 定点开关「排队等冷却」(写 `extra.queue_enabled`)。缺省=不动。
+    ///
+    /// 逐账号而非全局:企业号的上游并发跨租户共享,429 是跟别人抢、等一下就有;
+    /// 社交号的 429 常伴随额度见底,等待只会把客户多挂几秒后照样报错。
+    /// 见 `worker/scheduler.rs::queue_enabled`。
+    #[serde(default)]
+    queue_enabled: Option<bool>,
 }
 
 pub fn router() -> Router<AdminState> {
@@ -201,6 +208,7 @@ pub fn router() -> Router<AdminState> {
         .route("/accounts/{id}/refresh", post(refresh_account))
         .route("/accounts/{id}/quota", post(quota_account))
         .route("/accounts/{id}/models", post(models_account))
+        .route("/accounts/{id}/probe", post(probe_account))
         .route("/models/catalog", get(model_catalog))
 }
 
@@ -272,6 +280,8 @@ fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serd
         "provider": row.provider,
         "max_concurrency": row.max_concurrency,
         "priority": priority,
+        // 排队开关:extra 里没有即视作关闭(与 scheduler::queue_enabled 同口径)。
+        "queue_enabled": extra.get("queue_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
         "disabled": row.disabled,
         "extra": extra,
         "created_at": row.created_at,
@@ -1188,10 +1198,23 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
+    // 定点开关排队(同上:增量 merge,绝不碰凭据)。
+    if let Some(q) = body.queue_enabled {
+        let delta = serde_json::json!({ "queue_enabled": q }).to_string();
+        match st.store.merge_account_extra(&id, &delta) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     // 落库后 best-effort 捅所有 worker 立即同步(同 delete_account/import 的理由):
     // 否则启用/禁用/换组等改动要等 worker 自己最多 30s 的周期 sync 才生效,期间按号操作
     // (如导入对话框"编辑后立即验活")会误报"没有 worker 持有该账号"。
-    if has_patch || body.proxy_url.is_some() || body.priority.is_some() {
+    if has_patch
+        || body.proxy_url.is_some()
+        || body.priority.is_some()
+        || body.queue_enabled.is_some()
+    {
         poke_workers_sync(&st).await;
     }
     match st.store.get_account(&id) {
@@ -1248,6 +1271,8 @@ async fn runtime(State(st): State<AdminState>) -> axum::response::Response {
                         "online": true,
                         "accounts_status": v.get("accounts_status").cloned()
                             .unwrap_or(serde_json::Value::Array(vec![])),
+                        // 排队实况:面板要显示"当前排队 N / 容量 M"。
+                        "queue": v.get("queue").cloned().unwrap_or(serde_json::Value::Null),
                     }),
                     Err(e) => {
                         tracing::warn!(instance = w.instance, "worker /health 响应解析失败: {e}");
@@ -1431,6 +1456,71 @@ async fn quota_account(
 ///
 /// 拿 `rateMultiplier` 定价、拿逐模型的 thinking 档位表。**只读**,不发 chat。
 /// 与 quota 同款顺序扇出:2xx 立即返回,404 问下一个,其余记首个错误后继续。
+/// **人工探针**扇出:钉住指定账号真发一次最小 chat,看上游到底出不出词。
+///
+/// `POST /accounts/{id}/probe?model=claude-opus-5`(model 缺省 `claude-haiku-4.5`)。
+///
+/// 为什么必须有它:`/quota` 只证明控制面凭据活着,`/models` 只证明目录里有这个模型 ——
+/// **两者都不代表数据面能出词**。实测存在「有额度、目录有 opus,一发 chat 恒
+/// `ModelNotAvailable`」的号。判定一个停用号能不能复活,只有真收到 delta 才算数。
+///
+/// ⚠️ 调用方**必须串行 + 限速**:短时高频 chat 验号历史上直接导致 `TEMPORARILY_SUSPENDED`
+/// (见 memory caio-kiro-key-suspend-lesson)。本端点单次 `max_tokens=16`、收到首个文本
+/// delta 即断流,但**批量调用的节奏由调用方负责**,服务端不替你兜底。
+async fn probe_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let qs = query.filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
+    // ⚠️ **不能用 `st.http`**:它是 2s 超时的管理面客户端(为的是 worker 离线时快速跳过)。
+    // 探针要真发一次 chat,opus 首字节就可能十几秒 —— 用 2s 客户端必然超时,而超时在扇出
+    // 循环里等价于"该 worker 离线",最终误报成「没有 worker 持有该账号」。踩过一次,别改回去。
+    let probe_http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return internal_error(anyhow::anyhow!("探针 http 客户端构造失败: {e}")),
+    };
+    let mut first_error: Option<(u16, String)> = None;
+    for w in st.workers.iter() {
+        let url = format!("http://{}/accounts/{}/probe{}", w.listen, id, qs);
+        let resp = match probe_http.post(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(instance = w.instance, "probe 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status == 404 {
+            continue; // 该 worker 不持有此账号。
+        }
+        let body = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            return Json(
+                body.unwrap_or_else(|| serde_json::json!({"replied": false, "account_id": id})),
+            )
+            .into_response();
+        }
+        if first_error.is_none() {
+            first_error = Some((status, "探针失败".to_string()));
+        }
+    }
+    if let Some((status, msg)) = first_error {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return api_error(code, &msg);
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+    )
+}
+
 async fn models_account(
     State(st): State<AdminState>,
     Path(id): Path<String>,

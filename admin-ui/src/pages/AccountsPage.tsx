@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, KeyRound, Upload } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, KeyRound, Upload, Users } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
+import { cn } from '@/lib/utils'
 import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import type { RuntimeQueryState } from '@/features/accounts/components/AccountTableRow'
 import {
@@ -256,6 +257,41 @@ export default function AccountsPage() {
           )}
         </div>
       )}
+
+      {/* 排队实况：waiting/capacity。容量只算**开了排队且当前可服务**的号的并发之和，
+          所以这个比值是真实拥挤度 —— 不会因为库里躺着一堆额度跑干的号而虚高。
+          waiting 触到 capacity 时新请求立刻 503（不再排进来陪跑到超时）。
+          旧 worker 不返回 queue 字段 → 整块不渲染，而不是显示 0/0 误导。 */}
+      {(() => {
+        const instances = (runtimeQuery.data ?? []).filter((i) => i.online && i.queue)
+        if (instances.length === 0) return null
+        return (
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-1 text-xs">
+            {instances.map((i) => {
+              const q = i.queue!
+              const full = q.capacity > 0 && q.waiting >= q.capacity
+              return (
+                <span key={i.instance} className="flex items-center gap-1.5">
+                  <Users className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span className="text-muted-foreground">
+                    {t('accounts.queue.title')}
+                    {instances.length > 1 && ` · ${i.group}`}
+                  </span>
+                  <span
+                    className={cn('tabular-nums font-medium', full && 'text-destructive')}
+                    title={t('accounts.queue.statHint')}
+                  >
+                    {q.waiting} / {q.capacity}
+                  </span>
+                  <span className="text-muted-foreground">
+                    ({t('accounts.queue.enabledAccounts', { n: q.enabled_accounts })})
+                  </span>
+                </span>
+              )
+            })}
+          </div>
+        )
+      })()}
 
       {/* runtime 失败不致命：账号列表照常展示，但要明示状态列不可信 */}
       {runtimeQuery.isError && (
