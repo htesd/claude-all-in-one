@@ -791,11 +791,23 @@ pub async fn run(
     {
         Some(json) => match serde_json::from_str::<gw_core::config::SystemSettings>(&json) {
             Ok(s) => {
+                if !s.unknown.is_empty() {
+                    // 启动期没有"上一轮配置"可保持,只能忽略这几个字段继续起。
+                    // 但必须喊出来:它意味着本镜像比写库的那个旧。
+                    tracing::warn!(
+                        keys = ?s.unknown_keys(),
+                        "settings overlay 含本版本不认识的字段,已忽略这几个、其余照常生效\
+                         (通常说明本进程镜像偏旧)"
+                    );
+                }
                 s.apply_to(&mut effective_system);
                 s.default_proxy.clone()
             }
             Err(e) => {
-                tracing::warn!("settings overlay 解析失败,用 YAML 默认: {e}");
+                // ⚠️ 这条是**启动期**的回落,刻意不 fail-closed:否则一次 admin 误操作
+                // 就能让整套栈起不来。但级别从 warn 提到 error —— 此时全部调度参数
+                // (含 429 冷却)都退回 YAML 基线,是会打出全量 503 的状态。
+                tracing::error!("settings overlay 解析失败,本次启动退回 YAML 基线(调度参数全部失去热值): {e}");
                 None
             }
         },
@@ -941,6 +953,8 @@ pub async fn run(
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // 首跳立即触发,跳过(启动时刚加载过)。
+            // 上一轮告警过的未知字段集。只在**变化时**告警,否则 30s 一条会淹掉日志。
+            let mut warned_unknown: Vec<String> = Vec::new();
             loop {
                 tick.tick().await;
                 // 账号集同步(含脏 extra 冲刷)—— 与 /sync 立即同步共用实现。
@@ -950,11 +964,41 @@ pub async fn run(
                 // 这样 overlay 删某字段时能正确恢复到 YAML 默认(而非停留在上次热值)。
                 match store.get_settings() {
                     Ok(opt) => {
-                        let overlay = opt
-                            .and_then(|j| {
-                                serde_json::from_str::<gw_core::config::SystemSettings>(&j).ok()
-                            })
-                            .unwrap_or_default();
+                        // ⚠️ 这里曾是 `.ok().unwrap_or_default()` —— 解析失败**静默**变成空
+                        // overlay,于是全部调度参数回落 YAML 基线(冷却 300s),企业号几秒内
+                        // 被全部打下线 → 全量 503,而日志一行都没有。现在:解析失败**跳过本轮**,
+                        // 保持上一轮已生效的配置,并按 error 级别喊出来。
+                        let overlay = match opt {
+                            None => gw_core::config::SystemSettings::default(),
+                            Some(j) => {
+                                match serde_json::from_str::<gw_core::config::SystemSettings>(&j) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "settings overlay 解析失败,**保持上一轮已生效配置**\
+                                             (不回落 YAML 基线): {e}"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        // 未知字段不再作废整份 overlay(其余字段照常生效),但必须可见:
+                        // 它的含义通常是「本进程的镜像比写库的那个旧」。
+                        let unknown: Vec<String> =
+                            overlay.unknown.keys().cloned().collect();
+                        if unknown != warned_unknown {
+                            if !unknown.is_empty() {
+                                tracing::warn!(
+                                    keys = ?unknown,
+                                    "settings overlay 含本版本不认识的字段,已忽略这几个、其余照常生效\
+                                     (通常说明本进程镜像偏旧)"
+                                );
+                            } else if !warned_unknown.is_empty() {
+                                tracing::info!("settings overlay 的未知字段已消失,恢复完全识别");
+                            }
+                            warned_unknown = unknown;
+                        }
                         let mut eff = sys_base.clone();
                         overlay.apply_to(&mut eff);
                         let full = gw_core::config::SystemSettings::from_effective(

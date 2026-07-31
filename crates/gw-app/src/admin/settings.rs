@@ -172,14 +172,24 @@ async fn put_settings(
         overlay_map.insert(k, v);
     }
 
-    // 校验合并后的 overlay 能解析为 SystemSettings(deny_unknown_fields:拼错 key 直接拒,
-    // 类型不符也拒,不写坏库)。
+    // 校验合并后的 overlay 能解析为 SystemSettings(类型不符直接拒,不写坏库)。
     let overlay: SystemSettings = match serde_json::from_value(serde_json::Value::Object(
         overlay_map.clone(),
     )) {
         Ok(s) => s,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, &format!("设置字段不合法: {e}")),
     };
+    // 拼错 key 的保护。`SystemSettings` 的 `deny_unknown_fields` 已于 2026-07-31 移除
+    // (它同时卡死了 worker 读侧的容错,一个陌生 key 就让整份 overlay 归零 → 全量 503,
+    // 见该结构体的文档),保护改由**写侧**承担:`unknown` 装的就是没被任何字段认领的 key。
+    //
+    // ⚠️ 这道闸是 overlay 里**唯一**的拼错防线 —— 读侧现在只告警不拒绝。
+    if !overlay.unknown.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("未知设置字段: {}", overlay.unknown_keys().join(", ")),
+        );
+    }
 
     let json = serde_json::to_string(&overlay_map).unwrap_or_else(|_| "{}".into());
     if let Err(e) = st.store.upsert_settings(&json) {
@@ -335,12 +345,30 @@ mod tests {
     #[tokio::test]
     async fn put_rejects_unknown_field() {
         let (app, _store) = app();
-        // 拼错 key(max_failure 少了 s):deny_unknown_fields 应 400,不静默落库死 overlay。
+        // 拼错 key(max_failure 少了 s)应 400,不静默落库死 overlay。
+        // 机制已于 2026-07-31 从 `deny_unknown_fields` 换成「`SystemSettings::unknown` 非空即拒」
+        // —— 前者同时卡死了 worker 读侧的容错(一个陌生 key 作废整份 overlay → 全量 503)。
         let resp = app
             .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": 1}"#)))
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "未知字段应 400");
+    }
+
+    #[tokio::test]
+    async fn put_unknown_field_error_names_the_key() {
+        let (app, _store) = app();
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": 1}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(
+            s.contains("max_failure"),
+            "报错要点名是哪个 key 拼错了,否则运维得自己猜:{s}"
+        );
     }
 
     #[tokio::test]
