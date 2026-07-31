@@ -15,21 +15,55 @@ admin:
 # 空响应无配置:v60 起不做反代侧重试/兜底,固定为记一条 empty_response error +
 # 阈值冷却 + 客户端自重试。
 
-# 账号调度/冷却(可选,缺省即下值;对齐 kiro.rs 生产默认)。
-# 改动需重启 worker 生效(热调控制面在后续版本)。
+# 入站请求体上限(字节)。0 = 用内置默认 16MB。
+# ⚠️ **启动期参数** —— axum 的 DefaultBodyLimit 在建 app 时固定,改完必须重启,热调无效。
+# 超限由 axum 在 handler 之前直接返回 413,请求**不进 request_logs**,排障时查不到。
+# 注意这与出站上限是两道闸:出站 DEFAULT_MAX_BODY_BYTES = 6,300,000 是实测定标的硬编码值,
+# 不可配,调大只会把我方 400 换成上游 400(更糟,会进 poison_memo)。
+max_request_body_bytes: 0
+# 生产实际值(139 机):33554432   # 32MB,Claude Desktop 带附件长会话会撞 16MB
+
+# 账号调度/冷却(可选,缺省即下值)。
+# 下面标 [热调] 的字段可经 `PUT /admin/api/settings` 写进 DB settings 表逐字段覆盖本文件,
+# worker 30s 轮询 → from_effective() → update_tuning() 生效,**不需要重启**。
 scheduler:
-  rate_limit_cooldown_secs: 300     # 429 限流冷却(到期自愈)
-  empty_response_cooldown_secs: 60  # 空响应达阈值后的冷却
-  empty_response_window_secs: 60    # 空响应计数窗口
-  empty_response_threshold: 3       # 窗口内达此次数才冷却
-  max_failures: 5                   # 连续 5xx/网络失败达此数自动禁用(可全灭自愈)
-  affinity_ttl_secs: 1800           # 会话亲和条目 TTL(同会话钉同账号的记忆时长)
+  rate_limit_cooldown_secs: 300     # [热调] 429 限流冷却(到期自愈)。生产实际值:2
+  empty_response_cooldown_secs: 60  # [热调] 空响应达阈值后的冷却
+  empty_response_window_secs: 60    # [热调] 空响应计数窗口
+  empty_response_threshold: 3       # [热调] 窗口内达此次数才冷却
+  max_failures: 5                   # [热调] 连续 5xx/网络失败达此数自动禁用(可全灭自愈)
+  affinity_ttl_secs: 1800           # [热调] 会话亲和条目 TTL(同会话钉同账号的记忆时长)
+
+  # ── 抢占共享槽位(2026-07-31 加,针对企业号跨租户共享并发)────────────────
+  # 前提:企业号(ksk_/IdC)的上游并发槽位是跨租户共享的,429 是在跟其他买家抢,
+  # 不是我方打太猛。此时二值冷却纯亏 —— 一退让槽位立刻被别人吃掉。
+  queue_wait_ms: 0                  # [热调] 取号失败时的最长等待。0=关。生产实际值:15000
+                                    #   必须远小于 yapi 的 300s 硬中止。等待发生在响应开始之前。
+  rate_limit_pace_ms: 0             # [热调] 0=关。生产实际值:250
+                                    #   仅对开了 extra.queue_enabled 的账号生效:命中 429 不下线,
+                                    #   只在该窗口内不被选中,到点继续抢。面板上仍显示正常。
+  rate_limit_pace_max_strikes: 0    # [热调] 0=永不熔断回二值冷却。生产实际值:0
+                                    #   理由:429=竞争,403 TEMPORARILY_SUSPENDED 才是惩罚(已走独立分支),
+                                    #   不需要拿 429 连击去猜。
+  # ⚠️ 排队是**逐账号**开关 `extra.queue_enabled`(默认关,不在本文件),
+  #    经 `PATCH /admin/api/accounts/{id} {"queue_enabled":true}` 开。不能全局开:
+  #    社交号的 429 常伴额度见底,等待只是把客户多挂几秒后照样报错。
+  #    ⚠️ 新导入的企业号要手动开,导入接口不带这个字段。
+
+# 思考档位。
+thinking:
+  default_effort: high   # [热调] 客户端没指定时的默认档位。生产实际值:high(曾试过 max)
 
 # 图像压缩(可选,缺省即下值;🔵 移植 kiro.rs/xkiro,含解码前 OOM 护栏)。
 # 多模态大图按四档阈值等比缩放;失败一律回退原图,绝不丢图。
 image:
-  enabled: true
-  max_long_edge: 4000        # 长边像素上限
-  max_pixels_single: 4000000 # 单图总像素上限
-  max_pixels_multi: 4000000  # 多图档总像素上限(默认与单图相同,需要更严时调小)
+  enabled: true              # [热调,下同]
+  max_long_edge: 4000        # 长边像素上限。生产实际值:1568
+  max_pixels_single: 4000000 # 单图总像素上限。生产实际值:1150000
+  max_pixels_multi: 4000000  # 多图档总像素上限。生产实际值:1150000
   multi_threshold: 20        # 请求内图片数达此值启用多图档
+  # 生产收紧到 1568/1.15M 的依据:Anthropic 官方口径是长边 >1568px 或总像素 >~1.15M
+  # 会在**模型端**被缩掉,超出部分模型根本看不到 = 纯浪费。体积降到约 1/3.5。
+  # ⚠️ 未验证 Kiro 中转是否与 Anthropic 直连口径完全一致;有细节 OCR 需求的用户可能受影响。
+  # ⚠️ 改这几个值会让带图会话的 prompt 缓存前缀失效(字节变了),一次性成本。
+  # 顺带:PDF 等文档**完全不压缩**,超限时只能被 shed 整个剔掉,没有中间态。
