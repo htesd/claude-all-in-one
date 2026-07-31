@@ -242,6 +242,15 @@ pub struct QueueStats {
     pub capacity: usize,
     /// 开了排队开关的号数(不论其当前是否可用)。
     pub enabled_accounts: usize,
+    /// **累计**进过排队的请求数(worker 启动以来)。
+    ///
+    /// 为什么要它:`waiting` 是瞬时值,而排队只在「全组都不可用」时触发,面板上几乎恒为 0
+    /// —— 准确但看不出机制到底有没有在工作。累计值才能回答"这个开关有没有救到人"。
+    pub queued_total: u64,
+    /// **累计**被节流吸收的 429 次数(worker 启动以来)。
+    ///
+    /// 节流那行日志是 `debug!`,线上 `RUST_LOG=info` 看不到 —— 这个计数是它唯一的可观测面。
+    pub paced_total: u64,
 }
 
 /// [`AccountScheduler::sync_accounts`] 的变更统计(日志用)。
@@ -415,6 +424,9 @@ pub struct AccountScheduler {
     /// 最后集体等到超时 —— 比直接快速失败更糟(客户等更久、结果一样)。
     /// 用 `Relaxed`:它只是个准入近似阈值,不参与任何同步关系;短暂过冲无害。
     waiting: std::sync::atomic::AtomicUsize,
+    /// 累计进过排队的请求数 / 累计被节流吸收的 429 数(仅观测,不参与任何判定)。
+    queued_total: std::sync::atomic::AtomicU64,
+    paced_total: std::sync::atomic::AtomicU64,
     /// 会话亲和映射:session_key → primary。
     affinity: Mutex<HashMap<String, AffinityEntry>>,
     /// 调度参数(可热更:admin 设置面板改后 worker 30s 轮询经 [`Self::update_tuning`] 替换;
@@ -447,6 +459,8 @@ impl AccountScheduler {
         Self {
             entries: Mutex::new(entries),
             waiting: std::sync::atomic::AtomicUsize::new(0),
+            queued_total: std::sync::atomic::AtomicU64::new(0),
+            paced_total: std::sync::atomic::AtomicU64::new(0),
             affinity: Mutex::new(HashMap::new()),
             tuning: RwLock::new(Tuning::from(cfg)),
             model_unavailable: Mutex::new(HashMap::new()),
@@ -882,6 +896,8 @@ impl AccountScheduler {
         let entries = self.entries.lock();
         let mut st = QueueStats {
             waiting: self.waiting.load(std::sync::atomic::Ordering::Relaxed),
+            queued_total: self.queued_total.load(std::sync::atomic::Ordering::Relaxed),
+            paced_total: self.paced_total.load(std::sync::atomic::Ordering::Relaxed),
             ..Default::default()
         };
         for e in entries.values() {
@@ -908,6 +924,7 @@ impl AccountScheduler {
             self.waiting.fetch_sub(1, Relaxed);
             return None;
         }
+        self.queued_total.fetch_add(1, Relaxed);
         Some(QueueSlot(&self.waiting))
     }
 
@@ -1249,6 +1266,8 @@ impl AccountScheduler {
                     && (tuning.rate_limit_pace_max_strikes == 0
                         || e.rate_limit_strikes <= tuning.rate_limit_pace_max_strikes);
                 if paced {
+                    self.paced_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     e.paced_until = Some(now + tuning.rate_limit_pace);
                     tracing::debug!(
                         account = %id, strikes = e.rate_limit_strikes,

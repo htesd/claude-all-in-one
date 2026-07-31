@@ -116,6 +116,8 @@ const zh = {
     'accounts.queue.off': '关',
     'accounts.queue.title': '排队中',
     'accounts.queue.enabledAccounts': '{n} 个号已开',
+    'accounts.queue.totals': '累计排队 {queued} · 节流吸收 {paced}',
+    'accounts.queue.totalsHint': 'worker 启动以来的累计值。「排队」= 全组都不可用时被挡下来等待的请求数；「节流吸收」= 开了排队的号命中 429 后只节流、没有下线的次数。瞬时排队数几乎恒为 0，看累计值才知道机制有没有真的在工作。',
     'accounts.queue.statHint': '当前等待数 / 队列容量。容量 = 已开排队且当前可服务的号的并发之和；等待数触到容量时新请求立刻失败，不再排队。',
   'table.priorityHint':
     '两档:高优先级号被优先·积极调度(高层空出老会话回迁),低优先级号兜底。按分组分别设定：',
@@ -536,6 +538,8 @@ const en: Record<I18nKey, string> = {
     'accounts.queue.off': 'Off',
     'accounts.queue.title': 'Queued',
     'accounts.queue.enabledAccounts': '{n} accounts on',
+    'accounts.queue.totals': '{queued} queued total · {paced} throttles absorbed',
+    'accounts.queue.totalsHint': 'Cumulative since worker start. "Queued" counts requests held when every account was unavailable; "throttles absorbed" counts 429s where a queue-enabled account was paced instead of taken out of rotation. The instantaneous waiting count is almost always 0, so the totals are what tell you the mechanism is working.',
     'accounts.queue.statHint': 'Waiting / capacity. Capacity = summed concurrency of queue-enabled accounts that can serve right now; once waiting hits it, new requests fail immediately instead of queueing.',
   'table.priorityHint':
     'Two tiers: High accounts scheduled first and aggressively (sessions migrate back up when High frees); Low as fallback. Set per group:',

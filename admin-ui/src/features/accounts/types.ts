@@ -152,6 +152,16 @@ export interface QueueStats {
   capacity: number
   /** 开了排队开关的号数（不论当前是否可用）。 */
   enabled_accounts: number
+  /**
+   * **累计**进过排队的请求数（worker 启动以来）。
+   * `waiting` 是瞬时值、几乎恒为 0（排队只在全组不可用时触发），看不出机制有没有在工作；
+   * 累计值才能回答"这个开关到底救到人没有"。旧 worker 不返回 → 缺省视为 0。
+   */
+  queued_total?: number
+  /**
+   * **累计**被节流吸收的 429 次数。节流日志是 debug 级、线上看不到，这是它唯一的可观测面。
+   */
+  paced_total?: number
 }
 
 /** POST /accounts/import 请求体。 */

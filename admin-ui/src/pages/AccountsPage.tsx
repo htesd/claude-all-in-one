@@ -286,6 +286,13 @@ export default function AccountsPage() {
                   <span className="text-muted-foreground">
                     ({t('accounts.queue.enabledAccounts', { n: q.enabled_accounts })})
                   </span>
+                  {/* 累计值:waiting 几乎恒为 0,只有累计数能说明机制有没有真的在工作。 */}
+                  <span className="text-muted-foreground" title={t('accounts.queue.totalsHint')}>
+                    {t('accounts.queue.totals', {
+                      queued: q.queued_total ?? 0,
+                      paced: q.paced_total ?? 0,
+                    })}
+                  </span>
                 </span>
               )
             })}
