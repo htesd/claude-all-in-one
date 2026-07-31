@@ -3,6 +3,7 @@ import { ChevronRight, Info, Loader2 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Modal } from '@/components/ui/modal'
+import { Segment } from '@/components/ui/segment'
 import { Select } from '@/components/ui/select'
 import { useGroups, useSaveMemberships } from '@/features/groups/hooks'
 import { extractErrorMessage } from '@/lib/api'
@@ -60,6 +61,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   const [memberships, setMemberships] = useState<Record<string, number>>({})
   const [rotateOpen, setRotateOpen] = useState(false)
   const [token, setToken] = useState('')
+  const [queueEnabled, setQueueEnabled] = useState(false)
   const [proxyUrl, setProxyUrl] = useState('')
   const [initialProxyUrl, setInitialProxyUrl] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -71,6 +73,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
       setGroup(row.group_name)
       setConcurrency(String(row.max_concurrency))
       setMemberships(Object.fromEntries((row.groups ?? []).map((m) => [m.name, m.priority])))
+      setQueueEnabled(row.queue_enabled ?? false)
       setRotateOpen(false)
       setToken('')
       const currentProxy = typeof row.extra.proxy === 'string' ? row.extra.proxy : ''
@@ -121,6 +124,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     if (trimmedToken !== '') patch.extra = buildRotatedExtra(row.extra, trimmedToken)
     // proxy_url: 不传=不动，'' = 清除，非空字符串 = 设置
     if (proxyUrl !== initialProxyUrl) patch.proxy_url = proxyUrl
+    // 排队开关：与原值比较，没动就不带 —— 否则对着不认这个字段的旧后端，
+    // 只改并发也会让**整个保存**被判 400。
+    if (queueEnabled !== (row.queue_enabled ?? false)) patch.queue_enabled = queueEnabled
 
     const draft: AccountGroupMembership[] = Object.entries(memberships).map(
       ([name, priority]) => ({ name, priority }),
@@ -271,6 +277,27 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
               onChange={(event) => setConcurrency(event.target.value)}
               className={inputClass}
             />
+          </div>
+
+          {/* 排队等冷却：逐号开关。
+              企业号（ksk_/IdC）的上游并发跨租户共享，429 是跟别的买家抢同一个池子，
+              等一下真的就有 —— 开了以后客户感知不到限速，只是变慢。
+              社交号的 429 常伴额度见底，等待只会把客户多挂几秒后照样报错，别开。 */}
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium text-muted-foreground">
+              {t('accounts.field.queue')}
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <Segment
+                options={[
+                  { value: 'off', label: t('accounts.queue.off') },
+                  { value: 'on', label: t('accounts.queue.on') },
+                ]}
+                value={queueEnabled ? 'on' : 'off'}
+                onChange={(v) => setQueueEnabled(v === 'on')}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">{t('accounts.field.queueHint')}</p>
           </div>
 
           {/* 出口代理（可选） */}

@@ -184,6 +184,25 @@ export function AccountTableRow({
         )}
       </TD>
 
+      {/* 排队开关：runtime 值优先（worker 侧实时），回落到列表行的配置值。
+          关着的号显示灰「关」而不是空白 —— 空白会被误读成"这列还没加载"。 */}
+      <TD className="text-right">
+        {(() => {
+          const on = runtime?.online
+            ? (runtime.status.queue_enabled ?? row.queue_enabled ?? false)
+            : (row.queue_enabled ?? false)
+          return on ? (
+            <Badge variant="success" title={t('table.queueOnHint')}>
+              {t('table.queueOn')}
+            </Badge>
+          ) : (
+            <span className="text-xs text-muted-foreground" title={t('table.queueOffHint')}>
+              {t('table.queueOff')}
+            </span>
+          )
+        })()}
+      </TD>
+
       {/* 调度优先级:**按组**两档(高/低) —— 同一个号在 A 组可以是主力、B 组是兜底,
           所以这里只给个汇总,逐组明细在 title 里(以及编辑弹窗)。 */}
       <TD className="text-right">
