@@ -11,6 +11,7 @@ import {
   Moon,
   ScrollText,
   Settings,
+  ShoppingCart,
   Sun,
   Users,
   Zap,
@@ -48,6 +49,7 @@ const navItems: NavItem[] = [
   { to: '/accounts', labelKey: 'nav.accounts', icon: Users },
   { to: '/keys', labelKey: 'nav.apiKeys', icon: KeyRound },
   { to: '/groups', labelKey: 'nav.groups', icon: FolderKanban },
+  { to: '/restock', labelKey: 'nav.restock', icon: ShoppingCart },
   { to: '/settings', labelKey: 'nav.settings', icon: Settings },
   { to: '/logs', labelKey: 'nav.logs', icon: ScrollText },
 ]

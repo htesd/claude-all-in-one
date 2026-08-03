@@ -6,6 +6,7 @@
 mod admin;
 mod egress;
 mod registry;
+mod restock;
 mod router;
 mod websearch;
 mod worker;

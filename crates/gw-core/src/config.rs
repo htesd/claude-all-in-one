@@ -175,6 +175,51 @@ pub struct DarioSidecarConfig {
     pub api_key: String,
 }
 
+/// 自动补货(drop.kiro.ss 买 Kiro `ksk_` 号并自动上号)的**启动期**配置。
+///
+/// 这里只放三样:参与开关、上游地址、密钥。**运行时可调的策略参数一律不在这里**
+/// (水位/高峰窗口/日上限/预测参数……),它们存 control.db,面板改完即时生效无需重启。
+///
+/// 为什么这么切:热调参数的自然去处是 [`SystemSettings`],但那个结构体有一条**回滚地板**
+/// (见其注释)——给它加字段会让回滚到 2026-07-31 之前的镜像变成全量 503。补货参数走自己的
+/// 表天然避开,同时密钥也不会经 `GET /admin/api/settings` 回显给前端。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RestockConfig {
+    /// 本进程是否参与补货。**默认 false** —— 没显式打开就绝不会有任何进程去花钱。
+    ///
+    /// 注意它不是"业务开关"(那个在面板上、存 DB),而是"这个二进制允不允许跑补货循环"。
+    /// 生产上多个 router 共用同一份 system.yaml,所以打开它之后**由 DB 租约决定谁真正跑**,
+    /// 不能靠这个字段做互斥。
+    pub enabled: bool,
+    /// drop 平台地址。空 → 回落 [`Self::DEFAULT_BASE_URL`]。
+    pub base_url: String,
+    /// drop 平台的 `X-API-Key`(`usr-` 开头)。空 → 视为未配置,循环不启动。
+    pub api_key: String,
+}
+
+impl RestockConfig {
+    pub const DEFAULT_BASE_URL: &'static str = "https://drop.kiro.ss";
+
+    /// 有效地址:空串回落默认,并去掉尾斜杠(拼路径时避免 `//api/...`)。
+    pub fn base_url(&self) -> &str {
+        let s = self.base_url.trim().trim_end_matches('/');
+        if s.is_empty() {
+            Self::DEFAULT_BASE_URL
+        } else {
+            s
+        }
+    }
+
+    /// 配置是否完整到可以启动补货循环。
+    ///
+    /// fail-closed:`enabled` 打开但密钥是空的 → **不启动**(而不是带着一个必然 401 的
+    /// 客户端空转),让启动日志把这件事说出来。
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.api_key.trim().is_empty()
+    }
+}
+
 /// 思考强度档位。**闭集,由低到高**,序列化为小写串(与上游 enum 逐字一致)。
 ///
 /// 为什么是枚举而不是 `String`:这个值会**原样进 wire**
@@ -273,6 +318,10 @@ pub struct SystemConfig {
     /// **启动期参数**:worker 启动时一次性注入 provider 工厂;改后需重启相关 worker。
     #[serde(default)]
     pub dario: DarioSidecarConfig,
+    /// 自动补货(drop.kiro.ss 买 ksk_ 号并上号)。**启动期参数 + 密钥**;
+    /// 策略参数在 DB 里可热改。见 [`RestockConfig`]。
+    #[serde(default)]
+    pub restock: RestockConfig,
 }
 
 impl SystemConfig {
@@ -898,6 +947,34 @@ mod tests {
         let cfg2: SystemConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg2.dario.sidecar_url, "http://127.0.0.1:39100");
         assert_eq!(cfg2.dario.api_key, "local-key");
+    }
+
+    #[test]
+    fn restock_config_defaults_and_parse() {
+        // 缺省:不参与补货、无密钥。这条最重要——默认值必须是"不花钱"。
+        let d = RestockConfig::default();
+        assert!(!d.enabled);
+        assert!(!d.is_configured());
+        assert_eq!(d.base_url(), RestockConfig::DEFAULT_BASE_URL);
+
+        // 老 system.yaml 缺 restock 段 → 默认,不拒绝启动(顶层无 deny_unknown_fields)。
+        let cfg: SystemConfig = serde_yaml::from_str("upstream_timeout_secs: 600\n").unwrap();
+        assert!(!cfg.restock.enabled);
+
+        // enabled 但没密钥 → fail-closed,不算配置完整(否则会带着必然 401 的客户端空转)。
+        let half = "restock:\n  enabled: true\n";
+        let cfg2: SystemConfig = serde_yaml::from_str(half).unwrap();
+        assert!(cfg2.restock.enabled);
+        assert!(!cfg2.restock.is_configured());
+
+        // 完整配置。尾斜杠要被去掉,否则拼路径出 `//api/me/stock`。
+        let yaml = "restock:\n  enabled: true\n  base_url: \"https://drop.kiro.ss/\"\n  api_key: \"usr-abc\"\n";
+        let cfg3: SystemConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg3.restock.is_configured());
+        assert_eq!(cfg3.restock.base_url(), "https://drop.kiro.ss");
+
+        // 段内拼错字段当场报错(deny_unknown_fields),不静默忽略。
+        assert!(serde_yaml::from_str::<SystemConfig>("restock:\n  enabeld: true\n").is_err());
     }
 
     #[test]
