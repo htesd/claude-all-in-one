@@ -1811,12 +1811,75 @@ fn group_scoped_affinity_key(group: Option<&str>, key: Option<String>) -> Option
     }
 }
 
+/// 一条消息的 `content` 是否为空。
+///
+/// 空的判定与 Anthropic 官方 API 对齐:空串、纯空白、空数组、以及**含有空 text 块**的数组
+/// 都会被上游拒。注意最后一种——`[{"type":"text","text":""}]` 看起来"有内容",但上游同样拒收。
+///
+/// 非文本块(image / tool_use / tool_result / thinking …)不参与判空:一条只带图片、
+/// 没有文字的消息是合法的。
+fn is_empty_message_content(content: Option<&serde_json::Value>) -> bool {
+    match content {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+        Some(serde_json::Value::Array(blocks)) => {
+            if blocks.is_empty() {
+                return true;
+            }
+            // 任一空 text 块即非法(上游按块校验,不是按整条消息)。
+            blocks.iter().any(|b| {
+                b.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && b.get("text")
+                        .and_then(|t| t.as_str())
+                        .is_none_or(|t| t.trim().is_empty())
+            })
+        }
+        // 其余类型(数字/布尔/对象)本就不是合法 content,交给上游报错,这里不拦。
+        Some(_) => false,
+    }
+}
+
+/// 校验 `messages` 数组里没有空 content 的消息。
+///
+/// 返回 `Err(人话错误)` —— 点名是第几条、什么角色,让客户端能直接定位;上游那句
+/// "Improperly formed request." 什么都不说。
+fn validate_message_contents(body: &serde_json::Value) -> Result<(), String> {
+    let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else {
+        // 缺 messages / 类型不对:交给下游既有路径处理,这里只管空 content 这一件事。
+        return Ok(());
+    };
+    for (i, m) in msgs.iter().enumerate() {
+        if is_empty_message_content(m.get("content")) {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            return Err(format!(
+                "messages[{i}] (role={role}) 的 content 为空。Anthropic 协议不允许空消息内容,\
+                 上游会以 \"Improperly formed request\" 拒绝整个请求。请删除该条消息或填入非空内容。"
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn messages(
     State(st): State<Arc<WorkerState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
     let req = ChatRequest::from_anthropic_body(body);
+    // 入站结构校验:空 content 的消息上游必拒(2026-08-02 实测 失败样本命中 8/173、
+    // 成功样本 0/400,零假阳性),且失败时上游回的是含糊的 "Improperly formed request",
+    // 客户根本查不出是哪条消息的问题。在这里挡掉:不占账号、不消耗配额、报错点名下标。
+    if let Err(msg) = validate_message_contents(&req.body) {
+        tracing::debug!("入站请求结构非法,本地拒绝: {msg}");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": msg}
+            })),
+        )
+            .into_response();
+    }
     // 请求日志(#③)采集:进入即计时。报文序列化(client/kiro)推迟到收尾的 blocking 任务里做,
     // 不在热路径(handler 入口)同步跑(审查 Skeptic#1)。
     let started_at = std::time::Instant::now();
@@ -3271,6 +3334,74 @@ mod tests {
     use gw_core::provider::ChatUsage;
     use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
+
+    /// 空 content 必须在入站被拦下:上游对这类请求回含糊的 "Improperly formed request",
+    /// 客户查不出是哪条消息;放行还会白占一个账号的并发槽。
+    /// (2026-08-02 实测:失败样本命中 8/173,成功样本 0/400 —— 零假阳性。)
+    #[test]
+    fn empty_message_content_is_rejected_with_index_and_role() {
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": ""}
+            ]
+        });
+        let err = validate_message_contents(&body).expect_err("空 content 应被拒");
+        assert!(err.contains("messages[2]"), "应点名下标,实际: {err}");
+        assert!(err.contains("role=user"), "应点名角色,实际: {err}");
+    }
+
+    #[test]
+    fn empty_content_variants_all_rejected() {
+        for (label, content) in [
+            ("空串", serde_json::json!("")),
+            ("纯空白", serde_json::json!("   \n ")),
+            ("空数组", serde_json::json!([])),
+            ("空 text 块", serde_json::json!([{"type": "text", "text": ""}])),
+            (
+                "text 块缺 text 字段",
+                serde_json::json!([{"type": "text"}]),
+            ),
+            ("null", serde_json::Value::Null),
+        ] {
+            let body = serde_json::json!({"messages": [{"role": "user", "content": content}]});
+            assert!(
+                validate_message_contents(&body).is_err(),
+                "{label} 应被判为空 content"
+            );
+        }
+        // content 字段整个缺席
+        let body = serde_json::json!({"messages": [{"role": "user"}]});
+        assert!(validate_message_contents(&body).is_err(), "缺 content 应被拒");
+    }
+
+    #[test]
+    fn non_empty_and_non_text_blocks_pass() {
+        // 只带图片、没有文字的消息是合法的,不能误伤。
+        let img = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+        ]}]});
+        assert!(validate_message_contents(&img).is_ok(), "纯图片消息应放行");
+
+        // tool_result / tool_use 同理。
+        let tool = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": "done"}
+        ]}]});
+        assert!(validate_message_contents(&tool).is_ok(), "纯 tool_result 应放行");
+
+        // 正常文本 + 图片混排。
+        let mixed = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "看这张图"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+        ]}]});
+        assert!(validate_message_contents(&mixed).is_ok(), "文本+图片应放行");
+
+        // 没有 messages 字段:不归本校验管,放行交给下游。
+        let none = serde_json::json!({"model": "claude-opus-5"});
+        assert!(validate_message_contents(&none).is_ok(), "缺 messages 不该在此报错");
+    }
 
     #[test]
     fn switch_cap_benign_descends_full_ladder_risky_capped() {
