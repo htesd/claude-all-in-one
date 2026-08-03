@@ -1,6 +1,8 @@
 import { Segment } from '@/components/ui/segment'
 import { useI18n } from '@/lib/i18n'
 
+import type { AccountSortKey } from '../lib'
+
 export type StatusFilter = 'all' | 'ok' | 'abnormal' | 'disabled'
 export type TierFilter = 'all' | 'PRO' | 'POWER' | 'FREE' | 'OTHER'
 
@@ -22,9 +24,13 @@ interface AccountsFilterBarProps {
   tiers: TierFilter[]
   /** 当前筛选的 provider 是否属于需要展示档位的范围。 */
   showTierFilter: boolean
+
+  /** 当前排序键。 */
+  sortKey: AccountSortKey
+  onSortChange: (v: AccountSortKey) => void
 }
 
-/** 账号列表筛选条：状态 / 提供方 / 订阅档（均受控，父组件持状态）。 */
+/** 账号列表筛选条：状态 / 提供方 / 订阅档 / 排序（均受控，父组件持状态）。 */
 export function AccountsFilterBar({
   statusFilter,
   onStatusChange,
@@ -35,6 +41,8 @@ export function AccountsFilterBar({
   onTierChange,
   tiers,
   showTierFilter,
+  sortKey,
+  onSortChange,
 }: AccountsFilterBarProps) {
   const { t } = useI18n()
 
@@ -53,6 +61,12 @@ export function AccountsFilterBar({
   const tierOptions: Array<{ value: TierFilter; label: string }> = [
     { value: 'all', label: t('filter.tierAll') },
     ...tiers.map((tier) => ({ value: tier, label: tier })),
+  ]
+
+  const sortOptions: Array<{ value: AccountSortKey; label: string }> = [
+    { value: 'created_desc', label: t('filter.sortCreatedDesc') },
+    { value: 'created_asc', label: t('filter.sortCreatedAsc') },
+    { value: 'name', label: t('filter.sortName') },
   ]
 
   return (
@@ -78,6 +92,12 @@ export function AccountsFilterBar({
           <Segment options={tierOptions} value={tierFilter} onChange={onTierChange} />
         </div>
       )}
+
+      {/* 排序：默认「最新在前」——短命号要按上号时间管，后端返回的是按组+名排序 */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-muted-foreground">{t('filter.sort')}</span>
+        <Segment options={sortOptions} value={sortKey} onChange={onSortChange} />
+      </div>
     </div>
   )
 }

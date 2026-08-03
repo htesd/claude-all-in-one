@@ -198,6 +198,39 @@ export function deriveTier(
   return 'OTHER'
 }
 
+/**
+ * 账号列表排序。
+ *
+ * 后端固定按 `group_name ASC, account_id ASC` 返回(见 gw-store `list_accounts`),
+ * 那个顺序对「哪个号是刚上的」毫无帮助 —— 而 Kiro 的短命号(ksk_ API Key 寿命只有
+ * 二三十分钟、且成批死亡)恰恰要按上号时间来管。故在前端补一层排序。
+ *
+ * 排序是**纯函数**且不改入参:调用方是 useMemo,原地 sort 会污染 react-query 缓存里的
+ * 数组、让相同引用的后续 memo 读到被搅乱的顺序。
+ */
+export type AccountSortKey = 'created_desc' | 'created_asc' | 'name'
+
+export function sortAccounts(rows: AccountRow[], key: AccountSortKey): AccountRow[] {
+  const next = [...rows]
+  switch (key) {
+    case 'created_desc':
+      // 同一批导入的号 created_at 完全相同(秒级),再按 id 兜底保证顺序稳定,
+      // 否则 15s 轮询刷新时同批号会互相跳位。
+      return next.sort(
+        (a, b) => b.created_at - a.created_at || a.account_id.localeCompare(b.account_id),
+      )
+    case 'created_asc':
+      return next.sort(
+        (a, b) => a.created_at - b.created_at || a.account_id.localeCompare(b.account_id),
+      )
+    case 'name':
+      // 后端原序:先分组再账号名。
+      return next.sort(
+        (a, b) => a.group_name.localeCompare(b.group_name) || a.account_id.localeCompare(b.account_id),
+      )
+  }
+}
+
 /** provider → 账号页 tab 短标签(用户惯用语:claude-dario 即 "ccmax")。未知 provider 原样。 */
 export function providerTabLabel(provider: string): string {
   switch (provider) {

@@ -1,7 +1,57 @@
 import { describe, expect, it } from 'vitest'
 
-import { diffMemberships } from './lib'
-import type { AccountGroupMembership } from './types'
+import { diffMemberships, sortAccounts } from './lib'
+import type { AccountGroupMembership, AccountRow } from './types'
+
+/** 只填排序用得到的字段，其余给最小合法值。 */
+function row(account_id: string, created_at: number, group_name = 'G0'): AccountRow {
+  return {
+    account_id,
+    group_name,
+    provider: 'kiro',
+    max_concurrency: 1,
+    priority: 100,
+    disabled: false,
+    extra: {},
+    created_at,
+  }
+}
+
+describe('账号列表排序', () => {
+  it('默认「最新在前」：按 created_at 倒序', () => {
+    const rows = [row('a', 100), row('b', 300), row('c', 200)]
+    expect(sortAccounts(rows, 'created_desc').map((r) => r.account_id)).toEqual(['b', 'c', 'a'])
+  })
+
+  it('「最早在前」：按 created_at 正序', () => {
+    const rows = [row('a', 100), row('b', 300), row('c', 200)]
+    expect(sortAccounts(rows, 'created_asc').map((r) => r.account_id)).toEqual(['a', 'c', 'b'])
+  })
+
+  it('同批导入(created_at 相同)按 id 兜底，顺序稳定', () => {
+    // Kiro 号成批上，同批的 created_at 是同一秒。没有兜底键的话，
+    // 15s 运行态轮询每刷新一次同批号就会互相跳位。
+    const rows = [row('k3', 500), row('k1', 500), row('k2', 500)]
+    expect(sortAccounts(rows, 'created_desc').map((r) => r.account_id)).toEqual(['k1', 'k2', 'k3'])
+    expect(sortAccounts(rows, 'created_asc').map((r) => r.account_id)).toEqual(['k1', 'k2', 'k3'])
+  })
+
+  it('「按组+名称」复现后端原序(group_name ASC, account_id ASC)', () => {
+    const rows = [row('b', 1, 'GLOW'), row('a', 2, 'GLOW'), row('z', 3, 'G0')]
+    expect(sortAccounts(rows, 'name').map((r) => r.account_id)).toEqual(['z', 'a', 'b'])
+  })
+
+  it('不修改入参数组——原地 sort 会污染 react-query 缓存', () => {
+    const rows = [row('a', 100), row('b', 300)]
+    const before = rows.map((r) => r.account_id)
+    sortAccounts(rows, 'created_desc')
+    expect(rows.map((r) => r.account_id)).toEqual(before)
+  })
+
+  it('空列表不炸', () => {
+    expect(sortAccounts([], 'created_desc')).toEqual([])
+  })
+})
 
 const HIGH = 0
 const LOW = 100
