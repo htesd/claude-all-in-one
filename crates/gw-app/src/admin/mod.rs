@@ -18,6 +18,7 @@ mod accounts;
 mod groups;
 mod keys;
 mod logs;
+mod restock;
 mod settings;
 mod usage;
 
@@ -66,6 +67,7 @@ pub fn admin_api_router(state: AdminState) -> Router {
         .merge(accounts::router())
         .merge(settings::router())
         .merge(logs::router())
+        .merge(restock::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state)
 }

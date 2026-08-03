@@ -367,6 +367,64 @@ pub struct RequestLogFilter {
     pub offset: i64,
 }
 
+// === 自动补货(drop.kiro.ss 买 ksk_ 号并自动上号)===
+
+/// 一笔补货订单。
+///
+/// **状态机**:`pending`(幂等键已落库、请求可能在途)→ `purchased`(key 到手)
+/// → `imported`(号已上线)。任一步失败转 `failed`,`dry_run` 是演练留痕。
+/// 停在 `purchased` 的订单是**最坏情况**——钱花了号没进系统,必须人工处理,
+/// 面板会把它单列成"孤儿订单"。
+#[derive(Debug, Clone, Serialize)]
+pub struct RestockOrder {
+    pub client_order_id: String,
+    pub count: i64,
+    pub status: String,
+    pub keys: Vec<String>,
+    /// **实际扣款**(购买前后余额之差),不是按报价估算的——报价是 USD、扣款是 CNY。
+    pub spent_cny: f64,
+    pub error: String,
+    pub created_at: i64,
+}
+
+/// 一条决策流水。`action` ∈ skip/buy/import/reclaim/error。
+#[derive(Debug, Clone, Serialize)]
+pub struct RestockDecision {
+    pub ts: i64,
+    pub action: String,
+    pub reason: String,
+    pub healthy: Option<i64>,
+    pub stock: Option<i64>,
+    pub price_usd: Option<f64>,
+    pub balance_cny: Option<f64>,
+    pub detail: String,
+}
+
+/// 补货账号清单的一行。用量来自 `usage_records`(永不裁剪),故是**终身**统计。
+#[derive(Debug, Clone, Serialize)]
+pub struct RestockAccountRow {
+    pub account_id: String,
+    pub created_at: i64,
+    pub disabled: bool,
+    pub max_concurrency: i64,
+    pub calls: i64,
+    pub success: i64,
+    pub credits: f64,
+    /// 形如 `G0@0 GECO@0`,组内优先级的事实源(不是 extra.priority)。
+    pub groups: String,
+}
+
+/// 小时聚合的一行。键是 `(整点, 模型, 是否 ksk_)`,写入时按键累加。
+#[derive(Debug, Clone, Serialize)]
+pub struct CreditRollupRow {
+    pub hour_ts: i64,
+    pub model: String,
+    pub ksk: bool,
+    pub calls: i64,
+    pub success: i64,
+    pub credits: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

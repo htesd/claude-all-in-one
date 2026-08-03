@@ -16,9 +16,11 @@ use flate2::Compression;
 use gw_core::account::Account;
 use gw_core::config::AccountsConfig;
 use gw_core::store::{
-    AccountPatch, AccountRow, ApiKeyPatch, ApiKeyRow, AuthenticatedKey, ControlStore, GroupRow,
-    LogBlob, RequestLog, RequestLogDetail, RequestLogFilter, RequestLogRow, UsageByKey,
-    UsageByModel, UsageFilter, UsageRecord, UsageSink, UsageSummary,
+    AccountPatch, AccountRow, ApiKeyPatch, ApiKeyRow, AuthenticatedKey, ControlStore,
+    CreditRollupRow, GroupRow, LogBlob, RequestLog, RequestLogDetail, RequestLogFilter,
+    RequestLogRow, RestockAccountRow, RestockDecision, RestockOrder, UsageByKey,
+    UsageByModel, UsageFilter,
+    UsageRecord, UsageSink, UsageSummary,
 };
 use rusqlite::types::Value;
 use parking_lot::Mutex;
@@ -182,6 +184,62 @@ CREATE TABLE IF NOT EXISTS log_blob_refs (
     PRIMARY KEY (log_id, hash)
 );
 CREATE INDEX IF NOT EXISTS idx_blobref_hash ON log_blob_refs(hash);
+
+-- ── 自动补货(drop.kiro.ss 买 ksk_ 号并自动上号) ────────────────────────────
+-- 订单。**幂等键必须在发出购买请求之前落到这里**:进程崩在请求途中时,重启后靠这张表
+-- 才知道那个 client_order_id 是什么,用原 id 重放才能问出真实结果而不是重复扣款。
+-- 金额一律记**实际扣款**(购买前后余额之差),不用报价推算——报价是 USD、扣款是 CNY。
+CREATE TABLE IF NOT EXISTS restock_orders (
+    client_order_id TEXT PRIMARY KEY,
+    count           INTEGER NOT NULL,
+    max_total_cny   REAL    NOT NULL,
+    status          TEXT    NOT NULL,          -- pending/purchased/imported/failed/dry_run
+    keys_json       TEXT    NOT NULL DEFAULT '[]',
+    spent_cny       REAL    NOT NULL DEFAULT 0,
+    balance_before  REAL,
+    balance_after   REAL,
+    error           TEXT    NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_restock_orders_created ON restock_orders(created_at);
+
+-- 本服务买入并成功上号的账号。回收**只动这张表里的号** —— 人工上的历史死号
+-- (线上有 200+)不归自动化处置。
+CREATE TABLE IF NOT EXISTS restock_owned (
+    account_id      TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL,
+    created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    reclaimed_at    INTEGER
+);
+
+-- 每轮决策流水。这是"为什么没补/为什么补了"的唯一可查记录。
+CREATE TABLE IF NOT EXISTS restock_decisions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    action      TEXT    NOT NULL,              -- skip/buy/import/reclaim/error
+    reason      TEXT    NOT NULL,
+    healthy     INTEGER,
+    stock       INTEGER,
+    price_usd   REAL,
+    balance_cny REAL,
+    detail      TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_restock_decisions_ts ON restock_decisions(ts);
+
+-- 积分消耗的小时级聚合,数据源是 usage_records(**永不裁剪**,线上已有 51 天历史)。
+-- 物化成一张小表是为了让面板画图不必每次 GROUP BY 百万行;ksk 维度分开存,
+-- 因为补货只关心 ksk_ 号的消耗,但总量能看出整体负载。
+CREATE TABLE IF NOT EXISTS restock_credit_rollup (
+    hour_ts INTEGER NOT NULL,                  -- UTC 整点 epoch
+    model   TEXT    NOT NULL,
+    ksk     INTEGER NOT NULL,                  -- 1 = ksk_ 号(补货的对象)
+    calls   INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    credits REAL    NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_ts, model, ksk)
+);
+CREATE INDEX IF NOT EXISTS idx_restock_rollup_hour ON restock_credit_rollup(hour_ts);
 "#;
 
 /// 请求日志报文 gzip 压缩后入库(BLOB)——全文不截断,文本压 5-10 倍。压缩失败极罕见
@@ -842,6 +900,489 @@ impl SqliteStore {
     /// 写系统设置 overlay(整段 JSON 覆盖单行 key='system')。
     pub fn upsert_settings(&self, json: &str) -> anyhow::Result<()> {
         self.upsert_kv("system", json)
+    }
+
+    // ───────────────────────── 自动补货:租约 ─────────────────────────
+
+    /// 补货 leader 租约在 `settings` 表里的键名。
+    pub const KEY_RESTOCK_LEASE: &'static str = "restock_lease";
+    /// 积分汇总游标(已消费到的 `usage_records.id`)的键名。
+    pub const KEY_RESTOCK_CURSOR: &'static str = "restock_rollup_cursor";
+    /// 补货运行时参数(面板可改的那些)的键名,整段 JSON。
+    pub const KEY_RESTOCK_PARAMS: &'static str = "restock_params";
+
+    /// 抢占或续租补货 leader 租约。返回 `true` = 本进程当选,可以执行本轮补货。
+    ///
+    /// **为什么必须有这个**:生产上有**两个以上** `--mode router` 进程(kiro 一个、
+    /// dario 一个,开了 exp 栈还有第三个),它们共用同一个 control.db。把补货循环直接
+    /// 挂在 router 角色上会让每个进程各买各的 —— 直接重复扣款。
+    /// `README.md` 里"Router 单实例"的说法是单通道时代的过时描述。
+    ///
+    /// 实现是一条**条件 UPDATE**:只有「上一任已过期」或「本来就是我」两种情况写得进去
+    /// (首次是 INSERT,无冲突)。SQLite 单写者 + `busy_timeout=5000` 保证互斥,
+    /// 抢锁时会等待而不是当场 `database is locked`。
+    ///
+    /// 租约**故意不做续期保证**:持有者每轮都要重新调用本方法,进程被 SIGKILL
+    /// (docker stop 10s 后就是)时租约自然过期,由别的 router 接手。
+    pub fn try_acquire_restock_lease(&self, holder: &str, ttl_secs: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let now: i64 = conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?;
+        let value = serde_json::json!({ "holder": holder, "expires_at": now + ttl_secs.max(1) })
+            .to_string();
+        let n = conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                            updated_at = strftime('%s','now')
+             WHERE CAST(json_extract(settings.value, '$.expires_at') AS INTEGER) < ?3
+                OR json_extract(settings.value, '$.holder') = ?4",
+            rusqlite::params![Self::KEY_RESTOCK_LEASE, value, now, holder],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// 主动让出租约(优雅停机用)。只有持有者本人能让出,避免误伤接任者。
+    pub fn release_restock_lease(&self, holder: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1
+               AND json_extract(value, '$.holder') = ?2",
+            rusqlite::params![Self::KEY_RESTOCK_LEASE, holder],
+        )?;
+        Ok(())
+    }
+
+    /// 当前租约持有者(面板展示用;过期的返回 `None`)。
+    pub fn restock_lease_holder(&self) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT json_extract(value, '$.holder'),
+                        CAST(json_extract(value, '$.expires_at') AS INTEGER)
+                   FROM settings WHERE key = ?1",
+                [Self::KEY_RESTOCK_LEASE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let now: i64 = conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?;
+        Ok(row.filter(|(_, exp)| *exp > now).map(|(h, _)| h))
+    }
+
+    // ───────────────────────── 自动补货:订单 ─────────────────────────
+
+    /// 落库幂等键。**必须在发出购买请求之前调用** —— 进程崩在请求途中时,
+    /// 重启后靠这行才知道那个 `client_order_id` 是什么,用原 id 重放才能问出真实结果;
+    /// 否则重试就是重复扣款。
+    pub fn restock_create_order(
+        &self,
+        order_id: &str,
+        count: i64,
+        max_total_cny: f64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO restock_orders (client_order_id, count, max_total_cny, status)
+             VALUES (?1, ?2, ?3, 'pending')",
+            rusqlite::params![order_id, count, max_total_cny],
+        )?;
+        Ok(())
+    }
+
+    /// key 到手后立刻落库,并按余额差记**实际扣款**,返回该值。
+    ///
+    /// 记实扣而不是按报价估算:报价字段是 USD、扣款走 CNY,用报价推算会让日预算阀失真。
+    /// 拿不到 `balance_before` 时返回 0,调用方需要据此告警(账不平比少买一个号严重)。
+    pub fn restock_mark_purchased(
+        &self,
+        order_id: &str,
+        keys: &[String],
+        balance_before: Option<f64>,
+        balance_after: f64,
+    ) -> anyhow::Result<f64> {
+        let spent = balance_before.map(|b| (b - balance_after).max(0.0)).unwrap_or(0.0);
+        let keys_json = serde_json::to_string(keys)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE restock_orders
+                SET status='purchased', keys_json=?2, spent_cny=?3,
+                    balance_before=?4, balance_after=?5,
+                    updated_at=strftime('%s','now')
+              WHERE client_order_id=?1",
+            rusqlite::params![order_id, keys_json, spent, balance_before, balance_after],
+        )?;
+        Ok(spent)
+    }
+
+    /// 改订单状态(附带错误说明)。`status` 见 [`RestockOrder`] 的状态机注释。
+    pub fn restock_mark_status(
+        &self,
+        order_id: &str,
+        status: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE restock_orders SET status=?2, error=?3, updated_at=strftime('%s','now')
+              WHERE client_order_id=?1",
+            rusqlite::params![order_id, status, error],
+        )?;
+        Ok(())
+    }
+
+    /// 停在 `pending` 的订单:请求可能在途也可能已成功。启动时用原幂等键重放确认。
+    pub fn restock_pending_orders(&self) -> anyhow::Result<Vec<RestockOrder>> {
+        self.restock_orders_where("status = 'pending'", 100)
+    }
+
+    /// **孤儿订单:买到了 key 却没能上号。** 钱已经花了,必须人工处理。
+    pub fn restock_orphan_orders(&self) -> anyhow::Result<Vec<RestockOrder>> {
+        self.restock_orders_where("status = 'purchased'", 100)
+    }
+
+    /// 最近的订单(倒序)。
+    pub fn restock_recent_orders(&self, limit: i64) -> anyhow::Result<Vec<RestockOrder>> {
+        self.restock_orders_where("1=1", limit)
+    }
+
+    fn restock_orders_where(&self, cond: &str, limit: i64) -> anyhow::Result<Vec<RestockOrder>> {
+        let sql = format!(
+            "SELECT client_order_id, count, status, keys_json, spent_cny, error, created_at
+               FROM restock_orders WHERE {cond} ORDER BY created_at DESC LIMIT ?1"
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([limit.max(1)], |r| {
+                let keys_json: String = r.get(3)?;
+                Ok(RestockOrder {
+                    client_order_id: r.get(0)?,
+                    count: r.get(1)?,
+                    status: r.get(2)?,
+                    keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                    spent_cny: r.get(4)?,
+                    error: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `since_ts` 以来的实际花费与成功购买数(日预算阀读它)。
+    ///
+    /// 直接对订单求和而不另设计数器 —— 计数器与订单不一致这类对账问题不值得引入。
+    pub fn restock_spent_since(&self, since_ts: i64) -> anyhow::Result<(f64, i64)> {
+        let conn = self.conn.lock();
+        let r = conn.query_row(
+            "SELECT COALESCE(SUM(spent_cny),0), COUNT(*)
+               FROM restock_orders
+              WHERE created_at >= ?1 AND status IN ('purchased','imported')",
+            [since_ts],
+            |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(r)
+    }
+
+    // ───────────────────────── 自动补货:自购号 ─────────────────────────
+
+    /// 登记本服务买入并上号成功的账号。**回收只动这张表里的号**。
+    pub fn restock_record_owned(&self, order_id: &str, account_ids: &[String]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for aid in account_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO restock_owned (account_id, client_order_id) VALUES (?1, ?2)",
+                rusqlite::params![aid, order_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 尚未回收的自购号 `(account_id, created_at)`。
+    pub fn restock_owned_alive(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT account_id, created_at FROM restock_owned WHERE reclaimed_at IS NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 标记某个自购号已回收(删号之后调用)。
+    pub fn restock_mark_reclaimed(&self, account_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE restock_owned SET reclaimed_at = CAST(strftime('%s','now') AS INTEGER) WHERE account_id = ?1",
+            [account_id],
+        )?;
+        Ok(())
+    }
+
+    /// 某笔订单买到的账号 id(面板算单号成本用)。
+    pub fn restock_accounts_of_order(&self, order_id: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT account_id FROM restock_owned WHERE client_order_id = ?1")?;
+        let rows = stmt
+            .query_map([order_id], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ───────────────────────── 自动补货:决策流水 ─────────────────────────
+
+    /// 记一条决策。这是"为什么没补 / 为什么补了"的唯一可查记录。
+    pub fn restock_log_decision(&self, d: &RestockDecision) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO restock_decisions
+                (ts, action, reason, healthy, stock, price_usd, balance_cny, detail)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                d.ts, d.action, d.reason, d.healthy, d.stock, d.price_usd, d.balance_cny, d.detail
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 最近 N 条决策(倒序)。
+    pub fn restock_recent_decisions(&self, limit: i64) -> anyhow::Result<Vec<RestockDecision>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT ts, action, reason, healthy, stock, price_usd, balance_cny, detail
+               FROM restock_decisions ORDER BY ts DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([limit.max(1)], |r| {
+                Ok(RestockDecision {
+                    ts: r.get(0)?,
+                    action: r.get(1)?,
+                    reason: r.get(2)?,
+                    healthy: r.get(3)?,
+                    stock: r.get(4)?,
+                    price_usd: r.get(5)?,
+                    balance_cny: r.get(6)?,
+                    detail: r.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 清理过期决策流水(保留 `keep_days` 天)。
+    pub fn restock_prune_decisions(&self, keep_days: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM restock_decisions
+              WHERE ts < CAST(strftime('%s','now') AS INTEGER) - ?1 * 86400",
+            [keep_days.max(1)],
+        )?;
+        Ok(())
+    }
+
+    /// 全部 `ksk_`(API Key 凭据)账号的 id。
+    ///
+    /// 用**凭据字段**判定而不是 id 前缀:人工上的号可能叫别的名字(邮箱等),
+    /// 只认前缀会漏。前缀只在「号已被删、日志还在」时作兜底(见 rollup 的 LEFT JOIN)。
+    pub fn restock_ksk_account_ids(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT account_id FROM accounts
+              WHERE json_extract(extra, '$.kiro_api_key') IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// ksk_ 号清单,**按创建时间倒序**,带终身调用数与积分。
+    ///
+    /// 用量取自 `usage_records`(**永不裁剪**),所以这里是**号的终身产出**,
+    /// 不像只读 `request_logs` 时那样被 1.5 小时的环形窗口截断 ——
+    /// 「这个号花了多少钱、换来多少次调用」因此才算得准。
+    pub fn restock_account_inventory(&self) -> anyhow::Result<Vec<RestockAccountRow>> {
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT a.account_id, a.created_at, a.disabled, a.max_concurrency,
+                    (SELECT COUNT(*) FROM usage_records u WHERE u.account_id = a.account_id),
+                    (SELECT COALESCE(SUM(u.success),0) FROM usage_records u
+                      WHERE u.account_id = a.account_id),
+                    (SELECT COALESCE(SUM(CASE WHEN u.metering_credit > 0
+                                              THEN u.metering_credit ELSE 0 END),0)
+                       FROM usage_records u WHERE u.account_id = a.account_id),
+                    (SELECT COALESCE(GROUP_CONCAT(g.group_name || '@' || g.priority, ' '), '')
+                       FROM account_groups g WHERE g.account_id = a.account_id)
+               FROM accounts a
+              WHERE json_extract(a.extra, '$.kiro_api_key') IS NOT NULL
+              ORDER BY a.created_at DESC, a.account_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RestockAccountRow {
+                    account_id: r.get(0)?,
+                    created_at: r.get(1)?,
+                    disabled: r.get::<_, i64>(2)? != 0,
+                    max_concurrency: r.get(3)?,
+                    calls: r.get(4)?,
+                    success: r.get(5)?,
+                    credits: r.get(6)?,
+                    groups: r.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ───────────────────────── 自动补货:积分汇总 ─────────────────────────
+
+    /// 把 `usage_records` 增量聚合进 `restock_credit_rollup`,推进一个批次。
+    ///
+    /// 返回 `(本批消费到的 id, 是否还没追平)`。调用方循环调用直到追平,或按每轮预算收手。
+    ///
+    /// **为什么源是 `usage_records` 而不是 `request_logs`**:后者是
+    /// `REQUEST_LOG_CAP = 10_000` 的硬环形缓冲(实测只覆盖约 1.5 小时),想看跨天规律
+    /// 必须自己攒;而 `usage_records` 同样带 `metering_credit` 且**永不裁剪**
+    /// (见其建表注释),线上已有 51 天历史 —— 周画像因此上线即成熟,没有冷启动。
+    ///
+    /// **读写分离**:聚合走 `stats_conn`(只读连接),否则百万行 GROUP BY 会占住写锁,
+    /// 让客户请求的计费落库排队(`stats_conn` 存在的理由,见其字段注释);
+    /// 只有小结果集的 UPSERT 才拿写锁。
+    ///
+    /// **累加与游标推进在同一事务**:分开做的话,崩在两者之间会让同一段 id 被搬第二次,
+    /// 积分凭空翻倍 —— 而这种错误在图上完全看不出来。
+    pub fn restock_rollup_advance(&self, batch: i64) -> anyhow::Result<(i64, bool)> {
+        let cursor: i64 = self
+            .get_kv(Self::KEY_RESTOCK_CURSOR)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // ① 只读连接上聚合。id 是 INTEGER PRIMARY KEY,区间扫描走主键索引。
+        let (rows, max_id, more) = {
+            let conn = self.stats_conn.lock();
+            let hi: Option<i64> = conn.query_row(
+                "SELECT MAX(id) FROM usage_records WHERE id > ?1 AND id <= ?1 + ?2",
+                rusqlite::params![cursor, batch.max(1)],
+                |r| r.get(0),
+            )?;
+            let Some(hi) = hi else {
+                // 本批区间内没有行。可能是真追平了,也可能是这段 id 恰好空着(不会,
+                // usage_records 从不删行),两种情况都直接把游标推到区间末尾。
+                let global_max: i64 = conn
+                    .query_row("SELECT COALESCE(MAX(id),0) FROM usage_records", [], |r| r.get(0))?;
+                return if global_max > cursor {
+                    Ok((cursor + batch.max(1), true))
+                } else {
+                    Ok((cursor, false))
+                };
+            };
+            let mut stmt = conn.prepare(
+                "SELECT (u.created_at/3600)*3600 AS hour_ts,
+                        u.model,
+                        CASE WHEN json_extract(a.extra,'$.kiro_api_key') IS NOT NULL
+                                  OR u.account_id LIKE 'kiro-apikey-%'
+                             THEN 1 ELSE 0 END AS ksk,
+                        COUNT(*),
+                        COALESCE(SUM(u.success),0),
+                        COALESCE(SUM(CASE WHEN u.metering_credit > 0
+                                          THEN u.metering_credit ELSE 0 END),0)
+                   FROM usage_records u
+                   -- LEFT JOIN:回收掉的号在 accounts 里已不存在,但它的用量还在。
+                   -- 那种情况靠 account_id 前缀兜底,否则自购号生命末期的消耗会被
+                   -- 算进「其它号」,补货口径直接偏低。
+                   LEFT JOIN accounts a ON a.account_id = u.account_id
+                  WHERE u.id > ?1 AND u.id <= ?2
+                  GROUP BY hour_ts, u.model, ksk",
+            )?;
+            let rows: Vec<(i64, String, i64, i64, i64, f64)> = stmt
+                .query_map(rusqlite::params![cursor, hi], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let global_max: i64 = conn
+                .query_row("SELECT COALESCE(MAX(id),0) FROM usage_records", [], |r| r.get(0))?;
+            (rows, hi, global_max > hi)
+        };
+
+        // ② 写锁只用于小结果集的 UPSERT + 游标,同一事务。
+        {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            for (hour_ts, model, ksk, calls, success, credits) in &rows {
+                tx.execute(
+                    "INSERT INTO restock_credit_rollup
+                        (hour_ts, model, ksk, calls, success, credits)
+                     VALUES (?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(hour_ts, model, ksk) DO UPDATE SET
+                        calls   = calls   + excluded.calls,
+                        success = success + excluded.success,
+                        credits = credits + excluded.credits",
+                    rusqlite::params![hour_ts, model, ksk, calls, success, credits],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = strftime('%s','now')",
+                rusqlite::params![Self::KEY_RESTOCK_CURSOR, max_id.to_string()],
+            )?;
+            tx.commit()?;
+        }
+        Ok((max_id, more))
+    }
+
+    /// 小时聚合的明细行(面板画图与模型分解用)。
+    pub fn restock_credit_series(&self, since_ts: i64) -> anyhow::Result<Vec<CreditRollupRow>> {
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hour_ts, model, ksk, calls, success, credits
+               FROM restock_credit_rollup WHERE hour_ts >= ?1 ORDER BY hour_ts",
+        )?;
+        let rows = stmt
+            .query_map([since_ts], |r| {
+                Ok(CreditRollupRow {
+                    hour_ts: r.get(0)?,
+                    model: r.get(1)?,
+                    ksk: r.get::<_, i64>(2)? == 1,
+                    calls: r.get(3)?,
+                    success: r.get(4)?,
+                    credits: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 逐小时的 `(整点, ksk_ 积分, 全部积分)`,升序。**预测用这个** ——
+    /// 让 SQLite 先合并掉模型维度,免得在 Rust 里对几万行做分组。
+    pub fn restock_credit_hours(&self, since_ts: i64) -> anyhow::Result<Vec<(i64, f64, f64)>> {
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT hour_ts,
+                    SUM(CASE WHEN ksk = 1 THEN credits ELSE 0 END),
+                    SUM(credits)
+               FROM restock_credit_rollup WHERE hour_ts >= ?1
+              GROUP BY hour_ts ORDER BY hour_ts",
+        )?;
+        let rows = stmt
+            .query_map([since_ts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 已攒到的聚合区间 `(最早整点, 最晚整点)`;空表返回 `None`。
+    pub fn restock_rollup_span(&self) -> anyhow::Result<Option<(i64, i64)>> {
+        let conn = self.stats_conn.lock();
+        let r: (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT MIN(hour_ts), MAX(hour_ts) FROM restock_credit_rollup",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(match r {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        })
     }
 
     // === 请求日志(调试用,环形保留最新 N 条)===
@@ -1547,6 +2088,152 @@ impl UsageSink for SqliteStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod restock_tests {
+    use super::*;
+
+    /// **这是本次改动的红线测试。** 生产上有两个以上 `--mode router` 共用同一个
+    /// control.db,补货循环若不互斥就是各买各的、重复扣款。
+    #[test]
+    fn 租约同一时刻只有一个持有者() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.try_acquire_restock_lease("router-A", 60).unwrap(), "首个应当选");
+        assert!(
+            !s.try_acquire_restock_lease("router-B", 60).unwrap(),
+            "租约未过期时第二个进程必须抢不到 —— 抢到就是重复扣款"
+        );
+        // 持有者可以续租(每轮都会调一次)。
+        assert!(s.try_acquire_restock_lease("router-A", 60).unwrap());
+        assert_eq!(s.restock_lease_holder().unwrap().as_deref(), Some("router-A"));
+    }
+
+    #[test]
+    fn 租约过期后由别的进程接手() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // TTL 传 0 会被 max(1) 钳成 1 秒;这里直接写一条已过期的租约来验接管路径,
+        // 免得测试真去 sleep。
+        s.upsert_kv(
+            SqliteStore::KEY_RESTOCK_LEASE,
+            r#"{"holder":"router-A","expires_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(s.restock_lease_holder().unwrap(), None, "过期的不算持有");
+        assert!(s.try_acquire_restock_lease("router-B", 60).unwrap(), "过期后应能接手");
+        assert_eq!(s.restock_lease_holder().unwrap().as_deref(), Some("router-B"));
+    }
+
+    #[test]
+    fn 只有持有者本人能让出租约() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.try_acquire_restock_lease("router-A", 60).unwrap();
+        s.release_restock_lease("router-B").unwrap();
+        assert_eq!(
+            s.restock_lease_holder().unwrap().as_deref(),
+            Some("router-A"),
+            "别人不能把我的租约释放掉,否则等于绕过互斥"
+        );
+        s.release_restock_lease("router-A").unwrap();
+        assert_eq!(s.restock_lease_holder().unwrap(), None);
+    }
+
+    #[test]
+    fn 幂等键先落库且实扣按余额差记() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.restock_create_order("oid1", 1, 21.24).unwrap();
+        // 崩在这里也能查到这个 id —— 这正是先落库的意义。
+        let pending = s.restock_pending_orders().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].client_order_id, "oid1");
+
+        let spent = s
+            .restock_mark_purchased("oid1", &["ksk_a".into()], Some(200.0), 179.94)
+            .unwrap();
+        assert!((spent - 20.06).abs() < 1e-9, "实扣必须按余额差,实际 {spent}");
+        assert!(s.restock_pending_orders().unwrap().is_empty());
+        // 停在 purchased = 钱花了号没上,必须能被单独查出来。
+        assert_eq!(s.restock_orphan_orders().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 拿不到购买前余额时实扣记零而不是负数() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.restock_create_order("oid2", 1, 21.24).unwrap();
+        let spent = s.restock_mark_purchased("oid2", &["ksk_b".into()], None, 100.0).unwrap();
+        assert_eq!(spent, 0.0, "没有基准就记 0,由调用方告警,绝不能算出负数污染日预算");
+    }
+
+    #[test]
+    fn 日花费只统计成功购买的单() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.restock_create_order("ok1", 1, 21.0).unwrap();
+        s.restock_mark_purchased("ok1", &["ksk_a".into()], Some(100.0), 80.0).unwrap();
+        s.restock_create_order("bad1", 1, 21.0).unwrap();
+        s.restock_mark_status("bad1", "failed", "网络中断").unwrap();
+        let (spent, n) = s.restock_spent_since(0).unwrap();
+        assert!((spent - 20.0).abs() < 1e-9, "失败单不该计入花费,实际 {spent}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn 汇总累加而非覆盖且游标随之前进() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        {
+            let c = s.conn.lock();
+            c.execute_batch(
+                "INSERT INTO accounts (account_id, extra) VALUES
+                    ('kiro-apikey-a', '{\"kiro_api_key\":\"ksk_x\"}'),
+                    ('manual-1', '{\"access_token\":\"t\"}');
+                 INSERT INTO usage_records (id, account_id, model, metering_credit, success, created_at)
+                 VALUES (1,'kiro-apikey-a','opus',1.5,1,3600),
+                        (2,'kiro-apikey-a','opus',2.5,1,3600),
+                        (3,'manual-1','opus',9.0,1,3600);",
+            )
+            .unwrap();
+        }
+        let (cur, more) = s.restock_rollup_advance(1000).unwrap();
+        assert_eq!(cur, 3);
+        assert!(!more, "已追平");
+        let rows = s.restock_credit_series(0).unwrap();
+        let ksk: f64 = rows.iter().filter(|r| r.ksk).map(|r| r.credits).sum();
+        let other: f64 = rows.iter().filter(|r| !r.ksk).map(|r| r.credits).sum();
+        assert!((ksk - 4.0).abs() < 1e-9, "ksk_ 号 1.5+2.5,实际 {ksk}");
+        assert!((other - 9.0).abs() < 1e-9, "人工号归入非 ksk_,实际 {other}");
+
+        // 再跑一次不该重复累加 —— 游标已经推到底了。
+        s.restock_rollup_advance(1000).unwrap();
+        let again: f64 = s.restock_credit_series(0).unwrap().iter().map(|r| r.credits).sum();
+        assert!((again - 13.0).abs() < 1e-9, "重复搬运会让积分凭空翻倍,实际 {again}");
+    }
+
+    #[test]
+    fn 负积分不污染汇总() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        {
+            let c = s.conn.lock();
+            c.execute_batch(
+                "INSERT INTO usage_records (id, account_id, model, metering_credit, success, created_at)
+                 VALUES (1,'x','opus',-5.0,1,3600), (2,'x','opus',3.0,1,3600);",
+            )
+            .unwrap();
+        }
+        s.restock_rollup_advance(1000).unwrap();
+        let total: f64 = s.restock_credit_series(0).unwrap().iter().map(|r| r.credits).sum();
+        assert!((total - 3.0).abs() < 1e-9, "负值必须被 CASE WHEN>0 挡住,实际 {total}");
+    }
+
+    #[test]
+    fn 只回收登记过的自购号() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.restock_record_owned("oid", &["a".into(), "b".into()]).unwrap();
+        assert_eq!(s.restock_owned_alive().unwrap().len(), 2);
+        s.restock_mark_reclaimed("a").unwrap();
+        let alive = s.restock_owned_alive().unwrap();
+        assert_eq!(alive.len(), 1);
+        assert_eq!(alive[0].0, "b");
+        assert_eq!(s.restock_accounts_of_order("oid").unwrap().len(), 2);
     }
 }
 

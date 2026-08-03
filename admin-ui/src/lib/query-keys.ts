@@ -31,6 +31,14 @@ export const queryKeys = {
     root: ['settings'] as const,
     detail: () => ['settings', 'detail'] as const,
   },
+  restock: {
+    /** 自动补货域根 key；开关/参数变更后整域 invalidate。 */
+    root: ['restock'] as const,
+    state: () => ['restock', 'state'] as const,
+    params: () => ['restock', 'params'] as const,
+    credits: (hours: number) => ['restock', 'credits', hours] as const,
+    accounts: () => ['restock', 'accounts'] as const,
+  },
   logs: {
     /** 请求日志域根 key。 */
     root: ['logs'] as const,

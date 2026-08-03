@@ -315,6 +315,15 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
         (None, _) => None,
     };
 
+    // 自动补货后台循环。默认不启动(`restock.enabled` 缺省 false);启动后也要先抢到
+    // DB 租约才真正干活 —— 生产上有多个 `--mode router` 共用同一个 control.db,
+    // 不做互斥就是各买各的、重复扣款。见 `restock::spawn`。
+    if let Some(store) = &store {
+        crate::restock::spawn(store.clone(), all_worker_cfgs.clone(), &system.restock);
+    } else if system.restock.enabled {
+        tracing::warn!("补货:配置了 restock.enabled 但控制面库不可用,未启动");
+    }
+
     tracing::info!(
         listen = %instances.router.listen,
         workers = workers.len(),
