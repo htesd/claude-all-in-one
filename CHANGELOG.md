@@ -1,5 +1,36 @@
 # Changelog
 
+## [account-sort] - 2026-08-02
+
+### Features
+- 账号列表新增**排序**选择器:「最新在前」(默认) / 「最早在前」/「按组+名称」。
+  纯前端排序,不改后端接口。
+
+### Design Rationale
+- **默认改成「最新在前」**:后端 `list_accounts` 固定按 `group_name ASC, account_id ASC`
+  返回,新上的号会散落在字母序各处。而 Kiro 短命号(`ksk_` API Key 实测寿命只有 14–22 分钟、
+  额度约 320 次成功调用,且**成批死亡**)只能按上号时间管理,旧顺序完全帮不上忙。
+- **同批号按 `account_id` 兜底排序**:成批导入的号 `created_at` 是同一秒,没有第二排序键的话,
+  账号页 15s 运行态轮询每刷新一次同批号就互相跳位,根本点不中。
+- **`sortAccounts` 是纯函数、不改入参**:调用方是 `useMemo`,原地 `sort()` 会污染
+  react-query 缓存里的数组,让持有同一引用的其它 memo 读到被打乱的顺序。
+- **排在筛选之后、分页之前**:保证「第 1 页」永远是当前筛选条件下最新的号。
+
+### Notes & Caveats
+- 服务器 Node 是 v12、本机 v14,都跑不了 Vite 6 / React 19。构建走 `oven/bun:1-slim`
+  容器(该镜像本地已有,dario-sidecar 在用),**无需在宿主装任何东西**:
+  `docker run --rm -v $PWD/admin-ui:/app -w /app oven/bun:1-slim sh -c 'bun install && bun run build'`
+- `embed-ui` 是**编译期 feature**,前端改动必须重建整个 Rust 镜像才能生效,没有热更新路径。
+- 上线用**新标签** `acctsort-20260802` 构建,保留 `poison-fix` 作回滚锚点;compose 已备份为
+  `docker-compose.yml.bak-acctsort-20260802-151425`。只重建了 router(worker 不服务 `/admin`,
+  不动它们就不断流量)。**回滚**:把 compose 里的 image 改回 `claude-all-in-one:poison-fix`
+  再 `docker compose up -d router`。
+- 上线前已核对:`crates/` 下 **0 个**源文件比 `poison-fix` 镜像新,故本次镜像不夹带任何
+  未经上线验证的 Rust 改动;两个镜像二进制 md5 不同属预期(前端被 embed 进二进制)。
+- 验证:`tsc --noEmit` 0 错误、`vitest` 15/15 通过(其中 6 个新增排序用例)、线上 bundle
+  中英文案均命中、SPA 挂载无 console 报错、`/admin/api/{ping,accounts}` 与 `/health` 均 200。
+
+
 ## [queue-wait] - 2026-07-31
 
 ### Features

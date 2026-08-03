@@ -33,6 +33,8 @@ import {
   deriveTier,
   mergeRuntimeByAccount,
   quotaKindForProvider,
+  sortAccounts,
+  type AccountSortKey,
 } from '@/features/accounts/lib'
 import type { AccountRow } from '@/features/accounts/types'
 import { useGroups } from '@/features/groups/hooks'
@@ -63,6 +65,10 @@ export default function AccountsPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [providerFilter, setProviderFilter] = useState<string>('all')
   const [tierFilter, setTierFilter] = useState<TierFilter>('all')
+
+  // 排序状态。默认「最新在前」:Kiro 短命号(ksk_ 寿命二三十分钟、成批死亡)只能按
+  // 上号时间管理,而后端固定返回「按组+账号名」——那个顺序里新号会散落在各处。
+  const [sortKey, setSortKey] = useState<AccountSortKey>('created_desc')
 
   // 分页状态
   const [page, setPage] = useState(1)
@@ -119,10 +125,10 @@ export default function AccountsPage() {
     if (!showTierFilter) setTierFilter('all')
   }, [showTierFilter])
 
-  // 筛选后行 → 分页行
+  // 筛选后行 → 排序 → 分页行
   const filteredRows = useMemo(() => {
     const all = accountsQuery.data ?? []
-    return all.filter((row) => {
+    const kept = all.filter((row) => {
       // provider 筛选
       if (providerFilter !== 'all' && row.provider !== providerFilter) return false
 
@@ -142,12 +148,14 @@ export default function AccountsPage() {
 
       return true
     })
-  }, [accountsQuery.data, providerFilter, tierFilter, statusFilter, runtimeByAccount])
+    // 排序放在筛选之后、分页之前:先筛后排才能让「第 1 页」始终是当前筛选下最新的号。
+    return sortAccounts(kept, sortKey)
+  }, [accountsQuery.data, providerFilter, tierFilter, statusFilter, runtimeByAccount, sortKey])
 
-  // 任一筛选变化时重置到第 1 页
+  // 任一筛选/排序变化时重置到第 1 页
   useEffect(() => {
     setPage(1)
-  }, [statusFilter, providerFilter, tierFilter, pageSize])
+  }, [statusFilter, providerFilter, tierFilter, sortKey, pageSize])
 
   // 页码在渲染期钳到有效范围(不写回 state):筛选变化或 15s 运行态轮询令结果集缩小时,
   // 避免停留在越界的空白页(审查 H1/M1)。故意不走 setPage——否则每次运行态轮询都会把
@@ -319,6 +327,8 @@ export default function AccountsPage() {
         onTierChange={setTierFilter}
         tiers={distinctTiers}
         showTierFilter={showTierFilter}
+        sortKey={sortKey}
+        onSortChange={setSortKey}
       />
 
       <AccountsTable
