@@ -174,13 +174,18 @@ pub async fn chat_stream(
         (sim.cache_read_tokens as i32, sim.total_tokens as i32)
     };
 
-    // 3.7 毒报文备忘录(🔵 kiro.rs v63):同字节级 payload 近期已被上游确定性 400 过 →
-    // 本地 BadRequest 拦截,不再打上游。兜住无视 400 仍重试的客户端(本次事故上游即此类)。
+    // 3.7 毒报文备忘录(🔵 kiro.rs v63):同字节级 payload 近期已在**多个不同账号**上被上游
+    // 确定性 400 过 → 本地 BadRequest 拦截,不再打上游。兜住无视 400 仍重试的客户端。
+    //
+    // 「多账号」是 2026-08-02 修的:单账号 400 不判毒,否则一个坏号(如 profileArn 缺失的
+    // krs-52,对任何请求都回 "Improperly formed")会把它碰到的每一份 body 全局毒化 600s。
+    // 文案直接透传上游原文 —— 旧文案臆测"减少附件或历史",而实测失败请求平均 91 条消息、
+    // 成功请求 242 条,体积与此无关,那句提示只会把人引向错误方向。
     let poison_fp = crate::poison_memo::fingerprint(&body);
-    if crate::poison_memo::is_poisoned(&poison_fp) {
-        return Err(UpstreamError::bad_request_visible(
-            "该请求体近期已被判为非法(HTTP 400)并被拦截;重试相同请求不会成功,请修改请求(如减少附件或历史)后重试",
-        ));
+    if let Some(upstream_msg) = crate::poison_memo::poisoned_reason(&poison_fp) {
+        return Err(UpstreamError::bad_request_visible(format!(
+            "该请求体已在多个账号上被上游确定性拒绝(HTTP 400),重试相同请求不会成功。上游原文: {upstream_msg}"
+        )));
     }
 
     // 4. bearer token(apikey→kiro_api_key,social/IdC→access_token;刷新/重试由 scheduler 层负责)
@@ -218,15 +223,17 @@ pub async fn chat_stream(
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
         let err = classify_chat_error(status.as_u16(), &body_text);
-        // 只记**报文格式/体积类**的确定性 400("Improperly formed request"),不记所有
-        // BadRequest(审查 Minimalist#1):后者可能含账号/profile/entitlement 相关 400,
-        // 换号或修 profile 后同 body 本可成功,记毒会跨账号误伤 600s。格式/体积类才是
-        // 与账号无关、同 body 重试必败的真确定性失败 —— 对齐 kiro.rs v63 的短语门。
+        // 只记**报文格式/体积类**的确定性 400("Improperly formed request")。
+        //
+        // ⚠️ 短语门**不足以**区分「报文坏」与「账号坏」:2026-08-02 实测,`profileArn` 缺失的
+        // 账号(krs-52)对任何请求都回同样的 "Improperly formed request." —— 账号问题穿着
+        // 报文问题的外衣。所以这里只做**记录**,真正判毒由 `poison_memo` 按「同一 body 在
+        // ≥2 个不同账号上都失败」裁决;单账号失败仅留痕,交给账号生命周期处理。
         if status.as_u16() == 400
             && err.kind == UpstreamErrorKind::BadRequest
             && body_text.contains("Improperly formed")
         {
-            crate::poison_memo::remember(poison_fp);
+            crate::poison_memo::remember(poison_fp, &account.account_id, body_text.trim());
         }
         return Err(err);
     }
