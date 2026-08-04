@@ -46,19 +46,97 @@ impl Decision {
 /// ksk_ 号池的健康度快照。
 #[derive(Debug, Clone, Default)]
 pub struct Health {
-    /// caio 里状态「正常」的 ksk_ 号数。**补货水位比的就是它。**
+    /// **实证还在服务**的 ksk_ 号数。补货水位比的就是它。
     ///
-    /// 开了排队模式(`queue_enabled`)后 429 只设 `paced_until`、账号不下线,
-    /// 所以一个号掉出正常态基本只剩一个原因:上游 403 `TEMPORARILY_SUSPENDED`。
-    /// 而那是**永久的**(实测 0/35 个号在 1 小时冷却后恢复过),所以「只数正常号」
-    /// 是精确判据而非近似。
+    /// ⚠️ 不能只看 caio 的 `reason == ""`。曾经这么做过,后果是补货在池子全死时
+    /// 照样报「还有一个号」拒绝下单 —— 机制见 [`classify`] 的注释。
     pub healthy: i64,
+    /// caio 说「正常」但实证已死(窗口内有尝试、零成功)。**只做展示**,
+    /// 让人一眼看出「面板上那几个正常号是尸体」。
+    pub zombie: i64,
     pub cooling: i64,
     pub dead: i64,
     pub total: i64,
     /// 至少有一个 worker 在线且给出了运行态。为 false 时**不许下单** ——
     /// 读不到健康度就当成 0 个健康号会触发连环购买。
     pub any_online: bool,
+    /// 健康号里**最年轻**那个的年龄(秒)。提前量判据用它:取最小值是因为
+    /// 只要还有一个新号,就不需要提前买;全都老了才说明整池即将到期。
+    pub youngest_healthy_age_secs: Option<i64>,
+}
+
+/// worker 运行态里我们关心的三个字段。抽出来是为了让 [`classify`] 不依赖 HTTP。
+#[derive(Debug, Clone)]
+pub struct RuntimeRow {
+    pub account_id: String,
+    pub reason: String,
+    pub disabled: bool,
+}
+
+/// 把「caio 的运行态」与「请求日志里的实证」合成健康度。**纯函数,可直接测。**
+///
+/// ## 为什么不能只信 `reason`
+///
+/// `status_snapshot()` 干的第一件事是 `heal_cooldowns()`(见 `worker/scheduler.rs`),
+/// 而 `TemporarilySuspended` 被归进「可冷却自愈」类。于是每 `suspended_cooldown_secs`
+/// (默认 3600)一到,一个**永久死掉**的号就被复活成 `reason == ""`。
+/// 更糟的是:**补货每轮拉 `/health` 这个动作本身就会触发那次复活**,然后把复活的
+/// 尸体数进健康号 —— 观测行为改变了被观测量。
+///
+/// 2026-08-04 实测:22 个成功率 0% 的号各自每 51 分钟被轮到一次(正是 3600s 周期),
+/// 11 小时白烧 258 个客户请求;而在全池零成功的那 66 分钟里,引擎有 3 轮报
+/// `healthy=1` 拒绝补货。这套判据在 Python 原型里推导正确过,搬进 Rust 时丢了。
+///
+/// ## 三态判定
+///
+/// | 窗口内该号的请求记录 | 判定 | 为什么 |
+/// |---|---|---|
+/// | 有成功 | 活 | 唯一的正面证据 |
+/// | 有尝试、零成功 | **僵尸** | caio 说正常但打不通,就是死了 |
+/// | 一条都没有 | **不下结论**,维持 caio 的判断 | 没被选中 ≠ 打不通。全局没流量时(夜里、或整个网关刚崩过)所有号都零成功,一律判死会触发连环购买 |
+///
+/// 新号(建号不足 `new_account_grace_secs`)直接算健康:它还没来得及跑请求。
+pub fn classify(
+    rows: &[RuntimeRow],
+    activity: &std::collections::HashMap<String, (i64, i64)>,
+    created_at: &std::collections::HashMap<String, i64>,
+    p: &Params,
+    now: i64,
+) -> Health {
+    let mut h = Health { total: created_at.len() as i64, ..Default::default() };
+    let mut seen = std::collections::HashSet::new();
+    for r in rows {
+        if !created_at.contains_key(&r.account_id) || !seen.insert(r.account_id.clone()) {
+            continue;
+        }
+        match r.reason.as_str() {
+            "" if !r.disabled => {
+                let age = created_at.get(&r.account_id).map(|c| now - c).unwrap_or(0);
+                let fresh = age < p.new_account_grace_secs.max(0);
+                let alive = match activity.get(&r.account_id) {
+                    _ if fresh => true,
+                    Some(&(_, ok)) if ok > 0 => true,
+                    // 有尝试、零成功 —— caio 说正常,请求说打不通。信请求。
+                    Some(_) => false,
+                    // 窗口内根本没被选中:证明不了任何事,维持 caio 的判断。
+                    None => true,
+                };
+                if alive {
+                    h.healthy += 1;
+                    h.youngest_healthy_age_secs =
+                        Some(h.youngest_healthy_age_secs.map_or(age, |m| m.min(age)));
+                } else {
+                    h.zombie += 1;
+                }
+            }
+            // quota_exhausted / invalid_refresh_token 是持久禁用;其余(限流/临时封禁/
+            // 空响应/连败)caio 归为会自愈的冷却 —— 但 temporarily_suspended 实测从不
+            // 自愈(0/35),所以它其实也是死号,回收逻辑另行处理,这里只做展示区分。
+            "quota_exhausted" | "invalid_refresh_token" => h.dead += 1,
+            _ => h.cooling += 1,
+        }
+    }
+    h
 }
 
 pub struct Engine {
@@ -87,44 +165,69 @@ impl Engine {
 
     // ───────────────────────── 健康度 ─────────────────────────
 
-    /// 逐 worker 拉 `/health`,与 DB 里的 ksk_ 账号集求交,数出健康度。
+    /// 逐 worker 拉 `/health`,与 DB 里的 ksk_ 账号集求交,再叠上请求日志的实证,
+    /// 数出健康度。判定规则见 [`classify`]。
     ///
     /// 运行态(冷却/封禁/在途并发)只存在于 worker 内存,router 侧必须扇出去问。
     pub async fn health(&self) -> anyhow::Result<Health> {
-        let ksk: std::collections::HashSet<String> =
-            self.store.restock_ksk_account_ids()?.into_iter().collect();
-        let mut h = Health { total: ksk.len() as i64, ..Default::default() };
+        let p = self.params();
+        let now = now_ts();
+        let created: std::collections::HashMap<String, i64> =
+            self.store.restock_ksk_accounts()?.into_iter().collect();
+        let activity = self
+            .store
+            .restock_account_activity(now - p.liveness_window_secs.max(60))
+            .unwrap_or_default();
+        let (rows, any_online) = self.runtime_rows().await;
+        let mut h = classify(&rows, &activity, &created, &p, now);
+        h.any_online = any_online;
+        Ok(h)
+    }
+
+    /// 扇出各 worker 的 `/health`,摊平成 [`RuntimeRow`]。
+    /// 第二个返回值 = 至少有一个 worker 给出了**可用的**运行态(为 false 时**绝不许下单**)。
+    async fn runtime_rows(&self) -> (Vec<RuntimeRow>, bool) {
         let fetches = self.workers.iter().map(|w| {
             let http = self.http.clone();
             let url = format!("http://{}/health", w.listen);
             async move { http.get(&url).send().await.ok()?.json::<serde_json::Value>().await.ok() }
         });
-        let mut seen = std::collections::HashSet::new();
-        for v in futures::future::join_all(fetches).await.into_iter().flatten() {
-            h.any_online = true;
-            let Some(arr) = v.get("accounts_status").and_then(|a| a.as_array()) else {
-                continue;
-            };
-            for a in arr {
-                let Some(id) = a.get("account_id").and_then(|x| x.as_str()) else {
-                    continue;
-                };
-                if !ksk.contains(id) || !seen.insert(id.to_string()) {
-                    continue;
-                }
-                let reason = a.get("reason").and_then(|x| x.as_str()).unwrap_or("");
-                let disabled = a.get("disabled").and_then(|x| x.as_bool()).unwrap_or(false);
-                match reason {
-                    "" if !disabled => h.healthy += 1,
-                    // quota_exhausted / invalid_refresh_token 是真死;其余(限流/临时封禁/
-                    // 空响应/连败)caio 归为会自愈的冷却 —— 但 temporarily_suspended 实测
-                    // 从不自愈,所以这里只做展示区分,水位一律只认 healthy。
-                    "quota_exhausted" | "invalid_refresh_token" => h.dead += 1,
-                    _ => h.cooling += 1,
-                }
+        let bodies: Vec<serde_json::Value> =
+            futures::future::join_all(fetches).await.into_iter().flatten().collect();
+        parse_runtime(&bodies)
+    }
+
+    /// 当前需求速率(积分/时)= `max(最近窗口实测, 预测下一小时)`。
+    ///
+    /// 取 max 而不是只用其一,两边各防一件事:
+    /// - **实测**应对突发(画像里没有的流量高峰),也应对客户作息刚变。
+    /// - **预测**防自锁:整个网关刚崩过时实测会是 0,只看实测就永远不买号,
+    ///   而那恰恰是最需要补货的时刻。
+    ///
+    /// 口径是**全池**(含贵号池)—— 问的是「有多少活儿等着干」,不是「便宜号干了多少」。
+    fn demand_rate(&self, p: &Params, now: i64) -> f64 {
+        let measured = self
+            .store
+            .restock_recent_credit_rate(p.demand_window_secs)
+            .unwrap_or(0.0);
+        let predicted = (|| {
+            let cur_hour = now - now.rem_euclid(3600);
+            let hist: Vec<(i64, f64, f64)> = self
+                .store
+                .restock_credit_hours(0)
+                .ok()?
+                .into_iter()
+                .filter(|(t, _, _)| *t < cur_hour)
+                .collect();
+            // 拿三五个样本猜出来的画像不配参与决策。
+            if hist.len() < 24 {
+                return None;
             }
-        }
-        Ok(h)
+            let pts = forecast::forecast(&hist, p.utc_offset_secs(), cur_hour + 3600, 1);
+            pts.first().map(|x| x.credits)
+        })()
+        .unwrap_or(0.0);
+        measured.max(predicted)
     }
 
     /// 刷新面板快照(健康度每轮刷,drop 的库存/余额按 `stock_max_age` 节流)。
@@ -143,13 +246,33 @@ impl Engine {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({}));
 
+        let p = self.params();
         if let Ok(h) = self.health().await {
             snap["healthy"] = h.healthy.into();
+            snap["zombie"] = h.zombie.into();
             snap["cooling"] = h.cooling.into();
             snap["dead"] = h.dead.into();
             snap["total"] = h.total.into();
             snap["any_online"] = h.any_online.into();
             snap["at"] = now.into();
+        }
+        // 需求与预期单位成本:面板上这两个数才解释得了「为什么现在不买」。
+        let demand = self.demand_rate(&p, now);
+        snap["demand_rate"] = ((demand * 10.0).round() / 10.0).into();
+        let unit = p.expected_unit_cost(self.cached_price_cny(&p), demand);
+        snap["expected_unit_cost"] = if unit.is_finite() {
+            ((unit * 10000.0).round() / 10000.0).into()
+        } else {
+            serde_json::Value::Null
+        };
+        // 实测寿命中位数,**只展示不自动生效**:这个值估短了就是每轮提前下单、花费翻倍,
+        // 该由人看过再决定要不要调 expected_lifetime_secs。
+        if let Ok(mut v) = self.store.restock_measured_lifetimes(20, 1800) {
+            if !v.is_empty() {
+                v.sort_unstable();
+                snap["measured_lifetime_secs"] = v[v.len() / 2].into();
+                snap["measured_lifetime_samples"] = v.len().into();
+            }
         }
 
         let last = snap.get("stock_at").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -161,6 +284,9 @@ impl Engine {
                     snap["balance_cny"] = st.balance_cny.into();
                     snap["stock_at"] = now.into();
                     snap["drop_ok"] = true.into();
+                    // 成功了就得把旧报错抹掉,否则面板会一直挂着 drop_ok=true 加一条
+                    // 早就修好的错误 —— 看的人只能靠猜哪个是真的。
+                    snap["drop_error"] = serde_json::Value::Null;
                 }
                 Err(e) => {
                     snap["drop_ok"] = false.into();
@@ -192,15 +318,6 @@ impl Engine {
             }
         }
 
-        if !force && !p.in_peak_window(now) {
-            return Decision::skip(format!(
-                "不在高峰窗口 {}-{}(UTC{:+})",
-                p.peak_start,
-                p.peak_end,
-                p.utc_offset_minutes / 60
-            ));
-        }
-
         // ── 花钱闸门:日上限 ──
         let day_start = p.local_day_start(now);
         let (spent, _bought) = self.store.restock_spent_since(day_start).unwrap_or((0.0, 0));
@@ -213,26 +330,69 @@ impl Engine {
 
         // 健康度读失败即中止本轮,**绝不"当作 0 个健康号"去买** ——
         // worker 短暂不可用时那会触发连环购买。
+        //
+        // ⚠️ 顺序:健康度必须算在所有「可能跳过」的闸门**之前**,这样每一条 skip 流水
+        // 都带着当时的水位。原先高峰窗口排在它前面直接 return,于是整夜 419 轮流水
+        // 全是 healthy=NULL —— 事后根本查不出「那 7 小时池子到底是空是满」。
         let health = match self.health().await {
             Ok(h) if h.any_online => h,
             Ok(_) => return Decision::skip("没有 worker 在线,读不到运行态,本轮跳过"),
             Err(e) => return Decision::skip(format!("读取健康度失败,本轮跳过: {e}")),
         };
+        let zomb = if health.zombie > 0 {
+            format!(",另有 {} 个 caio 报正常但实证已死", health.zombie)
+        } else {
+            String::new()
+        };
 
-        if !force && health.healthy >= p.min_healthy {
+        // ── 硬禁买时段(可选)。默认 start == end = 全天允许,由下面的单位成本闸
+        //    负责「什么时候买划算」—— 钟点表写死的窗口会在客户作息变化后悄悄失准,
+        //    而且它拦不住「窗口内但没需求」,也放不过「窗口外但正断供」。 ──
+        if !force && !p.in_peak_window(now) {
             return Decision {
                 healthy: Some(health.healthy),
                 ..Decision::skip(format!(
-                    "正常 ksk_ 号 {} 个 ≥ 阈值 {},无需补货(冷却 {},真死 {})",
+                    "不在允许购买的时段 {}-{}(UTC{:+});当前存活 {}{zomb}",
+                    p.peak_start,
+                    p.peak_end,
+                    p.utc_offset_minutes / 60,
+                    health.healthy,
+                ))
+            };
+        }
+
+        // ── 水位。`lead_time_secs > 0` 时,活号快到期也算破水位(默认 0 = 关)。──
+        let due = p.lead_time_secs > 0
+            && health.youngest_healthy_age_secs.is_some_and(|age| {
+                age >= p.expected_lifetime_secs.saturating_sub(p.lead_time_secs)
+            });
+        if !force && health.healthy >= p.min_healthy && !due {
+            return Decision {
+                healthy: Some(health.healthy),
+                ..Decision::skip(format!(
+                    "存活 ksk_ 号 {} 个 ≥ 阈值 {},无需补货(冷却 {},真死 {}{zomb})",
                     health.healthy, p.min_healthy, health.cooling, health.dead
                 ))
             };
         }
 
-        // ── 闲时抑制:只会阻止购买、永不促成购买 ──
-        // 水位已经破了,但如果预测接下来根本没人用,买来的号只会闲置到被上游扫号扫死
-        // (实测号平均只用掉 13.6% 配额就被封)。等有需求再买。
-        // `healthy == 0` 时硬豁免:断供的代价永远大于一个号的钱。
+        // ── 单位成本闸:这单划不划算 ──
+        //
+        // 实测结论:号按**墙上时钟**死(烧速差 3 倍、存活一律 0.7–0.9 小时),所以
+        // 一个号的产出 = 需求速率 × 寿命,与号本身无关 —— 「什么时候买」就是全部策略。
+        // 需求不够时买号 = 花 ¥20 买 45 分钟只用掉三成,单位成本反而高过贵号池。
+        //
+        // 价格取**快照缓存**而不是现打 drop:夜里水位常年破,那会变成整夜每 30 秒
+        // 轮询对方接口。读不到就用限价兜底(价格取高 = 门槛更严 = 宁可不买)。
+        let demand = self.demand_rate(&p, now);
+        if !force {
+            if let Some(why) = unit_cost_veto(&p, self.cached_price_cny(&p), demand) {
+                return Decision { healthy: Some(health.healthy), ..Decision::skip(why) };
+            }
+        }
+
+        // ── 闲时抑制(相对判据,默认关)。与上面的绝对判据并存时更保守。
+        //    只会阻止购买、永不促成购买,所以预测错了最坏也只是晚买。──
         if !force && p.idle_skip_ratio > 0.0 && health.healthy > 0 {
             if let Some(why) = self.idle_check(&p, now) {
                 return Decision { healthy: Some(health.healthy), ..Decision::skip(why) };
@@ -273,6 +433,14 @@ impl Engine {
         let count = p.max_per_purchase.min(st.stock).max(1);
         let need = max_total_cny_for(count, st.price_usd, p.rate_cap);
 
+        // 拿到真实报价后再复核一次单位成本。上面那次用的是快照缓存价(最多陈旧 300s),
+        // 对方涨价时会偏乐观 —— 掏钱之前必须按**这一单的实际价**再算一遍。
+        if !force {
+            if let Some(why) = unit_cost_veto(&p, need / count.max(1) as f64, demand) {
+                return Decision { reason: why, ..base };
+            }
+        }
+
         // ── 花钱闸门:余额 ──
         if st.balance_cny < need + p.min_balance_reserve_cny {
             return Decision {
@@ -296,14 +464,44 @@ impl Engine {
 
         let trigger = if force {
             "手动触发".to_string()
+        } else if health.healthy < p.min_healthy {
+            format!(
+                "存活 ksk_ 号 {} < 阈值 {}(需求 {demand:.0} 分/时)",
+                health.healthy, p.min_healthy
+            )
         } else {
-            format!("正常 ksk_ 号 {} < 阈值 {}", health.healthy, p.min_healthy)
+            format!(
+                "活号已存活 {} 分钟、接近预期寿命 {} 分钟,提前补位",
+                health.youngest_healthy_age_secs.unwrap_or(0) / 60,
+                p.expected_lifetime_secs / 60
+            )
         };
         Decision {
             act: true,
             reason: format!("{trigger},库存 {},买 {count} 个(限价 ¥{need:.2})", st.stock),
             ..base
         }
+    }
+
+    /// 快照里缓存的「买一个号大约要花多少钱(¥)」。
+    ///
+    /// 单位成本闸必须排在问库存**之前** —— 池子空着的时候水位每轮都破,
+    /// 若为了拿价格而每轮现打 drop,夜里就变成整夜每 30 秒轮询对方接口。
+    /// 快照由 `refresh_snapshot` 每 300s 刷一次,足够做「划不划算」的量级判断。
+    ///
+    /// 读不到就用限价兜底:价格取高 → 门槛更严 → 宁可不买。方向必须是 fail-closed,
+    /// 反过来会在快照缺失时放行一堆亏本单。
+    fn cached_price_cny(&self, p: &Params) -> f64 {
+        let cached = self
+            .store
+            .get_kv(KEY_SNAPSHOT)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("price_usd").and_then(|x| x.as_f64()))
+            .filter(|x| *x > 0.0)
+            .unwrap_or(p.max_price_usd);
+        max_total_cny_for(1, cached, p.rate_cap)
     }
 
     /// 预测接下来是闲时则返回跳过理由。判据是**相对**的(预测/历史峰值),
@@ -669,24 +867,34 @@ impl Engine {
         removed
     }
 
+    /// 已确认死亡的账号 id。
+    ///
+    /// ⚠️ 原先只认 `quota_exhausted | invalid_refresh_token`,**恰好漏掉了实际死法**:
+    /// 这批号绝大多数死于 403 `TEMPORARILY_SUSPENDED`,caio 把它归为「会自愈的冷却」,
+    /// 于是永远不进回收名单。2026-08-04 实测后果:22 个成功率 0% 的号赖在池子里,
+    /// 每小时各被轮到一次(3600s 冷却到期即复活),11 小时白烧 258 个客户请求。
+    ///
+    /// 所以 `temporarily_suspended` 也要收,但**必须叠加实证**(近 `SUSPENDED_DEAD_WINDOW`
+    /// 内有尝试且零成功)—— 光凭 reason 会误伤刚撞上一次限流、其实还能用的号。
+    /// 号龄与「只动自购号」的判断留在 `reclaim` 里,与原设计一致。
     async fn dead_account_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        const SUSPENDED_DEAD_WINDOW: i64 = 6 * 3600;
+        let activity = self
+            .store
+            .restock_account_activity(now_ts() - SUSPENDED_DEAD_WINDOW)
+            .unwrap_or_default();
+        let (rows, _) = self.runtime_rows().await;
         let mut out = std::collections::HashSet::new();
-        let fetches = self.workers.iter().map(|w| {
-            let http = self.http.clone();
-            let url = format!("http://{}/health", w.listen);
-            async move { http.get(&url).send().await.ok()?.json::<serde_json::Value>().await.ok() }
-        });
-        for v in futures::future::join_all(fetches).await.into_iter().flatten() {
-            let Some(arr) = v.get("accounts_status").and_then(|a| a.as_array()) else {
-                continue;
-            };
-            for a in arr {
-                let reason = a.get("reason").and_then(|x| x.as_str()).unwrap_or("");
-                if matches!(reason, "quota_exhausted" | "invalid_refresh_token") {
-                    if let Some(id) = a.get("account_id").and_then(|x| x.as_str()) {
-                        out.insert(id.to_string());
-                    }
+        for r in rows {
+            let dead = match r.reason.as_str() {
+                "quota_exhausted" | "invalid_refresh_token" => true,
+                "temporarily_suspended" => {
+                    matches!(activity.get(&r.account_id), Some(&(n, 0)) if n > 0)
                 }
+                _ => false,
+            };
+            if dead {
+                out.insert(r.account_id);
             }
         }
         Ok(out)
@@ -721,9 +929,275 @@ impl Engine {
     }
 }
 
+/// 把各 worker `/health` 的响应体摊平成 [`RuntimeRow`],并判定「运行态是否可用」。
+/// **纯函数,可直接测。**
+///
+/// ⚠️ `any_online` 必须以「**拿到了 `accounts_status` 数组**」为准,不能只看「响应能解析
+/// 成 JSON」。后者会把「worker 返回了别的 JSON」(端口配错打到别的服务、反代的 JSON 错误页、
+/// 将来字段改名)当成在线,于是运行态是空的 → `healthy = 0` → 每轮都判定池子空了 →
+/// **一路买到日预算打满**。这条保护的整个意义就是「读不到运行态就别花钱」,
+/// 判据松一格就等于没有。空数组是合法的(该 worker 名下没有账号),照样算在线。
+pub fn parse_runtime(bodies: &[serde_json::Value]) -> (Vec<RuntimeRow>, bool) {
+    let mut out = Vec::new();
+    let mut any_online = false;
+    for v in bodies {
+        let Some(arr) = v.get("accounts_status").and_then(|a| a.as_array()) else {
+            continue;
+        };
+        any_online = true;
+        for a in arr {
+            let Some(id) = a.get("account_id").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            out.push(RuntimeRow {
+                account_id: id.to_string(),
+                reason: a.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                disabled: a.get("disabled").and_then(|x| x.as_bool()).unwrap_or(false),
+            });
+        }
+    }
+    (out, any_online)
+}
+
+/// 单位成本闸:这单划不划算。返回 `Some(理由)` = 该拦。**纯函数,可直接测。**
+///
+/// 实测的决定性事实(2026-08-04,22 个自购号的全生命周期):号按**墙上时钟**死 ——
+/// 烧速差 3 倍(676 vs 1990 分/时),存活一律 0.7–0.9 小时,烧得最猛的反而活得最久。
+/// 于是一个号的产出 = 需求速率 × 寿命,**与号本身无关**,「什么时候买」就是全部策略:
+///
+/// * 需求够时:并发拉满、榨得越快越好,省着烧的部分到点直接蒸发;
+/// * 需求不够时:花 ¥20 买 45 分钟只用掉三成,单位成本反而高过它要替代的贵号池。
+///
+/// 用「¥/积分」而不是「积分/时的阈值」做旋钮,是为了让它随价格自适应:
+/// drop 从 $2.95 降到 $2.20 时,可接受的需求门槛自动跟着降,不用人去改配置。
+pub fn unit_cost_veto(p: &Params, price_cny: f64, demand_rate: f64) -> Option<String> {
+    if p.max_unit_cost_cny_per_credit <= 0.0 {
+        return None; // 0 = 关闭这道闸
+    }
+    let unit = p.expected_unit_cost(price_cny, demand_rate);
+    if unit <= p.max_unit_cost_cny_per_credit {
+        return None;
+    }
+    Some(format!(
+        "需求撑不起这一单:近期 {demand_rate:.0} 分/时 × 预期寿命 {:.0} 分钟 ≈ 产出 {:.0} 分,\
+         单价 ¥{price_cny:.2} → 预期 ¥{unit:.4}/分,高于上限 ¥{:.4}/分。\
+         号是按时钟死的,买了闲置就是纯亏,等有需求再补",
+        p.expected_lifetime_secs as f64 / 60.0,
+        p.expected_yield(demand_rate),
+        p.max_unit_cost_cny_per_credit,
+    ))
+}
+
 pub fn now_ts() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const NOW: i64 = 1_785_800_000;
+
+    fn row(id: &str, reason: &str, disabled: bool) -> RuntimeRow {
+        RuntimeRow { account_id: id.into(), reason: reason.into(), disabled }
+    }
+
+    /// 全部号都是「很久以前建的」,以便默认落在宽限期之外。
+    fn born_long_ago(ids: &[&str]) -> HashMap<String, i64> {
+        ids.iter().map(|i| ((*i).to_string(), NOW - 10_000)).collect()
+    }
+
+    #[test]
+    fn 有尝试零成功的号不算健康() {
+        // caio 报 reason="" ,但窗口内 12 次请求一次没成 —— 这就是尸体。
+        let act: HashMap<String, (i64, i64)> = [("a".to_string(), (12, 0))].into();
+        let h = classify(
+            &[row("a", "", false)],
+            &act,
+            &born_long_ago(&["a"]),
+            &Params::default(),
+            NOW,
+        );
+        assert_eq!(h.healthy, 0, "打不通的号绝不能计入水位");
+        assert_eq!(h.zombie, 1);
+    }
+
+    #[test]
+    fn 窗口内没被选中时维持caio的判断() {
+        // 夜里没流量 / 整个网关刚崩过:所有号都零成功。此时「零成功」什么也证明不了,
+        // 一律判死会让补货每轮都以为池子空了,连环购买。
+        let h = classify(
+            &[row("a", "", false)],
+            &HashMap::new(),
+            &born_long_ago(&["a"]),
+            &Params::default(),
+            NOW,
+        );
+        assert_eq!(h.healthy, 1, "没有证据时不许下结论");
+        assert_eq!(h.zombie, 0);
+    }
+
+    #[test]
+    fn 新号在宽限期内算健康() {
+        // 刚上号还没跑过任何请求;没有宽限期的话它会被自己判成僵尸,于是不停买。
+        let mut p = Params::default();
+        p.new_account_grace_secs = 300;
+        let created: HashMap<String, i64> = [("a".to_string(), NOW - 60)].into();
+        let act: HashMap<String, (i64, i64)> = [("a".to_string(), (3, 0))].into();
+        let h = classify(&[row("a", "", false)], &act, &created, &p, NOW);
+        assert_eq!(h.healthy, 1, "宽限期内即使零成功也算健康");
+
+        // 宽限期一过,同样的数据就该判死。
+        let old: HashMap<String, i64> = [("a".to_string(), NOW - 600)].into();
+        let h2 = classify(&[row("a", "", false)], &act, &old, &p, NOW);
+        assert_eq!(h2.healthy, 0);
+        assert_eq!(h2.zombie, 1);
+    }
+
+    /// 2026-08-04 的生产现场:池子里 1 个 reason="" 的尸体 + 一堆冷却号,
+    /// 而全池零成功。旧判据在这里报 `healthy=1` 拒绝补货,断供 66 分钟。
+    #[test]
+    fn 生产回归_全池零成功时水位必须是零() {
+        let ids = ["z", "c1", "c2", "d1"];
+        let rows = [
+            row("z", "", false),                        // 复活的尸体
+            row("c1", "temporarily_suspended", true),
+            row("c2", "temporarily_suspended", true),
+            row("d1", "invalid_refresh_token", true),
+        ];
+        let act: HashMap<String, (i64, i64)> = [("z".to_string(), (5, 0))].into();
+        let h = classify(&rows, &act, &born_long_ago(&ids), &Params::default(), NOW);
+        assert_eq!(h.healthy, 0, "全池零成功时说「还有一个号」正是要修掉的 bug");
+        assert_eq!(h.zombie, 1);
+        assert_eq!(h.cooling, 2);
+        assert_eq!(h.dead, 1);
+        assert_eq!(h.total, 4);
+    }
+
+    #[test]
+    fn 非ksk号与重复上报都不计入() {
+        let act: HashMap<String, (i64, i64)> = [("a".to_string(), (1, 1))].into();
+        // "x" 不在 created_at(= 不是 ksk_ 号);"a" 在两个 worker 上各报一次。
+        let h = classify(
+            &[row("a", "", false), row("a", "", false), row("x", "", false)],
+            &act,
+            &born_long_ago(&["a"]),
+            &Params::default(),
+            NOW,
+        );
+        assert_eq!(h.healthy, 1);
+        assert_eq!(h.total, 1);
+    }
+
+    #[test]
+    fn 最年轻活号的年龄取最小值() {
+        // 只要还有一个新号就不该提前补位,所以取 min 而不是 max。
+        let created: HashMap<String, i64> =
+            [("old".to_string(), NOW - 2600), ("new".to_string(), NOW - 100)].into();
+        let act: HashMap<String, (i64, i64)> =
+            [("old".to_string(), (9, 9)), ("new".to_string(), (9, 9))].into();
+        let h = classify(
+            &[row("old", "", false), row("new", "", false)],
+            &act,
+            &created,
+            &Params::default(),
+            NOW,
+        );
+        assert_eq!(h.healthy, 2);
+        assert_eq!(h.youngest_healthy_age_secs, Some(100));
+    }
+
+    // ───────────────────── 运行态解析 ─────────────────────
+
+    /// **红线**:worker 回了别的 JSON(端口配错、反代错误页、字段改名)时,
+    /// 绝不能算「在线」。算在线 = 运行态为空 = `healthy=0` = 每轮都以为池子空了,
+    /// 一路买到日预算打满(¥800)。这条保护的全部意义就是「读不到运行态就别花钱」。
+    #[test]
+    fn 形状不对的health响应不算在线() {
+        let bad = serde_json::json!({"status": "ok", "role": "worker"}); // 没有 accounts_status
+        let (rows, online) = parse_runtime(&[bad]);
+        assert!(rows.is_empty());
+        assert!(!online, "拿不到账号运行态就必须判定离线,否则会一路买到预算打满");
+
+        let err_page = serde_json::json!({"error": "bad gateway"});
+        assert!(!parse_runtime(&[err_page]).1);
+    }
+
+    #[test]
+    fn 没有账号的worker仍然算在线() {
+        // 空数组是合法状态(该 worker 名下没有账号),不能因此判定整个运行态不可读。
+        let (rows, online) = parse_runtime(&[serde_json::json!({"accounts_status": []})]);
+        assert!(rows.is_empty());
+        assert!(online);
+    }
+
+    #[test]
+    fn 一个worker坏掉不影响另一个() {
+        let bodies = [
+            serde_json::json!({"oops": 1}),
+            serde_json::json!({"accounts_status": [
+                {"account_id": "a", "reason": "", "disabled": false},
+                {"reason": "", "disabled": false},               // 缺 id,跳过
+                {"account_id": "b", "reason": "temporarily_suspended", "disabled": true},
+            ]}),
+        ];
+        let (rows, online) = parse_runtime(&bodies);
+        assert!(online);
+        assert_eq!(rows.len(), 2, "缺 account_id 的条目要跳过,其余照收");
+        assert_eq!(rows[1].reason, "temporarily_suspended");
+        assert!(rows[1].disabled);
+    }
+
+    // ───────────────────── 单位成本闸 ─────────────────────
+
+    fn econ_params() -> Params {
+        let mut p = Params::default();
+        p.expected_lifetime_secs = 2700; // 45 分钟
+        p.account_throughput_credits_per_hour = 1900.0;
+        p.max_unit_cost_cny_per_credit = 0.04;
+        p
+    }
+
+    #[test]
+    fn 低谷时段不许买号() {
+        // 凌晨 6 点实测 77 分/时:一个 ¥20 的号只能榨出约 58 分 → ¥0.35/分,
+        // 比它要替代的贵号池(约 ¥0.068/分)还贵 5 倍。
+        let p = econ_params();
+        let why = unit_cost_veto(&p, 20.06, 77.0).expect("低谷必须拦住");
+        assert!(why.contains("需求撑不起"), "理由要说人话:{why}");
+    }
+
+    #[test]
+    fn 需求足够时放行() {
+        // 白天 1000 分/时 → 产出 750 分 → ¥0.027/分,低于上限。
+        assert!(unit_cost_veto(&econ_params(), 20.06, 1000.0).is_none());
+    }
+
+    #[test]
+    fn 零需求必须被拦而不是当成算不出来() {
+        // 预期产出为 0 时单位成本是 INFINITY。若图省事返回 None(「算不出来就放行」),
+        // 就会在完全没人用的时候照买不误。
+        assert!(unit_cost_veto(&econ_params(), 20.06, 0.0).is_some());
+    }
+
+    #[test]
+    fn 阈值设零即关闭这道闸() {
+        let mut p = econ_params();
+        p.max_unit_cost_cny_per_credit = 0.0;
+        assert!(unit_cost_veto(&p, 20.06, 0.0).is_none(), "0 = 显式关闭,不该再拦");
+    }
+
+    #[test]
+    fn 降价会自动放宽需求门槛() {
+        // 这是用「¥/积分」而不是「积分/时」当旋钮的理由:同样的需求,
+        // 号便宜了就该买,不用人去改配置。
+        let p = econ_params();
+        let demand = 700.0;
+        assert!(unit_cost_veto(&p, 21.24, demand).is_some(), "$2.95 时这个需求不划算");
+        assert!(unit_cost_veto(&p, 15.84, demand).is_none(), "$2.20 时同样的需求就划算了");
+    }
 }

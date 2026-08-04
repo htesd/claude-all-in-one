@@ -20,6 +20,7 @@ import {
   useBuyNow,
   useRestockAccounts,
   useRestockCredits,
+  useRestockParams,
   useRestockState,
   useResetBreaker,
 } from '@/features/restock/hooks'
@@ -46,6 +47,7 @@ export default function RestockPage() {
   const { data: state, error: stateError } = useRestockState()
   const { data: credits, isLoading: creditsLoading } = useRestockCredits(hours)
   const { data: accounts } = useRestockAccounts()
+  const { data: params } = useRestockParams()
   const buy = useBuyNow()
   const clearBreaker = useResetBreaker()
 
@@ -64,6 +66,8 @@ export default function RestockPage() {
       })
     if (snap.any_online === false) banners.push({ tone: 'bad', text: t('restock.banner.offline') })
     if (!state.in_peak) banners.push({ tone: 'warn', text: t('restock.banner.outOfWindow') })
+    if ((snap.zombie ?? 0) > 0)
+      banners.push({ tone: 'warn', text: `${t('restock.banner.zombie')}（${snap.zombie}）` })
   }
   if (credits && !credits.coverage.mature)
     banners.push({
@@ -107,12 +111,27 @@ export default function RestockPage() {
         </div>
       ))}
 
-      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-7">
         <StatCard
           icon={PackageSearch}
           label={t('restock.stat.healthy')}
           value={snap.healthy != null ? String(snap.healthy) : '—'}
-          sub={`阈值 ${state?.min_healthy ?? '—'} · 冷却 ${snap.cooling ?? '—'}`}
+          sub={
+            `阈值 ${state?.min_healthy ?? '—'} · 冷却 ${snap.cooling ?? '—'}` +
+            ((snap.zombie ?? 0) > 0 ? ` · 僵尸 ${snap.zombie}` : '')
+          }
+        />
+        {/* 「这单划不划算」是买号策略的主判据：号按墙上时钟死，所以产出＝需求×寿命，
+            需求不够时买号的单位成本会高过它要替代的贵号池。 */}
+        <StatCard
+          icon={Coins}
+          label={t('restock.stat.unitCost')}
+          value={
+            snap.expected_unit_cost != null ? `¥${snap.expected_unit_cost.toFixed(3)}` : '∞'
+          }
+          sub={`${t('restock.stat.unitCostSub')} ¥${
+            params?.values.max_unit_cost_cny_per_credit ?? '—'
+          }`}
         />
         <StatCard
           icon={ShoppingCart}
@@ -135,13 +154,29 @@ export default function RestockPage() {
           value={state ? `¥${state.spent_today.toFixed(0)}` : '—'}
           sub={state ? `/ ¥${state.daily_cap_cny} · 已购 ${state.bought_today}` : undefined}
         />
+        {/* 决策用的是「近期实测 与 预测下一小时 取大者」，所以这里显示的就是那个数，
+            而不是图表里的窗口累计 —— 两个数不一致时看的人会以为面板在说谎。 */}
         <StatCard
           icon={TrendingUp}
           label={t('restock.stat.demand')}
-          value={credits ? `${Math.round(credits.forecast_demand)}` : '—'}
-          sub={credits ? `分 / 未来 ${credits.forecast_hours}h` : undefined}
+          value={snap.demand_rate != null ? `${Math.round(snap.demand_rate)}` : '—'}
+          sub={
+            credits
+              ? `分/时 · 未来 ${credits.forecast_hours}h 共 ${Math.round(credits.forecast_demand)} 分`
+              : '分/时'
+          }
         />
       </div>
+
+      {snap.measured_lifetime_secs != null && (
+        <p className="text-xs text-muted-foreground">
+          {t('restock.lifetime.measured')}：
+          <b>{Math.round(snap.measured_lifetime_secs / 60)} 分钟</b>
+          （{snap.measured_lifetime_samples} 个样本） · 当前设定{' '}
+          {Math.round((params?.values.expected_lifetime_secs ?? 0) / 60)} 分钟 ·{' '}
+          {t('restock.lifetime.hint')}
+        </p>
+      )}
 
       <Card>
         <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-3">
@@ -239,19 +274,37 @@ export default function RestockPage() {
                   {a.self_bought && (
                     <Badge variant="success">{t('restock.acct.selfBought')}</Badge>
                   )}
+                  {/* 死法要单列：「被风控封」和「key 被吊销」是两个完全不同的问题，
+                      后者是供货质量，光看总产出分不出来。 */}
+                  <Badge variant={a.reason ? 'warning' : 'success'}>
+                    {a.reason || t('restock.acct.reasonAlive')}
+                  </Badge>
                   {a.disabled && <Badge variant="destructive">disabled</Badge>}
                 </div>
                 <div className="mt-1 text-xs leading-relaxed text-muted-foreground">
                   {fmt(a.created_at, off)} 建 · 调用 {a.calls}（成功 {a.success}） · 积分{' '}
                   <b>{a.credits}</b>
+                  {a.served_secs != null && (
+                    <>
+                      {' '}
+                      · {t('restock.acct.served')} {Math.round(a.served_secs / 60)} 分钟
+                    </>
+                  )}
                   {a.cost_cny != null && (
                     <>
                       {' '}
                       · 成本 ¥{a.cost_cny.toFixed(2)}
+                      {a.unit_cost_per_credit != null && (
+                        <>
+                          {' '}
+                          · <b>¥{a.unit_cost_per_credit.toFixed(4)}</b>/
+                          {t('restock.acct.perCredit')}
+                        </>
+                      )}
                       {a.unit_cost != null && (
                         <>
                           {' '}
-                          · <b>¥{a.unit_cost.toFixed(4)}</b>/{t('restock.acct.unitCost')}
+                          · ¥{a.unit_cost.toFixed(4)}/{t('restock.acct.unitCost')}
                         </>
                       )}
                     </>

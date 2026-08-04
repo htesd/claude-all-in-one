@@ -412,6 +412,13 @@ pub struct RestockAccountRow {
     pub credits: f64,
     /// 形如 `G0@0 GECO@0`,组内优先级的事实源(不是 extra.priority)。
     pub groups: String,
+    /// 首次/末次产生用量的时刻(epoch 秒),无用量时为 `None`。
+    ///
+    /// 两者之差就是这个号的**实际服务时长** —— 实测这批号一律只活 0.7–0.9 小时
+    /// 且与烧速无关(号按墙上时钟死,不按用量死),所以「花了多少钱 ÷ 活了多久」
+    /// 才是判断买贵没买贵的那把尺子,只看总产出会把「赶上高峰」当成「号好」。
+    pub first_used_at: Option<i64>,
+    pub last_used_at: Option<i64>,
 }
 
 /// 小时聚合的一行。键是 `(整点, 模型, 是否 ksk_)`,写入时按键累加。

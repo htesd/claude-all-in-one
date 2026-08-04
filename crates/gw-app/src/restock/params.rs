@@ -58,6 +58,21 @@ pub const BOUNDS: &[Bound] = &[
         label: "预测时长 小时", hint: "用「星期几×钟点」画像预测未来多少小时" },
     Bound { key: "idle_skip_ratio", kind: "float", min: 0.0, max: 1.0,
         label: "闲时抑制阈值", hint: "预测消耗低于历史峰值的此比例时不补。0 = 关闭" },
+    Bound { key: "max_unit_cost_cny_per_credit", kind: "float", min: 0.0, max: 10.0,
+        label: "可接受单位成本 ¥/积分",
+        hint: "预期「单价÷(需求×寿命)」高于此值就不买。0 = 关闭这道闸" },
+    Bound { key: "account_throughput_credits_per_hour", kind: "float", min: 1.0, max: 100000.0,
+        label: "单号吞吐上限 分/时", hint: "算预期产出的封顶。实测约 1900" },
+    Bound { key: "expected_lifetime_secs", kind: "int", min: 60.0, max: 86400.0,
+        label: "预期寿命 秒", hint: "号从上号到死的时长。实测中位数约 2880,面板会显示实测值" },
+    Bound { key: "demand_window_secs", kind: "int", min: 60.0, max: 86400.0,
+        label: "需求测量窗口 秒", hint: "用最近这么久的实测速率代表当前需求" },
+    Bound { key: "liveness_window_secs", kind: "int", min: 60.0, max: 86400.0,
+        label: "判活窗口 秒", hint: "回看这么久:有成功=活,有尝试零成功=僵尸,没尝试=不下结论" },
+    Bound { key: "new_account_grace_secs", kind: "int", min: 0.0, max: 86400.0,
+        label: "新号宽限 秒", hint: "刚上号还没跑过请求,这段时间内一律算健康" },
+    Bound { key: "lead_time_secs", kind: "int", min: 0.0, max: 3600.0,
+        label: "提前量 秒", hint: "活号预计还剩这么久就提前下单。0 = 关(提前买会折掉新号同样长的寿命)" },
 ];
 
 fn d_false() -> bool { false }
@@ -65,11 +80,23 @@ fn d_true() -> bool { true }
 fn d_1() -> i64 { 1 }
 fn d_200() -> f64 { 200.0 }
 fn d_rate() -> f64 { 7.2 }
-fn d_reserve() -> f64 { 40.0 }
+/// 保留额默认 **0**:它是在「本单价格」**之上**再留的余量,写 40 就意味着
+/// ¥58 的余额买不了 ¥21 的号 —— 实测 2026-08-04 卡住 25 轮。想留缓冲请显式填。
+fn d_reserve() -> f64 { 0.0 }
 fn d_2() -> i64 { 2 }
 fn d_price() -> f64 { 6.0 }
-fn d_60() -> i64 { 60 }
+/// 轮询 30s 而不是 60s:号一死到补上的空档 = 检测延迟 + 上号耗时(~25s)。
+/// 号只活 45 分钟,每个周期少丢 30 秒就是少丢 1% 的覆盖,而多跑一轮几乎不花钱
+/// (health 是 loopback,drop 库存另有 300s 节流)。
+fn d_30() -> i64 { 30 }
 fn d_24() -> i64 { 24 }
+fn d_600() -> i64 { 600 }
+fn d_300() -> i64 { 300 }
+fn d_1800() -> i64 { 1800 }
+fn d_lifetime() -> i64 { 2700 }
+fn d_unit_cost() -> f64 { 0.04 }
+fn d_throughput() -> f64 { 1900.0 }
+fn d_zero_i() -> i64 { 0 }
 fn d_peak_start() -> String { "09:00".into() }
 fn d_peak_end() -> String { "02:00".into() }
 fn d_offset() -> i64 { 480 }
@@ -116,7 +143,7 @@ pub struct Params {
     #[serde(default = "d_price")]
     pub max_price_usd: f64,
 
-    #[serde(default = "d_60")]
+    #[serde(default = "d_30")]
     pub poll_interval_secs: i64,
     #[serde(default = "d_24")]
     pub grave_ttl_hours: i64,
@@ -148,8 +175,58 @@ pub struct Params {
     pub forecast_hours: i64,
     /// 闲时抑制:预测消耗低于历史峰值的此比例时不补货。**0 = 关闭**。
     /// 这道闸**只会阻止购买、永不促成购买**,所以预测错了最坏也只是晚买。
+    ///
+    /// 与 [`Self::max_unit_cost_cny_per_credit`] 的分工:这条是**相对**判据
+    /// (比历史峰值),那条是**绝对**判据(比钱)。默认只开后者 —— 相对判据说不出
+    /// 「这单到底亏不亏」,而这正是要回答的问题。
     #[serde(default = "d_zero_f")]
     pub idle_skip_ratio: f64,
+
+    /// **可接受的单位成本上限(¥/积分)**。这是买号策略的主旋钮。
+    ///
+    /// 实测的决定性事实:号按**墙上时钟**死(22 个号烧速差 3 倍、存活一律 0.7–0.9h,
+    /// 烧得最猛的反而活得最久),所以一个号的产出 = 需求速率 × 寿命,**跟号本身无关**。
+    /// 于是「该不该买」就是一道算术题:
+    ///
+    /// ```text
+    /// 预期产出   = min(需求速率, 单号吞吐上限) × 预期寿命
+    /// 预期单位成本 = 本单价格 / 预期产出
+    /// ```
+    ///
+    /// 这比写死钟点表耐用:drop 降价时门槛自动放宽,客户作息变了也不用改配置。
+    /// 默认 0.04 对照两个数:当前实测 ¥0.0191/积分,而贵号池基准约 ¥0.068/积分
+    /// (0.06 元/次 ÷ 0.88 积分/次)。按 ¥20 单价反解,门槛落在约 670 积分/时 ——
+    /// 凌晨 6–8 点(77–391 分/时)因此不买,那几个钟点买号是**亏的**。
+    /// **0 = 关闭这道闸。**
+    #[serde(default = "d_unit_cost")]
+    pub max_unit_cost_cny_per_credit: f64,
+    /// 单号吞吐上限(积分/时),给预期产出封顶。实测最高持续速率约 1900。
+    /// 需求再高也吃不下,不封顶会在高峰期把预期产出算得过于乐观。
+    #[serde(default = "d_throughput")]
+    pub account_throughput_credits_per_hour: f64,
+    /// 预期寿命(秒)。实测中位数约 2880,取 2700 略保守。
+    /// 面板会同时显示**实测滚动中位数**供人工校准,但**不自动套用** ——
+    /// 这个值估短的后果是每轮都提前下单,花费直接翻倍。
+    #[serde(default = "d_lifetime")]
+    pub expected_lifetime_secs: i64,
+    /// 用最近多少秒的实测消耗代表「当前需求」。
+    #[serde(default = "d_1800")]
+    pub demand_window_secs: i64,
+
+    /// 判活回看窗口(秒)。见 `Engine::health` 的三态判定。
+    #[serde(default = "d_600")]
+    pub liveness_window_secs: i64,
+    /// 新号宽限期(秒):刚上号还没跑过任何请求,这段时间内一律算健康,
+    /// 否则新号会因为「窗口内零成功」被自己判成僵尸,于是不停买。
+    #[serde(default = "d_300")]
+    pub new_account_grace_secs: i64,
+    /// 提前量(秒):活号预计还剩这么久就先下单。**默认 0 = 关**。
+    ///
+    /// 算过账才关的:检测(≤1 轮 30s)+ 上号(~25s)的空档约占 45 分钟周期的 2%,
+    /// 而提前 N 秒下单会让新号白折掉自己 N 秒的寿命(同样是墙上时钟)——
+    /// 提前 180s 是拿 6.7% 的产出换 2% 的连续性,净亏。将来若判断连续性更值钱再开。
+    #[serde(default = "d_zero_i")]
+    pub lead_time_secs: i64,
 }
 
 impl Default for Params {
@@ -178,6 +255,26 @@ impl Params {
             }
         }
         (ok, bad)
+    }
+
+    /// 一个号在当前需求下的预期产出(积分)。
+    ///
+    /// 号按墙上时钟死,所以产出只由「这段时间里有多少活儿」决定,
+    /// 再被单号吞吐上限封顶 —— 需求 3000 分/时也不代表一个号能吃下 3000。
+    pub fn expected_yield(&self, demand_rate: f64) -> f64 {
+        let rate = demand_rate.max(0.0).min(self.account_throughput_credits_per_hour.max(0.0));
+        rate * (self.expected_lifetime_secs.max(0) as f64 / 3600.0)
+    }
+
+    /// 本单的预期单位成本(¥/积分)。预期产出为 0 时返回 `INFINITY`
+    /// —— 那正是「买了也没人用」,必须被闸门挡住,不能当成「算不出来所以放行」。
+    pub fn expected_unit_cost(&self, price_cny: f64, demand_rate: f64) -> f64 {
+        let y = self.expected_yield(demand_rate);
+        if y <= 0.0 {
+            f64::INFINITY
+        } else {
+            price_cny.max(0.0) / y
+        }
     }
 
     /// 当前 epoch 是否落在高峰窗口内。`start == end` 视为全天。
@@ -262,6 +359,43 @@ mod tests {
         assert_eq!(p.max_per_purchase, 1);
         assert_eq!(p.daily_cap_cny, 200.0);
         assert_eq!(p.idle_skip_ratio, 0.0, "闲时抑制默认关闭");
+        assert_eq!(p.lead_time_secs, 0, "提前量默认关闭:提前买会等长折掉新号寿命");
+        assert_eq!(
+            p.min_balance_reserve_cny, 0.0,
+            "保留额是在本单价格之上再留的,默认 40 会让 ¥58 买不了 ¥21 的号"
+        );
+    }
+
+    #[test]
+    fn 预期单位成本按需求算且被吞吐上限封顶() {
+        let mut p = Params::default();
+        p.expected_lifetime_secs = 3600; // 整一小时,便于心算
+        p.account_throughput_credits_per_hour = 1900.0;
+
+        // 需求 1000 分/时 × 1h = 1000 分产出,¥20 → ¥0.02/分
+        assert!((p.expected_unit_cost(20.0, 1000.0) - 0.02).abs() < 1e-9);
+        // 需求再高也吃不下:3000 被封到 1900
+        assert!((p.expected_unit_cost(20.0, 3000.0) - 20.0 / 1900.0).abs() < 1e-9);
+        // 凌晨低谷:100 分/时 → ¥0.2/分,远高于默认上限 0.04,必须被挡
+        assert!(p.expected_unit_cost(20.0, 100.0) > p.max_unit_cost_cny_per_credit);
+        // 零需求不是「算不出来」,是「买了也没人用」——必须是 INFINITY 而不是 0
+        assert_eq!(p.expected_unit_cost(20.0, 0.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn 新参数的边界表与结构体字段一一对应() {
+        // BOUNDS 漏一条,面板就改不了这个参数,而代码里它已经在起作用了 —— 静默分叉。
+        let v = serde_json::to_value(Params::default()).unwrap();
+        let obj = v.as_object().unwrap();
+        for b in BOUNDS {
+            assert!(obj.contains_key(b.key), "BOUNDS 里的 {} 在 Params 上不存在", b.key);
+        }
+        for k in ["max_unit_cost_cny_per_credit", "expected_lifetime_secs",
+                  "liveness_window_secs", "new_account_grace_secs",
+                  "account_throughput_credits_per_hour", "demand_window_secs",
+                  "lead_time_secs"] {
+            assert!(BOUNDS.iter().any(|b| b.key == k), "{k} 没进 BOUNDS,面板改不了");
+        }
     }
 
     #[test]

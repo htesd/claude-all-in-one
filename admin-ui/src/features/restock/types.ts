@@ -23,6 +23,14 @@ export interface RestockParams {
   new_account_queue_enabled: boolean
   forecast_hours: number
   idle_skip_ratio: number
+  /** 可接受的单位成本上限（¥/积分）。买号策略的主旋钮，0 = 关闭。 */
+  max_unit_cost_cny_per_credit: number
+  account_throughput_credits_per_hour: number
+  expected_lifetime_secs: number
+  demand_window_secs: number
+  liveness_window_secs: number
+  new_account_grace_secs: number
+  lead_time_secs: number
 }
 
 /** 参数上下限。后端 BOUNDS 表的投影，前端据此渲染表单并做前置校验。 */
@@ -42,7 +50,10 @@ export interface RestockParamsResponse {
 }
 
 export interface RestockSnapshot {
+  /** **实证还在服务**的号数（caio 报正常 + 近期真的成功过）。水位比的就是它。 */
   healthy?: number
+  /** caio 报「正常」但实证已死。>0 说明面板上那几个正常号是尸体。 */
+  zombie?: number
   cooling?: number
   dead?: number
   total?: number
@@ -53,7 +64,14 @@ export interface RestockSnapshot {
   stock_at?: number
   at?: number
   drop_ok?: boolean
-  drop_error?: string
+  drop_error?: string | null
+  /** 当前需求速率（积分/时，全池口径）。 */
+  demand_rate?: number
+  /** 按当前需求预估的单位成本（¥/积分）；产出为 0 时后端给 null。 */
+  expected_unit_cost?: number | null
+  /** 实测寿命中位数（秒）。**仅供人工校准** expected_lifetime_secs，不自动生效。 */
+  measured_lifetime_secs?: number
+  measured_lifetime_samples?: number
 }
 
 export interface RestockDecisionRow {
@@ -142,7 +160,16 @@ export interface RestockAccount {
   groups: string
   cost_cny: number | null
   self_bought: boolean
+  /** ¥/次成功调用。 */
   unit_cost: number | null
+  /** ¥/积分。积分才是号的真实刻度（opus 一次约 1.1 分、haiku 0.03 分，差 40 倍）。 */
+  unit_cost_per_credit: number | null
+  /** 实际服务时长（秒）＝ 首末次用量之差。实测这批号一律 0.7–0.9 小时且与烧速无关。 */
+  served_secs: number | null
+  first_used_at: number | null
+  last_used_at: number | null
+  /** 运行态原因，空串 = 正常。区分「被风控封」与「key 被吊销」用。 */
+  reason: string
 }
 
 export interface RestockAccountsResponse {
