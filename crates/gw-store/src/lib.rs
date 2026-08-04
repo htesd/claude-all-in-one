@@ -1186,13 +1186,19 @@ impl SqliteStore {
     /// 用**凭据字段**判定而不是 id 前缀:人工上的号可能叫别的名字(邮箱等),
     /// 只认前缀会漏。前缀只在「号已被删、日志还在」时作兜底(见 rollup 的 LEFT JOIN)。
     pub fn restock_ksk_account_ids(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.restock_ksk_accounts()?.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// ksk_ 号的 `(account_id, created_at)`。判活要用建号时刻给新号宽限期 ——
+    /// 刚上号还没跑过任何请求,不给宽限就会被自己判成僵尸,于是不停买。
+    pub fn restock_ksk_accounts(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let conn = self.stats_conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT account_id FROM accounts
+            "SELECT account_id, created_at FROM accounts
               WHERE json_extract(extra, '$.kiro_api_key') IS NOT NULL",
         )?;
         let rows = stmt
-            .query_map([], |r| r.get(0))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1213,7 +1219,11 @@ impl SqliteStore {
                                               THEN u.metering_credit ELSE 0 END),0)
                        FROM usage_records u WHERE u.account_id = a.account_id),
                     (SELECT COALESCE(GROUP_CONCAT(g.group_name || '@' || g.priority, ' '), '')
-                       FROM account_groups g WHERE g.account_id = a.account_id)
+                       FROM account_groups g WHERE g.account_id = a.account_id),
+                    (SELECT MIN(u.created_at) FROM usage_records u
+                      WHERE u.account_id = a.account_id),
+                    (SELECT MAX(u.created_at) FROM usage_records u
+                      WHERE u.account_id = a.account_id)
                FROM accounts a
               WHERE json_extract(a.extra, '$.kiro_api_key') IS NOT NULL
               ORDER BY a.created_at DESC, a.account_id",
@@ -1229,6 +1239,8 @@ impl SqliteStore {
                     success: r.get(5)?,
                     credits: r.get(6)?,
                     groups: r.get(7)?,
+                    first_used_at: r.get(8)?,
+                    last_used_at: r.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1367,6 +1379,83 @@ impl SqliteStore {
         )?;
         let rows = stmt
             .query_map([since_ts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 最近 `window_secs` 秒的实测消耗速率(**积分/小时**,全池口径)。
+    ///
+    /// 源用 `usage_records` 而不是 rollup:rollup 是整点聚合,当前这个不完整的小时
+    /// 会显示成半根柱子,拿去和阈值比就会在每个整点后误判成「没需求」。
+    ///
+    /// 口径是**全池**(含贵号池)而非只算 ksk_ —— 我们要问的是「有多少活儿等着干」,
+    /// 而不是「便宜号现在干了多少」。后者在断供时恰好是 0,拿它当需求会让补货自锁。
+    pub fn restock_recent_credit_rate(&self, window_secs: i64) -> anyhow::Result<f64> {
+        let w = window_secs.max(60);
+        let conn = self.stats_conn.lock();
+        let sum: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN metering_credit > 0 THEN metering_credit ELSE 0 END), 0)
+               FROM usage_records
+              WHERE created_at >= CAST(strftime('%s','now') AS INTEGER) - ?1",
+            [w],
+            |r| r.get(0),
+        )?;
+        Ok(sum * 3600.0 / w as f64)
+    }
+
+    /// 窗口内每个 ksk_ 账号的 `(尝试数, 成功数)`。**补货判活用这个。**
+    ///
+    /// 源必须是 `request_logs` 而不是 `usage_records`:后者**只写成功记录**
+    /// (线上近 24h 三万余行全是 `success=1`),分不出「试过但全败」与「压根没被选中」。
+    /// 而这两者的处置完全相反 —— 前者是死号必须补货,后者只是没流量不能下结论。
+    ///
+    /// 环形缓冲(`REQUEST_LOG_CAP`)只覆盖数小时,对分钟级的判活窗口绰绰有余。
+    pub fn restock_account_activity(
+        &self,
+        since_ts: i64,
+    ) -> anyhow::Result<std::collections::HashMap<String, (i64, i64)>> {
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT r.account_id, COUNT(*), COALESCE(SUM(r.success), 0)
+               FROM request_logs r
+               JOIN accounts a ON a.account_id = r.account_id
+              WHERE r.created_at >= ?1
+                AND json_extract(a.extra, '$.kiro_api_key') IS NOT NULL
+              GROUP BY r.account_id",
+        )?;
+        let rows = stmt
+            .query_map([since_ts], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+            })?
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 最近 `sample` 个**已经死透**的自购号的实测寿命(秒,首次到末次成功的间隔)。
+    ///
+    /// 只取「末次成功已超过 `settled_after_secs`」的号 —— 还在服务的号只走完了半程,
+    /// 算进去会把中位数一路拖低,进而让「该换号了」提前触发、白白多花钱。
+    ///
+    /// **只用于展示与人工校准**,不自动改 `expected_lifetime_secs`:寿命估计一旦估短,
+    /// 后果是每轮都提前下单,花费直接翻倍,这种旋钮不该自己转。
+    pub fn restock_measured_lifetimes(
+        &self,
+        sample: i64,
+        settled_after_secs: i64,
+    ) -> anyhow::Result<Vec<i64>> {
+        let conn = self.stats_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT MAX(u.created_at) - MIN(u.created_at)
+               FROM restock_owned o
+               JOIN usage_records u ON u.account_id = o.account_id
+              GROUP BY o.account_id
+             HAVING COUNT(*) > 1
+                AND MAX(u.created_at) < CAST(strftime('%s','now') AS INTEGER) - ?2
+              ORDER BY MAX(u.created_at) DESC
+              LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map([sample.max(1), settled_after_secs.max(0)], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }

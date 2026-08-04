@@ -294,15 +294,39 @@ pub struct CreditsQuery {
 
 // ───────────────────────── 账号清单 ─────────────────────────
 
-/// ksk_ 号清单,**按创建时间倒序**,带成本与实测积分。
+/// ksk_ 号清单,**按创建时间倒序**,带成本、实测积分、服务时长与死法。
 ///
 /// caio 自己的账号页给不出「这个号花了多少钱、产出多少调用」—— 那要跨账号表、
 /// usage 表和补货订单表才算得出来,而这恰恰是管理这批短命号最需要的两个数。
+///
+/// 另外两列是 2026-08-04 那次复盘逼出来的:实测这批号一律只活 0.7–0.9 小时,
+/// **且与烧速无关**(号按墙上时钟死),所以「花了多少 ÷ 榨出多少积分」才是判断
+/// 买贵没买贵的尺子;而「死法」分得出「被风控封」和「key 被吊销」——
+/// 后者占了 9/22,是供货质量问题,光看总产出根本看不出来。
 async fn accounts(State(st): State<AdminState>) -> axum::response::Response {
     let rows = match st.store.restock_account_inventory() {
         Ok(v) => v,
         Err(e) => return internal_error(e),
     };
+    // 死法只存在于 worker 内存,得扇出去问。这是页面触发的读路径,不是热路径;
+    // worker 离线也不影响主体,那一列显示空即可。
+    let mut reason: std::collections::HashMap<String, String> = Default::default();
+    let fetches = st.workers.iter().map(|w| {
+        let http = st.http.clone();
+        let url = format!("http://{}/health", w.listen);
+        async move { http.get(&url).send().await.ok()?.json::<serde_json::Value>().await.ok() }
+    });
+    for v in futures::future::join_all(fetches).await.into_iter().flatten() {
+        for a in v.get("accounts_status").and_then(|x| x.as_array()).unwrap_or(&vec![]) {
+            if let Some(id) = a.get("account_id").and_then(|x| x.as_str()) {
+                reason
+                    .entry(id.to_string())
+                    .or_insert_with(|| {
+                        a.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string()
+                    });
+            }
+        }
+    }
     // 自购号的成本:把订单金额摊到该单买到的号上(单次买 1 个时就是全额)。
     let mut cost: std::collections::HashMap<String, f64> = Default::default();
     for o in st.store.restock_recent_orders(500).unwrap_or_default() {
@@ -318,6 +342,11 @@ async fn accounts(State(st): State<AdminState>) -> axum::response::Response {
         .into_iter()
         .map(|r| {
             let c = cost.get(&r.account_id).copied();
+            // 服务时长 = 首末次用量之差。号只活 0.7–0.9 小时,分钟才是有意义的刻度。
+            let served = match (r.first_used_at, r.last_used_at) {
+                (Some(a), Some(b)) if b > a => Some(b - a),
+                _ => None,
+            };
             serde_json::json!({
                 "account_id": r.account_id,
                 "created_at": r.created_at,
@@ -331,6 +360,14 @@ async fn accounts(State(st): State<AdminState>) -> axum::response::Response {
                 "self_bought": c.is_some(),
                 "unit_cost": c.filter(|_| r.success > 0)
                     .map(|c| (c / r.success as f64 * 10000.0).round() / 10000.0),
+                // ¥/积分:积分才是号的真实刻度(opus 一次约 1.1 分、haiku 一次 0.03 分,
+                // 差 40 倍),按「次」算单价会被模型结构带偏。
+                "unit_cost_per_credit": c.filter(|_| r.credits > 0.0)
+                    .map(|c| (c / r.credits * 10000.0).round() / 10000.0),
+                "served_secs": served,
+                "first_used_at": r.first_used_at,
+                "last_used_at": r.last_used_at,
+                "reason": reason.get(&r.account_id).cloned().unwrap_or_default(),
             })
         })
         .collect();
