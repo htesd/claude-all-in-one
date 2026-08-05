@@ -1942,6 +1942,20 @@ async fn messages(
                         && !st.scheduler.is_model_unavailable(&a.account_id, &req.model)
                 },
                 view.as_ref(),
+                // 「降层前先等高优先层的节流窗口」只在**请求开头的一小段时间窗**内允许。
+                // 高优先层挂的是自购速刷号,被 429 节流那几百毫秒里降层 = 把量白送给低优先级
+                // 兜底池(实测占比 14%)。但**必须封顶**:限流类错误的 switch_cap 是全组
+                // (见 `switch_cap`),不封的话一个持续撞 429 的请求能在同一个号上来回弹到
+                // 180s 总时限,省钱变成客户干等。窗口外照常降层 —— 结果与开关关闭时一致,
+                // 绝不把错误抛给客户;窗口远小于 RETRY_DEADLINE,等待也就够不到那条硬线。
+                //
+                // ⚠️ 用**墙上时钟**而不是 `attempts`:后者对所有失败类别共用(凭证刷新失败、
+                // ModelNotAvailable 都在消耗它),拿它当等待额度会出现「前两轮被无关错误吃掉、
+                // 真撞上 429 时反而不许等」——正好是本开关要治的那个病。
+                {
+                    let w = st.scheduler.tier_hold_window();
+                    !w.is_zero() && retry_started.elapsed() < w
+                },
             )
             .await
         {

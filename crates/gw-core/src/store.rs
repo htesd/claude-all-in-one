@@ -381,10 +381,20 @@ pub struct RestockOrder {
     pub count: i64,
     pub status: String,
     pub keys: Vec<String>,
-    /// **实际扣款**(购买前后余额之差),不是按报价估算的——报价是 USD、扣款是 CNY。
+    /// **实际扣款**(供应商自报的单笔扣款,拿不到时回落买前买后余额之差),
+    /// 不是按报价估算的——报价是 USD/积分、扣款是 CNY。
     pub spent_cny: f64,
     pub error: String,
     pub created_at: i64,
+    /// 这单下给了哪一家。**在途订单靠它才知道该去问谁对账**;
+    /// 空串 = 多供应商引入前的历史订单。
+    pub supplier: String,
+    /// 供应商内部的货架标识(kiroapp 的 `us` / `eu`;drop 无此概念 = 空串)。
+    pub shelf: String,
+    /// 这单买到的号所属 Kiro 服务区。一单同一区,故是订单属性。
+    pub region: String,
+    /// 下单时的限价。对账要用**原始参数**重放,所以必须能读回来。
+    pub max_total_cny: f64,
 }
 
 /// 一条决策流水。`action` ∈ skip/buy/import/reclaim/error。

@@ -378,6 +378,19 @@ impl SqliteStore {
             "failure_count",
             "failure_count INTEGER NOT NULL DEFAULT 0",
         )?;
+        // 补货订单的货源列(存量库热升级)。历史行回填成空串而不是 'drop':
+        // 空串诚实地表示「这单下的时候还没有多供应商概念」,回填一个具体值会让
+        // 「drop 一共花了多少」这类统计把历史混进来,而那时的口径与现在并不相同。
+        Self::ensure_column(
+            conn,
+            "restock_orders",
+            "supplier",
+            "supplier TEXT NOT NULL DEFAULT ''",
+        )?;
+        Self::ensure_column(conn, "restock_orders", "shelf", "shelf TEXT NOT NULL DEFAULT ''")?;
+        // 订单级的 Kiro 服务区。一单里的 key 来自同一个货架,共享同一个区,
+        // 所以它是订单属性而不是 key 属性(见 `engine.rs` 落库处的注释)。
+        Self::ensure_column(conn, "restock_orders", "region", "region TEXT NOT NULL DEFAULT ''")?;
         Self::backfill_account_groups(conn)?;
         Ok(())
     }
@@ -906,10 +919,80 @@ impl SqliteStore {
 
     /// 补货 leader 租约在 `settings` 表里的键名。
     pub const KEY_RESTOCK_LEASE: &'static str = "restock_lease";
+    /// **花钱临界区**的互斥锁键名。见 [`Self::try_acquire_lock`] 的文档。
+    pub const KEY_RESTOCK_PURCHASE_LOCK: &'static str = "restock_purchase_lock";
     /// 积分汇总游标(已消费到的 `usage_records.id`)的键名。
     pub const KEY_RESTOCK_CURSOR: &'static str = "restock_rollup_cursor";
     /// 补货运行时参数(面板可改的那些)的键名,整段 JSON。
     pub const KEY_RESTOCK_PARAMS: &'static str = "restock_params";
+
+    /// 抢占一把带 TTL 的跨进程锁。返回 `true` = 拿到了。
+    ///
+    /// 一条**条件 UPDATE**:只有「上一任已过期」或「本来就是我」两种情况写得进去
+    /// (首次是 INSERT,无冲突)。SQLite 单写者 + `busy_timeout=5000` 保证互斥,
+    /// 抢锁时会等待而不是当场 `database is locked`。
+    ///
+    /// ## 为什么「花钱锁」必须与 leader 租约分开
+    ///
+    /// 两把锁回答的是**不同的问题**:
+    /// - leader 租约([`Self::KEY_RESTOCK_LEASE`])= 「**谁来跑轮询**」,由持有者
+    ///   长期持有、每轮续租;
+    /// - 花钱锁([`Self::KEY_RESTOCK_PURCHASE_LOCK`])= 「**此刻谁在花钱**」,
+    ///   只在「读预算 → 落幂等键 → 发购买请求 → 记账」这段临界区内持有,用完立刻释放。
+    ///
+    /// 把两者合并过(2026-08-05 之前的形态就是只有前者),后果是
+    /// `POST /restock/buy-now` **完全不受任何互斥保护** ——
+    /// 它不抢租约,直接 `run_once(true)`。手动点两次、或手动与后台轮询撞上,
+    /// 两个执行会先读到**同一个** `spent`,再各自插入订单并真实扣款。
+    ///
+    /// 反过来,若让 buy-now 去抢 leader 租约也不行:后台循环长期持有它,
+    /// 手动购买会永远拿不到、变成一个点了没反应的按钮。
+    pub fn try_acquire_lock(&self, key: &str, holder: &str, ttl_secs: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let now: i64 =
+            conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?;
+        let value = serde_json::json!({ "holder": holder, "expires_at": now + ttl_secs.max(1) })
+            .to_string();
+        let n = conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                            updated_at = strftime('%s','now')
+             WHERE CAST(json_extract(settings.value, '$.expires_at') AS INTEGER) < ?3
+                OR json_extract(settings.value, '$.holder') = ?4",
+            rusqlite::params![key, value, now, holder],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// 释放锁。**只有持有者本人能释放**,避免误伤接任者。
+    pub fn release_lock(&self, key: &str, holder: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1 AND json_extract(value, '$.holder') = ?2",
+            rusqlite::params![key, holder],
+        )?;
+        Ok(())
+    }
+
+    /// 我**此刻**是否仍持有这把锁(未过期且 holder 是我)。
+    ///
+    /// 花钱之前必须再问一次:租约 TTL 最短只有 30s(`poll_interval` 下限 10s × 3),
+    /// 而单轮决策的外层超时是 120s —— 中间隔着健康检查、报价、购买、上号。
+    /// 不复验的话,第 31 秒另一个 router 已经接管并下了单,而本进程恢复后还会照下不误。
+    pub fn holds_lock(&self, key: &str, holder: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let ok: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key = ?1
+                   AND json_extract(value, '$.holder') = ?2
+                   AND CAST(json_extract(value, '$.expires_at') AS INTEGER) >= \
+                       CAST(strftime('%s','now') AS INTEGER)",
+                rusqlite::params![key, holder],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ok.is_some())
+    }
 
     /// 抢占或续租补货 leader 租约。返回 `true` = 本进程当选,可以执行本轮补货。
     ///
@@ -925,30 +1008,12 @@ impl SqliteStore {
     /// 租约**故意不做续期保证**:持有者每轮都要重新调用本方法,进程被 SIGKILL
     /// (docker stop 10s 后就是)时租约自然过期,由别的 router 接手。
     pub fn try_acquire_restock_lease(&self, holder: &str, ttl_secs: i64) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let now: i64 = conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))?;
-        let value = serde_json::json!({ "holder": holder, "expires_at": now + ttl_secs.max(1) })
-            .to_string();
-        let n = conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
-                                            updated_at = strftime('%s','now')
-             WHERE CAST(json_extract(settings.value, '$.expires_at') AS INTEGER) < ?3
-                OR json_extract(settings.value, '$.holder') = ?4",
-            rusqlite::params![Self::KEY_RESTOCK_LEASE, value, now, holder],
-        )?;
-        Ok(n == 1)
+        self.try_acquire_lock(Self::KEY_RESTOCK_LEASE, holder, ttl_secs)
     }
 
     /// 主动让出租约(优雅停机用)。只有持有者本人能让出,避免误伤接任者。
     pub fn release_restock_lease(&self, holder: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM settings WHERE key = ?1
-               AND json_extract(value, '$.holder') = ?2",
-            rusqlite::params![Self::KEY_RESTOCK_LEASE, holder],
-        )?;
-        Ok(())
+        self.release_lock(Self::KEY_RESTOCK_LEASE, holder)
     }
 
     /// 当前租约持有者(面板展示用;过期的返回 `None`)。
@@ -972,33 +1037,47 @@ impl SqliteStore {
     /// 落库幂等键。**必须在发出购买请求之前调用** —— 进程崩在请求途中时,
     /// 重启后靠这行才知道那个 `client_order_id` 是什么,用原 id 重放才能问出真实结果;
     /// 否则重试就是重复扣款。
+    /// `supplier` / `shelf` / `region` 必须**和幂等键一起**落库,而不是等买成了再补:
+    /// 订单停在 `pending` 时,对账要靠 `supplier` 才知道该去问哪一家。少了它,
+    /// 一张在途订单在多供应商下就是**无主的** —— 谁都不敢重放,钱永远找不回来。
     pub fn restock_create_order(
         &self,
         order_id: &str,
         count: i64,
         max_total_cny: f64,
+        supplier: &str,
+        shelf: &str,
+        region: &str,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO restock_orders (client_order_id, count, max_total_cny, status)
-             VALUES (?1, ?2, ?3, 'pending')",
-            rusqlite::params![order_id, count, max_total_cny],
+            "INSERT INTO restock_orders
+                 (client_order_id, count, max_total_cny, status, supplier, shelf, region)
+             VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)",
+            rusqlite::params![order_id, count, max_total_cny, supplier, shelf, region],
         )?;
         Ok(())
     }
 
-    /// key 到手后立刻落库,并按余额差记**实际扣款**,返回该值。
+    /// key 到手后立刻落库,记**实际扣款**并返回该值。
     ///
     /// 记实扣而不是按报价估算:报价字段是 USD、扣款走 CNY,用报价推算会让日预算阀失真。
-    /// 拿不到 `balance_before` 时返回 0,调用方需要据此告警(账不平比少买一个号严重)。
+    ///
+    /// `debited` 是**供应商自报的单笔扣款**(kiroapp 的 `total_debit` 就是权威值);
+    /// 给不出时传 `None`,回落成余额差(drop 走这条)。两者都拿不到就是 0,
+    /// 调用方需要据此告警 —— 账不平比少买一个号严重。
     pub fn restock_mark_purchased(
         &self,
         order_id: &str,
         keys: &[String],
+        debited: Option<f64>,
         balance_before: Option<f64>,
         balance_after: f64,
     ) -> anyhow::Result<f64> {
-        let spent = balance_before.map(|b| (b - balance_after).max(0.0)).unwrap_or(0.0);
+        let spent = debited
+            .filter(|d| *d > 0.0)
+            .or_else(|| balance_before.map(|b| (b - balance_after).max(0.0)))
+            .unwrap_or(0.0);
         let keys_json = serde_json::to_string(keys)?;
         let conn = self.conn.lock();
         conn.execute(
@@ -1028,9 +1107,33 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// 停在 `pending` 的订单:请求可能在途也可能已成功。启动时用原幂等键重放确认。
-    pub fn restock_pending_orders(&self) -> anyhow::Result<Vec<RestockOrder>> {
-        self.restock_orders_where("status = 'pending'", 100)
+    /// 停在 `pending` 的订单:请求可能在途也可能已成功,用原幂等键重放确认。
+    ///
+    /// `min_age_secs` 是**必需的安全边距,不是优化**。对账现在每轮都跑(原先只在进程
+    /// 当选后跑一次,于是运行期产生的 pending 永远等不到确认),而「刚落库、请求正在飞」
+    /// 的订单本身就是 `pending`。不设年龄下限的话,另一个 router 会把**别人正在途中的
+    /// 那一单**拿去重放 —— 对方若还没记录这个 id,就是第二次真实扣款。
+    ///
+    /// 取值必须**大于单轮外层超时**(120s),这样任何一个还可能在途的订单都不会被碰。
+    pub fn restock_pending_orders(&self, min_age_secs: i64) -> anyhow::Result<Vec<RestockOrder>> {
+        self.restock_orders_where(
+            &format!(
+                "status = 'pending' AND created_at <= strftime('%s','now') - {}",
+                min_age_secs.max(0)
+            ),
+            100,
+        )
+    }
+
+    /// 在途订单数(面板展示)。与孤儿订单(`purchased` = 钱花了号没进系统)分开数:
+    /// 两者要人做的事完全不同 —— 在途的等对账,孤儿的要人工上号。
+    pub fn restock_pending_count(&self) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM restock_orders WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// **孤儿订单:买到了 key 却没能上号。** 钱已经花了,必须人工处理。
@@ -1045,7 +1148,8 @@ impl SqliteStore {
 
     fn restock_orders_where(&self, cond: &str, limit: i64) -> anyhow::Result<Vec<RestockOrder>> {
         let sql = format!(
-            "SELECT client_order_id, count, status, keys_json, spent_cny, error, created_at
+            "SELECT client_order_id, count, status, keys_json, spent_cny, error, created_at,
+                    supplier, shelf, region, max_total_cny
                FROM restock_orders WHERE {cond} ORDER BY created_at DESC LIMIT ?1"
         );
         let conn = self.conn.lock();
@@ -1061,21 +1165,67 @@ impl SqliteStore {
                     spent_cny: r.get(4)?,
                     error: r.get(5)?,
                     created_at: r.get(6)?,
+                    supplier: r.get(7)?,
+                    shelf: r.get(8)?,
+                    region: r.get(9)?,
+                    max_total_cny: r.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// `since_ts` 以来的实际花费与成功购买数(日预算阀读它)。
+    /// 某一家在 `since_ts` 以来的花费。用于每家独立的日上限。
+    ///
+    /// 口径与 [`Self::restock_spent_since`] **必须一致**(`pending` 按限价计入最坏情况),
+    /// 否则会出现「全局账说花了 ¥100、单家账加起来只有 ¥60」这种对不上的面板。
+    ///
+    /// 历史订单的 `supplier` 是空串,不会被任何一家匹配到 —— 这是有意的:
+    /// 它们下单时还没有多供应商概念,归给谁都是编的。
+    pub fn restock_spent_since_by_supplier(
+        &self,
+        since_ts: i64,
+        supplier: &str,
+    ) -> anyhow::Result<f64> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(CASE
+                        WHEN status IN ('purchased','imported') THEN spent_cny
+                        WHEN status = 'pending'                 THEN max_total_cny
+                        ELSE 0 END), 0)
+               FROM restock_orders
+              WHERE created_at >= ?1 AND supplier = ?2",
+            rusqlite::params![since_ts, supplier],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// `since_ts` 以来的花费与成功购买数(日预算阀读它)。
     ///
     /// 直接对订单求和而不另设计数器 —— 计数器与订单不一致这类对账问题不值得引入。
+    ///
+    /// ## `pending` 必须按**最坏情况**计入花费
+    ///
+    /// `pending` 的语义是「幂等键已落库,请求可能在途、也可能已经成交了但我们没看到」。
+    /// 原先只统计 `purchased`/`imported`,于是:单轮 120s 外层超时把 `run_once` 掐断在
+    /// 购买途中 → 订单停在 `pending` → **下一轮把它当成没花过钱** → 用一个新的
+    /// `client_order_id` 再买一次。幂等键防得住「同一个 id 重放」,防不住「换个 id 再来」。
+    ///
+    /// 所以这里用 `max_total_cny`(下单时的限价,即这单可能花掉的上限)把它算进去。
+    /// 方向必须是 fail-closed:宁可高估当日花费、少买一个号,也不能低估到超预算。
+    /// 对账把它落定成 `purchased`(记真实扣款)或 `failed`(记 0)之后,这个高估自动消失。
+    ///
+    /// 返回的**计数**仍只数真正买成的单 —— 面板上的「今日已补 N 个」不该把在途的算进去。
     pub fn restock_spent_since(&self, since_ts: i64) -> anyhow::Result<(f64, i64)> {
         let conn = self.conn.lock();
         let r = conn.query_row(
-            "SELECT COALESCE(SUM(spent_cny),0), COUNT(*)
+            "SELECT COALESCE(SUM(CASE
+                        WHEN status IN ('purchased','imported') THEN spent_cny
+                        WHEN status = 'pending'                 THEN max_total_cny
+                        ELSE 0 END), 0),
+                    COUNT(CASE WHEN status IN ('purchased','imported') THEN 1 END)
                FROM restock_orders
-              WHERE created_at >= ?1 AND status IN ('purchased','imported')",
+              WHERE created_at >= ?1",
             [since_ts],
             |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
         )?;
@@ -2229,19 +2379,104 @@ mod restock_tests {
     }
 
     #[test]
+    fn 花钱锁与leader租约互不干扰且能互斥两个执行体() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        const LOCK: &str = SqliteStore::KEY_RESTOCK_PURCHASE_LOCK;
+
+        // 后台循环长期持有 leader 租约。
+        assert!(s.try_acquire_restock_lease("loop-A", 60).unwrap());
+
+        // 管理面(另一个 holder)照样能拿到**花钱锁** —— 这正是两把锁分开的意义:
+        // 若让 buy-now 去抢 leader 租约,它会永远拿不到,变成点了没反应的按钮。
+        assert!(s.try_acquire_lock(LOCK, "admin-1", 90).unwrap());
+        assert!(s.holds_lock(LOCK, "admin-1").unwrap());
+
+        // 此时后台循环**买不了** —— 手动购买正在临界区内。
+        assert!(
+            !s.try_acquire_lock(LOCK, "loop-A", 90).unwrap(),
+            "花钱锁必须真的互斥,否则两个执行体会读到同一个 spent 再各自下单"
+        );
+        assert!(!s.holds_lock(LOCK, "loop-A").unwrap());
+
+        // 同一个 holder 可重入(续期),不会把自己锁死。
+        assert!(s.try_acquire_lock(LOCK, "admin-1", 90).unwrap());
+
+        // 释放后别人立刻能进。
+        s.release_lock(LOCK, "admin-1").unwrap();
+        assert!(s.try_acquire_lock(LOCK, "loop-A", 90).unwrap());
+
+        // 非持有者释放不掉(避免误伤接任者)。
+        s.release_lock(LOCK, "admin-1").unwrap();
+        assert!(s.holds_lock(LOCK, "loop-A").unwrap(), "别人不能释放我的锁");
+    }
+
+    #[test]
+    fn 过期的花钱锁可被接管() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        const LOCK: &str = SqliteStore::KEY_RESTOCK_PURCHASE_LOCK;
+        // 直接构造一个「持有者已死、租期已过」的锁。不能靠传负 TTL ——
+        // `try_acquire_lock` 里有 `ttl_secs.max(1)`,负数会被拉成 1 秒而不是立即过期;
+        // 也不能靠 sleep,那会让这条用例变慢且不稳。
+        s.upsert_kv(LOCK, r#"{"holder":"dead","expires_at":1}"#).unwrap();
+
+        assert!(!s.holds_lock(LOCK, "dead").unwrap(), "已过期的锁不算持有");
+        // 持有者被 SIGKILL(docker stop 10s 后就是)时锁必须能自己过期,
+        // 否则补货会被一个已经不存在的进程永久锁死。
+        assert!(s.try_acquire_lock(LOCK, "alive", 90).unwrap(), "过期后必须能被接管");
+        assert!(s.holds_lock(LOCK, "alive").unwrap());
+        // 而未过期时不能被抢。
+        assert!(!s.try_acquire_lock(LOCK, "other", 90).unwrap());
+    }
+
+    #[test]
+    fn 在途订单按限价计入日预算否则会重复购买() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // 场景复现:单轮 120s 外层超时把购买掐断,订单停在 pending。
+        s.restock_create_order("stuck", 1, 21.24, "drop", "", "").unwrap();
+
+        let (spent, bought) = s.restock_spent_since(0).unwrap();
+        assert!(
+            (spent - 21.24).abs() < 1e-9,
+            "在途单必须按限价(最坏情况)计入花费,实际 {spent} —— \
+             算成 0 就会让下一轮以为没花过钱,换个 order_id 再买一次"
+        );
+        assert_eq!(bought, 0, "在途的不该算进「今日已补 N 个」");
+
+        // 对账落定成真实扣款后,那个高估自动消失。
+        s.restock_mark_purchased("stuck", &["ksk_a".into()], None, Some(200.0), 179.94).unwrap();
+        let (spent, bought) = s.restock_spent_since(0).unwrap();
+        assert!((spent - 20.06).abs() < 1e-9, "落定后按实扣记,实际 {spent}");
+        assert_eq!(bought, 1);
+
+        // 判死的单记 0(确定没扣款)。
+        s.restock_create_order("dead", 1, 21.24, "drop", "", "").unwrap();
+        s.restock_mark_status("dead", "failed", "400 参数错").unwrap();
+        let (spent, _) = s.restock_spent_since(0).unwrap();
+        assert!((spent - 20.06).abs() < 1e-9, "failed 不该计入花费,实际 {spent}");
+    }
+
+    #[test]
     fn 幂等键先落库且实扣按余额差记() {
         let s = SqliteStore::open_in_memory().unwrap();
-        s.restock_create_order("oid1", 1, 21.24).unwrap();
+        s.restock_create_order("oid1", 1, 21.24, "drop", "", "").unwrap();
         // 崩在这里也能查到这个 id —— 这正是先落库的意义。
-        let pending = s.restock_pending_orders().unwrap();
+        // 年龄门槛传 0:刚落库的订单也要能查到。生产上对账用 300s,见其文档。
+        let pending = s.restock_pending_orders(0).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].client_order_id, "oid1");
+        assert_eq!(s.restock_pending_count().unwrap(), 1);
+        // 但**刚落库的单不该被对账碰**:它可能正在飞,重放就是第二次扣款。
+        assert!(
+            s.restock_pending_orders(300).unwrap().is_empty(),
+            "未够龄的在途单必须被年龄门槛挡住"
+        );
 
         let spent = s
-            .restock_mark_purchased("oid1", &["ksk_a".into()], Some(200.0), 179.94)
+            .restock_mark_purchased("oid1", &["ksk_a".into()], None, Some(200.0), 179.94)
             .unwrap();
         assert!((spent - 20.06).abs() < 1e-9, "实扣必须按余额差,实际 {spent}");
-        assert!(s.restock_pending_orders().unwrap().is_empty());
+        assert!(s.restock_pending_orders(0).unwrap().is_empty());
+        assert_eq!(s.restock_pending_count().unwrap(), 0);
         // 停在 purchased = 钱花了号没上,必须能被单独查出来。
         assert_eq!(s.restock_orphan_orders().unwrap().len(), 1);
     }
@@ -2249,21 +2484,65 @@ mod restock_tests {
     #[test]
     fn 拿不到购买前余额时实扣记零而不是负数() {
         let s = SqliteStore::open_in_memory().unwrap();
-        s.restock_create_order("oid2", 1, 21.24).unwrap();
-        let spent = s.restock_mark_purchased("oid2", &["ksk_b".into()], None, 100.0).unwrap();
+        s.restock_create_order("oid2", 1, 21.24, "drop", "", "").unwrap();
+        let spent = s.restock_mark_purchased("oid2", &["ksk_b".into()], None, None, 100.0).unwrap();
         assert_eq!(spent, 0.0, "没有基准就记 0,由调用方告警,绝不能算出负数污染日预算");
     }
 
     #[test]
     fn 日花费只统计成功购买的单() {
         let s = SqliteStore::open_in_memory().unwrap();
-        s.restock_create_order("ok1", 1, 21.0).unwrap();
-        s.restock_mark_purchased("ok1", &["ksk_a".into()], Some(100.0), 80.0).unwrap();
-        s.restock_create_order("bad1", 1, 21.0).unwrap();
+        s.restock_create_order("ok1", 1, 21.0, "drop", "", "").unwrap();
+        s.restock_mark_purchased("ok1", &["ksk_a".into()], None, Some(100.0), 80.0).unwrap();
+        s.restock_create_order("bad1", 1, 21.0, "drop", "", "").unwrap();
         s.restock_mark_status("bad1", "failed", "网络中断").unwrap();
         let (spent, n) = s.restock_spent_since(0).unwrap();
         assert!((spent - 20.0).abs() < 1e-9, "失败单不该计入花费,实际 {spent}");
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn 逐家花费与全局花费同口径() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // drop 成交 ¥20
+        s.restock_create_order("d1", 1, 21.0, "drop", "", "").unwrap();
+        s.restock_mark_purchased("d1", &["ksk_a".into()], None, Some(100.0), 80.0).unwrap();
+        // kiroapp 成交 ¥15.43(适配器自报扣款,不走余额差)
+        s.restock_create_order("k1", 1, 16.0, "kiroapp", "eu", "eu-central-1").unwrap();
+        s.restock_mark_purchased("k1", &["ksk_b".into()], Some(15.43), None, 0.0).unwrap();
+        // kiroapp 还有一张在途:必须按**限价**计入,否则下一轮会当它没花过钱再买一次。
+        s.restock_create_order("k2", 1, 16.0, "kiroapp", "eu", "eu-central-1").unwrap();
+        // 失败单两边都不计。
+        s.restock_create_order("k3", 1, 16.0, "kiroapp", "eu", "eu-central-1").unwrap();
+        s.restock_mark_status("k3", "failed", "余额不足").unwrap();
+
+        let drop_spent = s.restock_spent_since_by_supplier(0, "drop").unwrap();
+        let kiro_spent = s.restock_spent_since_by_supplier(0, "kiroapp").unwrap();
+        assert!((drop_spent - 20.0).abs() < 1e-9, "实际 {drop_spent}");
+        assert!((kiro_spent - (15.43 + 16.0)).abs() < 1e-9, "在途要按限价计入,实际 {kiro_spent}");
+
+        // 逐家之和必须等于全局 —— 对不上的面板会让人以为系统在骗自己。
+        let (total, _) = s.restock_spent_since(0).unwrap();
+        assert!((total - (drop_spent + kiro_spent)).abs() < 1e-9, "全局 {total}");
+
+        // 历史订单(多供应商之前下的,supplier 为空)不归任何一家,但仍进全局账。
+        s.restock_create_order("old", 1, 21.0, "", "", "").unwrap();
+        s.restock_mark_purchased("old", &["ksk_c".into()], None, Some(50.0), 30.0).unwrap();
+        assert_eq!(s.restock_spent_since_by_supplier(0, "drop").unwrap(), drop_spent);
+        let (total2, _) = s.restock_spent_since(0).unwrap();
+        assert!((total2 - total - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 订单记得住货源与区域否则在途单无人认领() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.restock_create_order("k9", 2, 32.0, "kiroapp", "eu", "eu-central-1").unwrap();
+        let o = s.restock_pending_orders(0).unwrap().pop().unwrap();
+        assert_eq!(o.supplier, "kiroapp", "对账要靠它才知道该问哪一家");
+        assert_eq!(o.shelf, "eu");
+        assert_eq!(o.region, "eu-central-1");
+        // 对账要用**下单时的限价**重放,所以它必须读得回来。
+        assert!((o.max_total_cny - 32.0).abs() < 1e-9);
     }
 
     #[test]

@@ -1,4 +1,12 @@
-//! 自动补货:从 drop.kiro.ss 买 Kiro `ksk_` 号,导入 caio 并提到高优先级。
+//! 自动补货:从**多家货源**买 Kiro `ksk_` 号,导入 caio 并提到高优先级。
+//!
+//! 货源目前两家:`drop.kiro.ss` 与 `kiroapp.io`。接第二家的理由**不是价差**
+//! (两边贴身跟价),而是**缺货**:近 7 天 drop 有 854 轮「水位已破、闸门全过、就差有货」,
+//! 其中 2026-08-04 一天连断 4.7 小时,那期间流量全落到贵号池(¥0.068/积分 vs 自购号
+//! 中位 ¥0.021)。多一家的价值是「总有一家有货」,不是「省那几毛」。
+//!
+//! 选家规则只有一条:**能买的里面最便宜的那个**,见 [`engine::choose_shelf`]。
+//! 货源的抽象见 [`supplier`],名册与配置见 [`registry`]。
 //!
 //! **背景**:Kiro 企业号约每 1–3 小时死一批(上游 403 `TEMPORARILY_SUSPENDED`,实测
 //! 0/35 个号在冷却后恢复过),夜里无人补号就断供。本模块把「买」和「上号」串起来。
@@ -16,7 +24,10 @@
 pub mod drop;
 pub mod engine;
 pub mod forecast;
+pub mod kiroapp;
 pub mod params;
+pub mod registry;
+pub mod supplier;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +46,8 @@ const LEASE_TTL_MULT: i64 = 3;
 const ROLLUP_BATCH: i64 = 50_000;
 const ROLLUP_BATCHES_PER_TICK: usize = 8;
 
-/// drop 的库存/余额在快照里的最长保鲜期。面板每 15s 轮询,但这两个数不需要秒级精度,
-/// 没必要为此持续打对方接口。
+/// 各家的库存/余额在快照里的最长保鲜期。面板每 15s 轮询,但这两个数不需要秒级精度,
+/// 没必要为此持续打对方接口(而且现在是**乘以货源家数**的请求量)。
 const STOCK_MAX_AGE_SECS: i64 = 300;
 
 /// 本进程在租约里的身份。同一台机上多个 router 容器的 pid 可能相同
@@ -65,19 +76,15 @@ fn hostname() -> String {
 /// 开了 exp 栈还有第三个),共用同一个 control.db。不做互斥就是各买各的、重复扣款。
 /// 这条对「将来再加一个 router」「部署时新旧容器短暂重叠」同样成立,不依赖部署纪律。
 pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockConfig) {
-    if !cfg.is_configured() {
-        if cfg.enabled {
-            tracing::warn!("补货:restock.enabled 为 true 但 api_key 为空,不启动(fail-closed)");
-        }
+    // 门只看「这个二进制允不允许参与」。**哪些货源可用交给名册** ——
+    // 原先这里要求 yaml 里必须有 drop 的密钥,那会让「只配了 kiroapp」的部署起不来,
+    // 而那恰恰是多供应商要支持的形态。名册为空时循环照跑,只是每轮都跳过,不花钱。
+    if !cfg.enabled {
         return;
     }
-    let drop_client = match drop::DropClient::new(cfg.base_url(), &cfg.api_key) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("补货:drop 客户端构造失败,不启动: {e}");
-            return;
-        }
-    };
+    if cfg.api_key.trim().is_empty() {
+        tracing::warn!("补货:system.yaml 未配 drop 密钥;drop 这家将被跳过,除非名册里另填");
+    }
     // worker /health 与 /sync 都是 loopback,短超时即可 —— worker 离线要快速跳过,
     // 不能让补货循环卡在一个下线的 worker 上。
     let http = match reqwest::Client::builder().timeout(Duration::from_secs(3)).build() {
@@ -87,22 +94,49 @@ pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockC
             return;
         }
     };
-    let eng = Arc::new(engine::Engine {
-        store,
-        drop: drop_client,
-        workers: Arc::new(workers),
-        http,
-    });
     let holder = holder_id();
-    tracing::info!(holder = %holder, "补货:后台循环已启动(是否真正执行由 DB 租约决定)");
+    let workers = Arc::new(workers);
+    let cfg = cfg.clone();
+    let mut eng = Arc::new(engine::Engine::build(
+        store,
+        &cfg,
+        workers.clone(),
+        http.clone(),
+        holder.clone(),
+    ));
+    if eng.suppliers.is_empty() {
+        tracing::warn!("补货:名册里没有任何可用货源,循环仍会启动(面板加货源后自动生效)");
+    }
+    tracing::info!(
+        holder = %holder,
+        suppliers = eng.suppliers.len(),
+        "补货:后台循环已启动(是否真正执行由 DB 租约决定)"
+    );
 
     tokio::spawn(async move {
-        let mut reconciled = false;
         let mut last_reclaim = 0i64;
         let mut last_prune = 0i64;
+        let mut roster_seen = eng.roster.clone();
         loop {
             let p = eng.params();
             let interval = p.poll_interval_secs.clamp(10, 3600);
+
+            // ⓪ 名册变了就重建客户端。面板改完**下一轮生效**,与其它补货参数同款,
+            //    不用重启 —— 断供时能立刻加一家,正是多供应商最要紧的那个动作。
+            //    重建整个 Engine 而不是原地改字段:客户端里带着连接池,换密钥必须换实例。
+            let raw = eng.store.get_kv(registry::KEY_SUPPLIERS).ok().flatten();
+            let roster_now = registry::parse_roster(raw.as_deref());
+            if roster_now != roster_seen {
+                tracing::warn!("补货:货源名册已变更,重建客户端");
+                roster_seen = roster_now;
+                eng = Arc::new(engine::Engine::build(
+                    eng.store.clone(),
+                    &cfg,
+                    workers.clone(),
+                    http.clone(),
+                    holder.clone(),
+                ));
+            }
 
             // ① 先抢租约。抢不到 = 别的 router 在跑,本轮什么都不做。
             //    注意**连汇总都不做** —— 两个进程同时推进同一个游标虽然有事务保护,
@@ -116,11 +150,16 @@ pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockC
                 continue;
             }
 
-            // ② 启动对账只做一次,且必须在当选之后 —— 没当选的进程不该去重放订单。
-            if !reconciled {
-                reconciled = true;
-                eng.reconcile_pending().await;
-            }
+            // ② 对账。**每轮都跑**,且必须在当选之后 —— 没当选的进程不该去重放订单。
+            //
+            // 原先只在进程当选后跑一次(`if !reconciled`)。那样只覆盖得到「重启前
+            // 遗留的在途单」,而**运行期新产生的在途单**(购买被 120s 外层超时掐断、
+            // 或网络失败后按新规则保持 `pending`)永远等不到确认 —— 只要进程不重启,
+            // 那笔钱就一直悬着。
+            //
+            // 每轮跑的代价接近零:没有够龄的在途单时 `reconcile_pending` 一次上游请求
+            // 都不发。「够龄」这道过滤是安全必需的,见 `restock_pending_orders` 的文档。
+            eng.reconcile_pending().await;
 
             // ③ 积分汇总(读 usage_records → 物化小时聚合)。
             for _ in 0..ROLLUP_BATCHES_PER_TICK {
