@@ -49,6 +49,51 @@ export interface RestockParamsResponse {
   values: RestockParams
 }
 
+/** 一个货架 = 同一批号、同一个价、同一个服务区。 */
+export interface ShelfView {
+  /** 供应商内部的货架标识（kiroapp 的 `us` / `eu`；drop 没有 = 空串）。 */
+  shelf: string
+  /** 人读的货架名，如 `kiroapp/eu`。 */
+  label: string
+  /** 该货架发出的号所属 Kiro 服务区。**与 `shelf` 是两个命名空间**。 */
+  region: string
+  stock: number
+  /** 单价，**已归一到 ¥**（按限价汇率折算，是上界；两家同汇率所以比价准确）。 */
+  unit_price_cny: number
+  max_per_order: number
+  /**
+   * 该货架的**生效档位**（数值越小越优先，已含逐货架覆盖）。
+   *
+   * 显示它是必须的：`shelf_priority` 的键写错（`EU` vs `eu`）不会报错，只会静默
+   * 回落本家档位。这个数字是唯一能让写错当场看得见的地方。
+   */
+  priority?: number
+}
+
+/** 一家货源在面板上的样子。 */
+export interface SupplierView {
+  id: string
+  kind: string
+  enabled: boolean
+  /** 名册里启用了，但密钥缺失/客户端建不出来 → false。 */
+  configured: boolean
+  /** 空 = 此刻可以从这家买；非空是人读的原因（熔断 / 超本家日上限）。 */
+  blocked: string
+  /** 本轮询价失败的原因；null = 问通了。 */
+  error: string | null
+  balance_cny: number | null
+  /** 对方原生单位的余额（如 `680 积分`）。**仅供对账用眼睛核**，别拿去算。 */
+  balance_native: string
+  spent_today_cny: number
+  /** 档位，数值越小越优先。同档才比价。 */
+  priority?: number
+  /** 逐货架档位覆盖，键是货架标识（`us` / `eu`）。 */
+  shelf_priority?: Record<string, number>
+  /** 本家日上限；0 = 不限，由全局日上限兜底。 */
+  daily_cap_cny: number
+  shelves: ShelfView[]
+}
+
 export interface RestockSnapshot {
   /** **实证还在服务**的号数（caio 报正常 + 近期真的成功过）。水位比的就是它。 */
   healthy?: number
@@ -58,9 +103,26 @@ export interface RestockSnapshot {
   dead?: number
   total?: number
   any_online?: boolean
+  /** 逐家视图。多供应商之后，「额度」不再是一个数。 */
+  suppliers?: SupplierView[]
+  /** 以下四个都是**最便宜那个货架**的数，不是某一家的。 */
   stock?: number
   price_usd?: number
+  price_cny?: number
+  best_shelf?: string | null
+  /**
+   * **下一单会买哪个货架**，由后端的 `choose_shelf` 本人回答（含全部花钱闸门）。
+   * null = 这一刻买不成，理由在 `next_pick_why`。
+   *
+   * 前端**不要**自己再算一遍：排序能复刻，余额/单价上限/日上限/unit_cost_veto
+   * 这些闸门复刻不了，猜错的时候正是面板最不该说谎的时候。
+   */
+  next_pick?: string | null
+  /** `next_pick` 为 null 时的逐货架被否理由。 */
+  next_pick_why?: string | null
   balance_cny?: number
+  /** 所有货源余额之和。「我还剩多少钱」在多家之后只有这个数说得准。 */
+  balance_total_cny?: number
   stock_at?: number
   at?: number
   drop_ok?: boolean
@@ -175,4 +237,35 @@ export interface RestockAccount {
 export interface RestockAccountsResponse {
   count: number
   items: RestockAccount[]
+}
+
+/**
+ * 名册里的一家（可写配置）。
+ *
+ * **响应里永远没有 `api_key`**，只有 `has_key` —— 掩码回显曾经引发过
+ * 「把 `***` 当成真值存回去」的事故，所以连掩码都不给。
+ */
+export interface SupplierConfig {
+  id: string
+  kind: 'drop' | 'kiroapp'
+  enabled: boolean
+  base_url: string
+  daily_cap_cny: number
+  priority?: number
+  shelf_priority?: Record<string, number>
+  has_key: boolean
+  /** 非空即这家已熔断，内容是原因。 */
+  breaker: string
+}
+
+/** PUT 时的一家。`api_key` 缺省 = 保留原值（面板改别的字段不用知道密钥）。 */
+export interface SupplierPatch {
+  id: string
+  kind: string
+  enabled: boolean
+  base_url: string
+  daily_cap_cny: number
+  priority: number
+  shelf_priority: Record<string, number>
+  api_key?: string
 }

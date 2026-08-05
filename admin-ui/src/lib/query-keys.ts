@@ -36,6 +36,7 @@ export const queryKeys = {
     root: ['restock'] as const,
     state: () => ['restock', 'state'] as const,
     params: () => ['restock', 'params'] as const,
+    suppliers: () => ['restock', 'suppliers'] as const,
     credits: (hours: number) => ['restock', 'credits', hours] as const,
     accounts: () => ['restock', 'accounts'] as const,
   },

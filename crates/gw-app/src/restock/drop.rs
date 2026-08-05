@@ -42,6 +42,26 @@ impl DropError {
     pub fn is_price_or_stock_conflict(&self) -> bool {
         self.status == 409
     }
+
+    /// **结果未知**:这一单到底扣没扣款,从我方看不出来。
+    ///
+    /// 两种情况:
+    /// - `status == 0` —— 网络层失败(超时 / 连接断 / 解码失败)。请求可能已经打到对方
+    ///   并成交,只是响应没回来。**实测该站往返 3.4–4.2s,而超时是 20s** ——
+    ///   真触发超时时,对方那边多半已经处理完了。
+    /// - `5xx` —— 对方内部错误。可能发生在扣款之前,也可能在之后。
+    ///
+    /// 反过来,`4xx`(409 竞争、400 参数错、401/403 鉴权)都是**对方在处理前就拒绝了**,
+    /// 确定没扣款,可以安全地把订单判死。
+    ///
+    /// ## 为什么必须单独分出这一类
+    ///
+    /// 原先所有 `purchase` 错误一律把订单标成 `failed`,而对账只扫 `pending`
+    /// —— 于是「对方已扣款、响应丢了」这条路径会**永久失去对账机会**,钱和 key 都成孤儿。
+    /// 结果未知的订单必须**停在 `pending`** 等重放确认,这是唯一能把钱找回来的状态。
+    pub fn is_indeterminate(&self) -> bool {
+        self.status == 0 || self.status >= 500
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,13 +72,57 @@ pub struct Stock {
     pub balance_cny: f64,
 }
 
+/// 买到的一个号。
+///
+/// **不能退化回 `String`** —— `region` 必须跟着 key 一路走到上号。Kiro 的号**绑死服务区**:
+/// 2026-08-05 实测一个 `eu-central-1` 的 key,打 `management.eu-central-1.kiro.dev` 返 200,
+/// 打 `management.us-east-1.kiro.dev` 直接 403 `Invalid token`;而 caio 读不到
+/// `extra.region` 时默认就是 `us-east-1`(`gw_kiro::usage_limits::DEFAULT_REGION`)。
+///
+/// 原先 [`super::engine::Engine::onboard`] 把 key 序列化成**裸串数组**,走
+/// `import::map_api_key(s, None)` 这条不带 region 的路径。drop 的号全是 us-east-1,
+/// 默认值恰好蒙对,所以这个洞一直没暴露 —— 换一家欧洲区的货源就是**每个请求都 403**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoughtKey {
+    /// 官方 API Key(`ksk_` 前缀,解析侧已过滤)。
+    pub api_key: String,
+    /// 该号所属服务区。**空串 = 用上游默认**(us-east-1),与本次改动前逐字节等价。
+    pub region: String,
+    /// 档位标签(如 `KIRO POWER`),仅作展示。空串 = 不写入 extra。
+    pub subscription_title: String,
+}
+
+impl BoughtKey {
+    /// 从响应里的一个 key 条目解析。裸串与 `{"key": "ksk_…"}` 对象都收,只放行 `ksk_` 前缀。
+    ///
+    /// 对象形态顺带取 `region` / `subscription_title`:**drop 目前两个都不发**
+    /// (它的号全是 us-east-1),取不到就留空;但同一个响应形状会被别家复用,
+    /// 取到就带上,免得下一家接进来时又丢一次 region。
+    pub fn parse(v: &serde_json::Value) -> Option<Self> {
+        let (api_key, region, subscription_title) = match v {
+            serde_json::Value::String(s) => (s.trim().to_string(), String::new(), String::new()),
+            serde_json::Value::Object(o) => {
+                let field = |name: &str| {
+                    o.get(name).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
+                };
+                (field("key"), field("region"), field("subscription_title"))
+            }
+            _ => return None,
+        };
+        if !api_key.starts_with("ksk_") {
+            return None;
+        }
+        Some(Self { api_key, region, subscription_title })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PurchaseResult {
     pub client_order_id: String,
     pub purchased: i64,
     pub remaining_cny: f64,
     pub status: String,
-    pub keys: Vec<String>,
+    pub keys: Vec<BoughtKey>,
 }
 
 /// 限价保护值:`count × 单价(USD) × 上限汇率`,向上取整到分。
@@ -158,6 +222,8 @@ struct PurchaseBody {
 }
 
 pub struct DropClient {
+    /// 供应商标识,进决策流水、订单表与每家独立的熔断键。
+    id: String,
     base: String,
     api_key: String,
     http: reqwest::Client,
@@ -167,11 +233,14 @@ impl DropClient {
     /// **不复用 `AdminState.http`** —— 那是 2s 超时的管理面客户端(为的是 worker 离线时
     /// 快速跳过),而 drop 往返实测要 3.4–4.2s。仓库里已有两处同样规避它的先例
     /// (账号探针 120s、OAuth 换码 30s)。
-    pub fn new(base_url: &str, api_key: &str) -> anyhow::Result<Self> {
+    /// `id` 是名册里的标识,会进订单表与该家独立的熔断键 —— 所以由调用方给,
+    /// 不在这里写死 `"drop"`(同一份适配器将来可能同时接两个 drop 站点)。
+    pub fn with_id(id: &str, base_url: &str, api_key: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .build()?;
         Ok(Self {
+            id: id.to_string(),
             base: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             http,
@@ -249,18 +318,8 @@ impl DropClient {
         let b: PurchaseBody = serde_json::from_str(&text)
             .map_err(|e| DropError::net(format!("drop 购买响应解析失败: {e}")))?;
         // key 可能是裸串,也可能是 {"key": "ksk_..."} 对象;只收 ksk_ 前缀的。
-        let keys = b
-            .keys
-            .iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Object(o) => {
-                    o.get("key").and_then(|k| k.as_str()).map(str::to_string)
-                }
-                _ => None,
-            })
-            .filter(|k| k.starts_with("ksk_"))
-            .collect();
+        // 解析细节(含为什么要顺带取 region)见 [`BoughtKey::parse`]。
+        let keys = b.keys.iter().filter_map(BoughtKey::parse).collect();
         Ok(PurchaseResult {
             client_order_id: if b.client_order_id.is_empty() {
                 client_order_id.to_string()
@@ -272,6 +331,100 @@ impl DropClient {
             status: b.status,
             keys,
         })
+    }
+}
+
+/// drop 作为「一家供应商」的样子。
+///
+/// **这是纯平移,不改任何行为**:一个货架、无区域概念(`shelf_id` 与 `account_region`
+/// 都是空串,落到 `import_payload` 时不写 `region`,与本抽象引入前逐字节等价)。
+///
+/// 报价折算:drop 的 `price` 是 USD、余额与扣款本来就是 CNY,所以只有单价要乘汇率,
+/// 且沿用 [`max_total_cny_for`] 的取整口径 —— 让「面板上显示的单价」与「下单时的限价」
+/// 是同一个数,免得两处差一分钱时没人说得清哪个对。
+#[async_trait::async_trait]
+impl super::supplier::Supplier for DropClient {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn survey(&self, usd_to_cny: f64) -> Result<super::supplier::Survey, String> {
+        let s = self.stock().await.map_err(|e| e.to_string())?;
+        Ok(super::supplier::Survey {
+            supplier_id: self.id.clone(),
+            balance_cny: s.balance_cny,
+            balance_native: String::new(), // drop 的余额本来就是人民币,没有第二种口径
+            shelves: vec![super::supplier::Shelf {
+                supplier_id: self.id.clone(),
+                shelf_id: String::new(),
+                account_region: String::new(),
+                stock: s.stock,
+                unit_price_cny: max_total_cny_for(1, s.price_usd, usd_to_cny),
+                // drop 不下发单笔上限;用库存兜底,真正的量闸在引擎的 max_per_purchase。
+                max_per_order: s.stock.max(1),
+                priority: 0, // 引擎按名册回填,适配器不表达自己的档位
+            }],
+        })
+    }
+
+    async fn buy(
+        &self,
+        _shelf: &super::supplier::Shelf,
+        count: i64,
+        order_id: &str,
+        max_total_cny: f64,
+        _usd_to_cny: f64,
+    ) -> super::supplier::BuyOutcome {
+        self.purchase_outcome(count, order_id, max_total_cny).await
+    }
+
+    /// drop 没有只读的查单接口,只能**重放**:用同一个 `client_order_id` 再发一次,
+    /// 对方认得就返回同一张订单。这正是幂等键存在的意义。
+    ///
+    /// (kiroapp 那边能先只读查单再决定要不要重放,更安全 —— 见其 `reconcile`。)
+    async fn reconcile(
+        &self,
+        order_id: &str,
+        _shelf: &str,
+        count: i64,
+        max_total_cny: f64,
+        _usd_to_cny: f64,
+    ) -> super::supplier::BuyOutcome {
+        self.purchase_outcome(count, order_id, max_total_cny).await
+    }
+}
+
+impl DropClient {
+    /// 把 [`Self::purchase`] 的 `Result` 翻译成四态结局。
+    ///
+    /// 三条分支的判据与本抽象引入前**逐条相同**,只是从引擎里搬到了这里:
+    /// 409 = 竞争失败(不计熔断)、其余 4xx = 故障、网络失败与 5xx = 结果未知。
+    async fn purchase_outcome(
+        &self,
+        count: i64,
+        order_id: &str,
+        max_total_cny: f64,
+    ) -> super::supplier::BuyOutcome {
+        use super::supplier::{BuyOutcome, Receipt};
+        match self.purchase(count, order_id, max_total_cny).await {
+            Ok(r) => BuyOutcome::Ok(Receipt {
+                keys: r.keys,
+                // drop 不下发单笔扣款额。留 0 表示「我说不出来」,由引擎按余额差算;
+                // 引擎在**对账**路径上拿不到买前余额,会回落到订单限价(宁可高估)。
+                // 早先这里的 0 会一路落成 `spent_cny = 0`,等于把一笔真实扣款
+                // 从日预算里抹掉,同一天可以凭空多买一单。
+                debited_cny: 0.0,
+                balance_after_cny: r.remaining_cny,
+                purchased: r.purchased,
+                // drop 的重放会返回同一张订单,但响应里没有可区分的标记 ——
+                // 所以也判断不了「幂等有没有失效」,`double_charged` 只能保守留 false。
+                replayed: false,
+                double_charged: false,
+            }),
+            Err(e) if e.is_indeterminate() => BuyOutcome::Unknown(e.to_string()),
+            Err(e) if e.is_price_or_stock_conflict() => BuyOutcome::Conflict(e.to_string()),
+            Err(e) => BuyOutcome::Fault(e.to_string()),
+        }
     }
 }
 
@@ -338,6 +491,51 @@ mod tests {
                 .unwrap();
         assert_eq!(p.purchased, 1);
         assert!((p.remaining - 443.32).abs() < 1e-9);
+    }
+
+    #[test]
+    fn key条目裸串与对象都收且只放行ksk前缀() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+
+        // 裸串:drop 的常见形态。region/档位留空 = 用上游默认,与改动前等价。
+        let k = BoughtKey::parse(&v(r#""ksk_abc""#)).unwrap();
+        assert_eq!(k.api_key, "ksk_abc");
+        assert_eq!(k.region, "", "drop 不发 region,必须留空而不是猜一个");
+        assert_eq!(k.subscription_title, "");
+
+        // 对象形态:顺带取 region 与档位(kiroapp 就是这个形状)。
+        let k = BoughtKey::parse(&v(
+            r#"{"key":"ksk_xyz","region":"eu-central-1","subscription_title":"KIRO POWER","price":20}"#,
+        ))
+        .unwrap();
+        assert_eq!(k.api_key, "ksk_xyz");
+        assert_eq!(k.region, "eu-central-1");
+        assert_eq!(k.subscription_title, "KIRO POWER");
+
+        // 对象但缺 region → 留空,不炸。
+        assert_eq!(BoughtKey::parse(&v(r#"{"key":"ksk_1"}"#)).unwrap().region, "");
+
+        // 非 ksk_ 前缀一律丢弃 —— 与改动前的 `.filter(|k| k.starts_with("ksk_"))` 同闸。
+        // 放进来的后果是建出一个跳过刷新、拿 TokenType: API_KEY 的假账号。
+        for bad in [r#""usr-abc""#, r#"{"key":"rt.1.xxx"}"#, r#"{"key":""}"#, "123", "null"] {
+            assert!(BoughtKey::parse(&v(bad)).is_none(), "不该收: {bad}");
+        }
+        // 缺 key 字段的对象。
+        assert!(BoughtKey::parse(&v(r#"{"region":"eu-central-1"}"#)).is_none());
+    }
+
+    #[test]
+    fn 购买响应解析出带区域的key() {
+        // kiroapp 实测形状(2026-08-05):keys 是对象数组,逐 key 带 region 与 price。
+        let b: PurchaseBody = serde_json::from_str(
+            r#"{"purchased":1,"remaining":680,"keys":[
+                 {"key":"ksk_a","region":"eu-central-1","price":20},
+                 {"key":"not_a_key","region":"eu-central-1"}]}"#,
+        )
+        .unwrap();
+        let keys: Vec<BoughtKey> = b.keys.iter().filter_map(BoughtKey::parse).collect();
+        assert_eq!(keys.len(), 1, "非 ksk_ 条目必须被丢掉");
+        assert_eq!(keys[0].region, "eu-central-1");
     }
 
     #[test]

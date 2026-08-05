@@ -15,9 +15,11 @@ use gw_core::config::WorkerConfig;
 use gw_core::store::{AccountPatch, RestockDecision};
 use gw_store::{MembershipOutcome, SqliteStore};
 
-use super::drop::{max_total_cny_for, new_order_id, DropClient};
+use super::drop::{max_total_cny_for, new_order_id, BoughtKey};
 use super::forecast;
 use super::params::Params;
+use super::registry::{self, SupplierCfg};
+use super::supplier::{rank_shelves, BuyOutcome, Shelf, Supplier, Survey};
 
 /// 面板快照在 `settings` 表里的键名。轮询线程写、admin 读。
 pub const KEY_SNAPSHOT: &str = "restock_snapshot";
@@ -33,8 +35,12 @@ pub struct Decision {
     pub reason: String,
     pub healthy: Option<i64>,
     pub stock: Option<i64>,
+    /// 决策流水的历史列,单位 **USD**(为了不改已有的表与图表口径而保留)。
+    /// 多供应商下它装的是**选中货架**的单价折回美元,没选中货架时为空。
     pub price_usd: Option<f64>,
     pub balance_cny: Option<f64>,
+    /// 选中的货架与本单参数。`act == true` 时必然是 `Some`。
+    pub candidate: Option<Candidate>,
 }
 
 impl Decision {
@@ -139,15 +145,310 @@ pub fn classify(
     h
 }
 
+/// 花钱临界区锁的 TTL(秒)。
+///
+/// 必须**长于**一次购买往返(实测 3.4–4.2s,客户端超时 20s),又必须**短于**单轮外层
+/// 超时(120s)—— 前者保证锁不会在请求还在飞的时候过期放第二个人进来,
+/// 后者保证持有者被掐断/SIGKILL 时锁能自己过期,不会把补货永久锁死。
+const PURCHASE_LOCK_TTL_SECS: i64 = 90;
+
+/// 对账时「多久以前的在途订单才敢碰」。见 `restock_pending_orders` 的文档:
+/// 必须大于单轮外层超时(120s),否则会重放**别人正在途中**的那一单。
+const RECONCILE_MIN_AGE_SECS: i64 = 300;
+
 pub struct Engine {
     pub store: Arc<SqliteStore>,
-    pub drop: DropClient,
+    /// 已启用且配置完整的货源。**顺序无关** —— 选家看的是名册里的档位与价格,
+    /// 不是这个 Vec 的下标,见 [`choose_shelf`]。
+    pub suppliers: Vec<Arc<dyn Supplier>>,
+    /// 名册原文。客户端里查不到每家的日上限与启用状态,那些只在配置里。
+    pub roster: Vec<SupplierCfg>,
     pub workers: Arc<Vec<WorkerConfig>>,
     /// 打 worker loopback `/health` 与 `/sync` 用。短超时:worker 离线要快速跳过。
     pub http: reqwest::Client,
+    /// 本执行体在花钱锁里的身份。后台循环与 `POST /restock/buy-now` 各自构造 Engine,
+    /// 但**共用同一把锁**,所以这个值必须每个执行体唯一。
+    pub holder: String,
+}
+
+/// 一个通过了全部花钱闸门的候选货架。
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub shelf: Shelf,
+    /// 这家此刻的余额(CNY),进决策流水。
+    pub balance_cny: f64,
+    /// 本单买几个。
+    pub count: i64,
+    /// 本单限价(CNY)。
+    pub need_cny: f64,
+}
+
+/// **多供应商的唯一调度判断:买哪个货架。**
+///
+/// 规则一句话:**能买的里面档位最高的那个,同档比价**。
+///
+/// 为什么不是纯比价(2026-08-05 修正):上线时的规则是「能买的里面最便宜的那个」,
+/// 理由写的是「实测两家的号价值等价」。那个前提**被证伪了** —— 同为 KIRO POWER,
+/// drop 侧 29 个号 0 次 `temporarily_suspended`,kiroapp/eu 侧 12 个号 12 次,
+/// 其中一个零成功请求即被封。号的封禁率无法观测、也无法编码进单价,只能由人按
+/// 观察结果表达成档位([`SupplierCfg::priority`] / `shelf_priority`)。
+///
+/// 档位是**软优先**:首选档缺货或过不了闸门时自动落到下一档,绝不会因为首选家没货
+/// 就停止补货 —— drop 常年 0 库存,硬绑定等于亲手制造多供应商要消除的断供。
+/// 全部缺省(0)时退化成纯比价,与本次改动前逐字节同序。
+///
+/// 仍然没有的东西:轮转、粘性、按质量自动加权。档位是**人写的**,因为「这家的号能不能用」
+/// 目前只能靠人看封禁数据判断,自动加权会把一次抽样噪声放大成长期偏置。
+///
+/// 纯函数,不碰网络与 DB:这是整套多供应商里唯一真正花钱的判断,它必须能被钉死在
+/// 单元测试里,而不是只能在生产上观察。
+///
+/// 返回 `Err` 时带**逐个货架被否的理由** —— 面板上「为什么这轮没买」必须答得出来,
+/// 只说一句「没有合适的货源」等于让人去翻日志。
+pub fn choose_shelf(
+    p: &Params,
+    surveys: &[Survey],
+    blocked: &std::collections::HashMap<String, String>,
+    caps: &std::collections::HashMap<String, (f64, f64)>,
+    spent_today: f64,
+    demand_rate: f64,
+    force: bool,
+) -> Result<Candidate, String> {
+    let balances: std::collections::HashMap<&str, f64> =
+        surveys.iter().map(|s| (s.supplier_id.as_str(), s.balance_cny)).collect();
+    let ranked = rank_shelves(surveys.iter().flat_map(|s| s.shelves.clone()).collect());
+    if ranked.is_empty() {
+        return Err("所有货源都没有库存".into());
+    }
+    // 单价上限的参数是 USD,货架是 CNY —— 在**同一处**折算,不要让两种单位在闸门里并存。
+    let max_price_cny = max_total_cny_for(1, p.max_price_usd, p.rate_cap);
+    let mut whys: Vec<String> = Vec::new();
+
+    for shelf in ranked {
+        let label = shelf.label();
+        if let Some(why) = blocked.get(&shelf.supplier_id) {
+            whys.push(format!("{label} 被跳过({why})"));
+            continue;
+        }
+        if shelf.unit_price_cny > max_price_cny {
+            whys.push(format!(
+                "{label} 单价 ¥{:.2} 高于上限 ¥{max_price_cny:.2}",
+                shelf.unit_price_cny
+            ));
+            continue;
+        }
+        // 三个量闸取最小:我方意愿、对方库存、对方单笔上限。
+        // ⚠️ 对方的上限**不能靠它自己执行** —— kiroapp 实测对超限的 count 是 clamp
+        // 并成交(发 99 买走 10 个)。所以这里必须我方先夹好再发。
+        let count = p
+            .max_per_purchase
+            .min(shelf.stock)
+            .min(shelf.max_per_order.max(1))
+            .max(1);
+        // 单价已含限价汇率与向上取整,乘 count 即本单限价(count=1 时与
+        // `max_total_cny_for(count, ..)` 逐字节相同;count>1 时略高,方向安全)。
+        let need = shelf.unit_price_cny * count as f64;
+
+        if !force {
+            if let Some(why) = unit_cost_veto(p, shelf.unit_price_cny, demand_rate) {
+                whys.push(format!("{label} {why}"));
+                continue;
+            }
+        }
+        let balance = balances.get(shelf.supplier_id.as_str()).copied().unwrap_or(0.0);
+        if balance < need + p.min_balance_reserve_cny {
+            whys.push(format!(
+                "{label} 余额 ¥{balance:.2} 不足(需 ¥{need:.2} + 保留 ¥{:.2})",
+                p.min_balance_reserve_cny
+            ));
+            continue;
+        }
+        if spent_today + need > p.daily_cap_cny {
+            whys.push(format!(
+                "{label} 本单 ¥{need:.2} 会突破日上限(已花 ¥{spent_today:.2} / ¥{:.2})",
+                p.daily_cap_cny
+            ));
+            continue;
+        }
+        // ── 花钱闸门:本单会不会突破**这一家**的日上限 ──
+        //
+        // 必须把 `need` 算进去。只在「已花 >= 上限」时屏蔽是拦不住的:上限 ¥20、
+        // 已花 ¥19 时这家看着还没到顶,一单 ¥15 下去就是 ¥34 —— 单家敞口上限名存实亡。
+        // 而单家上限存在的全部意义,就是限制一家出问题时能从我这里拿走多少钱。
+        if let Some(&(sup_spent, sup_cap)) = caps.get(&shelf.supplier_id) {
+            if sup_cap > 0.0 && sup_spent + need > sup_cap {
+                whys.push(format!(
+                    "{label} 本单 ¥{need:.2} 会突破本家上限(已花 ¥{sup_spent:.2} / ¥{sup_cap:.2})"
+                ));
+                continue;
+            }
+        }
+        return Ok(Candidate { shelf, balance_cny: balance, count, need_cny: need });
+    }
+    Err(whys.join(";"))
+}
+
+/// 花钱临界区的 RAII 守卫:`drop` 时归还锁。
+///
+/// 不用手工 `release` 是因为临界区里有十几条 early return(预算不足、库存查询失败、
+/// 单价超限……),漏掉任何一条都会把锁一直押到 TTL 过期,而那 90 秒里谁都买不了号。
+struct PurchaseGuard<'a> {
+    store: &'a SqliteStore,
+    holder: &'a str,
+}
+
+impl Drop for PurchaseGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .store
+            .release_lock(SqliteStore::KEY_RESTOCK_PURCHASE_LOCK, self.holder);
+    }
 }
 
 impl Engine {
+    /// 进入花钱临界区。拿不到 = 别的执行体正在花钱,本轮直接放弃。
+    ///
+    /// **`buy-now` 与后台循环都必须过这道门。** 在此之前 `buy-now` 不受任何互斥保护
+    /// (它连 leader 租约都不抢),手动点两次就能让两个执行读到同一个 `spent`、
+    /// 各自下单扣款。
+    fn enter_purchase_section(&self) -> Option<PurchaseGuard<'_>> {
+        match self.store.try_acquire_lock(
+            SqliteStore::KEY_RESTOCK_PURCHASE_LOCK,
+            &self.holder,
+            PURCHASE_LOCK_TTL_SECS,
+        ) {
+            Ok(true) => Some(PurchaseGuard { store: &self.store, holder: &self.holder }),
+            Ok(false) => None,
+            // 拿锁这件事本身失败(DB 忙/坏)→ **不许花钱**。方向必须 fail-closed。
+            Err(e) => {
+                tracing::error!("补货:获取花钱锁失败,本轮放弃购买: {e}");
+                None
+            }
+        }
+    }
+
+    /// 我此刻是否仍是补货 leader。
+    ///
+    /// 花钱锁保证「同一时刻只有一个执行体在花钱」,但**保证不了「这个执行体还该不该花」**:
+    /// 租约 TTL 最短 30s,而从抢到租约走到真正下单,中间隔着健康度扇出、报价、决策 ——
+    /// 完全可能已经被别的 router 接管。那个新 leader 会做自己的决策并买号;
+    /// 若旧 leader 恢复后接着买,就是同一个水位缺口被补了两次。
+    ///
+    /// 读失败按**不持有**处理(fail-closed):读不到就别花钱。
+    fn holds_lease(&self) -> bool {
+        self.store
+            .holds_lock(SqliteStore::KEY_RESTOCK_LEASE, &self.holder)
+            .unwrap_or(false)
+    }
+
+    /// 按名册建出引擎。名册在 DB 里,面板改完**下一轮就生效**,不用重启。
+    ///
+    /// `yaml` 是 `system.yaml` 的 restock 段:名册里 drop 那家不填密钥时回落到它,
+    /// 所以老部署不需要迁移任何凭据。
+    pub fn build(
+        store: Arc<SqliteStore>,
+        yaml: &gw_core::config::RestockConfig,
+        workers: Arc<Vec<WorkerConfig>>,
+        http: reqwest::Client,
+        holder: String,
+    ) -> Self {
+        let raw = store.get_kv(registry::KEY_SUPPLIERS).ok().flatten();
+        let roster = registry::parse_roster(raw.as_deref());
+        let suppliers = registry::build(&roster, yaml.base_url(), &yaml.api_key);
+        Self { store, suppliers, roster, workers, http, holder }
+    }
+
+    /// 并发问所有货源的报价与余额。
+    ///
+    /// 并发而不是串行:一家挂掉时串行会把整轮拖满超时,而多供应商存在的全部意义
+    /// 就是「一家不行还有另一家」—— 让慢的那家拖死快的那家等于自废武功。
+    async fn survey_all(&self, p: &Params) -> (Vec<Survey>, Vec<(String, String)>) {
+        let fx = p.rate_cap;
+        let calls = self.suppliers.iter().map(|s| {
+            let s = s.clone();
+            async move { (s.id().to_string(), s.survey(fx).await) }
+        });
+        let mut ok: Vec<Survey> = Vec::new();
+        let mut bad = Vec::new();
+        for (id, r) in futures::future::join_all(calls).await {
+            match r {
+                Ok(v) => ok.push(v),
+                Err(e) => {
+                    tracing::warn!("补货:询价 {id} 失败: {e}");
+                    bad.push((id, e));
+                }
+            }
+        }
+        // ── 档位回填 ──
+        //
+        // 适配器不知道也不该知道自己的档位(一家货源不该自己声明自己有多重要),
+        // 所以档位在这里、**在所有排序之前**统一按名册盖上去。
+        //
+        // 放在 survey_all 内部而不是各个调用点:漏盖一处的后果是那条路径悄悄退回
+        // 纯比价 —— 而那正是引入档位要修的行为,漏了不会报错只会静默不生效。
+        for s in &mut ok {
+            for sh in &mut s.shelves {
+                sh.priority = registry::shelf_priority_of(&self.roster, &s.supplier_id, &sh.shelf_id);
+            }
+        }
+        (ok, bad)
+    }
+
+    /// 此刻**不许花钱**的货源 → 原因。两类:本家熔断,和本家当日花费已到顶。
+    ///
+    /// 逐家而不是全局:kiroapp 的 key 失效不该让 drop 也停下 —— 那会亲手制造出
+    /// 多供应商本来要消除的断供。
+    fn blocked_suppliers(&self, p: &Params, day_start: i64) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        for c in &self.roster {
+            let id = c.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Ok(Some(r)) = self.store.get_kv(&registry::breaker_key(id)) {
+                if !r.is_empty() {
+                    out.insert(id.to_string(), format!("已熔断: {r}"));
+                    continue;
+                }
+            }
+            if c.daily_cap_cny > 0.0 {
+                let spent = self
+                    .store
+                    .restock_spent_since_by_supplier(day_start, id)
+                    .unwrap_or(0.0);
+                if spent >= c.daily_cap_cny {
+                    out.insert(
+                        id.to_string(),
+                        format!("本家今日已花 ¥{spent:.2} 达上限 ¥{:.2}", c.daily_cap_cny),
+                    );
+                }
+            }
+        }
+        let _ = p;
+        out
+    }
+
+    /// 每家的 `(今日已花, 本家上限)`。`choose_shelf` 要靠它把**本单**算进单家上限。
+    fn supplier_caps(&self, day_start: i64) -> std::collections::HashMap<String, (f64, f64)> {
+        self.roster
+            .iter()
+            .filter(|c| c.daily_cap_cny > 0.0)
+            .map(|c| {
+                let id = c.id.trim().to_string();
+                let spent = self
+                    .store
+                    .restock_spent_since_by_supplier(day_start, &id)
+                    .unwrap_or(f64::INFINITY); // 读不出来就当成已到顶:fail-closed
+                (id, (spent, c.daily_cap_cny))
+            })
+            .collect()
+    }
+
+    /// 按 id 找客户端。名册被改小之后,老订单的对账仍然要找得到那一家。
+    fn supplier_of(&self, id: &str) -> Option<&Arc<dyn Supplier>> {
+        self.suppliers.iter().find(|s| s.id() == id)
+    }
+
     /// 读当前运行时参数(面板改完即时生效,所以每轮都重读)。
     pub fn params(&self) -> Params {
         self.store
@@ -277,27 +578,153 @@ impl Engine {
 
         let last = snap.get("stock_at").and_then(|v| v.as_i64()).unwrap_or(0);
         if force || now - last >= stock_max_age {
-            match self.drop.stock().await {
-                Ok(st) => {
-                    snap["stock"] = st.stock.into();
-                    snap["price_usd"] = st.price_usd.into();
-                    snap["balance_cny"] = st.balance_cny.into();
-                    snap["stock_at"] = now.into();
-                    snap["drop_ok"] = true.into();
-                    // 成功了就得把旧报错抹掉,否则面板会一直挂着 drop_ok=true 加一条
-                    // 早就修好的错误 —— 看的人只能靠猜哪个是真的。
-                    snap["drop_error"] = serde_json::Value::Null;
+            let (surveys, failed) = self.survey_all(&p).await;
+            let blocked = self.blocked_suppliers(&p, p.local_day_start(now));
+            snap["suppliers"] = self.suppliers_view(&p, &surveys, &failed, &blocked, now);
+            // ── 顶层的 stock/price_usd/balance_cny 保留,装的是**首选货架**的数 ──
+            // 它们是决策链上游(`cached_price_cny`)与历史图表的输入。多供应商之后
+            // 「库存/单价/余额」不再是一家的属性,但「下一单会买的那个货架现在什么价」
+            // 仍然是单个有意义的数,而且正是成本预测要的那个。
+            //
+            // ⚠️ 引入档位后这**不再等于最低价**:首选货架可能比末档贵。这是有意的 ——
+            // 成本预测要预测的是我们**真的会付**的价,不是市面上最便宜的价。
+            // ── 「下一单会买哪个」由 `choose_shelf` 本人回答 ──
+            //
+            // 以前面板自己按价格排一遍来猜这个答案。排序**能**复刻,闸门复刻不了:
+            // 余额、单价上限、`unit_cost_veto`、全局与单家日上限,任何一道否掉首选,
+            // 引擎买的就不是面板宣称的那个。面板在这种时刻说谎最贵 —— 值班的人
+            // 看到「下一单会买 drop」就不会再去查为什么池子里全是 kiroapp 的号。
+            //
+            // 所以这里直接调真正的判断函数,把结论(以及被否时的逐货架理由)写进快照,
+            // 前端只渲染,不再自己算一遍。
+            let day_start = p.local_day_start(now);
+            let (spent_today, _) = self.store.restock_spent_since(day_start).unwrap_or((0.0, 0));
+            match choose_shelf(
+                &p,
+                &surveys,
+                &blocked,
+                &self.supplier_caps(day_start),
+                spent_today,
+                snap.get("demand_rate").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                false,
+            ) {
+                Ok(c) => {
+                    snap["next_pick"] = c.shelf.label().into();
+                    snap["next_pick_why"] = serde_json::Value::Null;
                 }
-                Err(e) => {
-                    snap["drop_ok"] = false.into();
-                    snap["drop_error"] = e.to_string().into();
-                    tracing::warn!("补货:读取 drop 库存失败: {e}");
+                Err(why) => {
+                    snap["next_pick"] = serde_json::Value::Null;
+                    snap["next_pick_why"] = why.into();
                 }
             }
+            // 顶层数字仍取**排序第一名**而不是 `next_pick`:闸门是瞬时的(余额、日上限),
+            // 让成本预测的输入随闸门开合来回跳会让历史曲线失去可读性。
+            // 「首选货架的价」是稳定量,「这一秒买不买得成」是另一件事。
+            let best = rank_shelves(surveys.iter().flat_map(|s| s.shelves.clone()).collect())
+                .into_iter()
+                .next();
+            match best {
+                Some(b) => {
+                    let bal = surveys
+                        .iter()
+                        .find(|s| s.supplier_id == b.supplier_id)
+                        .map(|s| s.balance_cny)
+                        .unwrap_or(0.0);
+                    snap["stock"] = b.stock.into();
+                    // 折回 USD 只为了兼容既有列与图表口径;比价一律用 CNY。
+                    snap["price_usd"] = (b.unit_price_cny / p.rate_cap.max(0.01)).into();
+                    snap["price_cny"] = b.unit_price_cny.into();
+                    snap["balance_cny"] = bal.into();
+                    snap["best_shelf"] = b.label().into();
+                }
+                None => {
+                    snap["stock"] = 0.into();
+                    snap["best_shelf"] = serde_json::Value::Null;
+                }
+            }
+            // 全池余额:多家之后「我还剩多少钱」不再等于任何单独一家的余额。
+            snap["balance_total_cny"] =
+                surveys.iter().map(|s| s.balance_cny).sum::<f64>().into();
+            snap["stock_at"] = now.into();
+            // 至少一家问得通才算「上游正常」。全挂了才是真的没得买。
+            snap["drop_ok"] = (!surveys.is_empty()).into();
+            snap["drop_error"] = if failed.is_empty() {
+                serde_json::Value::Null
+            } else {
+                failed
+                    .iter()
+                    .map(|(id, e)| format!("{id}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+                    .into()
+            };
         }
         let _ = self
             .store
             .upsert_kv(KEY_SNAPSHOT, &snap.to_string());
+    }
+
+    /// 面板要的逐家视图:余额、货架、状态、今日花费。
+    ///
+    /// 一次算完写进快照,而不是让 admin 每次轮询都去打各家接口 —— 面板 15 秒一次,
+    /// 那会变成对上游的持续压测。
+    fn suppliers_view(
+        &self,
+        p: &Params,
+        surveys: &[Survey],
+        failed: &[(String, String)],
+        blocked: &std::collections::HashMap<String, String>,
+        now: i64,
+    ) -> serde_json::Value {
+        let day_start = p.local_day_start(now);
+        let items: Vec<serde_json::Value> = self
+            .roster
+            .iter()
+            .map(|c| {
+                let id = c.id.trim();
+                let sv = surveys.iter().find(|s| s.supplier_id == id);
+                let err = failed.iter().find(|(fid, _)| fid == id).map(|(_, e)| e.clone());
+                let spent = self.store.restock_spent_since_by_supplier(day_start, id).unwrap_or(0.0);
+                let shelves: Vec<serde_json::Value> = sv
+                    .map(|s| {
+                        s.shelves
+                            .iter()
+                            .map(|sh| {
+                                serde_json::json!({
+                                    "shelf": sh.shelf_id,
+                                    "label": sh.label(),
+                                    "region": sh.account_region,
+                                    "stock": sh.stock,
+                                    "unit_price_cny":
+                                        (sh.unit_price_cny * 100.0).round() / 100.0,
+                                    "max_per_order": sh.max_per_order,
+                                    // **生效**档位(已含逐货架覆盖)。面板显示它是覆盖键
+                                    // 写错时的唯一发现途径 —— 见 SupplierCfg::shelf_priority。
+                                    "priority": sh.priority,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "id": id,
+                    "kind": c.kind,
+                    "enabled": c.enabled,
+                    "configured": self.supplier_of(id).is_some(),
+                    // 空 = 此刻可以从这家买。非空是人读的原因,直接显示。
+                    "blocked": blocked.get(id).cloned().unwrap_or_default(),
+                    "error": err,
+                    "balance_cny": sv.map(|s| (s.balance_cny * 100.0).round() / 100.0),
+                    "balance_native": sv.map(|s| s.balance_native.clone()).unwrap_or_default(),
+                    "spent_today_cny": (spent * 100.0).round() / 100.0,
+                    "daily_cap_cny": c.daily_cap_cny,
+                    "priority": c.priority,
+                    "shelf_priority": c.shelf_priority,
+                    "shelves": shelves,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(items)
     }
 
     // ───────────────────────── 决策 ─────────────────────────
@@ -399,68 +826,36 @@ impl Engine {
             }
         }
 
-        // ── 到这里才去问对方库存(前面没破水位就不该增加上游请求密度)──
-        let st = match self.drop.stock().await {
-            Ok(s) => s,
-            Err(e) => {
+        // ── 到这里才去问各家库存(前面没破水位就不该增加上游请求密度)──
+        let (surveys, failed) = self.survey_all(&p).await;
+        if surveys.is_empty() {
+            let why = if self.suppliers.is_empty() {
+                "没有配置任何可用货源".to_string()
+            } else {
+                failed.iter().map(|(i, e)| format!("{i}: {e}")).collect::<Vec<_>>().join("; ")
+            };
+            return Decision {
+                healthy: Some(health.healthy),
+                ..Decision::skip(format!("所有货源询价失败,本轮跳过 —— {why}"))
+            };
+        }
+        let blocked = self.blocked_suppliers(&p, day_start);
+        let total_stock: i64 = surveys.iter().flat_map(|s| &s.shelves).map(|x| x.stock).sum();
+        let total_balance: f64 = surveys.iter().map(|s| s.balance_cny).sum();
+
+        // ── 选家:能买的里面最便宜的那个。所有花钱闸门都在这里面逐货架跑一遍。──
+        let caps = self.supplier_caps(day_start);
+        let cand = match choose_shelf(&p, &surveys, &blocked, &caps, spent, demand, force) {
+            Ok(c) => c,
+            Err(why) => {
                 return Decision {
                     healthy: Some(health.healthy),
-                    ..Decision::skip(format!("查询 drop 库存失败: {e}"))
+                    stock: Some(total_stock),
+                    balance_cny: Some(total_balance),
+                    ..Decision::skip(format!("无可买货架 —— {why}"))
                 }
             }
         };
-        let base = Decision {
-            healthy: Some(health.healthy),
-            stock: Some(st.stock),
-            price_usd: Some(st.price_usd),
-            balance_cny: Some(st.balance_cny),
-            ..Default::default()
-        };
-        if st.stock <= 0 {
-            return Decision { reason: "drop 无库存".into(), ..base };
-        }
-        // ── 花钱闸门:单价异常兜底 ──
-        if st.price_usd > p.max_price_usd {
-            return Decision {
-                reason: format!(
-                    "单价 ${:.2} 高于上限 ${:.2},不买",
-                    st.price_usd, p.max_price_usd
-                ),
-                ..base
-            };
-        }
-
-        let count = p.max_per_purchase.min(st.stock).max(1);
-        let need = max_total_cny_for(count, st.price_usd, p.rate_cap);
-
-        // 拿到真实报价后再复核一次单位成本。上面那次用的是快照缓存价(最多陈旧 300s),
-        // 对方涨价时会偏乐观 —— 掏钱之前必须按**这一单的实际价**再算一遍。
-        if !force {
-            if let Some(why) = unit_cost_veto(&p, need / count.max(1) as f64, demand) {
-                return Decision { reason: why, ..base };
-            }
-        }
-
-        // ── 花钱闸门:余额 ──
-        if st.balance_cny < need + p.min_balance_reserve_cny {
-            return Decision {
-                reason: format!(
-                    "余额 ¥{:.2} 不足(需 ¥{need:.2} + 保留 ¥{:.2})",
-                    st.balance_cny, p.min_balance_reserve_cny
-                ),
-                ..base
-            };
-        }
-        // ── 花钱闸门:本单会不会突破日上限 ──
-        if spent + need > p.daily_cap_cny {
-            return Decision {
-                reason: format!(
-                    "本单预计 ¥{need:.2} 会突破日上限(已花 ¥{spent:.2} / ¥{:.2})",
-                    p.daily_cap_cny
-                ),
-                ..base
-            };
-        }
 
         let trigger = if force {
             "手动触发".to_string()
@@ -478,8 +873,19 @@ impl Engine {
         };
         Decision {
             act: true,
-            reason: format!("{trigger},库存 {},买 {count} 个(限价 ¥{need:.2})", st.stock),
-            ..base
+            reason: format!(
+                "{trigger};选中 {} @ ¥{:.2}/个(库存 {}),买 {} 个,限价 ¥{:.2}",
+                cand.shelf.label(),
+                cand.shelf.unit_price_cny,
+                cand.shelf.stock,
+                cand.count,
+                cand.need_cny,
+            ),
+            healthy: Some(health.healthy),
+            stock: Some(cand.shelf.stock),
+            price_usd: Some(cand.shelf.unit_price_cny / p.rate_cap.max(0.01)),
+            balance_cny: Some(cand.balance_cny),
+            candidate: Some(cand),
         }
     }
 
@@ -492,16 +898,25 @@ impl Engine {
     /// 读不到就用限价兜底:价格取高 → 门槛更严 → 宁可不买。方向必须是 fail-closed,
     /// 反过来会在快照缺失时放行一堆亏本单。
     fn cached_price_cny(&self, p: &Params) -> f64 {
-        let cached = self
+        let snap = self
             .store
             .get_kv(KEY_SNAPSHOT)
             .ok()
             .flatten()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v.get("price_usd").and_then(|x| x.as_f64()))
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        // 优先读 CNY 原值:多供应商之后快照里的 `price_usd` 是最便宜货架折回美元的结果,
+        // 再折一次会来回丢精度。老快照没有 `price_cny`,回落 USD 路径。
+        snap.as_ref()
+            .and_then(|v| v.get("price_cny").and_then(|x| x.as_f64()))
             .filter(|x| *x > 0.0)
-            .unwrap_or(p.max_price_usd);
-        max_total_cny_for(1, cached, p.rate_cap)
+            .unwrap_or_else(|| {
+                let usd = snap
+                    .as_ref()
+                    .and_then(|v| v.get("price_usd").and_then(|x| x.as_f64()))
+                    .filter(|x| *x > 0.0)
+                    .unwrap_or(p.max_price_usd);
+                max_total_cny_for(1, usd, p.rate_cap)
+            })
     }
 
     /// 预测接下来是闲时则返回跳过理由。判据是**相对**的(预测/历史峰值),
@@ -550,6 +965,20 @@ impl Engine {
     // ───────────────────────── 执行 ─────────────────────────
 
     pub async fn run_once(&self, force: bool) -> Decision {
+        // 花钱临界区从**读预算**开始,而不是从下单开始 —— `evaluate` 里那次
+        // `restock_spent_since` 与后面的 `restock_create_order` 必须在同一把锁内,
+        // 否则两个执行体会先后读到同一个 `spent`,各自认为「还有额度」再各自下单。
+        //
+        // ⚠️ TTL 锁给不了 exactly-once(没有 fencing token):持有者卡死超过
+        // `PURCHASE_LOCK_TTL_SECS` 时锁会过期放第二个人进来。这里拿到的是两层保障:
+        // 常见情况被串行化,而**最坏情况的总花费**由日预算兜住 —— 后者现在把 `pending`
+        // 按限价计入,所以卡死那一单的钱不会被下一个执行体当成没花过。
+        let Some(_guard) = self.enter_purchase_section() else {
+            let d = Decision::skip("另一个执行体正在补货(花钱锁被占),本轮跳过");
+            self.log("skip", &d);
+            tracing::info!("补货跳过: {}", d.reason);
+            return d;
+        };
         let d = self.evaluate(force).await;
         if !d.act {
             self.log("skip", &d);
@@ -564,75 +993,217 @@ impl Engine {
             tracing::warn!("[DRY-RUN] 本应购买: {}", d.reason);
             return d;
         }
+        // 掏钱之前**再确认一次自己仍是 leader**(见 [`Self::holds_lease`])。
+        // `force` = 人在面板上点的「立即补一个」,它不参与 leader 选举,跳过这道检查 ——
+        // 它的互斥由花钱锁负责。
+        if !force && !self.holds_lease() {
+            let mut dd = d.clone();
+            dd.act = false;
+            dd.reason = format!("已不再持有补货租约(可能被别的 router 接管),放弃购买 —— {}", d.reason);
+            self.log("skip", &dd);
+            tracing::warn!("补货:{}", dd.reason);
+            return dd;
+        }
         self.buy_and_onboard(&p, &d).await;
         d
     }
 
     async fn buy_and_onboard(&self, p: &Params, d: &Decision) {
-        let count = p.max_per_purchase.min(d.stock.unwrap_or(1)).max(1);
-        let price = d.price_usd.unwrap_or(0.0);
-        let cap = max_total_cny_for(count, price, p.rate_cap);
+        let Some(cand) = d.candidate.clone() else {
+            tracing::error!("补货:决策说要买却没有选中货架,放弃(这是 bug)");
+            return;
+        };
+        let Some(sup) = self.supplier_of(&cand.shelf.supplier_id) else {
+            tracing::error!("补货:选中的货源 {} 已不存在,放弃", cand.shelf.supplier_id);
+            return;
+        };
         let order_id = new_order_id();
 
-        // ① 幂等键先落库。落库失败就**不发请求** —— 否则崩在途中会丢失 order_id,
-        //    重试即变成重复扣款。
-        if let Err(e) = self.store.restock_create_order(&order_id, count, cap) {
+        // ① 幂等键先落库,**并且带上货源** —— 落库失败就不发请求(否则崩在途中会丢失
+        //    order_id,重试即重复扣款);而没记货源的在途订单在多供应商下是无主的,
+        //    对账时谁都不敢去重放,那笔钱就永远找不回来了。
+        if let Err(e) = self.store.restock_create_order(
+            &order_id,
+            cand.count,
+            cand.need_cny,
+            &cand.shelf.supplier_id,
+            &cand.shelf.shelf_id,
+            &cand.shelf.account_region,
+        ) {
             tracing::error!("补货:幂等键落库失败,放弃本轮购买: {e}");
             self.log_msg("error", &format!("幂等键落库失败,未发出购买请求: {e}"));
             return;
         }
 
-        let res = match self.drop.purchase(count, &order_id, cap).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = self.store.restock_mark_status(&order_id, "failed", &e.to_string());
-                self.log_msg("error", &format!("购买失败: {e}"));
+        let outcome = sup
+            .buy(&cand.shelf, cand.count, &order_id, cand.need_cny, p.rate_cap)
+            .await;
+        let r = match outcome {
+            BuyOutcome::Ok(r) => r,
+            // ── 结果未知(网络失败 / 5xx):**订单必须停在 `pending`** ──
+            //
+            // 原先所有错误一律标 `failed`,而对账只扫 `pending` —— 于是「对方已扣款、
+            // 响应丢了」会永久失去对账机会,钱和 key 双双成孤儿。停在 `pending` 之后:
+            // 日预算按限价把它算进当日花费(不会再被当成没花钱),5 分钟后对账用
+            // **原幂等键**去确认,key 也就找回来了。
+            //
+            // 也**不计熔断** —— 网络抖动不是供应商故障,拿它熔断等于自己关掉补货。
+            BuyOutcome::Unknown(e) => {
+                let _ = self.store.restock_mark_status(&order_id, "pending", &e);
+                self.log_msg(
+                    "error",
+                    &format!("{} 购买结果未知,订单在途待对账(可能已扣款): {e}", cand.shelf.label()),
+                );
+                tracing::error!("补货:购买结果未知 order={order_id},**不判死**,留给对账确认: {e}");
+                return;
+            }
+            // ── 竞争失败:确定没扣款,不计熔断(一个抢购高峰不该把补货自己关掉)。──
+            BuyOutcome::Conflict(e) => {
+                let _ = self.store.restock_mark_status(&order_id, "failed", &e);
+                self.log_msg("error", &format!("{} 竞争失败: {e}", cand.shelf.label()));
+                tracing::warn!("补货:竞争失败 order={order_id}: {e}");
+                return;
+            }
+            // ── 对方拒绝:确定没扣款,但重试一万次也一样 → 计入**这一家**的熔断。──
+            BuyOutcome::Fault(e) => {
+                let _ = self.store.restock_mark_status(&order_id, "failed", &e);
+                self.log_msg("error", &format!("{} 购买失败: {e}", cand.shelf.label()));
                 tracing::error!("补货:购买失败 order={order_id}: {e}");
-                // 409 是正常的竞争失败(库存/价格/余额),不计熔断;其余按故障处理。
-                if !e.is_price_or_stock_conflict() {
-                    self.maybe_trip(p, &format!("购买异常: {e}"));
-                }
+                self.trip_supplier(p, &cand.shelf.supplier_id, &format!("购买异常: {e}"));
                 return;
             }
         };
 
         // ② key 一到手立刻落库,后续任何失败都不会让它蒸发。
+        //
+        // 落库只存 key 串本身:订单里所有 key 来自同一个货架、共享同一个 region,
+        // 所以 region 是**订单级**属性,已在 ① 里随订单记下,不在每个 key 上重复一遍。
+        let debited = if r.debited_cny > 0.0 { Some(r.debited_cny) } else { None };
         let spent = self
             .store
-            .restock_mark_purchased(&order_id, &res.keys, d.balance_cny, res.remaining_cny)
+            .restock_mark_purchased(
+                &order_id,
+                &key_strings(&r.keys),
+                debited,
+                d.balance_cny,
+                r.balance_after_cny,
+            )
             .unwrap_or(0.0);
         tracing::warn!(
-            "补货:购买成功 order={order_id} 数量={} 实扣=¥{spent:.2} 余额=¥{:.2}",
-            res.purchased,
-            res.remaining_cny
+            "补货:{} 购买成功 order={order_id} 数量={} 实扣=¥{spent:.2} 余额=¥{:.2}",
+            cand.shelf.label(),
+            r.purchased,
+            r.balance_after_cny
         );
         self.log_msg(
             "buy",
             &format!(
-                "购买 {} 个,实扣 ¥{spent:.2},余额 ¥{:.2}",
-                res.purchased, res.remaining_cny
+                "{} 购买 {} 个,实扣 ¥{spent:.2},余额 ¥{:.2}",
+                cand.shelf.label(),
+                r.purchased,
+                r.balance_after_cny
             ),
         );
-        if d.balance_cny.is_none() || spent <= 0.0 {
-            // 拿不到余额差就无法准确记账,日预算阀会失真 —— 必须让人看见。
+        if spent <= 0.0 {
+            // 记不了账,日预算阀就会失真 —— 必须让人看见,别让它静静地漏。
             tracing::error!("补货:order={order_id} 无法计算实际扣款,日预算累计可能失真");
         }
-
-        if res.keys.is_empty() {
+        // 买成了就把该家的连败计数清零。不清的话它只增不减 ——
+        // 上周一次 401、之后几百单成功、下周再一次 401,会被算成「连续 2 次失败」
+        // 而熔断一家健康的货源,流量白白落回贵号池。
+        let _ = self
+            .store
+            .upsert_kv(&registry::fault_streak_key(&cand.shelf.supplier_id), "0");
+        // 全新的幂等键不该命中重放。命中说明 `new_order_id` 撞了号,
+        // 而幂等键一旦重复,「这单是不是已经买过」就永远问不清楚了。
+        if r.replayed {
+            tracing::error!(
+                "补货:全新订单 {order_id} 被对方判为重放 —— 幂等键疑似撞号,请立刻核对"
+            );
+        }
+        // 实扣显著超过本单限价 = 对方在询价与下单之间涨了价,而它**不执行限价**。
+        // 这一笔拦不住(钱已经扣了),但必须立刻熔断这家,否则同样的超付会每轮重演。
+        // 容差 1 分,躲开浮点与取整噪声。
+        if spent > cand.need_cny + 0.01 {
+            let msg = format!(
+                "{} 实扣 ¥{spent:.2} 超过本单限价 ¥{:.2} —— 对方不执行限价,已熔断该货源",
+                cand.shelf.label(),
+                cand.need_cny
+            );
+            self.log_msg("error", &msg);
+            tracing::error!("补货:{msg}");
             let _ = self
                 .store
-                .restock_mark_status(&order_id, "failed", "响应未包含任何 ksk_ key");
+                .upsert_kv(&registry::breaker_key(&cand.shelf.supplier_id), &msg);
+        }
+        // 拿到的 key 数少于付了钱的数量 = 有钱买了却没到手的号。
+        // 订单最终会标 imported,那几份价值不会进孤儿告警,只能靠这条流水看见。
+        if !r.keys.is_empty() && (r.keys.len() as i64) < r.purchased {
+            self.log_msg(
+                "error",
+                &format!(
+                    "⚠ {} 只解析出 {} 个 key,但对方称成交 {} 个 —— 差额已付款未到手",
+                    cand.shelf.label(),
+                    r.keys.len(),
+                    r.purchased
+                ),
+            );
+        }
+        // 成交数超过请求数 = 对方放大了我们的订单(kiroapp 实测会 clamp 后成交)。
+        // 号照收(钱已经花了,丢掉才是真损失),但必须在流水里留下证据。
+        if r.purchased > cand.count {
+            self.log_msg(
+                "error",
+                &format!(
+                    "⚠ {} 超卖:请求 {} 个、成交 {} 个,请核对钱包余额",
+                    cand.shelf.label(),
+                    cand.count,
+                    r.purchased
+                ),
+            );
+        }
+
+        if r.keys.is_empty() {
+            let _ = self
+                .store
+                .restock_mark_status(&order_id, "purchased", "响应未包含任何 ksk_ key");
+            // 状态停在 `purchased` 而不是 `failed`:钱确实扣了,这是**孤儿订单**,
+            // 面板会单列出来交给人处理。判 failed 等于把这笔花费从账上抹掉。
             self.maybe_trip(p, "购买成功但响应无 key");
             return;
         }
-        self.onboard(p, &order_id, &res.keys).await;
+        self.onboard(p, &order_id, &r.keys).await;
+    }
+
+    /// 某一家连续购买故障达阈值 → **只熔断这一家**。
+    ///
+    /// 与全局熔断([`Self::maybe_trip`],管的是「买到却没上号」)分开:
+    /// 那是系统性问题、该整个停手;这是某一家的问题,停它一家、继续用别家 ——
+    /// 用一个全局开关去关掉一家的故障,等于亲手制造多供应商本来要消除的断供。
+    fn trip_supplier(&self, p: &Params, id: &str, reason: &str) {
+        let key = registry::fault_streak_key(id);
+        let n: i64 = self
+            .store
+            .get_kv(&key)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+            + 1;
+        let _ = self.store.upsert_kv(&key, &n.to_string());
+        if n >= p.import_fail_breaker {
+            let msg = format!("连续 {n} 次失败: {reason}");
+            let _ = self.store.upsert_kv(&registry::breaker_key(id), &msg);
+            self.log_msg("error", &format!("{id} 已熔断: {msg}"));
+            tracing::error!("补货:货源 {id} 熔断,暂停从它购买 —— {msg}");
+        }
     }
 
     /// 建号 → 逐组提权 → 调并发 → 开排队 → 捅 worker 同步。
     ///
     /// 搬进 caio 之后这些全是**内部调用**,不再走 admin HTTP。
-    async fn onboard(&self, p: &Params, order_id: &str, keys: &[String]) {
-        let json = match serde_json::to_string(keys) {
+    async fn onboard(&self, p: &Params, order_id: &str, keys: &[BoughtKey]) {
+        let json = match serde_json::to_string(&import_payload(keys)) {
             Ok(j) => j,
             Err(e) => {
                 self.fail_import(p, order_id, &format!("序列化 key 失败: {e}"));
@@ -783,45 +1354,118 @@ impl Engine {
 
     // ───────────────────────── 启动对账 ─────────────────────────
 
-    /// 处理卡在 `pending` 的订单。
+    /// 处理卡在 `pending` 的订单:用**原幂等键 + 原参数**向下单的那一家确认真实结果。
     ///
-    /// 对方保证「同 order_id + 同 count 可安全重试」,所以用原 id 重放一次就能问出
-    /// 真实结果:若上次其实成功了,这次会返回同一张订单而不会重复扣款。
+    /// 「向哪一家确认」靠订单自己的 `supplier` 列 —— 它和幂等键同一条 INSERT 落库,
+    /// 所以任何在途订单都是有主的。
+    ///
+    /// 各家的确认手法不同(drop 只能重放、kiroapp 能先只读查单),但对本函数是透明的:
+    /// 契约只承诺「返回四态之一」,见 [`Supplier::reconcile`]。
     pub async fn reconcile_pending(&self) {
         let p = self.params();
-        let Ok(pending) = self.store.restock_pending_orders() else {
+        let Ok(pending) = self.store.restock_pending_orders(RECONCILE_MIN_AGE_SECS) else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        // 对账会**重放购买请求**,所以它和下单一样属于花钱临界区。
+        //
+        // 光靠 leader 租约不够:租约 TTL 是 `poll_interval × 3`(默认 90s),而一轮对账
+        // 最多处理 100 单、每单一到两次上游往返 —— 完全可能跑过租约到期,于是第二个
+        // router 当选后对**同一批 pending** 再重放一次。两个执行体同时重放同一个
+        // 幂等键,一旦对方的幂等有任何缝隙就是双扣。
+        let Some(_guard) = self.enter_purchase_section() else {
+            tracing::info!("补货:对账跳过(花钱锁被占,另一个执行体正在处理)");
             return;
         };
         for o in pending {
-            tracing::warn!("补货:发现未完成订单 {},用原幂等键重放确认真实结果", o.client_order_id);
             if p.dry_run {
                 continue;
             }
-            let Ok(st) = self.drop.stock().await else { continue };
-            let cap = max_total_cny_for(o.count, st.price_usd, p.rate_cap);
-            match self.drop.purchase(o.count, &o.client_order_id, cap).await {
-                Ok(res) if !res.keys.is_empty() => {
+            // 历史订单(多供应商之前下的)没有 supplier 列,归给 drop —— 那时只有它一家,
+            // 这不是猜,是事实。
+            let sid = if o.supplier.is_empty() { "drop" } else { o.supplier.as_str() };
+            let Some(sup) = self.supplier_of(sid) else {
+                tracing::error!(
+                    "补货:在途订单 {} 的货源 {sid} 已不在名册里,无法对账 —— \
+                     请先把它加回名册(哪怕只是为了收尾),否则这笔钱找不回来",
+                    o.client_order_id
+                );
+                continue;
+            };
+            tracing::warn!("补货:发现未完成订单 {}(货源 {sid}),确认真实结果", o.client_order_id);
+            // 用**下单时的限价**而不是现价重放:现价可能已经涨过,拿它去重放等于
+            // 悄悄放宽了当初的限价保护。
+            match sup
+                .reconcile(&o.client_order_id, &o.shelf, o.count, o.max_total_cny, p.rate_cap)
+                .await
+            {
+                BuyOutcome::Ok(r) => {
+                    // 对方没认出幂等键 = **已经发生第二次真实扣款**。重放安全这个前提没了,
+                    // 而整套对账都建立在它上面 —— 立刻熔断这家,别让下一轮接着重放。
+                    if r.double_charged {
+                        let msg = format!(
+                            "{sid} 对账重放未命中幂等,疑似二次扣款(订单 {})",
+                            o.client_order_id
+                        );
+                        let _ = self.store.upsert_kv(&registry::breaker_key(sid), &msg);
+                        self.log_msg("error", &msg);
+                    }
+                    // 扣款 **fail-closed**:适配器说不出实扣时回落到**下单时的限价**,
+                    // 绝不能记 0。drop 就说不出(它不下发单笔扣款额),而对账路径又拿不到
+                    // 买前余额 —— 记 0 的后果是一笔真实扣款从日预算里凭空消失,
+                    // 当天可以据此再多买一单。宁可高估。
+                    let debited = if r.debited_cny > 0.0 {
+                        r.debited_cny
+                    } else {
+                        tracing::warn!(
+                            "补货:{sid} 订单 {} 对账拿不到实扣额,按限价 ¥{:.2} 记账(宁可高估)",
+                            o.client_order_id,
+                            o.max_total_cny
+                        );
+                        o.max_total_cny
+                    };
                     let _ = self.store.restock_mark_purchased(
                         &o.client_order_id,
-                        &res.keys,
-                        Some(st.balance_cny),
-                        res.remaining_cny,
+                        &key_strings(&r.keys),
+                        Some(debited),
+                        None,
+                        r.balance_after_cny,
                     );
-                    self.onboard(&p, &o.client_order_id, &res.keys).await;
+                    if r.keys.is_empty() {
+                        // 确认成交却拿不回 key:状态停在 `purchased` = **孤儿订单**,
+                        // 面板醒目地交给人处理。钱已如实记账,预算不会漏。
+                        let _ = self.store.restock_mark_status(
+                            &o.client_order_id,
+                            "purchased",
+                            "对账确认已成交但取不回 key,需人工上号",
+                        );
+                        self.log_msg(
+                            "error",
+                            &format!("{sid} 订单 {} 已扣款但无 key,转人工", o.client_order_id),
+                        );
+                    } else {
+                        self.onboard(&p, &o.client_order_id, &r.keys).await;
+                    }
                 }
-                Ok(_) => {
+                // **确定没成交**(对方无此单 / 明确拒绝)→ 判死,把限价占用的预算还回来。
+                BuyOutcome::Conflict(e) | BuyOutcome::Fault(e) => {
                     let _ = self.store.restock_mark_status(
                         &o.client_order_id,
                         "failed",
-                        "重放未返回 key",
+                        &format!("对账确认未成交: {e}"),
                     );
                 }
-                Err(e) => {
+                // 确认本身结果未知 → **继续留在 `pending`**,下一轮再试。
+                // 判死等于放弃找回这笔钱,而确认是只读/幂等的,多试几次没有代价。
+                BuyOutcome::Unknown(e) => {
                     let _ = self.store.restock_mark_status(
                         &o.client_order_id,
-                        "failed",
-                        &format!("重放失败: {e}"),
+                        "pending",
+                        &format!("对账结果未知,继续在途: {e}"),
                     );
+                    tracing::warn!("补货:订单 {} 对账结果未知,保持在途", o.client_order_id);
                 }
             }
         }
@@ -929,6 +1573,44 @@ impl Engine {
     }
 }
 
+/// 落库用的 key 串列表(订单 `keys_json` 只记 key 本身)。
+pub fn key_strings(keys: &[BoughtKey]) -> Vec<String> {
+    keys.iter().map(|k| k.api_key.clone()).collect()
+}
+
+/// 上号用的导入载荷。**纯函数,可直接测。**
+///
+/// ⚠️ **必须是对象数组,不能是裸串数组。** 这是整个 P1 的要害:
+///
+/// | 形态 | import 走的路 | extra 里有 region 吗 |
+/// |---|---|---|
+/// | `["ksk_a"]` | `map_account` → `map_api_key(s, None)` | **没有** |
+/// | `[{"api_key":"ksk_a","region":"eu-central-1"}]` | `map_account` → `map_flat` → `map_api_key(key, Some(acc))` | **有** |
+///
+/// 而 region 缺失时 `gw_kiro` 一律按 `us-east-1` 发包,欧洲区的号会**每个请求都 403**
+/// (依据见 [`BoughtKey`])。
+///
+/// **对 drop 的号逐字节等价**:两条路的 `account_id` 派生完全相同
+/// (无 email 时都是 `kiro-apikey-{sha256(key)[..12]}`,见 `import.rs:292`),
+/// 而空的 `region` / `subscription_title` 这里直接**不写进对象** —— import 侧对这两个字段
+/// 用的是 `filter(|s| !s.is_empty())`,写空串与不写等效,但不写能让日志和排障时
+/// 一眼看出「这家没给区域」而不是「区域是空的」。
+pub fn import_payload(keys: &[BoughtKey]) -> Vec<serde_json::Value> {
+    keys.iter()
+        .map(|k| {
+            let mut o = serde_json::Map::new();
+            o.insert("api_key".into(), serde_json::json!(k.api_key));
+            if !k.region.is_empty() {
+                o.insert("region".into(), serde_json::json!(k.region));
+            }
+            if !k.subscription_title.is_empty() {
+                o.insert("subscription_title".into(), serde_json::json!(k.subscription_title));
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect()
+}
+
 /// 把各 worker `/health` 的响应体摊平成 [`RuntimeRow`],并判定「运行态是否可用」。
 /// **纯函数,可直接测。**
 ///
@@ -1009,6 +1691,335 @@ mod tests {
     /// 全部号都是「很久以前建的」,以便默认落在宽限期之外。
     fn born_long_ago(ids: &[&str]) -> HashMap<String, i64> {
         ids.iter().map(|i| ((*i).to_string(), NOW - 10_000)).collect()
+    }
+
+    // ───────────────────── 选家:多供应商唯一花钱的判断 ─────────────────────
+
+    /// 2026-08-05 实测的两家真实报价。drop 只有一个货架,kiroapp 分 us / eu。
+    fn two_suppliers(drop_stock: i64, eu_stock: i64, us_stock: i64) -> Vec<Survey> {
+        vec![
+            Survey {
+                supplier_id: "drop".into(),
+                balance_cny: 123.29,
+                balance_native: String::new(),
+                shelves: vec![Shelf {
+                    supplier_id: "drop".into(),
+                    shelf_id: String::new(),
+                    account_region: String::new(),
+                    stock: drop_stock,
+                    unit_price_cny: 20.95, // $2.91 × 7.2
+                    max_per_order: 10,
+                    priority: 0,
+                }],
+            },
+            Survey {
+                supplier_id: "kiroapp".into(),
+                balance_cny: 699.4,
+                balance_native: "680 积分".into(),
+                shelves: vec![
+                    Shelf {
+                        supplier_id: "kiroapp".into(),
+                        shelf_id: "eu".into(),
+                        account_region: "eu-central-1".into(),
+                        stock: eu_stock,
+                        unit_price_cny: 15.43, // 15 积分 ÷ 7 × 7.2
+                        max_per_order: 10,
+                        priority: 0,
+                    },
+                    Shelf {
+                        supplier_id: "kiroapp".into(),
+                        shelf_id: "us".into(),
+                        account_region: "us-east-1".into(),
+                        stock: us_stock,
+                        unit_price_cny: 30.86, // 30 积分,贵 47%
+                        max_per_order: 10,
+                        priority: 0,
+                    },
+                ],
+            },
+        ]
+    }
+
+    /// 同样两家,但盖上生产打算用的档位:drop 0 / kiroapp-us 1 / kiroapp-eu 2。
+    /// 模拟 [`Engine::survey_all`] 回填后的形态。
+    fn two_suppliers_tiered(drop_stock: i64, eu_stock: i64, us_stock: i64) -> Vec<Survey> {
+        let mut v = two_suppliers(drop_stock, eu_stock, us_stock);
+        for s in &mut v {
+            for sh in &mut s.shelves {
+                sh.priority = match (s.supplier_id.as_str(), sh.shelf_id.as_str()) {
+                    ("kiroapp", "eu") => 2,
+                    ("kiroapp", _) => 1,
+                    _ => 0,
+                };
+            }
+        }
+        v
+    }
+
+    /// 需求足够高,让单位成本闸不参与判断(它是另一条测试线的事)。
+    fn busy() -> Params {
+        Params::default()
+    }
+
+    /// 没有配置任何单家日上限。
+    fn no_caps() -> HashMap<String, (f64, f64)> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn 选中能买的里面最便宜的那个() {
+        let d = choose_shelf(&busy(), &two_suppliers(5, 18, 3), &HashMap::new(), &no_caps(), 0.0, 1800.0, false)
+            .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/eu", "EU ¥15.43 比 drop ¥20.95 便宜");
+        assert_eq!(d.shelf.account_region, "eu-central-1", "区域必须跟着货架走到订单上");
+        assert_eq!(d.count, 1);
+    }
+
+    #[test]
+    fn 便宜那家没货就落到贵的那家而不是不买() {
+        // **这才是接第二家的真正理由。** 近 7 天 drop 有 854 轮「就差有货」,
+        // 那些轮里流量全落到贵号池。此处 EU 没货 → 必须自动换 drop,而不是空手而归。
+        let d =
+            choose_shelf(&busy(), &two_suppliers(5, 0, 0), &HashMap::new(), &no_caps(), 0.0, 1800.0, false)
+                .unwrap();
+        assert_eq!(d.shelf.label(), "drop");
+    }
+
+    // ── 档位:让「便宜但号会被封」不再自动获胜 ──
+
+    #[test]
+    fn 配了档位后首选家有货就买首选家哪怕它更贵() {
+        // 生产口径:drop ¥20.95 档 0,kiroapp/eu ¥15.43 档 2。
+        // 纯比价会选 EU;配了档位必须选 drop —— 这就是这次改动要的行为。
+        let d = choose_shelf(
+            &busy(),
+            &two_suppliers_tiered(5, 18, 3),
+            &HashMap::new(),
+            &no_caps(),
+            0.0,
+            1800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.shelf.label(), "drop");
+        assert_eq!(d.shelf.account_region, "", "drop 不带区域,走上游默认 us-east-1");
+    }
+
+    #[test]
+    fn 首选家没货时按档位落到次选而不是落到最便宜() {
+        // drop 常年 0 库存,所以这条路径才是**生产上的常态**:
+        // 落下去之后要落到 kiroapp/us(档 1),不是更便宜的 kiroapp/eu(档 2)。
+        let d = choose_shelf(
+            &busy(),
+            &two_suppliers_tiered(0, 18, 3),
+            &HashMap::new(),
+            &no_caps(),
+            0.0,
+            1800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/us", "档位比价格优先");
+        assert_eq!(d.shelf.account_region, "us-east-1");
+    }
+
+    #[test]
+    fn 只剩末档有货时仍然买而不是宁缺毋滥() {
+        // 档位是**软优先**。末档再不受待见,也好过池子空掉 ——
+        // 断供的代价(客户报障)远高于买到一个可能被封的号。
+        let d = choose_shelf(
+            &busy(),
+            &two_suppliers_tiered(0, 18, 0),
+            &HashMap::new(),
+            &no_caps(),
+            0.0,
+            1800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/eu");
+    }
+
+    #[test]
+    fn 首选家被熔断时档位不会把补货一起锁死() {
+        // 熔断与档位是两条正交的闸。首选家熔断 → 照样往下落,而不是「首选家不可用就不买」。
+        let blocked: HashMap<String, String> =
+            [("drop".to_string(), "已熔断: 连续 2 次失败".to_string())].into();
+        let d = choose_shelf(
+            &busy(),
+            &two_suppliers_tiered(5, 18, 3),
+            &blocked,
+            &no_caps(),
+            0.0,
+            1800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/us");
+    }
+
+    #[test]
+    fn 首选家有货但过不了花钱闸门时照样落到下一档() {
+        // 「缺货才落档」只是软优先的一半,而且是生产上更少见的那一半。
+        // 更常见的是**有货但买不起**:首选家余额见底、或本家日上限到顶。
+        // 这条路径走的是 choose_shelf 里的 continue,rank_shelves 的测试覆盖不到。
+        let caps: HashMap<String, (f64, f64)> =
+            [("drop".to_string(), (19.0, 30.0))].into(); // 已花 ¥19 / 上限 ¥30,一单 ¥20.95 会突破
+        let d = choose_shelf(
+            &busy(),
+            &two_suppliers_tiered(5, 18, 3),
+            &HashMap::new(),
+            &caps,
+            0.0,
+            1800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/us", "档 0 超本家上限 → 落到档 1,不是落到最便宜的档 2");
+
+        // 余额不足同理:把 drop 的余额压到一单都不够。
+        let mut sv = two_suppliers_tiered(5, 18, 3);
+        sv[0].balance_cny = 1.0;
+        let d = choose_shelf(&busy(), &sv, &HashMap::new(), &no_caps(), 0.0, 1800.0, false).unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/us");
+    }
+
+    #[test]
+    fn 档位全缺省时与引入档位前选同一个货架() {
+        // 回滚安全:名册没配 priority → 全 0 → 必须仍然选最便宜的 kiroapp/eu。
+        let plain = choose_shelf(
+            &busy(),
+            &two_suppliers(5, 18, 3),
+            &HashMap::new(),
+            &no_caps(),
+            0.0,
+            1800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plain.shelf.label(), "kiroapp/eu");
+    }
+
+    #[test]
+    fn 全都没货时说得出是哪一种没有() {
+        let e = choose_shelf(&busy(), &two_suppliers(0, 0, 0), &HashMap::new(), &no_caps(), 0.0, 1800.0, false)
+            .unwrap_err();
+        assert!(e.contains("没有库存"), "面板要答得出「为什么没买」,实际: {e}");
+    }
+
+    #[test]
+    fn 某家熔断只跳过这一家() {
+        // 熔断 kiroapp 不该让 drop 也停 —— 那正是多供应商要消除的断供,
+        // 用一个全局开关反手制造出来。
+        let blocked: HashMap<String, String> =
+            [("kiroapp".to_string(), "已熔断: 连续 2 次失败".to_string())].into();
+        let d = choose_shelf(&busy(), &two_suppliers(5, 18, 3), &blocked, &no_caps(), 0.0, 1800.0, false)
+            .unwrap();
+        assert_eq!(d.shelf.label(), "drop", "被熔断的那家跳过,别家照买");
+
+        // 两家都被挡住时,理由里要点名到货架,不能只说一句「没有合适的货源」。
+        let all: HashMap<String, String> = [
+            ("kiroapp".to_string(), "已熔断".to_string()),
+            ("drop".to_string(), "本家今日已花 ¥50 达上限".to_string()),
+        ]
+        .into();
+        let e =
+            choose_shelf(&busy(), &two_suppliers(5, 18, 3), &all, &no_caps(), 0.0, 1800.0, false).unwrap_err();
+        assert!(e.contains("kiroapp/eu") && e.contains("drop"), "实际: {e}");
+    }
+
+    #[test]
+    fn 余额不足的那家会被跳过而不是让整轮失败() {
+        let mut sv = two_suppliers(5, 18, 3);
+        sv[1].balance_cny = 1.0; // kiroapp 钱包见底
+        let d = choose_shelf(&busy(), &sv, &HashMap::new(), &no_caps(), 0.0, 1800.0, false).unwrap();
+        assert_eq!(d.shelf.label(), "drop");
+    }
+
+    #[test]
+    fn 日上限只卡到会突破的那一单不会连累便宜货架() {
+        let p = busy(); // daily_cap 默认 200
+        // 已花 ¥180:EU 的 ¥15.43 还塞得下(195.43),drop 的 ¥20.95 塞不下(200.95)。
+        let d = choose_shelf(&p, &two_suppliers(5, 18, 3), &HashMap::new(), &no_caps(), 180.0, 1800.0, false)
+            .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/eu");
+        // 已花 ¥199:两个都塞不下 → 不买,且理由里带得出数字。
+        let e = choose_shelf(&p, &two_suppliers(5, 18, 3), &HashMap::new(), &no_caps(), 199.0, 1800.0, false)
+            .unwrap_err();
+        assert!(e.contains("日上限"), "实际: {e}");
+    }
+
+    #[test]
+    fn 单家日上限必须把本单算进去否则形同虚设() {
+        // 审查发现的真 bug:原先只在「已花 >= 上限」时屏蔽这家,于是
+        // 上限 ¥20、已花 ¥19 时它看着还没到顶,一单 ¥15.43 下去就是 ¥34.43。
+        // 单家上限存在的全部意义就是限制一家能从我这里拿走多少钱,拦不住就没意义。
+        let caps: HashMap<String, (f64, f64)> = [("kiroapp".to_string(), (19.0, 20.0))].into();
+        let d = choose_shelf(&busy(), &two_suppliers(5, 18, 3), &HashMap::new(), &caps, 0.0, 1800.0, false)
+            .unwrap();
+        assert_eq!(d.shelf.label(), "drop", "kiroapp 会超本家上限,应换 drop 而不是照买");
+
+        // 塞得下就照买,别过度保守。
+        let ok: HashMap<String, (f64, f64)> = [("kiroapp".to_string(), (19.0, 100.0))].into();
+        assert_eq!(
+            choose_shelf(&busy(), &two_suppliers(5, 18, 3), &HashMap::new(), &ok, 0.0, 1800.0, false)
+                .unwrap()
+                .shelf
+                .label(),
+            "kiroapp/eu"
+        );
+
+        // 读不出这家已花多少时,`supplier_caps` 会填 INFINITY —— 必须表现为不买(fail-closed)。
+        let broken: HashMap<String, (f64, f64)> =
+            [("kiroapp".to_string(), (f64::INFINITY, 20.0))].into();
+        assert_eq!(
+            choose_shelf(&busy(), &two_suppliers(5, 18, 3), &HashMap::new(), &broken, 0.0, 1800.0, false)
+                .unwrap()
+                .shelf
+                .label(),
+            "drop"
+        );
+    }
+
+    #[test]
+    fn 单价上限按cny口径比较不会因为单位混用而误判() {
+        let mut p = busy();
+        // 上限 $2.50 → ¥18.00。EU(¥15.43)过,drop(¥20.95)不过。
+        p.max_price_usd = 2.5;
+        let d = choose_shelf(&p, &two_suppliers(5, 18, 0), &HashMap::new(), &no_caps(), 0.0, 1800.0, false)
+            .unwrap();
+        assert_eq!(d.shelf.label(), "kiroapp/eu");
+        // 上限压到 $2.00 → ¥14.40,两个都不过。
+        p.max_price_usd = 2.0;
+        assert!(choose_shelf(&p, &two_suppliers(5, 18, 0), &HashMap::new(), &no_caps(), 0.0, 1800.0, false)
+            .is_err());
+    }
+
+    #[test]
+    fn 需求撑不起时两家都不买而force能越过() {
+        let p = busy(); // max_unit_cost 默认 0.04 ¥/积分
+        // 凌晨:100 分/时 × 45 分钟 ≈ 75 分产出,¥15.43 → ¥0.2/分,远超上限。
+        let e = choose_shelf(&p, &two_suppliers(5, 18, 3), &HashMap::new(), &no_caps(), 0.0, 100.0, false)
+            .unwrap_err();
+        assert!(e.contains("需求撑不起"), "实际: {e}");
+        // 人在面板上点「立即补一个」时,这道**自动化**闸门可以越过。
+        assert!(choose_shelf(&p, &two_suppliers(5, 18, 3), &HashMap::new(), &no_caps(), 0.0, 100.0, true)
+            .is_ok());
+    }
+
+    #[test]
+    fn 单笔数量取我方意愿与对方上限的较小者() {
+        let mut p = busy();
+        p.max_per_purchase = 10;
+        p.daily_cap_cny = 100_000.0;
+        let mut sv = two_suppliers(0, 18, 0);
+        sv[1].shelves[0].max_per_order = 3;
+        // ⚠️ 对方的上限**不能靠它自己执行**:2026-08-05 实测 kiroapp 对超限 count 是
+        // clamp 并成交(发 99 买走 10 个、扣 150 积分)。必须我方先夹好再发。
+        assert_eq!(choose_shelf(&p, &sv, &HashMap::new(), &no_caps(), 0.0, 1800.0, false).unwrap().count, 3);
+        // 库存比两者都小时以库存为准。
+        sv[1].shelves[0].stock = 2;
+        assert_eq!(choose_shelf(&p, &sv, &HashMap::new(), &no_caps(), 0.0, 1800.0, false).unwrap().count, 2);
     }
 
     #[test]
@@ -1199,5 +2210,86 @@ mod tests {
         let demand = 700.0;
         assert!(unit_cost_veto(&p, 21.24, demand).is_some(), "$2.95 时这个需求不划算");
         assert!(unit_cost_veto(&p, 15.84, demand).is_none(), "$2.20 时同样的需求就划算了");
+    }
+
+    // ───────────── 上号载荷:region 贯通 ─────────────
+
+    fn bought(api_key: &str, region: &str) -> BoughtKey {
+        BoughtKey {
+            api_key: api_key.into(),
+            region: region.into(),
+            subscription_title: String::new(),
+        }
+    }
+
+    type IdAndExtra = (String, serde_json::Map<String, serde_json::Value>);
+
+    /// 把导入载荷真正喂给 `gw_kiro::import`,断言 extra 的最终形态。
+    fn imported_extra(keys: &[BoughtKey]) -> Vec<IdAndExtra> {
+        let json = serde_json::to_string(&import_payload(keys)).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&json).unwrap();
+        gw_kiro::import::parse_accounts_export(&root)
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.account_id, a.extra))
+            .collect()
+    }
+
+    #[test]
+    fn 区域必须落到extra否则欧洲区的号每个请求都403() {
+        let got = imported_extra(&[bought("ksk_eu1", "eu-central-1")]);
+        assert_eq!(got.len(), 1);
+        let (_, extra) = &got[0];
+        assert_eq!(
+            extra.get("region").and_then(|v| v.as_str()),
+            Some("eu-central-1"),
+            "region 丢了 → gw_kiro 按默认 us-east-1 发包 → 实测 403 Invalid token"
+        );
+        assert_eq!(extra.get("kiro_api_key").and_then(|v| v.as_str()), Some("ksk_eu1"));
+        assert_eq!(extra.get("auth_method").and_then(|v| v.as_str()), Some("api_key"));
+    }
+
+    #[test]
+    fn 无区域时与改动前的裸串路径逐字节等价() {
+        // P1 敢单独上线的**全部依据**:drop 的号(不带 region)经过新载荷之后,
+        // account_id 与 extra 必须与旧的裸串数组路径一模一样。
+        let old: serde_json::Value = serde_json::from_str(r#"["ksk_a","ksk_b"]"#).unwrap();
+        let old_out: Vec<_> = gw_kiro::import::parse_accounts_export(&old)
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.account_id, a.extra))
+            .collect();
+
+        let new_out = imported_extra(&[bought("ksk_a", ""), bought("ksk_b", "")]);
+
+        assert_eq!(new_out, old_out, "对 drop 的号必须零行为差异");
+        // 顺带钉死 account_id 的派生没变(它是账号的稳定身份,变了等于全量重建号)。
+        assert!(new_out[0].0.starts_with("kiro-apikey-"), "实际 {}", new_out[0].0);
+        assert!(!new_out[0].1.contains_key("region"), "空 region 不该写进 extra");
+    }
+
+    #[test]
+    fn 档位标签非空才写入() {
+        let with = BoughtKey {
+            api_key: "ksk_p".into(),
+            region: String::new(),
+            subscription_title: "KIRO POWER".into(),
+        };
+        let got = imported_extra(&[with]);
+        assert_eq!(
+            got[0].1.get("subscription_title").and_then(|v| v.as_str()),
+            Some("KIRO POWER")
+        );
+        // 空的不写:写空串虽然 import 侧也会过滤,但留空能让排障时一眼看出
+        // 「这家没给档位」而不是「档位是空的」。
+        let payload = import_payload(&[bought("ksk_q", "")]);
+        assert!(!payload[0].as_object().unwrap().contains_key("subscription_title"));
+        assert!(!payload[0].as_object().unwrap().contains_key("region"));
+    }
+
+    #[test]
+    fn 落库只记key串() {
+        let ks = [bought("ksk_a", "eu-central-1"), bought("ksk_b", "")];
+        assert_eq!(key_strings(&ks), vec!["ksk_a".to_string(), "ksk_b".to_string()]);
     }
 }

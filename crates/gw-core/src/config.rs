@@ -519,6 +519,36 @@ pub struct SchedulerConfig {
     /// 若日后真的观察到 suspend 增多,把它调回 10 左右即可恢复熔断(热调,不用重启)。
     #[serde(default = "default_rate_limit_pace_max_strikes")]
     pub rate_limit_pace_max_strikes: u32,
+    /// **降层前为高优先层等待**的最长毫秒数。`0` = 关闭(与本开关引入前逐字节等价)。
+    ///
+    /// 背景(2026-08-04):自购速刷号挂在组内最高优先层,单号被 429 节流的那几百毫秒里,
+    /// `eligible_ids` 会把它剔出合格集,请求于是**立刻降到低优先层的兜底号**。实测一个
+    /// 30 分钟窗口:速刷号吃 1082 个请求,兜底号吃 169 个,而这 169 个与 429 次数分钟级
+    /// 近乎 1:1 —— 零 429 的 13 分钟里兜底号精确为 0。这不是容量问题(在途并发 4–13,
+    /// 上限 100),纯粹是「不肯等 250ms」。
+    ///
+    /// 开启后:若更高优先层存在**仅因 429 节流**而暂不可选的号,就在预算内等它回来,
+    /// 而不是降层。等待发生在**响应开始之前**,客户端只是变慢、不会看到半截流;顺带
+    /// 保住 prompt 缓存亲和(换号意味着 cache_read 全部重算)。
+    ///
+    /// ⚠️ **只等节流,不等冷却**:禁用/冷却态的号由 [`Self::queue_wait_ms`] 负责,两者
+    /// 职责不重叠。预算用尽一律降层兜底,**绝不因此把错误抛给客户**。
+    #[serde(default = "default_tier_hold_ms")]
+    pub tier_hold_ms: u64,
+    /// **请求级窗口**:一个请求开始后多少毫秒内,它的取号还允许触发上面的等待。
+    /// 超出即照常降层。`0` = 关闭。
+    ///
+    /// 为什么必须封顶:`switch_cap(RateLimited)` 是 `total`(全组),配 180s 的请求级
+    /// 总时限,若不封,一个持续撞 429 的请求能在同一个高优先号上来回弹几百次 ——
+    /// 把「省钱」变成「客户干等」。窗口远小于 180s,等待也就不可能把响应推到那条硬线附近。
+    ///
+    /// ⚠️ 为什么是**时间窗口**而不是「等几轮」:换号重试的轮数计数器
+    /// (`worker::messages` 的 `attempts`)对**所有**失败类别共用 —— 凭证刷新失败、
+    /// `ModelNotAvailable` 都会消耗它。拿它当等待额度,会出现「前两轮被无关错误吃掉,
+    /// 真撞上 429 时反而不许等」的反直觉行为,而这正是本开关要治的病。时间窗口只
+    /// 依赖墙上时钟,不受失败类别干扰。
+    #[serde(default = "default_tier_hold_window_ms")]
+    pub tier_hold_window_ms: u64,
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
@@ -533,6 +563,13 @@ fn default_rate_limit_pace_ms() -> u64 {
     0
 }
 fn default_rate_limit_pace_max_strikes() -> u32 {
+    0
+}
+/// 降层前等待默认**关闭**(0 = 节流即降层,与开关引入前逐字节等价)。
+fn default_tier_hold_ms() -> u64 {
+    0
+}
+fn default_tier_hold_window_ms() -> u64 {
     0
 }
 fn default_suspended_cooldown_secs() -> u64 {
@@ -575,6 +612,8 @@ impl Default for SchedulerConfig {
             queue_wait_ms: default_queue_wait_ms(),
             rate_limit_pace_ms: default_rate_limit_pace_ms(),
             rate_limit_pace_max_strikes: default_rate_limit_pace_max_strikes(),
+            tier_hold_ms: default_tier_hold_ms(),
+            tier_hold_window_ms: default_tier_hold_window_ms(),
         }
     }
 }
@@ -720,6 +759,13 @@ pub struct SystemSettings {
     /// 节流熔断阈值。详见 [`SchedulerConfig::rate_limit_pace_max_strikes`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_pace_max_strikes: Option<u32>,
+    /// 降层前为高优先层等待的最长毫秒(None = 用 yaml 基线;0 = 关闭)。
+    /// 详见 [`SchedulerConfig::tier_hold_ms`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_hold_ms: Option<u64>,
+    /// 请求级等待窗口(毫秒)。详见 [`SchedulerConfig::tier_hold_window_ms`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_hold_window_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_ttl_secs: Option<u64>,
     /// worker 后台配额轮询热开关(None = 用 yaml 基线默认 true)。
@@ -797,6 +843,8 @@ impl SystemSettings {
         if let Some(v) = self.queue_wait_ms { base.scheduler.queue_wait_ms = v; }
         if let Some(v) = self.rate_limit_pace_ms { base.scheduler.rate_limit_pace_ms = v; }
         if let Some(v) = self.rate_limit_pace_max_strikes { base.scheduler.rate_limit_pace_max_strikes = v; }
+        if let Some(v) = self.tier_hold_ms { base.scheduler.tier_hold_ms = v; }
+        if let Some(v) = self.tier_hold_window_ms { base.scheduler.tier_hold_window_ms = v; }
         if let Some(v) = self.affinity_ttl_secs { base.scheduler.affinity_ttl_secs = v; }
         if let Some(v) = self.quota_poll_enabled { base.scheduler.quota_poll_enabled = v; }
         if let Some(v) = self.image_enabled { base.image.enabled = v; }
@@ -835,6 +883,8 @@ impl SystemSettings {
             queue_wait_ms: Some(cfg.scheduler.queue_wait_ms),
             rate_limit_pace_ms: Some(cfg.scheduler.rate_limit_pace_ms),
             rate_limit_pace_max_strikes: Some(cfg.scheduler.rate_limit_pace_max_strikes),
+            tier_hold_ms: Some(cfg.scheduler.tier_hold_ms),
+            tier_hold_window_ms: Some(cfg.scheduler.tier_hold_window_ms),
             affinity_ttl_secs: Some(cfg.scheduler.affinity_ttl_secs),
             quota_poll_enabled: Some(cfg.scheduler.quota_poll_enabled),
             image_enabled: Some(cfg.image.enabled),

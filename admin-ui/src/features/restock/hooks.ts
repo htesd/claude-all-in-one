@@ -8,10 +8,12 @@ import {
   fetchRestockCredits,
   fetchRestockParams,
   fetchRestockState,
+  fetchSuppliers,
   resetBreaker,
   updateRestockParams,
+  updateSuppliers,
 } from './api'
-import type { RestockParams } from './types'
+import type { RestockParams, SupplierPatch } from './types'
 
 /** 实况。15s 轮询，与账号运行态同一节奏。 */
 export function useRestockState() {
@@ -34,6 +36,25 @@ export function useUpdateRestockParams() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (patch: Partial<RestockParams>) => updateRestockParams(patch),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.restock.root })
+    },
+  })
+}
+
+/** 货源名册。改动不频繁，跟着实况一起刷新即可，不单独轮询。 */
+export function useSuppliers() {
+  return useQuery({
+    queryKey: queryKeys.restock.suppliers(),
+    queryFn: fetchSuppliers,
+  })
+}
+
+/** 改名册；成功后整域 invalidate（实况卡里的逐家视图要立刻跟上）。 */
+export function useUpdateSuppliers() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (items: SupplierPatch[]) => updateSuppliers(items),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.restock.root })
     },

@@ -15,6 +15,7 @@ path = "src/main.rs"
 embed-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
+async-trait.workspace = true
 gw-core.workspace = true
 gw-kiro.workspace = true
 gw-store.workspace = true

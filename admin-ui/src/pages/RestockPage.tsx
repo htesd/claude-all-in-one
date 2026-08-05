@@ -16,6 +16,7 @@ import { ErrorNote } from '@/components/ui/error-note'
 import { Segment } from '@/components/ui/segment'
 import { StatCard } from '@/components/ui/stat-card'
 import { CreditCharts } from '@/features/restock/components/CreditCharts'
+import { SuppliersCard } from '@/features/restock/components/SuppliersCard'
 import {
   useBuyNow,
   useRestockAccounts,
@@ -53,6 +54,7 @@ export default function RestockPage() {
 
   const off = credits?.utc_offset_minutes ?? 480
   const snap = state?.snapshot ?? {}
+  const suppliers = snap.suppliers ?? []
   const banners: { tone: 'warn' | 'bad'; text: string }[] = []
   if (state) {
     if (!state.configured) banners.push({ tone: 'warn', text: t('restock.notConfigured') })
@@ -65,6 +67,14 @@ export default function RestockPage() {
         text: `${t('restock.banner.orphan')}（${state.orphan_orders}）`,
       })
     if (snap.any_online === false) banners.push({ tone: 'bad', text: t('restock.banner.offline') })
+    // 逐家的问题要单独说出来。合并成一句「上游异常」的话，两家里坏了一家时
+    // 面板看起来和全好一样 —— 而那正是最该被看见的状态。
+    for (const s of suppliers) {
+      if (!s.enabled) continue
+      if (!s.configured) banners.push({ tone: 'bad', text: `货源 ${s.id} 缺密钥，未参与补货` })
+      else if (s.blocked) banners.push({ tone: 'bad', text: `货源 ${s.id} ${s.blocked}` })
+      else if (s.error) banners.push({ tone: 'warn', text: `货源 ${s.id} 询价失败：${s.error}` })
+    }
     if (!state.in_peak) banners.push({ tone: 'warn', text: t('restock.banner.outOfWindow') })
     if ((snap.zombie ?? 0) > 0)
       banners.push({ tone: 'warn', text: `${t('restock.banner.zombie')}（${snap.zombie}）` })
@@ -133,20 +143,44 @@ export default function RestockPage() {
             params?.values.max_unit_cost_cny_per_credit ?? '—'
           }`}
         />
+        {/* 多供应商之后,「库存/单价」问的是**下一单会买的那个货架**(档位优先、同档比价),
+            不是某一家的属性、也不一定是最便宜的那个。副标题必须点名是哪个货架 ——
+            不然看到数字变了会以为是同一家在涨价。 */}
         <StatCard
           icon={ShoppingCart}
           label={t('restock.stat.stock')}
           value={snap.stock != null ? String(snap.stock) : '—'}
+          sub={snap.best_shelf ? `首选货架 ${snap.best_shelf}` : '全部货源'}
         />
         <StatCard
           icon={Coins}
           label={t('restock.stat.price')}
-          value={snap.price_usd != null ? `$${snap.price_usd.toFixed(2)}` : '—'}
+          value={
+            snap.price_cny != null
+              ? `¥${snap.price_cny.toFixed(2)}`
+              : snap.price_usd != null
+                ? `$${snap.price_usd.toFixed(2)}`
+                : '—'
+          }
+          sub={snap.best_shelf ?? undefined}
         />
+        {/* 余额显示**全池合计** —— 只显示一家的话,那家充足、另一家见底导致
+            买不到号时,面板上会一切正常。逐家明细在下面的货源卡里。 */}
         <StatCard
           icon={Wallet}
           label={t('restock.stat.balance')}
-          value={snap.balance_cny != null ? `¥${snap.balance_cny.toFixed(0)}` : '—'}
+          value={
+            snap.balance_total_cny != null
+              ? `¥${snap.balance_total_cny.toFixed(0)}`
+              : snap.balance_cny != null
+                ? `¥${snap.balance_cny.toFixed(0)}`
+                : '—'
+          }
+          sub={
+            suppliers.length > 1
+              ? `${suppliers.length} 家合计`
+              : suppliers[0]?.balance_native || undefined
+          }
         />
         <StatCard
           icon={Wallet}
@@ -177,6 +211,12 @@ export default function RestockPage() {
           {t('restock.lifetime.hint')}
         </p>
       )}
+
+      <SuppliersCard
+        views={suppliers}
+        nextPick={snap.next_pick}
+        nextPickWhy={snap.next_pick_why}
+      />
 
       <Card>
         <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-3">

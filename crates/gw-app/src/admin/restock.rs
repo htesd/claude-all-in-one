@@ -22,12 +22,13 @@ use gw_store::SqliteStore;
 
 use super::{internal_error, AdminState};
 use crate::restock::engine::{self, Engine};
-use crate::restock::{forecast, params};
+use crate::restock::{forecast, params, registry};
 
 pub fn router() -> Router<AdminState> {
     Router::new()
         .route("/restock/state", get(state))
         .route("/restock/params", get(get_params).put(put_params))
+        .route("/restock/suppliers", get(get_suppliers).put(put_suppliers))
         .route("/restock/credits", get(credits))
         .route("/restock/accounts", get(accounts))
         .route("/restock/buy-now", post(buy_now))
@@ -56,20 +57,28 @@ fn not_configured() -> axum::response::Response {
 /// 低频操作,不值得为它引一层共享状态。
 fn engine_of(st: &AdminState) -> Option<Engine> {
     let cfg = &st.yaml_config.restock;
-    if !cfg.is_configured() {
+    if !cfg.enabled {
         return None;
     }
-    let drop = crate::restock::drop::DropClient::new(cfg.base_url(), &cfg.api_key).ok()?;
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()?;
-    Some(Engine {
-        store: st.store.clone(),
-        drop,
-        workers: std::sync::Arc::new((*st.workers).clone()),
+    Some(Engine::build(
+        st.store.clone(),
+        cfg,
+        std::sync::Arc::new((*st.workers).clone()),
         http,
-    })
+        // 管理面每次操作都是一个**独立的执行体**,必须有自己的 holder 身份 ——
+        // 花钱锁靠它把「手动购买」和「后台循环」区分开并互斥。
+        // 借用后台循环那个 id 会让两者互相认作自己人,锁形同虚设。
+        format!("admin-{}", uuid::Uuid::new_v4()),
+    ))
+}
+
+fn read_roster(st: &AdminState) -> Vec<registry::SupplierCfg> {
+    let raw = st.store.get_kv(registry::KEY_SUPPLIERS).ok().flatten();
+    registry::parse_roster(raw.as_deref())
 }
 
 fn read_params(st: &AdminState) -> params::Params {
@@ -84,7 +93,10 @@ fn read_params(st: &AdminState) -> params::Params {
 // ───────────────────────── 实况 ─────────────────────────
 
 async fn state(State(st): State<AdminState>) -> axum::response::Response {
-    let configured = st.yaml_config.restock.is_configured();
+    // 「配好了吗」= 这个二进制允许参与,**且名册上至少有一家拿得出密钥**。
+    // 只看 yaml 的 drop 密钥会让「只配了 kiroapp」的部署被面板判成未配置。
+    let configured = st.yaml_config.restock.enabled
+        && registry::usable_count(&read_roster(&st), &st.yaml_config.restock.api_key) > 0;
     let p = read_params(&st);
     let snap: serde_json::Value = st
         .store
@@ -101,6 +113,7 @@ async fn state(State(st): State<AdminState>) -> axum::response::Response {
         .unwrap_or((0.0, 0));
     let decisions = st.store.restock_recent_decisions(60).unwrap_or_default();
     let orphans = st.store.restock_orphan_orders().map(|v| v.len()).unwrap_or(0);
+    let in_flight = st.store.restock_pending_count().unwrap_or(0);
     let holder = st.store.restock_lease_holder().ok().flatten();
 
     Json(serde_json::json!({
@@ -116,6 +129,10 @@ async fn state(State(st): State<AdminState>) -> axum::response::Response {
         "bought_today": bought,
         // 「买到了 key 却没上号」——钱花了号没进系统,必须单独醒目地报出来。
         "orphan_orders": orphans,
+        // 「在途」——结果未知、正等对账重放确认的订单。与孤儿分开数:
+        // 孤儿要人工上号,在途的**不要人碰**,碰了就是重复扣款。
+        // 这个数长时间不降说明对账没在跑或对方一直确认不了,那才要人介入。
+        "in_flight_orders": in_flight,
         // 哪个进程在跑补货。生产上有多个 router,这个数能让人确认互斥真的生效了。
         "lease_holder": holder,
         "snapshot": snap,
@@ -138,7 +155,8 @@ async fn get_params(State(st): State<AdminState>) -> axum::response::Response {
         })
         .collect();
     Json(serde_json::json!({
-        "configured": st.yaml_config.restock.is_configured(),
+        "configured": st.yaml_config.restock.enabled
+            && registry::usable_count(&read_roster(&st), &st.yaml_config.restock.api_key) > 0,
         "spec": spec,
         "values": p,
     }))
@@ -197,6 +215,165 @@ async fn put_params(
         detail: String::new(),
     });
     Json(serde_json::json!({ "values": parsed })).into_response()
+}
+
+// ───────────────────────── 货源名册 ─────────────────────────
+
+/// 名册 + 每家的熔断状态。**响应里没有密钥**,只有 `has_key`。
+async fn get_suppliers(State(st): State<AdminState>) -> axum::response::Response {
+    let roster = read_roster(&st);
+    let items: Vec<serde_json::Value> = roster
+        .iter()
+        .map(|c| {
+            let mut v = c.redacted();
+            let breaker = st
+                .store
+                .get_kv(&registry::breaker_key(c.id.trim()))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            v["breaker"] = breaker.into();
+            v
+        })
+        .collect();
+    Json(serde_json::json!({ "items": items })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct PutSuppliersBody {
+    items: Vec<SupplierPatch>,
+}
+
+/// 一家的可写字段。`api_key` **缺省 = 保留原值**,这样面板改并发/上限时
+/// 不需要知道密钥,也不会像掩码方案那样把 `***` 当成真值存回去。
+#[derive(serde::Deserialize)]
+pub struct SupplierPatch {
+    id: String,
+    kind: String,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    daily_cap_cny: f64,
+    /// 档位,数值越小越优先。**缺省 = 保留原值**,与 `api_key` 同语义。
+    ///
+    /// ⚠️ 绝不能做成 `#[serde(default)] i64`(缺省 0)。这是整份替换的接口:
+    /// 部署瞬间浏览器里缓存着的旧版面板 JS 不认识这个字段,它保存一次名册
+    /// (哪怕只是想改个日上限)就会把**所有档位静默归零** —— 排序退回纯比价,
+    /// 也就是这次改动要消灭的行为被悄悄回滚,而只留下一条 warn 日志。
+    #[serde(default)]
+    priority: Option<i64>,
+    /// 逐货架档位覆盖(键是货架标识,如 `us` / `eu`)。**缺省 = 保留原值**,理由同上。
+    #[serde(default)]
+    shelf_priority: Option<std::collections::BTreeMap<String, i64>>,
+}
+
+/// 整份替换名册。校验通过才落库;**下一轮补货循环自动重建客户端,不用重启**。
+async fn put_suppliers(
+    State(st): State<AdminState>,
+    Json(body): Json<PutSuppliersBody>,
+) -> axum::response::Response {
+    let old = read_roster(&st);
+    let mut next = Vec::new();
+    for p in body.items {
+        // 同 id 的旧配置。缺省字段一律沿用它 —— 改名等于换一家,那种情况本来就该重填。
+        let prev = old.iter().find(|o| o.id.trim() == p.id.trim());
+        let api_key = match p.api_key {
+            Some(k) => k.trim().to_string(),
+            None => prev.map(|o| o.api_key.clone()).unwrap_or_default(),
+        };
+        let priority = p.priority.unwrap_or_else(|| prev.map(|o| o.priority).unwrap_or(0));
+        let shelf_priority = match p.shelf_priority {
+            // 货架键两端去空白:面板上手输的 " eu" 匹配不到任何货架,而那是**静默失效**。
+            // trim 后撞车(`eu` 与 ` eu` 同时存在)取后写入的那个 —— 面板产生不了这种输入,
+            // 手写 JSON 撞车时静默择一也好过整份名册被拒。
+            Some(m) => m.into_iter().map(|(k, v)| (k.trim().to_string(), v)).collect(),
+            None => prev.map(|o| o.shelf_priority.clone()).unwrap_or_default(),
+        };
+        next.push(registry::SupplierCfg {
+            id: p.id.trim().to_string(),
+            kind: p.kind.trim().to_string(),
+            enabled: p.enabled,
+            base_url: p.base_url.trim().to_string(),
+            api_key,
+            daily_cap_cny: p.daily_cap_cny,
+            priority,
+            shelf_priority,
+        });
+    }
+    if let Err(e) = registry::validate_roster(&next) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    // ── 在途订单的货源**不许被删掉或停用** ──
+    //
+    // 一张 pending 单的语义是「钱可能已经扣了,正等着向那一家确认」。把那一家从名册里
+    // 移走(删除、改名、或停用)之后,`reconcile_pending` 找不到客户端,只能记一条日志
+    // 然后永久跳过 —— 那笔钱和那批 key 就再也回不来了。
+    //
+    // 停用也拦:`registry::build` 只建 enabled 的家,停用与删除对对账是同一个后果。
+    // 想撤掉一家的正确顺序是:先等在途单收尾(或人工处理),再改名册。
+    let live: std::collections::HashSet<String> =
+        next.iter().filter(|c| c.enabled).map(|c| c.id.trim().to_string()).collect();
+    if let Ok(pending) = st.store.restock_pending_orders(0) {
+        let mut orphaned: Vec<String> = pending
+            .iter()
+            .map(|o| if o.supplier.is_empty() { "drop".to_string() } else { o.supplier.clone() })
+            .filter(|s| !live.contains(s))
+            .collect();
+        orphaned.sort();
+        orphaned.dedup();
+        if !orphaned.is_empty() {
+            return api_error(
+                StatusCode::CONFLICT,
+                &format!(
+                    "货源 {} 还有在途订单(钱可能已扣、正等对账),现在删除或停用会让那笔钱\
+                     再也找不回来。请先等在途订单收尾或人工处理,再改名册。",
+                    orphaned.join("、")
+                ),
+            );
+        }
+    }
+    let json = match serde_json::to_string(&next) {
+        Ok(j) => j,
+        Err(e) => return internal_error(e),
+    };
+    if let Err(e) = st.store.upsert_kv(registry::KEY_SUPPLIERS, &json) {
+        return internal_error(e);
+    }
+    // 档位进日志:选家规则改了之后,「为什么这轮买的是它」的第一手证据是名册,
+    // 而名册只在被改的这一刻留得下痕迹。
+    let names: Vec<String> = next
+        .iter()
+        .map(|c| {
+            let ov = if c.shelf_priority.is_empty() {
+                String::new()
+            } else {
+                let mut kv: Vec<String> =
+                    c.shelf_priority.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                kv.sort();
+                format!("[{}]", kv.join(","))
+            };
+            format!("{}@{}{ov}{}", c.id, c.priority, if c.enabled { "" } else { "(停用)" })
+        })
+        .collect();
+    tracing::warn!("补货:面板改货源名册 → {}", names.join(", "));
+    let _ = st.store.restock_log_decision(&gw_core::store::RestockDecision {
+        ts: engine::now_ts(),
+        action: "skip".into(),
+        reason: format!("面板改货源名册: {}", names.join(", ")),
+        healthy: None,
+        stock: None,
+        price_usd: None,
+        balance_cny: None,
+        detail: String::new(),
+    });
+    Json(serde_json::json!({
+        "items": next.iter().map(|c| c.redacted()).collect::<Vec<_>>()
+    }))
+    .into_response()
 }
 
 // ───────────────────────── 积分曲线 ─────────────────────────
@@ -391,16 +568,25 @@ async fn buy_now(State(st): State<AdminState>) -> axum::response::Response {
     .into_response()
 }
 
+/// 解除熔断。**一次清干净**:全局的那一个,加名册上每一家自己的。
+///
+/// 不做成「逐家解除」是因为这个按钮的语义是人已经看过原因、决定继续 ——
+/// 留着某一家还熔着,人会以为已经恢复了,然后对着「为什么还是不买」再查一遍。
 async fn reset_breaker(State(st): State<AdminState>) -> axum::response::Response {
     if let Err(e) = st.store.upsert_kv(engine::KEY_BREAKER, "") {
         return internal_error(e);
     }
     let _ = st.store.upsert_kv(engine::KEY_FAIL_STREAK, "0");
-    tracing::warn!("补货:面板解除熔断");
+    for c in read_roster(&st) {
+        let id = c.id.trim();
+        let _ = st.store.upsert_kv(&registry::breaker_key(id), "");
+        let _ = st.store.upsert_kv(&registry::fault_streak_key(id), "0");
+    }
+    tracing::warn!("补货:面板解除熔断(全局 + 各货源)");
     let _ = st.store.restock_log_decision(&gw_core::store::RestockDecision {
         ts: engine::now_ts(),
         action: "skip".into(),
-        reason: "面板操作: 熔断已解除".into(),
+        reason: "面板操作: 熔断已解除(全局与各货源)".into(),
         healthy: None,
         stock: None,
         price_usd: None,

@@ -6,6 +6,8 @@ import type {
   RestockParams,
   RestockParamsResponse,
   RestockState,
+  SupplierConfig,
+  SupplierPatch,
 } from './types'
 
 /** GET /admin/api/restock/state → 实况（开关、水位、库存余额、决策流水）。 */
@@ -25,6 +27,23 @@ export async function updateRestockParams(
   patch: Partial<RestockParams>,
 ): Promise<{ values: RestockParams }> {
   const response = await api.put<{ values: RestockParams }>('/restock/params', patch)
+  return response.data
+}
+
+/** GET /admin/api/restock/suppliers → 货源名册（**不含密钥**，只有 has_key）。 */
+export async function fetchSuppliers(): Promise<{ items: SupplierConfig[] }> {
+  const response = await api.get<{ items: SupplierConfig[] }>('/restock/suppliers')
+  return response.data
+}
+
+/**
+ * PUT /admin/api/restock/suppliers → 整份替换名册。
+ *
+ * 补货循环**下一轮自动重建客户端，不用重启** —— 断供时能立刻加一家，
+ * 而那正是多供应商最要紧的动作。
+ */
+export async function updateSuppliers(items: SupplierPatch[]): Promise<{ items: SupplierConfig[] }> {
+  const response = await api.put<{ items: SupplierConfig[] }>('/restock/suppliers', { items })
   return response.data
 }
 
