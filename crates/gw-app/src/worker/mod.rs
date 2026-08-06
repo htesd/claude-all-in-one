@@ -30,11 +30,69 @@ use crate::egress;
 use crate::registry::Registry;
 use scheduler::AccountScheduler;
 
+/// 设置热调链路的**可观测状态**:worker 此刻真正在用的值 + 最近一次同步的结果。
+///
+/// ## 为什么需要它
+///
+/// 热调链路有两处**静默**失败:overlay 解析失败会每 30s 跳过一轮并**永久**保持旧配置
+/// (只留一行 error 日志);本版本不认识的字段会被无声忽略(镜像比写库的那个旧时发生)。
+/// 两者在面板上与「保存成功」完全无法区分,于是「我改了没生效」变成一个查不下去的问题 ——
+/// 只能靠翻业务数据反推(如观察计费命中率有没有跳变),而那要等几分钟且需要有流量。
+///
+/// 把 worker **实际生效的值**回显出来,「没生效」与「生效了但我看早了」才分得开。
+#[derive(Clone, Default)]
+struct SettingsSync {
+    /// 最近一次**成功应用**的 unix 秒。0 = 启动后一次都没成功过。
+    applied_at: i64,
+    /// 最近一次同步的错误(空 = 正常)。非空时 [`Self::applied_at`] 停在上次成功的时刻,
+    /// 「现在 − applied_at」就是配置已经僵住多久 —— 这正是静默失效唯一的外部特征。
+    error: String,
+    /// 本版本不认识、已被忽略的 overlay 字段。非空 = 本进程镜像比写库的那个旧,
+    /// 表现为「别的设置都生效,就这一个不生效」。
+    unknown: Vec<String>,
+    /// worker **应用之后**在用的关键热调值(不是 DB 里存的那份)。
+    effective: serde_json::Value,
+    /// 本 worker 的 provider 是否真的热应用 **provider 级**设置(缓存计费/图像/实验开关)。
+    /// `false` 时 [`Self::effective`] 里那半边是「算得出但没生效」——必须让面板知道,
+    /// 否则它会对着一份从未应用的值报「一致」。scheduler 那半边不受影响,一直是热的。
+    provider_hot: bool,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// worker 此刻在用的**全部**热调值,键名与 `GET /settings` 的应然值逐字对齐。
+///
+/// 走 `SystemSettings::from_effective` 而不是手写字段清单,有三个理由:
+///
+/// 1. **手写清单会制造新的盲区**。漏掉的字段在面板上会得出「一致」这个错误结论,
+///    而漏掉的恰恰是没人想到的那个(对抗审查三个视角都点了这条)。
+/// 2. **键名天然对齐**。应然值就是同一个类型序列化出来的,前端逐键比对不需要映射表。
+/// 3. **`default_proxy` 传 `None`**:代理 URL 里可能带 `user:pass@`,而这份数据要经
+///    admin 上到浏览器。应然值那边有 `redact_proxy_url` 掩码,这边最省事也最稳的做法
+///    是**根本不回显它** —— 少一个字段,少一条泄漏路径。
+fn effective_view(eff: &gw_core::config::SystemConfig) -> serde_json::Value {
+    serde_json::to_value(gw_core::config::SystemSettings::from_effective(eff, None))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// 掉进面板的错误串要先脱敏:serde 的类型错误会把出错的**值**嵌进消息里,
+/// 而那个值可能是 `socks5://user:pass@host`(对抗审查 Architect#6)。
+fn redact_err(msg: &str) -> String {
+    crate::admin::redact_proxy_url(msg)
+}
+
 struct WorkerState {
     instance: u32,
     egress_desc: String,
     group: String,
     provider: Arc<dyn Provider>,
+    /// 设置热调的可观测状态,见 [`SettingsSync`]。`/health` 直接回显。
+    settings_sync: parking_lot::RwLock<SettingsSync>,
     /// 组内账号 v52 会话亲和调度器(选号 + 并发 + 冷却/禁用生命周期 + 凭证真值)。
     scheduler: AccountScheduler,
     /// per-account 刷新单飞锁:同一账号同时只允许一个 in-flight refresh(契约 H4)。
@@ -785,6 +843,10 @@ pub async fn run(
     // DB 设置 overlay:叠在 system.yaml 基线上得"有效配置"(热调首启即生效)。
     // default_proxy 单独取出注入 provider(出口选择,不属运行开关)。
     let mut effective_system = system.clone();
+    // 启动期这次解析的结果要**带到 /health 上**,不能只进日志:退回 YAML 基线是会打出
+    // 全量 503 的状态,而它原本的唯一痕迹是一行启动日志 —— 事后没人翻得到。
+    let mut initial_settings_error = String::new();
+    let mut initial_settings_unknown: Vec<String> = Vec::new();
     let initial_default_proxy: Option<String> = match store
         .as_ref()
         .and_then(|s| s.get_settings().ok().flatten())
@@ -794,6 +856,7 @@ pub async fn run(
                 if !s.unknown.is_empty() {
                     // 启动期没有"上一轮配置"可保持,只能忽略这几个字段继续起。
                     // 但必须喊出来:它意味着本镜像比写库的那个旧。
+                    initial_settings_unknown = s.unknown_keys().into_iter().map(String::from).collect();
                     tracing::warn!(
                         keys = ?s.unknown_keys(),
                         "settings overlay 含本版本不认识的字段,已忽略这几个、其余照常生效\
@@ -807,6 +870,7 @@ pub async fn run(
                 // ⚠️ 这条是**启动期**的回落,刻意不 fail-closed:否则一次 admin 误操作
                 // 就能让整套栈起不来。但级别从 warn 提到 error —— 此时全部调度参数
                 // (含 429 冷却)都退回 YAML 基线,是会打出全量 503 的状态。
+                initial_settings_error = format!("启动期 overlay 解析失败,已退回 YAML 基线: {e}");
                 tracing::error!("settings overlay 解析失败,本次启动退回 YAML 基线(调度参数全部失去热值): {e}");
                 None
             }
@@ -834,6 +898,9 @@ pub async fn run(
         }
     }
     let provider = registry.build(&provider_family, &provider_cfg, client.clone())?;
+    // 在 provider 被 move 进 WorkerState 之前取一次:这是「provider 级设置是否热生效」
+    // 的唯一权威来源(见 Provider::hot_settings_supported)。
+    let provider_hot_supported = provider.hot_settings_supported();
 
     // 启动即把"有效设置"热应用一次:实验开关等进程级全局仅由 env 初始化,DB overlay 原本要等
     // 30s 轮询(首跳被跳过)才生效。期间若 DB 已设 `thinking_signature=false`,这段窗口里 Kiro
@@ -940,6 +1007,23 @@ pub async fn run(
         quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
         quota_sem: Arc::new(tokio::sync::Semaphore::new(QUOTA_MAX_CONCURRENCY)),
         sync_lock: tokio::sync::Mutex::new(()),
+        // 启动期的同步结果照实记:此时 `effective_system` 已经叠过 overlay(或在解析失败时
+        // 退回了 YAML 基线),两种情况都要能在面板上看出来 —— 启动就退回基线是最危险的
+        // 状态(调度参数全失去热值),而它原本只有一行日志。
+        settings_sync: parking_lot::RwLock::new(SettingsSync {
+            applied_at: if initial_settings_error.is_empty() { now_unix() } else { 0 },
+            // 库打不开时 30s 轮询循环**根本不会 spawn**,热调从此永久失效。
+            // 不写一句的话,面板 90 秒后只会永久标红「N 秒前同步」,没有任何线索,
+            // 运维会把一个按设计降级运行的进程当成同步卡死去重启(对抗审查 Architect#9)。
+            error: if store.is_none() && initial_settings_error.is_empty() {
+                "控制面库不可用,本 worker 的设置热调不生效(改设置必须重启它)".to_string()
+            } else {
+                initial_settings_error
+            },
+            unknown: initial_settings_unknown,
+            effective: effective_view(&effective_system),
+            provider_hot: provider_hot_supported,
+        }),
         _client: client,
     });
 
@@ -954,7 +1038,6 @@ pub async fn run(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // 首跳立即触发,跳过(启动时刚加载过)。
             // 上一轮告警过的未知字段集。只在**变化时**告警,否则 30s 一条会淹掉日志。
-            let mut warned_unknown: Vec<String> = Vec::new();
             loop {
                 tick.tick().await;
                 // 账号集同步(含脏 extra 冲刷)—— 与 /sync 立即同步共用实现。
@@ -974,6 +1057,13 @@ pub async fn run(
                                 match serde_json::from_str::<gw_core::config::SystemSettings>(&j) {
                                     Ok(s) => s,
                                     Err(e) => {
+                                        // 这一跳会**每 30s 重复发生且永不自愈**,配置就此僵在
+                                        // 上一轮的值上。只记日志的话,面板上看到的是「保存成功」,
+                                        // 实际再也不会生效 —— 必须让它在 /health 上冒头。
+                                        st.settings_sync.write().error = format!(
+                                            "overlay 解析失败,配置已僵在上一次成功的值: {}",
+                                            redact_err(&e.to_string())
+                                        );
                                         tracing::error!(
                                             "settings overlay 解析失败,**保持上一轮已生效配置**\
                                              (不回落 YAML 基线): {e}"
@@ -985,8 +1075,11 @@ pub async fn run(
                         };
                         // 未知字段不再作废整份 overlay(其余字段照常生效),但必须可见:
                         // 它的含义通常是「本进程的镜像比写库的那个旧」。
+                        // BTreeMap → 顺序稳定,可以直接比。去重基准取自 settings_sync,
+                        // 不再另存一份 warned_unknown(两份手工同步早晚会不一致)。
                         let unknown: Vec<String> =
                             overlay.unknown.keys().cloned().collect();
+                        let warned_unknown = st.settings_sync.read().unknown.clone();
                         if unknown != warned_unknown {
                             if !unknown.is_empty() {
                                 tracing::warn!(
@@ -997,7 +1090,6 @@ pub async fn run(
                             } else if !warned_unknown.is_empty() {
                                 tracing::info!("settings overlay 的未知字段已消失,恢复完全识别");
                             }
-                            warned_unknown = unknown;
                         }
                         let mut eff = sys_base.clone();
                         overlay.apply_to(&mut eff);
@@ -1005,14 +1097,42 @@ pub async fn run(
                             &eff,
                             overlay.default_proxy.clone(),
                         );
-                        if let Ok(sv) = serde_json::to_value(&full) {
-                            st.provider.apply_hot_settings(&sv);
-                        }
+                        // provider 侧应用失败必须记下来。原本这里是 `if let Ok(..)`
+                        // 静默跳过:序列化一失败,provider 拿不到新值,而紧随其后的
+                        // scheduler / cache_sim 照常更新,快照照记「成功」——
+                        // 面板于是显示「一致」而 provider 级设置(缓存计费)根本没变。
+                        // 这正是本功能要消灭的那种谎(对抗审查三视角一致指出)。
+                        let apply_err = match serde_json::to_value(&full) {
+                            Ok(sv) => {
+                                st.provider.apply_hot_settings(&sv);
+                                String::new()
+                            }
+                            Err(e) => {
+                                tracing::error!("settings 序列化失败,provider 级设置本轮未应用: {e}");
+                                format!("provider 级设置未应用(序列化失败): {}", redact_err(&e.to_string()))
+                            }
+                        };
                         st.scheduler.update_tuning(&eff.scheduler);
                         gw_kiro::cache_sim::global().set_ttl_secs(eff.cache.sim_ttl_secs);
                         gw_kiro::cache_sim::global().set_max_sessions(eff.cache.max_sessions);
+                        // 应用成功才刷新时间戳与快照:面板上「多久前同步的」才是可信的
+                        // 新鲜度指标 —— 失败时它会停住不动,一眼看出配置僵了多久。
+                        *st.settings_sync.write() = SettingsSync {
+                            applied_at: now_unix(),
+                            error: apply_err,
+                            unknown: unknown.clone(),
+                            effective: effective_view(&eff),
+                            // 本 provider 压根不热应用 provider 级设置(dario 就是这样):
+                            // scheduler 那半边确实生效了,但缓存计费这半边要重启才动。
+                            // 不说出来的话,面板会对着一份「算得出但没生效」的值报「一致」。
+                            provider_hot: st.provider.hot_settings_supported(),
+                        };
                     }
-                    Err(e) => tracing::warn!("settings sync 读库失败,跳过本轮: {e}"),
+                    Err(e) => {
+                        st.settings_sync.write().error =
+                            format!("读库失败,本轮跳过: {}", redact_err(&e.to_string()));
+                        tracing::warn!("settings sync 读库失败,跳过本轮: {e}");
+                    }
                 }
             }
         });
@@ -1057,7 +1177,14 @@ pub async fn run(
     let mut app = Router::new()
         .route("/v1/messages", post(messages))
         .route("/v1/models", get(models))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        // 只回显设置同步实况的**轻量**端点。
+        //
+        // 为什么不复用 /health:那个端点会跑全账号 status_snapshot,并对配额缓存
+        // 陈旧的账号触发上游 getUsageLimits —— 也就是说「有人打开设置页」会变成
+        // 「对付费账号打上游」。这个账号池对封禁很敏感,一个只读的可观测性接口
+        // 不该和生产流量耦合(对抗审查三视角一致指出)。这里只读一把 RwLock。
+        .route("/settings-sync", get(settings_sync));
 
     // worker 不做对外鉴权、且信任 router 注入的 X-Gw-Client-Key;必须只绑 loopback,
     // 否则客户端可直连 worker 绕过 router 鉴权并伪造用量归属(审查 #2)。
@@ -1254,6 +1381,32 @@ fn is_loopback_listen(listen: &str) -> bool {
     }
 }
 
+/// `GET /settings-sync` —— 设置热调实况(轻量,不碰 scheduler 与配额)。
+async fn settings_sync(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "role": "worker",
+        "instance": st.instance,
+        "group": st.group,
+        "provider": st.provider.family(),
+        "settings": settings_view(&st),
+    }))
+}
+
+/// 设置同步实况的 JSON 投影(`/health` 与 `/settings-sync` 共用,免得两处分叉)。
+fn settings_view(st: &WorkerState) -> serde_json::Value {
+    let s = st.settings_sync.read();
+    serde_json::json!({
+        "applied_at": s.applied_at,
+        // 距今多少秒。轮询周期 30s,所以 >90 基本就是同步停了。-1 = 一次都没成功过。
+        "age_secs": if s.applied_at > 0 { now_unix() - s.applied_at } else { -1 },
+        "error": s.error,
+        "unknown": s.unknown,
+        "effective": s.effective,
+        // false = provider 级设置(缓存计费等)对本 worker 要重启才生效。
+        "provider_hot": s.provider_hot,
+    })
+}
+
 async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
     // 每账号运行态 + 配额(配额读缓存,陈旧时后台刷新,不阻塞本响应)。
     let accounts_status: Vec<serde_json::Value> = st
@@ -1282,6 +1435,9 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
         "queue": st.scheduler.queue_stats(),
         // usage 是否在落库:库打开失败时为 false(降级,usage 不入库),便于运维发现。
         "usage_persist": st.usage_sink.is_some(),
+        // 设置热调的实况:本 worker **真正在用**的值 + 最近一次同步的结果。
+        // 面板据此回答「我保存的设置到底生效没有」—— 见 [`SettingsSync`]。
+        "settings": settings_view(&st),
         "status": "ok"
     }))
 }

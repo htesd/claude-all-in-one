@@ -1,5 +1,115 @@
 # Changelog
 
+## [settings-effective-echo] - 2026-08-06
+
+### 起因:「我保存了设置很多时候不生效」查不下去
+
+运行参数存 DB 的 `settings` 表,worker 每 30s 轮询后热应用。链路本身是好的
+(实测 `cache_floor_ratio` 0.6→0.9 在 **11:51→11:52** 生效,worker 连续运行 18.4 小时
+`restarts=0`,全期 0 次解析失败)。真正的问题是**面板上只有应然值,没有实然值**:
+
+- 面板显示的是「库里的 overlay 叠 YAML 基线」算出来的**应该是什么**
+- 决定计费与调度的是各 worker 自己轮询、应用之后的**实际是什么**
+
+于是这两件事完全无法区分:①真的没生效;②生效了,但在 30s 轮询窗口内看的、
+或看的是保存前的历史日志行(用户这次遇到的正是②——截图是 11:46,生效于 11:52)。
+
+更糟的是链路里有两处**静默**失败,长得和「保存成功」一模一样:
+
+1. overlay 解析失败 → `continue` → 每 30s 跳过一轮、保持旧配置,只有一行 error 日志
+2. 本版本不认识的字段 → 被无声忽略(该 worker 镜像比写库的那个旧),表现为
+   「别的设置都生效,就这一个不生效」
+
+### Features
+
+- worker 新增 `SettingsSync`(最近一次**成功应用**的时刻 / 错误 / 未知字段 /
+  应用后真正在用的值),启动期与 30s 轮询两处写入,`/health` 回显 `settings` 段。
+- admin `GET /settings` 扇出问各 worker,把实然值挂在同一份响应的 `workers` 字段。
+  **`PUT` 不带** —— 刚写完库时 worker 还没轮询到,回一份必然过时的值只会误导。
+- 面板在**改设置的同一页**新增一张卡:逐 worker 显示「多久前同步」「同步是否报错」
+  「未知字段」以及**与应然值对不上的字段**(全对时不列)。
+
+### Design Rationale
+
+- **成功才刷新时间戳**:失败时 `applied_at` 停住不动,「现在 − applied_at」就是
+  配置僵了多久 —— 这是静默失效唯一的外部特征,必须让它可读。
+- **比对 worker 回报的全部字段**,而不是一份手写清单:手写清单漏掉的字段会得出
+  「一致」这个错误结论,而漏掉的恰恰是没人想到的那个。
+- **新鲜度阈值取 90s**(轮询周期的 3 倍):每轮还要先跑账号同步并抢锁,一轮超 30s 很常见。
+  宁可迟报也不能误报 —— 天天变红的健康 worker 会让整张卡失去可信度。
+
+### 对抗审查(kimi)修掉的问题
+
+- **[high] 旧镜像 worker 会被显示成绿色「一致」**,正好是本功能唯一想抓的场景:
+  它的 `/health` 没有 `settings` 字段 → 前端拿到 null → 走「无差异」分支渲染绿勾。
+  改为服务端单独标 `stale_image`,前端红色单列。
+- **非 2xx 响应也可能带可解析的 JSON 错误体**,当成正常回包会把坏掉的 worker 显示成
+  健康。加 `status().is_success()` 校验。
+- **文案错误**:原写「重启才会恢复」,实际库里 JSON 恢复可解析后下一轮就自愈。
+- **`inject_workers` 重建响应体**(序列化→解析→再序列化)有 Content-Length 与
+  「body 非 object 就 panic」的边角。改成 `respond_with_workers` 多传一个参数。
+- **时钟回拨**会让 `age_secs` 变负并被渲染成「从未成功同步」;区分 `applied_at==0`
+  与时钟异常。
+- React key 由 `instance` 改为 `group#instance`(instance 配重时会合并渲染)。
+
+判定为误报、已核实的三条:①`unknown` 是 `BTreeMap`,顺序稳定,告警去重不会失效;
+②admin 的 http 客户端有 **2s 全局超时**,一个挂住的 worker 拖不垮 `GET /settings`;
+③保存后走 `invalidateQueries` 重新 GET,卡片不会消失。
+
+### 第二轮对抗审查(kimi 三视角)修掉的问题
+
+三个视角**独立指向同一组**核心问题,说明不是风格分歧:
+
+- **[medium×3] 回显的是「打算应用的值」而非「真正在用的值」**。两处会让面板报假「一致」:
+  ① `if let Ok(sv) = to_value(&full)` 序列化失败时 provider 被跳过,而 scheduler 与
+  cache_sim 照常更新、快照照记成功;②**`claude-dario` 的 `apply_hot_settings` 是 no-op**
+  —— 它的 provider 级设置(缓存计费)改了永远不生效,但 worker 算得出「有效配置」照样报,
+  面板会渲染绿色「一致」,把原本要抓的 bug 原样重演。
+  修:`Provider` 新增 `hot_settings_supported()`(默认 `false`,与 `apply_hot_settings`
+  的默认 no-op 同进退,只覆盖其一就是撒谎),KiroProvider 覆盖为 `true`;序列化失败写进 `error`。
+- **[medium×3] 手写 9 字段清单本身就是新的盲区**,而卡片注释还在批评这个模式。
+  改用 `SystemSettings::from_effective` 全量回显(30 项),同时删掉前后端两份手工清单。
+  `default_proxy` 传 `None` —— 代理 URL 可能带 `user:pass@`,而这份数据要上浏览器。
+- **[medium×3] 扇出复用 `/health` 把设置页和上游耦合了**:该端点会对配额缓存陈旧的账号
+  触发 `getUsageLimits`,于是「有人打开设置页」= 「对付费账号打上游」。这个号池对封禁
+  很敏感。新增轻量端点 `GET /settings-sync`(只读一把 RwLock),扇出改打它。
+- **错误串脱敏**:serde 的类型错误会把出错的**值**嵌进消息,而那个值可能是
+  `socks5://user:pass@host` —— 这条串要一路上到浏览器。入库前过 `redact_proxy_url`。
+- **保存后的正常收敛窗不再报红**:每次 PUT 后 ≤30s 必有 drift,一律标红等于训练用户
+  忽略红色。改成黄色「收敛中」,同步僵住才上红。
+- **`SystemSettingsPatch` 排除 `workers`**:它是只读回显,留在可写类型里的话,任何把 GET
+  数据摊开进 patch 的写法都会被写侧的未知字段保护用 400 挡掉**整次保存**。
+- 「一致」文案在同步僵住 / 有未知字段 / provider 不热应用时一律不显示(信号自相矛盾)。
+- `store=None`(库打不开)的降级 worker 现在会说明原因,而不是永久标红却毫无线索。
+- 删掉 `warned_unknown` 这份与 `settings_sync.unknown` 重复的手工同步状态。
+
+判定为误报、已核实的三条:①`unknown` 是 `BTreeMap`,顺序稳定,告警去重不会失效;
+②admin 的 http 客户端有 **2s 全局超时**,挂住的 worker 拖不垮 `GET /settings`;
+③保存后走 `invalidateQueries` 重新 GET,卡片不会消失。
+
+### 上线时实测撞到的第四个问题
+
+首次上线后核对生产数据发现:`caio-worker-dario` 跑着 3 天前的镜像,`/settings-sync`
+返回 **404**,而原实现把「非 2xx」一律当成抓取失败 → 面板显示**离线**。但它 `/health`
+是 200,进程活得好好的。「连不上」与「连得上但没这个路由」指向完全不同的运维动作
+(去看容器 vs 重建镜像),报错方向反了会把人指到错的地方。
+
+抓取结果改成三态 `Fetched::{Unreachable, NoData, Body}`:**答得出话就说明进程活着**,
+只是镜像旧。上线后三种状态各自渲染正确:
+
+| worker | 状态 |
+|---|---|
+| worker0 (G0) | 绿色,30 项全部一致,18 秒前同步 |
+| worker1 (DARIO) | 在线 + **镜像过旧**(而不是「离线」) |
+| worker2 (EXP) | 离线(确实没在跑) |
+
+### Notes & Caveats
+
+- 本次改动在 **worker** 里,所以 worker0 必须重建重启 —— 会打断在途请求。
+  (第二轮修的是 admin 侧映射,只重启 router,不再打断 worker。)
+- `caio-worker-dario` 仍在旧镜像上,面板会持续标它「镜像过旧」。这是**准确的**:
+  它的 provider 级设置本来就不热生效。等它重建后会转成 `provider_hot: false` 的红字说明。
+
 ## [restock-supplier-priority] - 2026-08-05
 
 ### 起因:「两家的号价值等价」这个前提被证伪

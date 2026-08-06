@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ErrorNote } from '@/components/ui/error-note'
 import { RestockSettingsCard } from '@/features/restock/components/RestockSettingsCard'
+import { WorkerEffectiveCard } from '@/features/settings/components/WorkerEffectiveCard'
 import { useSettings, useUpdateSettings } from '@/features/settings/hooks'
 import type { SystemSettings, SystemSettingsPatch, ThinkingEffort } from '@/features/settings/types'
 import { THINKING_EFFORTS } from '@/features/settings/types'
@@ -228,6 +229,9 @@ export default function SettingsPage() {
 
       {/* 自动补货：自成一体的一段（自己的 GET/PUT、自己的保存按钮）。
           放在主 <form> 之外 —— 塞进去会被主表单的 submit 裹挟。 */}
+      {/* 「我保存的到底生效没有」——放在改设置的同一页，不用切页也不用 SSH。 */}
+      <WorkerEffectiveCard workers={data?.workers} desired={data} />
+
       <RestockSettingsCard />
 
       <form onSubmit={handleSubmit} className="space-y-6">

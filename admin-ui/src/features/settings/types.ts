@@ -57,6 +57,49 @@ export interface SystemSettings {
   /** 客户端**未指定** effort 时的默认思考档位。只影响没说话的客户端——显式点了档位的请求原样透传。
    *  档位越高思考越深也越慢：实测 max 的思考量约为 xhigh 的 1.7 倍。默认 high。 */
   default_thinking_effort: ThinkingEffort
+  /**
+   * 逐 worker 的**实然值**：该 worker 此刻真正在用的热调参数 + 最近一次同步的结果。
+   *
+   * 本响应体的其余字段是**应然值**（库里的 overlay 叠 YAML 基线算出来的）。
+   * 两者不一致，就是「我保存了不生效」的全部内容 —— 在此之前面板上只有应然值，
+   * 于是那个问题在面板上根本不可见，只能 SSH 上去翻库反推。
+   *
+   * 仅 GET 携带；PUT 不带（刚写完库时 worker 还没轮询到，回一份必然过时的值只会误导）。
+   */
+  workers?: WorkerSettingsView[]
+}
+
+/** 一个 worker 的设置同步实况。 */
+export interface WorkerSettingsView {
+  instance: number
+  group: string
+  online: boolean
+  /**
+   * 该 worker 在线、但 `/health` 里**没有** `settings` 字段 = 它的镜像旧到还不带这个
+   * 回显。必须单独标出来：若与「正常」混为一谈，前端会把它渲染成绿色「一致」，
+   * 而这恰恰是本功能唯一存在的理由（旧镜像忽略新字段 → 保存不生效）。
+   */
+  stale_image?: boolean
+  settings?: {
+    /** 最近一次**成功应用**的 unix 秒；0 = 启动后一次都没成功过。 */
+    applied_at: number
+    /** 距今秒数。轮询周期 30s，所以 >60 基本就是同步停了；-1 = 从未成功。 */
+    age_secs: number
+    /** 非空 = 同步出错，配置已僵在上一次成功的值上（每 30s 重复且不自愈）。 */
+    error: string
+    /** 本版本不认识、已被忽略的字段 = 本 worker 镜像比写库的那个旧。 */
+    unknown: string[]
+    /** worker 应用之后真正在用的值（键名与本响应体的应然值逐字对齐）。 */
+    effective: Record<string, unknown>
+    /**
+     * 该 worker 的 provider 是否**真的**热应用 provider 级设置（缓存计费/图像/实验开关）。
+     *
+     * false（如 claude-dario）时 `effective` 里那半边是「算得出但从未应用」——
+     * 不说出来的话，面板会对着一份没生效的值报「一致」，把原本要抓的 bug 原样重演。
+     * scheduler 那半边不受影响，一直是热的。
+     */
+    provider_hot?: boolean
+  } | null
 }
 
 /** 上游 effort 档位全集（由低到高）。与后端 `VALID_EFFORTS` 一致。 */
@@ -70,6 +113,14 @@ export type ThinkingEffort = (typeof THINKING_EFFORTS)[number]
  * - 字段存在且为 null → 重置为 YAML 默认值
  * - 字段缺失 → 不动
  */
+/**
+ * PUT 的部分 patch。
+ *
+ * `Omit<..., 'workers'>` 是必须的：`workers` 是 GET **只读**回显的实然值，不是可写设置。
+ * 留在这里的话，任何把 GET 数据摊开进 patch 的写法都会把它发上去，而写侧的未知字段
+ * 保护会用 400「未知设置字段: workers」把**整次保存**挡掉 —— 报错文案还与用户的操作
+ * 毫无关系（对抗审查 Architect#8）。
+ */
 export type SystemSettingsPatch = {
-  [K in keyof SystemSettings]?: SystemSettings[K] | null
+  [K in keyof Omit<SystemSettings, 'workers'>]?: SystemSettings[K] | null
 }
