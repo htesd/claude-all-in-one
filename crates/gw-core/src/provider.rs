@@ -277,6 +277,20 @@ pub trait Provider: Send + Sync {
     /// `&self` 不可变共享语义对外)。
     fn apply_hot_settings(&self, _settings: &serde_json::Value) {}
 
+    /// 本 provider 是否**真的**热应用 provider 级设置(缓存计费、图像压缩、实验开关)。
+    ///
+    /// 默认 `false`,与 [`Self::apply_hot_settings`] 的默认 no-op 保持一致 ——
+    /// 二者必须同进退,只覆盖其中一个就是在撒谎。
+    ///
+    /// 存在的理由:worker 的 `/health` 要回显「我此刻在用什么设置」给面板核对。
+    /// 对**没有**覆盖 `apply_hot_settings` 的 provider(如 claude-dario),
+    /// provider 级设置改了永远不生效(要重启),但 worker 算得出「有效配置」照样能报出来 ——
+    /// 面板会显示绿色「一致」,把原本要抓的那个 bug 原样重演一遍。
+    /// 所以这件事必须由 provider 自己声明,不能让面板按 family 名去猜。
+    fn hot_settings_supported(&self) -> bool {
+        false
+    }
+
     /// 查询账号配额(只读;`getUsageLimits` 这类接口)。返回 `Ok(None)` = 该 provider
     /// 不支持配额查询(默认)。**安全契约**:实现只发只读请求(刷新 + GET),绝不触发
     /// 计费/发包动作。account 应已带有效 access_token(调用方先 ensure_credentialed)。

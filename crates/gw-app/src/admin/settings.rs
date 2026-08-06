@@ -48,10 +48,31 @@ fn effective(st: &AdminState, overlay: &SystemSettings) -> SystemSettings {
     full
 }
 
+/// 同 [`respond`],额外挂一个 `workers` 字段(逐 worker 实然值)。
+///
+/// 单开一个函数而不是「先 respond 再把 body 拆出来改」:后者要走
+/// 序列化→解析→再序列化的往返,还要操心 Content-Length 与「body 不是 object 就 panic」
+/// 这类边角(对抗审查 Skeptic#8)。多传一个参数便宜得多。
+fn respond_with_workers(
+    settings: SystemSettings,
+    workers: Vec<serde_json::Value>,
+) -> axum::response::Response {
+    let mut v = redacted_value(&settings);
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("workers".into(), serde_json::Value::Array(workers));
+    }
+    Json(v).into_response()
+}
+
 /// 把有效设置序列化为响应,并掩码 default_proxy 的密码段(防 user:pass@ 经接口泄漏,
 /// 审查 Architect#3)。真实值仍在库里,worker 用真实值。
 fn respond(settings: SystemSettings) -> axum::response::Response {
-    let mut v = serde_json::to_value(&settings).unwrap_or(serde_json::Value::Null);
+    Json(redacted_value(&settings)).into_response()
+}
+
+/// 掩码后的 JSON 值(两个 respond 共用,免得掩码规则分叉)。
+fn redacted_value(settings: &SystemSettings) -> serde_json::Value {
+    let mut v = serde_json::to_value(settings).unwrap_or(serde_json::Value::Null);
     if let Some(dp) = v.get("default_proxy").and_then(|d| d.as_str()) {
         let masked = super::redact_proxy_url(dp);
         v["default_proxy"] = serde_json::json!(masked);
@@ -67,16 +88,97 @@ fn respond(settings: SystemSettings) -> axum::response::Response {
             .collect();
         v["egress_pool"] = serde_json::Value::Array(masked);
     }
-    Json(v).into_response()
+    v
 }
 
 /// `GET /settings` → 当前有效全量设置。
+/// 逐 worker 问「你此刻**真正在用**的热调值是什么」。
+///
+/// 为什么 GET /settings 要带上它:这个接口回的是「库里存的 + YAML 基线」算出来的**应然**值,
+/// 而 worker 用的是它自己 30s 轮询应用后的**实然**值。两者不一致正是「我保存了不生效」的
+/// 全部内容,而在此之前面板上只有应然值 —— 于是那个问题在面板上根本不可见。
+///
+/// 单个 worker 离线/超时不影响整体:该条标 `online:false`,其余照常回。
+async fn worker_settings(st: &AdminState) -> Vec<serde_json::Value> {
+    let fetches = st.workers.iter().map(|w| {
+        let http = st.http.clone();
+        async move {
+            // 打**轻量**端点而不是 /health:后者会跑全账号快照并对配额缓存陈旧的账号
+            // 触发上游 getUsageLimits —— 「打开设置页」不该变成「对付费账号打上游」。
+            //
+            // 超时靠 `st.http` 的全局 2s(见 `AdminState` 构造),各 worker 并发,
+            // 所以一个挂住的 worker 最多让本接口慢 2 秒,不会拖死设置页。
+            let url = format!("http://{}/settings-sync", w.listen);
+            let fetched = match http.get(&url).send().await {
+                // 状态码必须看:非 2xx 也可能带一个能解析成 JSON 的错误体,当成正常
+                // 回包会把坏掉的 worker 显示成健康(对抗审查 Skeptic#12)。
+                Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                    Ok(v) => Fetched::Body(v),
+                    Err(_) => Fetched::NoData,
+                },
+                // **答得出话就说明进程活着**,只是这个路由/字段它没有(旧镜像 404)。
+                Ok(_) => Fetched::NoData,
+                Err(_) => Fetched::Unreachable,
+            };
+            worker_row(w.instance, &w.account_group, fetched)
+        }
+    });
+    futures::future::join_all(fetches).await
+}
+
+/// 一次抓取的三种结局。
+///
+/// 分成三态而不是 `Option`,是因为后两种指向**完全不同的运维动作**:
+/// 连不上 = 进程可能死了,该去看容器;连得上但没这个路由 = 进程活得好好的,是镜像旧。
+/// 把后者显示成「离线」会把人指向错误的方向 —— 2026-08-06 上线时实测撞到:
+/// `caio-worker-dario` 跑着旧镜像,`/settings-sync` 返回 404,一度被判成掉线。
+enum Fetched {
+    /// 连不上(拒绝连接 / 超时)。
+    Unreachable,
+    /// 答得出话,但拿不到可用的 settings(旧镜像 404、非 2xx、body 解析失败)。
+    NoData,
+    Body(serde_json::Value),
+}
+
+/// 把一次抓取结果映射成面板要的一行。**纯函数**,把扇出里唯一有判断的部分抽出来测 ——
+/// 这几个分支正是本功能最想抓的场景,不该只靠线上观察(对抗审查 Skeptic#7)。
+fn worker_row(instance: u32, group: &str, fetched: Fetched) -> serde_json::Value {
+    let mut o = serde_json::json!({
+        "instance": instance, "group": group, "online": false,
+        "settings": serde_json::Value::Null, "stale_image": false,
+    });
+    let body = match fetched {
+        Fetched::Unreachable => return o,
+        // ⚠️ 这条是本次改动**最想抓**的那个场景:worker 镜像旧到还没有这个端点/字段。
+        //
+        // 若把它和「正常」一样留成 null,前端拿到 null 会走「无差异」分支渲染成绿色
+        // 「一致」—— 可观测性在它唯一存在的理由上说谎(对抗审查 Skeptic#1)。
+        Fetched::NoData => {
+            o["online"] = true.into();
+            o["stale_image"] = true.into();
+            return o;
+        }
+        Fetched::Body(v) => v,
+    };
+    o["online"] = true.into();
+    match body.get("settings") {
+        Some(s) if !s.is_null() => o["settings"] = s.clone(),
+        _ => o["stale_image"] = true.into(),
+    }
+    o
+}
+
 async fn get_settings(State(st): State<AdminState>) -> axum::response::Response {
     let overlay = match read_overlay(&st) {
         Ok(o) => o,
         Err(e) => return internal_error(e),
     };
-    respond(effective(&st, &overlay))
+    // 把逐 worker 的实然值挂在同一份响应里:面板在**改设置的那一页**就能核对,
+    // 不用切页、更不用 SSH 上去查库。
+    //
+    // `PUT` 走不带 workers 的 `respond`:刚写完库时 worker 还没轮询到,
+    // 回一份必然过时的实然值只会让人以为没生效。
+    respond_with_workers(effective(&st, &overlay), worker_settings(&st).await)
 }
 
 /// `PUT /settings` ← 部分 patch(null=删该 overlay 字段回 YAML 默认,非 null=存)。
@@ -201,6 +303,7 @@ async fn put_settings(
 #[cfg(test)]
 mod tests {
     use super::super::tests_support::{app, req};
+    use super::{worker_row, Fetched};
     use axum::body::to_bytes;
     use tower::ServiceExt;
 
@@ -219,6 +322,64 @@ mod tests {
         assert_eq!(v["max_failures"], 5);
         assert_eq!(v["cache_read_multiplier"], 1.0);
         assert!(v.get("default_proxy").map(|d| d.is_null()).unwrap_or(true));
+    }
+
+    #[test]
+    fn 抓不到或没有settings字段的worker绝不能被当成一致() {
+        // 连不上 → online=false,没有任何「一致」可言。
+        let off = worker_row(0, "G0", Fetched::Unreachable);
+        assert_eq!(off["online"], false);
+        assert_eq!(off["stale_image"], false);
+        assert!(off["settings"].is_null());
+
+        // **答得出话就说明进程活着**,只是没这个路由(旧镜像 404)。
+        // 报成「离线」会让人去查容器是不是死了,而真正该做的是重建镜像 ——
+        // 2026-08-06 上线时 caio-worker-dario 正是这种,一度被判成掉线。
+        let stale = worker_row(1, "DARIO", Fetched::NoData);
+        assert_eq!(stale["online"], true, "404 不等于进程死了");
+        assert_eq!(stale["stale_image"], true);
+
+        // 2xx 但回包里没有 settings 字段,同样是旧镜像。
+        // 漏标的话前端会拿 null 走「无差异」分支渲染绿勾 —— 恰好在本功能唯一存在的理由上说谎。
+        let nofield = worker_row(2, "G0", Fetched::Body(serde_json::json!({"role":"worker"})));
+        assert_eq!(nofield["online"], true);
+        assert_eq!(nofield["stale_image"], true, "旧镜像必须单独标出,不能混进「一致」");
+
+        // settings 显式为 null 同样算旧镜像,不能当成「有数据」。
+        let nulled = worker_row(3, "G0", Fetched::Body(serde_json::json!({"settings": null})));
+        assert_eq!(nulled["stale_image"], true);
+
+        // 正常回包才透传。
+        let ok = worker_row(
+            4,
+            "G0",
+            Fetched::Body(serde_json::json!({"settings": {"applied_at": 42, "provider_hot": true}})),
+        );
+        assert_eq!(ok["online"], true);
+        assert_eq!(ok["stale_image"], false);
+        assert_eq!(ok["settings"]["applied_at"], 42);
+    }
+
+    #[tokio::test]
+    async fn get_带上逐worker的实然值而put不带() {
+        // 这是「保存了不生效」唯一能被看见的地方:GET 回的是应然值(库+YAML),
+        // `workers` 回的是各 worker 真正在用的值。两者必须在**同一份响应**里,
+        // 否则面板要么显示不出差异、要么得再开一个接口。
+        let (app, _store) = app();
+        let resp = app.clone().oneshot(req("GET", "/settings", None)).await.unwrap();
+        let v = body_json(resp).await;
+        assert!(v["workers"].is_array(), "GET 必须带 workers(没有 worker 时是空数组)");
+
+        // PUT **不带**:刚写完库时 worker 还没轮询到,回一份必然过时的实然值
+        // 只会让人误判成「没生效」。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"cache_floor_ratio":0.5}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["cache_floor_ratio"], 0.5);
+        assert!(v.get("workers").is_none(), "PUT 不该回 workers");
     }
 
     #[tokio::test]

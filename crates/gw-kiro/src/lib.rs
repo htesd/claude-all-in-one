@@ -373,6 +373,12 @@ impl Provider for KiroProvider {
         profiles::force_discover_profile_arn(&client, account).await
     }
 
+    /// 见 trait 文档:本 provider 确实覆盖了 [`Self::apply_hot_settings`],
+    /// 所以 `/health` 回显的 provider 级设置对它是**可信的实然值**。
+    fn hot_settings_supported(&self) -> bool {
+        true
+    }
+
     /// 热应用设置(worker 30s 轮询):更新默认代理 + 缓存计费 + 图像压缩参数。
     /// 仅覆盖 JSON 中出现的字段(部分更新);无副作用、线程安全(内部 RwLock)。
     fn apply_hot_settings(&self, settings: &serde_json::Value) {
