@@ -47,7 +47,23 @@ fn model_cost(row: &UsageByModel) -> (f64, f64) {
                 ),
             )
         }
-        None => (0.0, 0.0),
+        // ⚠️ **没有价目 ≠ 免费。** `price_for` 只认 opus/sonnet/haiku,而 cursor 的
+        // `/v1/models` 还广播 `default` / `composer-2.5` / `grok-4.5` / `gpt-5.6-*` /
+        // `claude-fable-5` —— 客户真按目录点这些名字,成本视图上就是 0,收入隐形。
+        //
+        // 这里**不猜价**(定价是业务决策,不是代码能替人做的),但必须让它可见:
+        // 有 token 却算不出成本时吼一声,免得"这个渠道很赚"其实是没记账。
+        None => {
+            if row.input_tokens + row.output_tokens > 0 {
+                tracing::warn!(
+                    model = %row.model,
+                    input = row.input_tokens,
+                    output = row.output_tokens,
+                    "该模型没有价目表条目,成本按 0 计入 —— 需要在 gw_core::pricing 补价"
+                );
+            }
+            (0.0, 0.0)
+        }
     }
 }
 
