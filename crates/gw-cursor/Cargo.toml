@@ -1,0 +1,36 @@
+[package]
+name = "gw-cursor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gw-core.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+base64.workspace = true
+# session_id 需要确定性 UUIDv5(按 token 派生),故在本 crate 显式开 v5 feature
+uuid = { version = "1.10", features = ["v4", "v5", "fast-rng"] }
+# AgentService/Run 的 Connect 帧是**逐帧 gzip**(connect-content-encoding: gzip),
+# 与 HTTP 层的 content-encoding 无关,reqwest 不会代劳,必须自己压/解。
+flate2 = "1"
+# traceparent 的 trace-id 必须全熵:UUIDv4 有 6 bit 被版本/变体位钉死,
+# 那是一个每请求广播两次的稳定指纹(见 wire::random_hex)。
+getrandom = "0.3"
+
+[dev-dependencies]
+# e2e 要看 provider 内部的 tracing 事件 —— 没有 subscriber 时 tracing::debug! 直接丢弃,
+# 排查会完全瞎掉(踩过一次)。
+tracing-subscriber = { workspace = true }
+# e2e 示例:只读本机 Cursor 的 state.vscdb 取真实 token/machineId 做验证
+rusqlite = { version = "0.32", features = ["bundled"] }
