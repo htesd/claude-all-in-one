@@ -90,7 +90,14 @@ pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
     // 上游 conversationId 按**账号**加盐:换号必须换 ID,否则同一个 conversationId
     // 会横跨一串 AWS 账号(号 ~50min 就死,而客户端会话跑几小时)——那是账号池最强的
     // 特征之一。调度亲和键不受影响(它走 scope="" 的口径)。
-    let conversion = match converter::convert_request(&messages_req, &account.account_id) {
+    // 盐必须与**真正发出去**的那次一致(见 `chat_stream`),否则落库的 payload 里的
+    // conversationId 与上游实际收到的不是同一个,排查时对不上。machineId 用同一个
+    // 按账号的派生口径(`generate_from_account`,与 provider 的 machine_identity 同源)。
+    let scope = account_scope(
+        &account.account_id,
+        &crate::machine_id::generate_from_account(account),
+    );
+    let conversion = match converter::convert_request(&messages_req, &scope) {
         Ok(c) => c,
         Err(e) => return format!("<转换失败: {e}>"),
     };
@@ -108,6 +115,27 @@ pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
 ///
 /// - `client`:worker 的 egress client(固定出口 IP)。
 /// - `machine_id`:本账号设备指纹(由 KiroProvider::machine_identity 派生)。
+/// 账号作用域盐。**空串在 `convert_request` 里的语义是「不加盐」,所以绝不能把一个
+/// 可能为空的值直接传进去。**
+///
+/// `account_id` 是 accounts 表的主键,正常不该为空;但 SQLite 允许空串主键,而遗留/
+/// 导入异常/数据损坏的号真有可能带着 `account_id=""` 进来。那时两个后果都是静默的:
+/// 消息路径退回无盐 ID,而 **metadata 路径会把客户端的 session UUID 原文发给上游** ——
+/// 恰好是这次改动要消除的那条最强关联特征,却没有任何日志或报错暴露它。
+///
+/// 所以这里退回 `machine_id`:它同样是**按账号**的(显式配置或按凭据派生),且保证非空。
+/// 换号一样换盐,伪装不破;同时吵一声,让这个本不该存在的号被发现。
+fn account_scope(account_id: &str, machine_id: &str) -> String {
+    if !account_id.is_empty() {
+        return account_id.to_string();
+    }
+    tracing::warn!(
+        "kiro 账号的 account_id 为空(数据异常),conversationId 的账号盐退回 machineId。\
+         请检查该号的入库来源 —— 空主键的号不该存在"
+    );
+    machine_id.to_string()
+}
+
 pub async fn chat_stream(
     client: reqwest::Client,
     account: Arc<Account>,
@@ -129,7 +157,11 @@ pub async fn chat_stream(
     crate::thinking_policy::override_thinking_from_model_name(&mut messages_req);
 
     // 2. converter:Anthropic → Kiro ConversationState
-    let conversion = converter::convert_request(&messages_req, &account.account_id).map_err(|e| {
+    let conversion = converter::convert_request(
+        &messages_req,
+        &account_scope(&account.account_id, &machine_id),
+    )
+    .map_err(|e| {
         // UnsupportedModel / EmptyMessages 都是请求本身问题 → BadRequest(不换号)。
         // 文案只有「模型不支持: <客户请求的模型名>」/「消息列表为空」→ 对外可见。
         UpstreamError::bad_request_visible(format!("转换失败: {e}"))

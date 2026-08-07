@@ -2313,17 +2313,34 @@ fn 换号则上游会话_id_跟着换() {
     assert_eq!(a, scoped_conv_id(&req, "acct-A"), "同号同会话必须恒等");
 }
 
+/// ⚠️ 这条测试**第一版是假的**:`extract_session_id` 要求 `session_` 后面是 36 字符的
+/// 合法 UUID(`session.rs`),而第一版传的是 `session_deadbeef-99`(11 字符)——
+/// 于是它落到了内容哈希那条路,`scope_session_id` 一个断言都没覆盖,却全绿。
+/// 现在用真 UUID,并**先断言确实进了 metadata 分支**(scope="" 时应原样返回该 UUID)。
 #[test]
 fn metadata_里的客户端_session_id_也要按账号分叉() {
-    // 这条路最危险:不加盐时 ID 就是客户端 session id 的**原文**,
-    // 等于把「同一个客户端会话」在多个 AWS 账号之间明文关联起来。
-    let req = req_with(None, "hi", Some("deadbeef-99"));
+    const SID: &str = "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    let req = req_with(None, "hi", Some(SID));
+
+    // ① 先证明这条路真的走的是 metadata 分支:不加盐时应**原样**返回客户端 UUID。
+    //    (这同时是改动前的行为,也就是那条最危险的原状。)
+    assert_eq!(
+        scoped_conv_id(&req, ""),
+        SID,
+        "没进 metadata 分支 —— 这条测试就白测了(第一版正是栽在这里)"
+    );
+
+    // ② 加盐后:不再原样透出,且按账号分叉、同号恒等。
     let a = scoped_conv_id(&req, "acct-A");
     let b = scoped_conv_id(&req, "acct-B");
-    assert_ne!(a, b);
-    assert_ne!(a, "session_deadbeef-99", "不能再原样透出客户端 session id");
-    assert!(!a.contains("deadbeef"), "客户端 session id 不该出现在上游 ID 里");
-    assert_eq!(a, scoped_conv_id(&req, "acct-A"));
+    assert_ne!(a, SID, "不能再原样透出客户端 session id");
+    assert!(!a.contains("3f2b1c4d"), "客户端 session id 的片段不该出现在上游 ID 里");
+    assert_ne!(a, b, "不同账号必须不同");
+    assert_eq!(a, scoped_conv_id(&req, "acct-A"), "同号必须恒等");
+
+    // ③ 固定向量:钉住 `scope_session_id` 的具体派生,防止将来悄悄改了构造
+    //    (改了会让所有在途会话的上游 ID 再迁移一次)。
+    assert_eq!(a, super::scope_session_id(SID, "acct-A"));
 }
 
 #[test]
@@ -2331,7 +2348,8 @@ fn 加盐后仍是_uuid_形状() {
     // 拼前缀会造出上游没见过的形状;必须仍然长得像 Kiro 客户端发的 UUID。
     for (req, scope) in [
         (req_with(Some("s"), "u", None), "acct-A"),
-        (req_with(None, "u", Some("sess-1")), "acct-A"),
+        // 真 UUID —— 用短串会落到内容哈希路径,覆盖不到 metadata 分支
+        (req_with(None, "u", Some("3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d")), "acct-A"),
     ] {
         let id = scoped_conv_id(&req, scope);
         let parts: Vec<&str> = id.split('-').collect();

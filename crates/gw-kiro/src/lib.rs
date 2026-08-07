@@ -232,6 +232,14 @@ impl Provider for KiroProvider {
         //   profileArn / 刷新(chat 与配额均用 ksk_ 作 bearer)。
         // - **social / IdC**:需 refresh_token(运行时换取 access_token)。
         // 两者皆缺 → 该账号无任何可用凭据,加载即拒(避免"加载通过、首请求才炸"的边界破裂)。
+        // 空 account_id:accounts 表的主键,正常不该为空(SQLite 允许空串主键,
+        // 所以遗留/导入异常的号真能带着它进来)。它会让 conversationId 的账号盐落空
+        // (见 `chat::account_scope`),而那条路径的失败是**静默**的。加载期就拒掉。
+        if account.account_id.is_empty() {
+            return Err(UpstreamError::bad_request(
+                "Kiro 账号的 account_id 为空 —— 空主键的号会让 conversationId 的账号隔离失效",
+            ));
+        }
         let has_api_key = machine_id::is_api_key_credential(account);
         let has_refresh = account.extra_str("refresh_token").is_some_and(|s| !s.is_empty());
         if !has_api_key && !has_refresh {
