@@ -87,7 +87,10 @@ pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
             Err(e) => return format!("<解析 Anthropic 请求体失败: {e}>"),
         };
     crate::thinking_policy::override_thinking_from_model_name(&mut messages_req);
-    let conversion = match converter::convert_request(&messages_req) {
+    // 上游 conversationId 按**账号**加盐:换号必须换 ID,否则同一个 conversationId
+    // 会横跨一串 AWS 账号(号 ~50min 就死,而客户端会话跑几小时)——那是账号池最强的
+    // 特征之一。调度亲和键不受影响(它走 scope="" 的口径)。
+    let conversion = match converter::convert_request(&messages_req, &account.account_id) {
         Ok(c) => c,
         Err(e) => return format!("<转换失败: {e}>"),
     };
@@ -126,7 +129,7 @@ pub async fn chat_stream(
     crate::thinking_policy::override_thinking_from_model_name(&mut messages_req);
 
     // 2. converter:Anthropic → Kiro ConversationState
-    let conversion = converter::convert_request(&messages_req).map_err(|e| {
+    let conversion = converter::convert_request(&messages_req, &account.account_id).map_err(|e| {
         // UnsupportedModel / EmptyMessages 都是请求本身问题 → BadRequest(不换号)。
         // 文案只有「模型不支持: <客户请求的模型名>」/「消息列表为空」→ 对外可见。
         UpstreamError::bad_request_visible(format!("转换失败: {e}"))

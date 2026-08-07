@@ -118,11 +118,42 @@ pub(super) fn safe_prefix(s: &str, max_bytes: usize) -> &str {
 /// char ~2500）、滚动参数（`Today's date`，char ~57400）。取前 8192 字节恰覆盖前两者、避开第三者，
 /// 故既能分开 agent/用户、又不会被每日变化的日期误拆健康会话。**空 / 纯空白 system 时哈希输入
 /// 与旧版逐字节一致**，无 system 的老会话 conversationId 不变，零迁移成本。
+/// `scope` = **账号作用域盐**。空串 = 不加盐(调度亲和键用这条路,见
+/// [`super::affinity_key_from_body`])。
+///
+/// ## 为什么上游 ID 必须按账号分叉
+///
+/// 这个 ID 原先只由**请求内容**决定,于是「同一会话」在任何账号上都是同一个
+/// `conversationId`。而池里的号寿命只有 ~50 分钟(2026-08-07 实测),客户端会话却能跑
+/// 几小时 —— 结果是**同一个 conversationId 被依次发给一串不同的 AWS 账号**。
+/// 从上游风控看,这是账号池的教科书特征:一个客户端会话不可能横跨多个订阅账号。
+/// 走 `metadata.user_id` 那条路更糟 —— 那时 ID 就是客户端 session id 的原文。
+///
+/// ## 为什么是「按账号派生」而不是「切号时换成随机值」
+///
+/// 随机值有两个反效果:
+/// 1. 同一个号上同一个会话会拿到多个 ID(进程重启、多 worker),那比稳定 ID **更**可疑;
+/// 2. 上游 prefix cache 是按 conversationId 的,随机化等于每次都冷启动(实测稳定
+///    `agentContinuationId` 能让 metering 降 ~36%,见 `cache_point.rs`)。
+///
+/// 按 `(内容, 账号)` 派生同时满足两边:**同号同会话恒等**(缓存照旧命中)、
+/// **换号即换 ID**(不可关联)。而且它是**纯函数**,不需要记「上次是哪个号」——
+/// 无状态才能跨 router/worker 多进程与重启保持一致。
+///
+/// 盐里放 `account_id`:不知道 account_id 就无法把两个号上的同一会话对上。
 pub(super) fn derive_conversation_id_from_messages(
     messages: &[crate::anthropic_types::Message],
     system_anchor: &str,
+    scope: &str,
 ) -> String {
     let mut hasher = Sha256::new();
+    // 账号盐**放在最前**,且带长度前缀框定边界(与 sys 段同样的防碰撞理由)。
+    if !scope.is_empty() {
+        let b = scope.as_bytes();
+        hasher.update(b"acct:");
+        hasher.update((b.len() as u64).to_be_bytes());
+        hasher.update(b);
+    }
     // v55：先把 system 锚点喂进哈希。
     // 回归约束（关键）：**空 / 纯空白 system 时哈希输入必须与旧版逐字节一致**（旧版只哈希
     // 前 2 条 user：`user1\x00user2\x00`），否则无 system 的老会话会冷启动。故用 trim 判断，
@@ -149,8 +180,25 @@ pub(super) fn derive_conversation_id_from_messages(
             }
         }
     }
-    let digest = hasher.finalize();
-    // 取前 16 字节排成 UUID 字符串（不强求真 v4 标志位，Kiro 只看字符串相等）
+    uuid_shape(&hasher.finalize())
+}
+
+/// 把若干段字节哈希成 UUID 形态字符串。
+///
+/// 抽出来给 [`super::scope_session_id`] 复用:客户端 session id 按账号重派生时,
+/// 输出必须仍然长得像 Kiro 客户端会发的 UUID(拼前缀会造出上游没见过的形状)。
+/// 每段自带长度前缀,防止跨段拼接碰撞。
+pub(super) fn uuid_from_parts(parts: &[&[u8]]) -> String {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_be_bytes());
+        h.update(p);
+    }
+    uuid_shape(&h.finalize())
+}
+
+/// sha256 摘要 → UUID 串(不强求真 v4 标志位,Kiro 只看字符串相等)。
+fn uuid_shape(digest: &[u8]) -> String {
     let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 has 32 bytes");
     format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",

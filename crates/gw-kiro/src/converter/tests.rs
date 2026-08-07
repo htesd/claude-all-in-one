@@ -270,7 +270,7 @@ fn test_tool_name_mapping_in_convert_request() {
         context_management: None,
     };
 
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
 
     // 应该有映射
     assert_eq!(result.tool_name_map.len(), 1);
@@ -309,7 +309,7 @@ fn convert_request_omits_agent_continuation_by_default() {
         metadata: None,
         context_management: None,
     };
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     assert_eq!(cs.chat_trigger_type.as_deref(), Some("MANUAL"), "应发 chat_trigger_type=MANUAL");
     // 默认关:不上 wire(env 未设)。
     assert!(cs.agent_continuation_id.is_none(), "默认(开关关)不发 agentContinuationId");
@@ -424,7 +424,7 @@ fn multimodal_request_downgrades_complex_tool_schema() {
         context_management: None,
     };
     let tools_json = |req: &MessagesRequest| {
-        let cs = convert_request(req).unwrap().conversation_state;
+        let cs = convert_request(req, "").unwrap().conversation_state;
         serde_json::to_string(
             &cs.current_message.user_input_message.user_input_message_context.tools,
         )
@@ -484,7 +484,7 @@ fn test_tool_name_mapping_in_history() {
         context_management: None,
     };
 
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
 
     // 历史中 assistant 消息的 tool_use name 也应该被映射
@@ -532,7 +532,7 @@ fn dup_tool_use_id_rewrite_does_not_perturb_conversation_id() {
     });
     let req: MessagesRequest = serde_json::from_value(body.clone()).unwrap();
     // 先证改写确实被触发(否则本测试退化为空守卫):转换产物里应出现改写后缀。
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let renamed_present = result.conversation_state.history.iter().any(|m| {
         matches!(m, Message::Assistant(a)
             if a.assistant_response_message.tool_uses.iter().flatten()
@@ -584,7 +584,7 @@ fn test_history_tools_added_to_tools_list() {
         context_management: None,
     };
 
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
 
     // 验证 tools 列表中包含了历史中使用的工具的占位符定义
     let tools = &result
@@ -645,7 +645,7 @@ fn req_with_system_and_tools(
 #[test]
 fn test_chunked_policy_injected_when_write_tool_present() {
     let req = req_with_system_and_tools(Some(vec![make_named_tool("Write")]));
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert!(
         first_history_user_text(&result).contains("comply silently"),
         "带 Write 工具时应注入 SYSTEM_CHUNKED_POLICY"
@@ -655,7 +655,7 @@ fn test_chunked_policy_injected_when_write_tool_present() {
 #[test]
 fn test_chunked_policy_injected_when_edit_tool_present() {
     let req = req_with_system_and_tools(Some(vec![make_named_tool("Edit")]));
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert!(
         first_history_user_text(&result).contains("comply silently"),
         "带 Edit 工具时应注入 SYSTEM_CHUNKED_POLICY"
@@ -666,7 +666,7 @@ fn test_chunked_policy_injected_when_edit_tool_present() {
 fn test_chunked_policy_absent_for_clean_client() {
     // 无工具的干净客户端（如第三方行为检测）：系统消息不应被污染
     let req = req_with_system_and_tools(None);
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let text = first_history_user_text(&result);
     assert!(
         !text.contains("comply silently"),
@@ -679,7 +679,7 @@ fn test_chunked_policy_absent_for_clean_client() {
 fn test_chunked_policy_absent_when_only_other_tools() {
     // 带了别的工具（非 Write/Edit）也不应注入
     let req = req_with_system_and_tools(Some(vec![make_named_tool("get_weather")]));
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert!(
         !first_history_user_text(&result).contains("comply silently"),
         "仅含非 Write/Edit 工具时不应注入分块策略"
@@ -708,7 +708,7 @@ fn test_pdf_document_block_maps_to_kiro_documents() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let docs = &result.conversation_state.current_message.user_input_message.documents;
     assert_eq!(docs.len(), 1, "PDF document 块应转成 1 个 KiroDocument");
     assert_eq!(docs[0].format, "pdf");
@@ -768,7 +768,7 @@ fn test_document_only_message_gets_media_placeholder() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let cm = &result.conversation_state.current_message.user_input_message;
     assert_eq!(cm.content, MEDIA_ONLY_PLACEHOLDER, "纯文档无文本应补引导语，不能留空");
     assert_eq!(cm.documents.len(), 1, "文档应保留");
@@ -795,7 +795,7 @@ fn test_image_only_message_gets_media_placeholder() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let cm = &result.conversation_state.current_message.user_input_message;
     assert_eq!(cm.content, MEDIA_ONLY_PLACEHOLDER, "纯图像无文本应补引导语");
     assert_eq!(cm.images.len(), 1, "图像应保留");
@@ -823,7 +823,7 @@ fn test_document_with_text_keeps_text() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let cm = &result.conversation_state.current_message.user_input_message;
     assert_eq!(cm.content, "总结这个PDF", "有文本时保留用户文本");
 }
@@ -858,7 +858,7 @@ fn test_structured_output_injects_schema_instruction() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let sys = first_history_user_text(&result);
     assert!(sys.contains("strictly conforms to this JSON Schema"), "应注入结构化输出指令");
     assert!(sys.contains("\"expression\""), "指令应含 schema 内容");
@@ -884,7 +884,7 @@ fn test_structured_output_instruction_absent_without_schema() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert!(!first_history_user_text(&result).contains("JSON Schema"), "无 schema 不应注入");
 }
 
@@ -908,7 +908,7 @@ fn test_identity_override_and_privacy_always_injected() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let h0 = first_history_user_text(&result);
     assert!(h0.contains("<identity_override>"), "应注入 identity_override: {h0}");
     assert!(h0.contains("Never claim to be Kiro"), "identity_override 文案应逐字: {h0}");
@@ -941,7 +941,7 @@ fn test_structured_output_with_empty_system_still_injects() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert!(
         first_history_user_text(&result).contains("strictly conforms to this JSON Schema"),
         "空 system 时结构化指令仍应注入"
@@ -1020,7 +1020,7 @@ fn test_convert_request_with_session_metadata() {
         context_management: None,
     };
 
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert_eq!(
         result.conversation_state.conversation_id,
         "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -1049,7 +1049,7 @@ fn test_convert_request_without_metadata() {
         context_management: None,
     };
 
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     // 验证生成的是有效的 UUID 格式
     assert_eq!(result.conversation_state.conversation_id.len(), 36);
     assert_eq!(
@@ -1087,7 +1087,7 @@ fn req_with_system(system: Option<&str>, user: &str) -> MessagesRequest {
 }
 
 fn conv_id(system: Option<&str>, user: &str) -> String {
-    convert_request(&req_with_system(system, user))
+    convert_request(&req_with_system(system, user), "")
         .unwrap()
         .conversation_state
         .conversation_id
@@ -1142,7 +1142,7 @@ fn test_derive_conv_id_empty_system_matches_legacy() {
         role: "user".to_string(),
         content: serde_json::json!("Hello legacy"),
     }];
-    let legacy = derive_conversation_id_from_messages(&msgs, "");
+    let legacy = derive_conversation_id_from_messages(&msgs, "", "");
     let none_system = conv_id(None, "Hello legacy");
     let empty_system = conv_id(Some(""), "Hello legacy");
     assert_eq!(legacy, none_system, "无 system 必须等于空锚点派生（零迁移）");
@@ -1154,7 +1154,7 @@ fn test_derive_conv_id_empty_system_matches_legacy() {
         SystemMessage { text: "".to_string() },
         SystemMessage { text: "".to_string() },
     ]);
-    let multi_empty = convert_request(&req_multi_empty)
+    let multi_empty = convert_request(&req_multi_empty, "")
         .unwrap()
         .conversation_state
         .conversation_id;
@@ -1189,8 +1189,8 @@ fn test_derive_conv_id_stable_across_turns() {
         AnthropicMessage { role: "user".to_string(), content: serde_json::json!("third question") },
     ]; // 前 2 条 user 仍 = [first, second]
 
-    let id1 = convert_request(&turn1).unwrap().conversation_state.conversation_id;
-    let id2 = convert_request(&turn2).unwrap().conversation_state.conversation_id;
+    let id1 = convert_request(&turn1, "").unwrap().conversation_state.conversation_id;
+    let id2 = convert_request(&turn2, "").unwrap().conversation_state.conversation_id;
     assert_eq!(id1, id2, "同 agent 多轮、前 2 条 user 不变时 conversationId 必须稳定");
 }
 
@@ -1848,7 +1848,7 @@ fn test_convert_request_strips_history_thinking_keeps_current_turn() {
         metadata: None,
         context_management: None,
     };
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     let cs = result.conversation_state;
     let history_json = serde_json::to_string(&cs.history).unwrap();
     // 1) 历史 thinking 文本被剥离
@@ -1923,7 +1923,7 @@ fn test_consecutive_assistant_with_tool_use_result_pairing() {
         context_management: None,
     };
 
-    let result = convert_request(&req);
+    let result = convert_request(&req, "");
     assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
 
     let state = result.unwrap().conversation_state;
@@ -1966,7 +1966,7 @@ fn test_trailing_consecutive_user_messages_merge_into_current_turn() {
         metadata: None,
         context_management: None,
     };
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     // 当前轮 = 两条尾部 user 合并(\n 连接)
     assert_eq!(
         cs.current_message.user_input_message.content,
@@ -2027,7 +2027,7 @@ fn test_trailing_user_tool_result_merges_with_current_text() {
         metadata: None,
         context_management: None,
     };
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     let cm = &cs.current_message.user_input_message;
     assert_eq!(cm.content, "基于结果继续", "当前轮文本应来自最后一条 user");
     assert_eq!(
@@ -2070,7 +2070,7 @@ fn test_system_role_stable_prefix_promoted_to_history() {
         },
         AM { role: "user".to_string(), content: serde_json::json!("hi") },
     ]);
-    let result = convert_request(&req).unwrap();
+    let result = convert_request(&req, "").unwrap();
     assert!(
         first_history_user_text(&result).contains("SessionStart hook additional context"),
         "稳定 system 前缀应提升进 history[0]"
@@ -2090,7 +2090,7 @@ fn test_system_role_dynamic_noise_dropped() {
         },
         AM { role: "user".to_string(), content: serde_json::json!("继续") },
     ]);
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     let all_text: String = cs
         .history
         .iter()
@@ -2122,7 +2122,7 @@ fn test_system_role_interrupted_user_converted_to_user() {
         },
         AM { role: "user".to_string(), content: serde_json::json!("继续") },
     ]);
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     let current = &cs.current_message.user_input_message.content;
     assert!(current.contains("等一下先看这个"), "中断正文应转 user(并入当前轮),实际={}", current);
     assert!(!current.contains("IMPORTANT"), "IMPORTANT 之后应被截断");
@@ -2152,7 +2152,7 @@ fn test_system_role_unknown_wrapped_as_system_context() {
         AM { role: "assistant".to_string(), content: serde_json::json!("答") },
         AM { role: "user".to_string(), content: serde_json::json!("再问") },
     ]);
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     let history_text: String = cs
         .history
         .iter()
@@ -2190,7 +2190,7 @@ fn test_model_identity_normalized_in_system_block() {
         metadata: None,
         context_management: None,
     };
-    let text = first_history_user_text(&convert_request(&req).unwrap());
+    let text = first_history_user_text(&convert_request(&req, "").unwrap());
     assert!(
         text.contains("You are powered by the model named Opus 4.8. The exact model ID is claude-opus-4-8."),
         "model identity 应被规范化成官方名,实际={}",
@@ -2206,7 +2206,7 @@ fn test_no_system_role_messages_is_noop() {
     let req = req_with_messages(vec![
         AM { role: "user".to_string(), content: serde_json::json!("只有普通对话") },
     ]);
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     assert_eq!(cs.current_message.user_input_message.content, "只有普通对话");
 }
 
@@ -2235,7 +2235,7 @@ fn test_thinking_prefix_injected_into_current_turn_not_system() {
         metadata: None,
         context_management: None,
     };
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     let current = &cs.current_message.user_input_message.content;
     // **对齐 Kiro 1.0.212**:正文里不再注入任何 thinking 文本标签(当前轮与 system 都不注)。
     assert!(current.contains("用户问题"), "当前轮原文应保留");
@@ -2272,7 +2272,103 @@ fn test_thinking_prefix_not_duplicated_when_already_present() {
         metadata: None,
         context_management: None,
     };
-    let cs = convert_request(&req).unwrap().conversation_state;
+    let cs = convert_request(&req, "").unwrap().conversation_state;
     let current = &cs.current_message.user_input_message.content;
     assert_eq!(current.matches("<thinking_mode>").count(), 1, "不应重复注入 thinking 标签,实际={}", current);
+}
+
+
+// ── 换号伪装:上游 conversationId 按账号分叉(2026-08-07)────────────────────
+//
+// 背景:池里的号寿命只有 ~50 分钟,客户端会话却能跑几小时。ID 只由内容决定时,
+// **同一个 conversationId 会被依次发给一串不同的 AWS 账号** —— 一个客户端会话不可能
+// 横跨多个订阅账号,这是账号池最强的特征之一。
+
+fn req_with(system: Option<&str>, first_user: &str, session: Option<&str>) -> MessagesRequest {
+    let mut body = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "messages": [{"role":"user","content": first_user}]
+    });
+    if let Some(sys) = system {
+        body["system"] = serde_json::json!(sys);
+    }
+    if let Some(sid) = session {
+        body["metadata"] = serde_json::json!({"user_id": format!("user_1_session_{sid}")});
+    }
+    serde_json::from_value(body).unwrap()
+}
+
+fn scoped_conv_id(req: &MessagesRequest, scope: &str) -> String {
+    convert_request(req, scope).unwrap().conversation_state.conversation_id.clone()
+}
+
+#[test]
+fn 换号则上游会话_id_跟着换() {
+    let req = req_with(Some("be brief"), "帮我看下这段代码", None);
+    let a = scoped_conv_id(&req, "acct-A");
+    let b = scoped_conv_id(&req, "acct-B");
+    assert_ne!(a, b, "同一会话在不同账号上必须是不同的 conversationId");
+    // 同号恒等 —— 上游 prefix cache 靠这条(随机化会让缓存每次冷启动)
+    assert_eq!(a, scoped_conv_id(&req, "acct-A"), "同号同会话必须恒等");
+}
+
+#[test]
+fn metadata_里的客户端_session_id_也要按账号分叉() {
+    // 这条路最危险:不加盐时 ID 就是客户端 session id 的**原文**,
+    // 等于把「同一个客户端会话」在多个 AWS 账号之间明文关联起来。
+    let req = req_with(None, "hi", Some("deadbeef-99"));
+    let a = scoped_conv_id(&req, "acct-A");
+    let b = scoped_conv_id(&req, "acct-B");
+    assert_ne!(a, b);
+    assert_ne!(a, "session_deadbeef-99", "不能再原样透出客户端 session id");
+    assert!(!a.contains("deadbeef"), "客户端 session id 不该出现在上游 ID 里");
+    assert_eq!(a, scoped_conv_id(&req, "acct-A"));
+}
+
+#[test]
+fn 加盐后仍是_uuid_形状() {
+    // 拼前缀会造出上游没见过的形状;必须仍然长得像 Kiro 客户端发的 UUID。
+    for (req, scope) in [
+        (req_with(Some("s"), "u", None), "acct-A"),
+        (req_with(None, "u", Some("sess-1")), "acct-A"),
+    ] {
+        let id = scoped_conv_id(&req, scope);
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 5, "{id}");
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "{id}"
+        );
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{id}");
+    }
+}
+
+#[test]
+fn 调度亲和键不受账号影响() {
+    // ⭐ 回归护栏:worker 是**先算亲和键、再选号**的。这个键一旦掺进账号,
+    // 钉扎就会自我推翻(每次选到的号不同 → 键不同 → 又换号),缓存永远冷启动。
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-5", "max_tokens": 64,
+        "messages": [{"role":"user","content":"anchor"}]
+    });
+    let k1 = affinity_key_from_body(&body).unwrap();
+    let k2 = affinity_key_from_body(&body).unwrap();
+    assert_eq!(k1, k2);
+    // 且它等于 scope 为空时的派生值 —— 两处口径必须同源
+    let req: MessagesRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(k1, scoped_conv_id(&req, ""));
+    // 而真正发出去的(带账号盐的)与它不同
+    assert_ne!(k1, scoped_conv_id(&req, "acct-A"));
+}
+
+#[test]
+fn agent_continuation_id_跟着会话_id_一起换() {
+    // 它是从 conversationId 派生的,所以换号时**必须**也变 —— 否则它自己成了
+    // 跨账号的关联键,伪装等于漏了一半。
+    let req = req_with(Some("s"), "u", None);
+    let a = derive_agent_continuation_id(&scoped_conv_id(&req, "acct-A"));
+    let b = derive_agent_continuation_id(&scoped_conv_id(&req, "acct-B"));
+    assert_ne!(a, b, "换号后 agentContinuationId 仍相同 = 关联键没换干净");
 }
