@@ -1997,12 +1997,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.shelf.label(), "drop");
-        assert_eq!(d.shelf.account_region, "", "drop 不带区域,走上游默认 us-east-1");
+        // ⚠️ 这里的 fixture 是**合成的**,`account_region` 留空只是为了覆盖「区域未知」
+        // 这个仍然存在的分支(老配置/别家不下发区域)。**drop 现在是按区分货的**
+        // (eu-central-1 / us-east-1,见 `drop::REGIONS`),别把这条当成 drop 的现状。
+        assert_eq!(d.shelf.account_region, "", "区域未知的货架:留空 = 用上游默认 us-east-1");
     }
 
     #[test]
     fn 首选家没货时按档位落到次选而不是落到最便宜() {
-        // drop 常年 0 库存,所以这条路径才是**生产上的常态**:
+        // drop 的 us 区常年 0 库存,所以这条路径才是**生产上的常态**:
+        // (2026-08-07 起 drop 还有 eu 区,那一档通常有货且更便宜)
         // 落下去之后要落到 kiroapp/us(档 1),不是更便宜的 kiroapp/eu(档 2)。
         let d = choose_shelf(
             &busy(),

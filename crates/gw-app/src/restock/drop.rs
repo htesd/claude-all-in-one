@@ -15,6 +15,27 @@ use serde::Deserialize;
 /// 补货循环卡死等于补货停摆。
 const TIMEOUT_SECS: u64 = 20;
 
+/// drop 现在**按服务区分货**(2026-08-07 实测)。
+///
+/// `GET /api/me/stock` 不带参数时只回 `us-east-1` 那一档;带 `?region=` 才看得到别的。
+/// 实测同一时刻:
+///
+/// ```text
+/// (无参数)              → {"region":"us-east-1",   "price":"5.88","stock":0}
+/// ?region=eu-central-1 → {"region":"eu-central-1","price":"3.67","stock":3}
+/// ?region=eu           → 同上(简写会被归一成 eu-central-1)
+/// ```
+///
+/// ## 不带 region 的代价(这是一次真实故障)
+///
+/// 旧代码只问不带参数的那一档。于是 us 缺货时引擎看到 `stock=0` 判「缺货」→ 不补货,
+/// 而**网站上明明有 eu 的货**。号按墙上时钟一个个死掉,池子抽干,客户端拿 503 ——
+/// 用户侧的表现是「有货却显示缺货,然后卡顿一段时间」。
+///
+/// 没有区域列表端点(`/api/me/regions`、`/api/me/shelves`、`/api/regions` 全 404),
+/// 所以区域集合只能写死在这里。新增一个区就往这个数组里加一项。
+const REGIONS: &[&str] = &["eu-central-1", "us-east-1"];
+
 #[derive(Debug)]
 pub struct DropError {
     pub message: String,
@@ -64,10 +85,38 @@ impl DropError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Stock {
+/// 库存/购买端点的路径(含 region 查询参数)。
+///
+/// 抽成纯函数是为了**能测**:购买那条路我方不能实测(一次就是一次真实扣款),
+/// 至少要保证「区域到底有没有拼进请求」这件事有断言钉住。
+fn path_with_region(base: &str, region: Option<&str>) -> String {
+    match region {
+        Some(r) if !r.trim().is_empty() => format!("{base}?region={}", r.trim()),
+        _ => base.to_string(),
+    }
+}
+
+/// 响应里没带 region 的 key,按本次请求的区域补上,并返回补了几个。
+///
+/// 抽成纯函数同上:这段决定号会打哪个 `management.<region>.kiro.dev`,
+/// 写错就是每个请求 403,而它所在的那条路不能实测。
+fn fill_missing_regions(keys: &mut [BoughtKey], want: &str) -> usize {
+    if want.trim().is_empty() {
+        return 0;
+    }
+    let mut n = 0;
+    for k in keys.iter_mut().filter(|k| k.region.is_empty()) {
+        k.region = want.trim().to_string();
+        n += 1;
+    }
+    n
+}
+
+/// 一个区域档的库存快照。`region` 是**对方回显**的值,见 [`StockBody::region`]。
+#[derive(Debug, Clone)]
+pub struct RegionStock {
+    pub region: String,
     pub stock: i64,
-    /// **USD**。对方报价用美元、扣款走人民币,别把它当人民币用。
     pub price_usd: f64,
     pub balance_cny: f64,
 }
@@ -191,6 +240,11 @@ struct StockBody {
     price: f64,
     #[serde(default, deserialize_with = "de_f64")]
     balance: f64,
+    /// 对方**回显**的服务区。以它为准,不以我方请求的为准 —— 参数拼错或对方改了
+    /// 归一规则时,回显是唯一能发现「我要的是 eu,拿到的是 us」的地方,
+    /// 而这个错会一路落进 `extra.region`,让号的每个请求 403。
+    #[serde(default)]
+    region: String,
 }
 
 #[derive(Deserialize)]
@@ -287,39 +341,92 @@ impl DropClient {
     }
 
     /// 库存 / 单价 / 余额。**路由是 `/api/me/stock`**,全站唯一用 `me` 的端点。
-    pub async fn stock(&self) -> Result<Stock, DropError> {
-        let text = self.call(reqwest::Method::GET, "/api/me/stock", None).await?;
+    ///
+    /// 不带 region = 只看 `us-east-1` 那一档(对方的默认),这正是那次
+    /// 「有货却报缺货」故障的成因,见 [`REGIONS`]。
+    /// 某个服务区的库存。`None` = 用对方默认档。
+    ///
+    /// **故意没有不带参数的版本。** 早先那个 `stock()` 正是这次故障的成因
+    /// (只问默认档 → us 缺货就判全线缺货),留着它等于留一个随时会被再调一次的坑。
+    pub async fn stock_in(&self, region: Option<&str>) -> Result<RegionStock, DropError> {
+        let path = path_with_region("/api/me/stock", region);
+        let text = self.call(reqwest::Method::GET, &path, None).await?;
         let b: StockBody = serde_json::from_str(&text)
             .map_err(|e| DropError::net(format!("drop 库存响应解析失败: {e}")))?;
-        Ok(Stock { stock: b.stock, price_usd: b.price, balance_cny: b.balance })
+        // 回显为空时退回我方请求值(老部署/老响应),两者都空则留空 = 上游默认区。
+        let echoed = if b.region.is_empty() {
+            region.unwrap_or("").to_string()
+        } else {
+            b.region.clone()
+        };
+        if let (Some(want), false) = (region, b.region.is_empty()) {
+            if !want.is_empty() && b.region != want && !want.starts_with(&b.region) && !b.region.starts_with(want) {
+                tracing::warn!(
+                    requested = %want, echoed = %b.region,
+                    "drop 库存:请求的服务区与对方回显不一致,按回显为准"
+                );
+            }
+        }
+        Ok(RegionStock {
+            region: echoed,
+            stock: b.stock,
+            price_usd: b.price,
+            balance_cny: b.balance,
+        })
     }
 
     /// 扣款购买。
     ///
     /// **调用前 `client_order_id` 必须已落库** —— 同 id + 同 count 可安全重试,
     /// 但前提是崩溃后还知道那个 id 是什么。
-    pub async fn purchase(
+    /// 指定服务区下单。**没有不带 region 的版本**,理由同 [`Self::stock_in`]。
+    ///
+    /// ## ⚠️ region 参数的传法是**推断,不是实测**
+    ///
+    /// 库存端点确认吃 `?region=`(见 [`Self::stock_in`]),购买端点没法试 ——
+    /// 试一次就是一次真实扣款。所以这里**同时**从两处传:query 参数与 body 字段。
+    /// 多传一个对方不认的字段,常规实现是忽略;而少传那个它认的,后果是买错区。
+    ///
+    /// **真正的护栏不在请求侧,在响应侧**:落进 `extra.region` 的值一律取自
+    /// 响应里 key 对象自带的 `region`(见 [`BoughtKey::parse`]),取不到才退回本次请求的
+    /// 区域,并在 [`Self::purchase_in`] 里留一条 warn。买错区不会静默 ——
+    /// 号会在第一次 `getUsageLimits` 就 403,而 warn 已经把「我方无法确认」写在日志里了。
+    pub async fn purchase_in(
         &self,
         count: i64,
         client_order_id: &str,
         max_total_cny: f64,
+        region: Option<&str>,
     ) -> Result<PurchaseResult, DropError> {
-        let text = self
-            .call(
-                reqwest::Method::POST,
-                "/api/my/purchase",
-                Some(serde_json::json!({
-                    "count": count,
-                    "client_order_id": client_order_id,
-                    "max_total_cny": max_total_cny,
-                })),
-            )
-            .await?;
+        let path = path_with_region("/api/my/purchase", region);
+        let mut body = serde_json::json!({
+            "count": count,
+            "client_order_id": client_order_id,
+            "max_total_cny": max_total_cny,
+        });
+        if let (Some(r), Some(o)) = (region, body.as_object_mut()) {
+            if !r.is_empty() {
+                o.insert("region".into(), serde_json::json!(r));
+            }
+        }
+        let text = self.call(reqwest::Method::POST, &path, Some(body)).await?;
         let b: PurchaseBody = serde_json::from_str(&text)
             .map_err(|e| DropError::net(format!("drop 购买响应解析失败: {e}")))?;
         // key 可能是裸串,也可能是 {"key": "ksk_..."} 对象;只收 ksk_ 前缀的。
         // 解析细节(含为什么要顺带取 region)见 [`BoughtKey::parse`]。
-        let keys = b.keys.iter().filter_map(BoughtKey::parse).collect();
+        let mut keys: Vec<BoughtKey> = b.keys.iter().filter_map(BoughtKey::parse).collect();
+        // 响应没给 region 时,退回本次请求的区域 —— 但要吵一声:我方无法确认对方
+        // 是否真的按 region 发货,而这个值会决定号打哪个 `management.<region>.kiro.dev`。
+        if let Some(want) = region.filter(|r| !r.is_empty()) {
+            let filled = fill_missing_regions(&mut keys, want);
+            if filled > 0 {
+                tracing::warn!(
+                    requested = %want, keys = keys.len(), filled,
+                    "drop 购买:响应里的 key 没带 region,按本次请求的区域记录(**未经对方确认**)。\
+                     若这些号第一次查配额就 403 Invalid token,就是买错区了"
+                );
+            }
+        }
         Ok(PurchaseResult {
             client_order_id: if b.client_order_id.is_empty() {
                 client_order_id.to_string()
@@ -336,8 +443,12 @@ impl DropClient {
 
 /// drop 作为「一家供应商」的样子。
 ///
-/// **这是纯平移,不改任何行为**:一个货架、无区域概念(`shelf_id` 与 `account_region`
-/// 都是空串,落到 `import_payload` 时不写 `region`,与本抽象引入前逐字节等价)。
+/// **一区一货架**(2026-08-07):对方按服务区分货,不同区不同价、不同库存
+/// (实测 eu-central-1 $3.67/3 个 vs us-east-1 $5.88/0 个)。只问默认档的旧写法
+/// 会在 us 缺货时误判「全线缺货」,见 [`REGIONS`]。
+///
+/// 货架排序由引擎的 `rank_shelves` 负责(先档位再价格),所以便宜的区会自动胜出 ——
+/// 这里不表达偏好,只把两个区如实报上去。
 ///
 /// 报价折算:drop 的 `price` 是 USD、余额与扣款本来就是 CNY,所以只有单价要乘汇率,
 /// 且沿用 [`max_total_cny_for`] 的取整口径 —— 让「面板上显示的单价」与「下单时的限价」
@@ -349,33 +460,61 @@ impl super::supplier::Supplier for DropClient {
     }
 
     async fn survey(&self, usd_to_cny: f64) -> Result<super::supplier::Survey, String> {
-        let s = self.stock().await.map_err(|e| e.to_string())?;
+        let mut shelves = Vec::new();
+        let mut balance_cny = 0.0;
+        let mut last_err: Option<String> = None;
+
+        for region in REGIONS {
+            match self.stock_in(Some(region)).await {
+                Ok(r) => {
+                    // 余额是账户级的,每个区回的都是同一个数;取任意一个即可。
+                    balance_cny = r.balance_cny;
+                    shelves.push(super::supplier::Shelf {
+                        supplier_id: self.id.clone(),
+                        // drop 的「货架标识」就是区域串,下单时原样回传。
+                        shelf_id: r.region.clone(),
+                        account_region: r.region.clone(),
+                        stock: r.stock,
+                        unit_price_cny: max_total_cny_for(1, r.price_usd, usd_to_cny),
+                        // drop 不下发单笔上限;用库存兜底,真正的量闸在引擎的 max_per_purchase。
+                        max_per_order: r.stock.max(1),
+                        priority: 0, // 引擎按名册回填,适配器不表达自己的档位
+                    });
+                }
+                // **一个区查不到不该让整家掉线。** 另一个区可能正好有货,而这家整体
+                // 报错会让引擎跳过它 —— 那就又回到「有货却买不到」了。
+                Err(e) => {
+                    tracing::warn!(supplier = %self.id, region = %region,
+                        "drop 该区库存查询失败,跳过这个货架: {e}");
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        // 全部区都失败才算这家掉线(熔断/故障计数据此)。
+        if shelves.is_empty() {
+            return Err(last_err.unwrap_or_else(|| "drop 所有区域库存查询均失败".to_string()));
+        }
         Ok(super::supplier::Survey {
             supplier_id: self.id.clone(),
-            balance_cny: s.balance_cny,
+            balance_cny,
             balance_native: String::new(), // drop 的余额本来就是人民币,没有第二种口径
-            shelves: vec![super::supplier::Shelf {
-                supplier_id: self.id.clone(),
-                shelf_id: String::new(),
-                account_region: String::new(),
-                stock: s.stock,
-                unit_price_cny: max_total_cny_for(1, s.price_usd, usd_to_cny),
-                // drop 不下发单笔上限;用库存兜底,真正的量闸在引擎的 max_per_purchase。
-                max_per_order: s.stock.max(1),
-                priority: 0, // 引擎按名册回填,适配器不表达自己的档位
-            }],
+            shelves,
         })
     }
 
     async fn buy(
         &self,
-        _shelf: &super::supplier::Shelf,
+        shelf: &super::supplier::Shelf,
         count: i64,
         order_id: &str,
         max_total_cny: f64,
         _usd_to_cny: f64,
     ) -> super::supplier::BuyOutcome {
-        self.purchase_outcome(count, order_id, max_total_cny).await
+        // 必须把货架的区域带上,否则**买的是对方默认区**(us-east-1)而我方会按
+        // 货架的 `account_region` 记 `extra.region` —— 那正是「每个请求 403」的配方。
+        self.purchase_outcome(count, order_id, max_total_cny, Some(&shelf.shelf_id))
+            .await
     }
 
     /// drop 没有只读的查单接口,只能**重放**:用同一个 `client_order_id` 再发一次,
@@ -385,12 +524,15 @@ impl super::supplier::Supplier for DropClient {
     async fn reconcile(
         &self,
         order_id: &str,
-        _shelf: &str,
+        shelf: &str,
         count: i64,
         max_total_cny: f64,
         _usd_to_cny: f64,
     ) -> super::supplier::BuyOutcome {
-        self.purchase_outcome(count, order_id, max_total_cny).await
+        // 重放**必须带原单的区域**:少了它,一笔 eu 的订单会被当成 us 重发 ——
+        // 若对方把 region 当订单的一部分,那就不是重放而是一笔新订单(二次扣款)。
+        self.purchase_outcome(count, order_id, max_total_cny, Some(shelf))
+            .await
     }
 }
 
@@ -404,9 +546,10 @@ impl DropClient {
         count: i64,
         order_id: &str,
         max_total_cny: f64,
+        region: Option<&str>,
     ) -> super::supplier::BuyOutcome {
         use super::supplier::{BuyOutcome, Receipt};
-        match self.purchase(count, order_id, max_total_cny).await {
+        match self.purchase_in(count, order_id, max_total_cny, region).await {
             Ok(r) => BuyOutcome::Ok(Receipt {
                 keys: r.keys,
                 // drop 不下发单笔扣款额。留 0 表示「我说不出来」,由引擎按余额差算;
@@ -444,6 +587,76 @@ fn strip_url(e: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // ── 按服务区分货(2026-08-07)────────────────────────────────────────
+    //
+    // 这组用例守的是一次真实故障:旧代码只问不带 region 的那一档,us 缺货时
+    // 判「全线缺货」而 eu 明明有货 → 不补货 → 池子抽干 → 客户拿 503。
+
+    #[test]
+    fn 区域会拼进请求路径() {
+        assert_eq!(
+            path_with_region("/api/me/stock", Some("eu-central-1")),
+            "/api/me/stock?region=eu-central-1"
+        );
+        assert_eq!(
+            path_with_region("/api/my/purchase", Some("us-east-1")),
+            "/api/my/purchase?region=us-east-1"
+        );
+        // 空/None → 不拼参数(等于用对方默认档)
+        assert_eq!(path_with_region("/api/me/stock", None), "/api/me/stock");
+        assert_eq!(path_with_region("/api/me/stock", Some("")), "/api/me/stock");
+        assert_eq!(path_with_region("/api/me/stock", Some("  ")), "/api/me/stock");
+    }
+
+    #[test]
+    fn 两个区都在名册里且_eu_在前() {
+        // 顺序本身不决定选家(引擎按价格排),但 eu 更便宜,放前面让日志更直观。
+        assert!(REGIONS.contains(&"eu-central-1"));
+        assert!(REGIONS.contains(&"us-east-1"));
+        assert_eq!(REGIONS.len(), 2, "加区就改这条断言,提醒你顺带看一眼 shelf_priority");
+    }
+
+    #[test]
+    fn 库存响应的_region_回显会被解析() {
+        let b: StockBody = serde_json::from_str(
+            r#"{"balance":"124.304000","price":"3.67","region":"eu-central-1","stock":3}"#,
+        )
+        .unwrap();
+        assert_eq!(b.region, "eu-central-1");
+        assert_eq!(b.stock, 3);
+        assert!((b.price - 3.67).abs() < 1e-9);
+        // 老响应没有 region 字段也不能炸(默认空串 = 用上游默认区)
+        let old: StockBody =
+            serde_json::from_str(r#"{"balance":"1","price":"5.88","stock":0}"#).unwrap();
+        assert_eq!(old.region, "");
+    }
+
+    #[test]
+    fn 响应没带_region_时按请求区域补齐() {
+        let mut keys = vec![
+            BoughtKey { api_key: "ksk_a".into(), region: String::new(), subscription_title: String::new() },
+            BoughtKey { api_key: "ksk_b".into(), region: "us-east-1".into(), subscription_title: String::new() },
+        ];
+        let filled = fill_missing_regions(&mut keys, "eu-central-1");
+        assert_eq!(filled, 1, "只补空的那个");
+        assert_eq!(keys[0].region, "eu-central-1");
+        // **对方明确说了的不动** —— 响应是事实,我方请求只是意愿。
+        assert_eq!(keys[1].region, "us-east-1", "对方给的 region 优先于我方请求的");
+    }
+
+    #[test]
+    fn 请求区域为空时不乱补() {
+        let mut keys = vec![BoughtKey {
+            api_key: "ksk_a".into(),
+            region: String::new(),
+            subscription_title: String::new(),
+        }];
+        assert_eq!(fill_missing_regions(&mut keys, ""), 0);
+        assert_eq!(fill_missing_regions(&mut keys, "   "), 0);
+        // 留空 = 用上游默认(us-east-1),与本次改动前逐字节等价
+        assert_eq!(keys[0].region, "");
+    }
     use super::*;
 
     #[test]
