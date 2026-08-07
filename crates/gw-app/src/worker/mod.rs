@@ -924,7 +924,12 @@ pub async fn run(
     // on-line that intentionally omit machine_id (e.g. legacy rows that rely
     // on runtime defaults).  Restricting to dario eliminates any kiro regression
     // risk while still catching dario accounts imported without credentials.
-    let accounts = if provider_family == "claude-dario" {
+    // cursor 一并纳入(2026-08-07):它的 validate_account 除了 token 还会校验
+    // **出口代理构造得出来**。代理配错的 cursor 号必须挡在池外 —— 让它进池的话,
+    // 每个打到它的请求都会失败(provider 侧 fail-closed,绝不回退默认出口:回退
+    // 等于把本该隔离的号并到同一 IP,已实测的封号维度)。挡在池外 + 启动告警,
+    // 比"号在池里但每次都失败"好查得多。
+    let accounts = if matches!(provider_family.as_str(), "claude-dario" | "cursor") {
         let total = accounts.len();
         let valid: Vec<Arc<Account>> = accounts
             .into_iter()
@@ -934,7 +939,8 @@ pub async fn run(
                     tracing::warn!(
                         account = %a.account_id,
                         reason = %e,
-                        "dario 账号校验失败,跳过不进调度池"
+                        family = %provider_family,
+                        "账号校验失败,跳过不进调度池"
                     );
                     false
                 }
@@ -946,7 +952,8 @@ pub async fn run(
                 total,
                 valid = valid.len(),
                 skipped,
-                "dario 账号校验:部分账号缺凭据被跳过"
+                family = %provider_family,
+                "账号校验:部分账号未通过(缺凭据 / 出口代理非法)被跳过"
             );
         }
         valid
@@ -2049,7 +2056,9 @@ async fn messages(
             tracing::error!("分组头非法,拒绝请求: {msg}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"type":"error","error":{"message": msg}})),
+                // `error.type` 必填,少了它严格校验的客户端解析不了(见 anthropic_error_type)。
+                Json(serde_json::json!({"type":"error","error":{
+                    "type":"api_error","message": msg}})),
             )
                 .into_response();
         }
@@ -2138,9 +2147,9 @@ async fn messages(
                 );
                 return (
                     code,
-                    Json(
-                        serde_json::json!({"type":"error","error":{"message": e.client_message()}}),
-                    ),
+                    Json(serde_json::json!({"type":"error","error":{
+                        "type": error_type_for_status(code),
+                        "message": e.client_message()}})),
                 )
                     .into_response();
             }
@@ -2514,6 +2523,70 @@ async fn chat_with_overload_backoff(
 /// - `Overloaded` → **529**(Anthropic 官方过载语义:Claude Code 与各家 SDK 据此自动重试,
 ///   且不会把渠道判死。语义上这也确实不是"坏网关",是上游没容量)
 /// - 其余 → 502
+#[cfg(test)]
+mod error_shape_tests {
+    use super::*;
+    use gw_core::error::{UpstreamError, UpstreamErrorKind as K};
+
+    /// ⭐ 2026-08-07 事故:除 Overloaded 外都不发 `error.type`,按 schema 严格校验的
+    /// 客户端(opencode/zod)连错误都解析不了,真 message 被吞掉。
+    /// **每一种 kind 都必须给出非空的 `error.type`。**
+    #[test]
+    fn every_error_kind_emits_a_string_error_type() {
+        for kind in [
+            K::TokenInvalid, K::RateLimited, K::TemporarilyBlocked, K::QuotaExhausted,
+            K::Network, K::ServerError, K::Overloaded, K::BadRequest,
+            K::ModelNotAvailable, K::EmptyResponse, K::Other,
+        ] {
+            let e = UpstreamError::new(kind, "x");
+            for (path, body) in [
+                ("http", upstream_error_payload(&e)),
+                ("sse", sse_error_payload(&e)),
+            ] {
+                let ty = body.pointer("/error/type").and_then(|v| v.as_str());
+                assert!(
+                    ty.is_some_and(|t| !t.is_empty()),
+                    "{path} 路径 {kind:?} 缺 error.type:{body}"
+                );
+                assert!(body.pointer("/error/message").is_some_and(|m| m.is_string()));
+                assert_eq!(body["type"], "error");
+            }
+        }
+    }
+
+    /// type 必须与状态码自洽 —— 两者打架会让客户端 SDK 的重试判断和状态码判断冲突。
+    #[test]
+    fn error_type_agrees_with_status_code() {
+        assert_eq!(anthropic_error_type(K::BadRequest), "invalid_request_error");
+        assert_eq!(anthropic_error_type(K::ModelNotAvailable), "invalid_request_error");
+        assert_eq!(anthropic_error_type(K::Overloaded), "overloaded_error");
+        // 选号失败那条路自己算状态码,走 error_type_for_status
+        assert_eq!(error_type_for_status(StatusCode::SERVICE_UNAVAILABLE), "overloaded_error");
+        assert_eq!(error_type_for_status(StatusCode::BAD_REQUEST), "invalid_request_error");
+        assert_eq!(error_type_for_status(StatusCode::BAD_GATEWAY), "api_error");
+        // 502 那一大类:api_error(而不是 authentication_error —— 那会让客户以为
+        // 是自己的 key 有问题,而坏的是我们的上游账号)。
+        for k in [K::TokenInvalid, K::EmptyResponse, K::Network, K::QuotaExhausted] {
+            assert_eq!(anthropic_error_type(k), "api_error", "{k:?}");
+        }
+    }
+
+    /// 上游自己发来的 error 载荷若没带 type,也要补上。
+    #[test]
+    fn sanitizing_upstream_payload_fills_missing_type() {
+        let out = sanitize_upstream_error_payload(&serde_json::json!({
+            "type":"error","error":{"message":"上游原文含指纹"}
+        }));
+        assert_eq!(out.pointer("/error/type").unwrap(), "api_error");
+        assert_ne!(out.pointer("/error/message").unwrap(), "上游原文含指纹");
+        // 带 type 的保留原 type(客户端按它判重试语义,不能动)。
+        let kept = sanitize_upstream_error_payload(&serde_json::json!({
+            "type":"error","error":{"type":"rate_limit_error","message":"raw"}
+        }));
+        assert_eq!(kept.pointer("/error/type").unwrap(), "rate_limit_error");
+    }
+}
+
 fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
     match kind {
         UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable => {
@@ -2524,6 +2597,56 @@ fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
     }
 }
 
+/// `UpstreamErrorKind` → Anthropic 协议的 `error.type` 常量。
+///
+/// ## 为什么这个字段**必须**有(2026-08-07 实测事故)
+///
+/// Anthropic 的错误体形状是 `{"type":"error","error":{"type":..., "message":...}}` ——
+/// `error.type` 是**必填**。早先除 `Overloaded` 外都只发 `message`,于是按 schema
+/// 严格校验的客户端(opencode 用 zod)**连错误都解析不了**:
+///
+/// ```text
+/// Type validation failed: {"error":{"message":"服务未返回内容,请重试"},"type":"error"}
+/// Error message: [{ "expected":"string", "path":["error","type"],
+///                   "message":"Invalid input: expected string, received undefined" }]
+/// ```
+///
+/// 客户看到的是一句 zod 报错,真正的 message 被吞掉 —— 排查成本极高,而且**所有
+/// provider 都受影响**(不只 cursor)。
+///
+/// 取值**跟着 [`upstream_status`] 的状态码走**,不另立一套:type 与 status 不一致
+/// 会让客户端 SDK 的重试判断和状态码判断打架。
+/// - 400 → `invalid_request_error`
+/// - 529 → `overloaded_error`
+/// - 502 → `api_error`(Anthropic taxonomy 里没有 bad_gateway;`api_error` 的语义
+///   正是"服务端出问题,重试可能有用",与 502 一致,且**不会**让客户端以为是自己的
+///   key 或请求有问题)
+fn anthropic_error_type(kind: UpstreamErrorKind) -> &'static str {
+    error_type_for_status(upstream_status(kind))
+}
+
+/// 状态码 → Anthropic `error.type`。
+///
+/// 单独拆出来是因为有些错误路径(选号失败)自己算状态码、手里没有 `UpstreamErrorKind`。
+/// **type 必须跟着 status 走**:两者打架会让客户端 SDK 的重试判断与状态码判断冲突。
+fn error_type_for_status(code: StatusCode) -> &'static str {
+    match code.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        // 503(池子暂时没号)与 529(模型级过载)都是"容量,稍后重试"。
+        // Anthropic taxonomy 里没有 service_unavailable,`overloaded_error` 是语义最近的,
+        // 而且客户端 SDK 对它的处置正是退避重试。
+        503 | 529 => "overloaded_error",
+        // 502 及其他 5xx:`api_error` = 服务端出问题、可重试,且**不指认**客户的
+        // key 或请求有问题(那会让 Claude Code 之类去要求重新登录)。
+        _ => "api_error",
+    }
+}
+
 /// 把 [`UpstreamError`] 映射为对外 HTTP 响应(状态码见 [`upstream_status`])。
 ///
 /// **message 走 `client_message()` 而不是 `to_string()`**:后者带内部 kind 标签 +
@@ -2531,16 +2654,18 @@ fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
 /// 印在每条报错上。诊断原文在调用方的 `tracing` 里一字不少。
 fn upstream_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Response {
     let code = upstream_status(e.kind);
-    // 过载走 Anthropic 的 `overloaded_error` 类型,其余保持既有形状(只有 message)。
-    let body = if e.kind == UpstreamErrorKind::Overloaded {
-        serde_json::json!({
-            "type": "error",
-            "error": {"type": "overloaded_error", "message": e.client_message()},
-        })
-    } else {
-        serde_json::json!({"type":"error","error":{"message": e.client_message()}})
-    };
-    (code, Json(body)).into_response()
+    (code, Json(upstream_error_payload(e))).into_response()
+}
+
+/// 对外错误体。**永远带 `error.type`**,见 [`anthropic_error_type`]。
+fn upstream_error_payload(e: &gw_core::error::UpstreamError) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": anthropic_error_type(e.kind),
+            "message": e.client_message(),
+        },
+    })
 }
 
 /// 流中硬错误 → 对外 SSE `error` 事件。
@@ -2553,7 +2678,8 @@ fn sse_error_event(e: &gw_core::error::UpstreamError) -> Event {
 
 /// [`sse_error_event`] 的载荷。单独拆出来只为可测:`Event` 没有取回 data 的公开接口。
 fn sse_error_payload(e: &gw_core::error::UpstreamError) -> serde_json::Value {
-    serde_json::json!({"type":"error","error":{"message": e.client_message()}})
+    // 与 HTTP 那条路同口径 —— 包括**必须带 `error.type`**(见 anthropic_error_type)。
+    upstream_error_payload(e)
 }
 
 /// 把**上游自己发来的** Anthropic 形状 error 载荷改写成中性版本。
@@ -2579,7 +2705,10 @@ fn sanitize_upstream_error_payload(data: &serde_json::Value) -> serde_json::Valu
     .client_message();
     match ty {
         Some(t) => serde_json::json!({"type":"error","error":{"type": t, "message": msg}}),
-        None => serde_json::json!({"type":"error","error":{"message": msg}}),
+        // 上游没给 type 也**必须补一个**:少了它,严格按 schema 校验的客户端连错误都
+        // 解析不了(见 anthropic_error_type 的事故记录)。补 `api_error` 是最保守的选择 ——
+        // 不指认客户的 key/请求有问题,语义是"服务端出问题,可重试"。
+        None => serde_json::json!({"type":"error","error":{"type":"api_error","message": msg}}),
     }
 }
 
@@ -2595,7 +2724,8 @@ fn admin_error_response(e: &gw_core::error::UpstreamError) -> axum::response::Re
     let code = upstream_status(e.kind);
     (
         code,
-        Json(serde_json::json!({"type":"error","error":{"message": e.to_string()}})),
+        Json(serde_json::json!({"type":"error","error":{
+            "type": anthropic_error_type(e.kind), "message": e.to_string()}})),
     )
         .into_response()
 }
@@ -3442,7 +3572,9 @@ fn stream_response(
                             // 序列化失败也算本次响应损坏 → 收尾按失败上报(审查 Architect#9)。
                             ctx.saw_error = true;
                             Event::default().event("error").data(
-                                serde_json::json!({"type":"error","error":{"message": format!("serialize sse: {e}")}})
+                                serde_json::json!({"type":"error","error":{
+                                    "type":"api_error",
+                                    "message": format!("serialize sse: {e}")}})
                                     .to_string(),
                             )
                         }
@@ -4230,12 +4362,20 @@ mod tests {
         assert_eq!(v["error"]["type"], "overloaded_error");
         assert_eq!(v["type"], "error");
 
-        // 非过载错误保持原有形状:只有 message,不带 error.type。
+        // ⚠️ **这里原先断言的是「非过载错误不带 error.type」——那条断言把一个 bug 钉住了。**
+        //
+        // Anthropic 的错误体里 `error.type` 是必填。少了它,按 schema 严格校验的客户端
+        // (opencode 用 zod)会在**解析错误体时**就失败,把真正的 message 吞掉,
+        // 客户只看到一句 "Invalid input: expected string, received undefined"
+        // (2026-08-07 实测)。原来的顾虑是"造错 type 反而误导客户端重试" —— 顾虑本身
+        // 合理,但结论反了:根本没法解析比 type 不够精确糟得多。`api_error` 是最保守的
+        // 取值(服务端问题、可重试),而且与我们已经返回的 502 状态码一致。
         let se = UpstreamError::new(UpstreamErrorKind::ServerError, "boom").with_status(500);
         let sresp = upstream_error_response(&se);
         assert_eq!(sresp.status(), StatusCode::BAD_GATEWAY);
         let sv = body_json(sresp).await;
-        assert!(sv["error"]["type"].is_null(), "既有错误体形状不应变");
+        assert_eq!(sv["error"]["type"], "api_error", "502 那一类必须给 api_error");
+        assert!(sv["error"]["message"].is_string());
     }
 
     /// 上游身份指纹**一个字都不许**出现在对外响应里 —— 客户看不出这条渠道背后是谁,
@@ -4319,10 +4459,15 @@ mod tests {
         assert_eq!(out["type"], "error");
         assert_eq!(out["error"]["message"], "服务繁忙,请稍后重试");
 
-        // 没有 type 的载荷:不凭空造一个(造错反而误导客户端重试),只换 message。
+        // 上游没给 type 的载荷:**必须补一个**,而不是留空。
+        //
+        // 这条原先断言"不该凭空造 error.type",理由是"造错反而误导客户端重试"。
+        // 实测推翻了它:留空的后果是客户端连错误体都解析不了(见上面
+        // `overloaded_response_carries_anthropic_error_type` 里的说明)。补 `api_error`
+        // 是保守解 —— 语义是"服务端出问题、可重试",不指认客户的 key/请求有问题。
         let untyped = serde_json::json!({"error":{"message":"kiro boom"}});
         let out2 = sanitize_upstream_error_payload(&untyped);
-        assert!(out2["error"]["type"].is_null(), "不该凭空造 error.type");
+        assert_eq!(out2["error"]["type"], "api_error", "缺 type 必须补,否则客户端解析不了");
         assert!(!out2.to_string().contains("kiro"));
 
         // 各 type 映射到语义相符的中性文案(反向:别全塞同一句)。
