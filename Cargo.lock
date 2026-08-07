@@ -655,6 +655,7 @@ dependencies = [
  "futures",
  "gw-claude-subprocess",
  "gw-core",
+ "gw-cursor",
  "gw-dario",
  "gw-kiro",
  "gw-store",
@@ -703,6 +704,30 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "gw-cursor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "flate2",
+ "futures",
+ "getrandom 0.3.4",
+ "gw-core",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1846,6 +1871,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2287,6 +2318,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "rand 0.10.1",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
