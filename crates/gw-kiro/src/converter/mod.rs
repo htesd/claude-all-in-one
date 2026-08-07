@@ -102,19 +102,39 @@ const SYSTEM_ANCHOR_PREFIX_LEN: usize = 8192;
 /// 都走它,保证 router/cache_sim/账号亲和三处身份链同源(审查 #131③)。
 ///
 /// `messages` 应为 prefill 预处理后的切片(末尾 user);body 级入口见 [`affinity_key_from_body`]。
+/// `scope` = 账号作用域盐(见 [`derive_conversation_id_from_messages`] 的长注释)。
+/// **调度亲和键传空串**,发包时传 `account_id`。
 pub fn derive_conversation_id(
     req: &MessagesRequest,
     messages: &[crate::anthropic_types::Message],
+    scope: &str,
 ) -> String {
-    req.metadata
+    let from_metadata = req
+        .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| {
+        .and_then(|user_id| extract_session_id(user_id));
+    match from_metadata {
+        // ⚠️ **metadata 那条路也必须加盐。** 那时 ID 是客户端 session id 的**原文**,
+        // 不加盐等于把「同一个客户端会话」这件事在多个 AWS 账号之间明文关联起来 ——
+        // 这是三条路里最强的池化特征。加盐后仍然「同号恒等」,亲和与缓存都不受影响
+        // (调度键走的是 scope 为空的那条,见 `affinity_key_from_body`)。
+        Some(sid) if !scope.is_empty() => scope_session_id(&sid, scope),
+        Some(sid) => sid,
+        None => {
             let sys_full = normalized_client_system(req);
             let sys_anchor = safe_prefix(&sys_full, SYSTEM_ANCHOR_PREFIX_LEN);
-            derive_conversation_id_from_messages(messages, sys_anchor)
-        })
+            derive_conversation_id_from_messages(messages, sys_anchor, scope)
+        }
+    }
+}
+
+/// 把客户端给的 session id 按账号重新派生成 UUID 形态。
+///
+/// 输出必须仍然长得像 Kiro 客户端会发的值(UUID),所以走同一套「sha256 前 16 字节排成
+/// UUID」的成型逻辑,而不是简单拼前缀 —— 拼前缀会让 ID 变成一个上游从没见过的形状。
+fn scope_session_id(session_id: &str, scope: &str) -> String {
+    session::uuid_from_parts(&[b"sid:", session_id.as_bytes(), b"acct:", scope.as_bytes()])
 }
 
 /// 会话亲和键入口:从原始 Anthropic body 派生 conversationId(供 worker 选号亲和)。
@@ -132,11 +152,20 @@ pub fn affinity_key_from_body(body: &serde_json::Value) -> Option<String> {
     } else {
         &req.messages
     };
-    Some(derive_conversation_id(&req, messages))
+    // ⚠️ **亲和键不加盐**:它是调度层的 key(选号、缓存模拟、钉扎),必须只依赖请求内容 ——
+    // worker 是**先算这个键、再选号**的,这里拿不到也不该拿到账号。
+    // 账号盐只作用于真正发给上游的 conversationId(见 `convert_request` 的 `scope`)。
+    Some(derive_conversation_id(&req, messages, ""))
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+pub fn convert_request(
+    req: &MessagesRequest,
+    // 账号作用域盐(通常是 `account_id`)。空串 = 不加盐(仅测试/亲和键口径)。
+    // 见 `session::derive_conversation_id_from_messages`:换号必须换上游 ID,否则同一个
+    // conversationId 会横跨多个 AWS 账号,那是账号池最强的特征之一。
+    scope: &str,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -162,7 +191,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 3. 生成会话 ID 和代理 ID。conversationId 派生逻辑抽到 [`derive_conversation_id`]
     //    (worker 会话亲和也复用它,保证 router/sim/亲和三处身份链同源)。
-    let conversation_id = derive_conversation_id(req, messages);
+    let conversation_id = derive_conversation_id(req, messages, scope);
     // 【2026-06-15 修正·真实缓存全 miss 根因再定位】
     // 2026-06-13 曾删除 agentContinuationId,理由"kiro.rs/static_flow 都不发、发了破缓存"。
     // 复核证伪:kiro.rs **生产一直在发**稳定的 agentContinuationId(converter.rs:670,实测注释
