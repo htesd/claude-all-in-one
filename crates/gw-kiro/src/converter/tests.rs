@@ -2372,3 +2372,38 @@ fn agent_continuation_id_跟着会话_id_一起换() {
     let b = derive_agent_continuation_id(&scoped_conv_id(&req, "acct-B"));
     assert_ne!(a, b, "换号后 agentContinuationId 仍相同 = 关联键没换干净");
 }
+
+
+/// ⭐ **回归金标准**:`scope=""` 的 conversationId 必须与加盐改动**之前**逐字节相同。
+///
+/// 这两个字面值是用改动前的代码(HEAD~1)真跑出来的,不是用新代码生成的 ——
+/// 用新代码生成会让这条测试自证其说。作者在改动说明里断言了「只有加盐时才变」,
+/// 这条把断言变成事实:一旦有人动了哈希输入的构造(段顺序、分隔符、长度前缀),
+/// 全部在途会话的上游 prefix cache 会静默冷启动,而那件事**没有任何报错**。
+#[test]
+fn 不加盐时与改动前逐字节一致() {
+    let cases = [
+        (
+            serde_json::json!({"model":"claude-sonnet-4-5","max_tokens":64,
+                "messages":[{"role":"user","content":"anchor-A"}]}),
+            "a0704163-3305-00eb-e462-7ff2f23ce2e7",
+        ),
+        (
+            serde_json::json!({"model":"claude-sonnet-4-5","max_tokens":64,
+                "system":"be brief","messages":[{"role":"user","content":"anchor-A"}]}),
+            "8a496364-0ed4-c2ae-8743-7107a475dcd8",
+        ),
+    ];
+    for (body, want) in cases {
+        let req: MessagesRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(
+            scoped_conv_id(&req, ""),
+            want,
+            "scope=\"\" 的派生变了 —— 全部在途会话的上游缓存会冷启动,且无任何报错"
+        );
+        // 亲和键(worker 选号用的那条口径)必须等于同一个值
+        assert_eq!(affinity_key_from_body(&body).as_deref(), Some(want));
+        // 而加盐后必须不同
+        assert_ne!(scoped_conv_id(&req, "acct-A"), want);
+    }
+}
