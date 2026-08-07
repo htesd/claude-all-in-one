@@ -24,7 +24,9 @@
 pub mod drop;
 pub mod engine;
 pub mod forecast;
+pub mod hunt;
 pub mod kiroapp;
+pub mod notify;
 pub mod params;
 pub mod registry;
 pub mod supplier;
@@ -116,10 +118,20 @@ pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockC
     tokio::spawn(async move {
         let mut last_reclaim = 0i64;
         let mut last_prune = 0i64;
+        let mut last_rollup = 0i64;
+        let mut last_snapshot = 0i64;
         let mut roster_seen = eng.roster.clone();
+        // ── 抢货模式(2026-08-06)──
+        //
+        // 缺货时本循环改用 `hunt_interval_secs` 重探。**只在「闸门全过、就差有货」
+        // 时进入**(见 `Decision::out_of_stock`)。其它任何跳过理由都不提速:
+        // 闸门不会因为多问几次就放行。状态机本身是纯逻辑,见 [`hunt`]。
+        let mut hunt = hunt::Hunt::default();
         loop {
             let p = eng.params();
             let interval = p.poll_interval_secs.clamp(10, 3600);
+            let hunt_interval = p.hunt_interval_secs.clamp(2, 300);
+            let hunting = hunt.active();
 
             // ⓪ 名册变了就重建客户端。面板改完**下一轮生效**,与其它补货参数同款,
             //    不用重启 —— 断供时能立刻加一家,正是多供应商最要紧的那个动作。
@@ -141,11 +153,18 @@ pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockC
             // ① 先抢租约。抢不到 = 别的 router 在跑,本轮什么都不做。
             //    注意**连汇总都不做** —— 两个进程同时推进同一个游标虽然有事务保护,
             //    但白白重复扫表没有意义。
+            //
+            //    ⚠️ TTL 一律按**常规轮询间隔**算,绝不能用抢货间隔:抢货时 TTL 会缩到
+            //    15 秒,而一旦退出抢货就要睡 30 秒 —— 租约在睡眠中途就过期了,
+            //    另一个 router 顺势接管,两边轮流当 leader。提速反而把互斥搞坏。
             let won = eng
                 .store
                 .try_acquire_restock_lease(&holder, interval * LEASE_TTL_MULT)
                 .unwrap_or(false);
             if !won {
+                // 不是 leader 就不该维持抢货状态 —— 否则重新当选时会带着一份
+                // 早已过期的「已等待多久」,通知里的时长直接失真。
+                hunt.reset();
                 tokio::time::sleep(Duration::from_secs(interval as u64)).await;
                 continue;
             }
@@ -162,37 +181,163 @@ pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockC
             eng.reconcile_pending().await;
 
             // ③ 积分汇总(读 usage_records → 物化小时聚合)。
-            for _ in 0..ROLLUP_BATCHES_PER_TICK {
-                match eng.store.restock_rollup_advance(ROLLUP_BATCH) {
-                    Ok((_, more)) => {
-                        if !more {
+            //    抢货时降到每 60s 一次:它是批量补历史的活,晚几十秒毫无影响,
+            //    而抢货那一轮的每一毫秒都在跟别人抢同一批号。
+            //    (需求速率不受影响 —— `restock_recent_credit_rate` 直接读
+            //    `usage_records`,不经这份物化聚合。)
+            let now0 = engine::now_ts();
+            if !hunting || now0 - last_rollup >= 60 {
+                last_rollup = now0;
+                for _ in 0..ROLLUP_BATCHES_PER_TICK {
+                    match eng.store.restock_rollup_advance(ROLLUP_BATCH) {
+                        Ok((_, more)) => {
+                            if !more {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("补货:积分汇总失败: {e}");
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("补货:积分汇总失败: {e}");
-                        break;
+                }
+            }
+
+            // ④ 面板快照(健康度每轮、各家库存 300s 节流)。
+            //    抢货时降到每 30s:决策本身每轮都在问库存,快照只负责面板显示,
+            //    没必要跟着一起加密度。
+            let started = engine::now_ts();
+            if !hunting || started - last_snapshot >= 30 {
+                last_snapshot = started;
+                eng.refresh_snapshot(STOCK_MAX_AGE_SECS, false).await;
+            }
+
+            // ⑤ 决策。整轮兜住异常 —— 补货服务自己崩掉比某一轮判断失败严重得多。
+            //    抢货时**不逐轮写跳过流水**,见 `run_once_opts` 的注释。
+            let outcome = match tokio::time::timeout(
+                Duration::from_secs(120),
+                eng.run_once_opts(false, !hunting),
+            )
+            .await
+            {
+                Ok(d) => {
+                    if d.act {
+                        // 刚下过单,余额和库存都变了。不强刷的话面板会在几分钟内显示
+                        // 购买前的余额 —— 看到「买了但余额没动」必然让人以为没扣款。
+                        eng.refresh_snapshot(STOCK_MAX_AGE_SECS, true).await;
+                        last_snapshot = engine::now_ts();
+                    }
+                    Some(d)
+                }
+                Err(e) => {
+                    tracing::error!("补货:本轮决策超时被放弃: {e}");
+                    None
+                }
+            };
+
+            // ⑥ 抢货状态机。
+            //
+            //    **决策超时(`None`)时不推进状态机** —— 一次超时不代表有货了,
+            //    按「非缺货」处理会让它进进出出,把流水搅成一堆开关记录。
+            let now = engine::now_ts();
+            if let Some(d) = &outcome {
+                let st = hunt.step(now, d.out_of_stock, p.notify_after_secs, p.hunt_max_secs);
+                let mmss = |s: i64| format!("{} 分 {} 秒", s / 60, s % 60);
+
+                if st.entered {
+                    eng.log_msg(
+                        "skip",
+                        &format!("缺货,进入抢货模式:改为每 {hunt_interval}s 重探(期间不再逐轮记流水)"),
+                    );
+                    tracing::warn!("补货:缺货,进入抢货模式,每 {hunt_interval}s 重探一次");
+                }
+
+                // 抢不到就得叫人 —— 对方长时间不上架时机器已经尽力了,
+                // 剩下的只能是人去别处想办法,而人得先知道。
+                if st.notify {
+                    eng.notify(
+                        notify::EV_OUT_OF_STOCK,
+                        &format!(
+                            "【补货抢不到号】已连续 {} 没货(探测 {} 次)。\n当前存活 ksk_ 号 {} 个。\n{}",
+                            mmss(st.waited),
+                            st.probes,
+                            d.healthy.unwrap_or(-1),
+                            d.reason,
+                        ),
+                        serde_json::json!({
+                            "waited_secs": st.waited,
+                            "probes": st.probes,
+                            "healthy": d.healthy,
+                            "reason": d.reason,
+                        }),
+                    )
+                    .await;
+                }
+
+                if st.exhausted {
+                    eng.log_msg(
+                        "skip",
+                        &format!(
+                            "抢货已持续 {}、探测 {} 次仍无货,退回 {interval}s 常规轮询",
+                            mmss(st.waited),
+                            st.probes
+                        ),
+                    );
+                    tracing::warn!("补货:抢货达时长上限,退回常规轮询");
+                }
+
+                // 抢货实况落库,面板据此显示「抢货中,已 N 分钟」。
+                // 抢货期间不写决策流水,没有这一条的话面板会连着几小时一动不动。
+                //
+                // `at` 是心跳:进程被 SIGKILL 时这个键会原样留在库里,
+                // 没有心跳的话面板会永远显示「正在抢货」。读侧据此判过期。
+                //
+                // 只在抢货中或刚结束时写:平时每轮写一个空串是纯粹的无用写入。
+                if hunt.active() || st.exited || st.exhausted {
+                    let _ = eng.store.upsert_kv(
+                        engine::KEY_HUNT,
+                        &if hunt.active() {
+                            serde_json::json!({
+                                "since": now - st.waited,
+                                "at": now,
+                                "probes": st.probes,
+                                "interval_secs": hunt_interval,
+                                "notified": hunt.notified(),
+                            })
+                            .to_string()
+                        } else {
+                            String::new()
+                        },
+                    );
+                }
+
+                if st.exited {
+                    eng.log_msg(
+                        "skip",
+                        &format!(
+                            "退出抢货模式:探测 {} 次、持续 {} —— {}",
+                            st.probes,
+                            mmss(st.waited),
+                            d.reason
+                        ),
+                    );
+                    // 只在**通知过缺货**之后才报恢复:没叫过人就不用告诉人「好了」。
+                    if d.act && st.was_notified {
+                        eng.notify(
+                            notify::EV_RESTOCKED,
+                            &format!("【补货已恢复】等了 {} 后抢到号。\n{}", mmss(st.waited), d.reason),
+                            serde_json::json!({
+                                "waited_secs": st.waited,
+                                "probes": st.probes,
+                                "reason": d.reason,
+                            }),
+                        )
+                        .await;
                     }
                 }
             }
 
-            // ④ 面板快照(健康度每轮、drop 库存 300s 节流)。
-            let started = engine::now_ts();
-            eng.refresh_snapshot(STOCK_MAX_AGE_SECS, false).await;
-
-            // ⑤ 决策。整轮兜住异常 —— 补货服务自己崩掉比某一轮判断失败严重得多。
-            match tokio::time::timeout(Duration::from_secs(120), eng.run_once(false)).await {
-                Ok(d) if d.act => {
-                    // 刚下过单,余额和库存都变了。不强刷的话面板会在几分钟内显示
-                    // 购买前的余额 —— 看到「买了但余额没动」必然让人以为没扣款。
-                    eng.refresh_snapshot(STOCK_MAX_AGE_SECS, true).await;
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!("补货:本轮决策超时被放弃: {e}"),
-            }
-
-            // ⑤ 回收与清理。
-            let now = engine::now_ts();
+            // ⑦ 回收与清理。
             if now - last_reclaim >= 3600 {
                 last_reclaim = now;
                 eng.reclaim().await;
@@ -202,8 +347,16 @@ pub fn spawn(store: Arc<SqliteStore>, workers: Vec<WorkerConfig>, cfg: &RestockC
                 let _ = eng.store.restock_prune_decisions(14);
             }
 
+            // 抢货时按 `hunt_interval` 走。减去本轮耗时是有意的:询价往返 3–4 秒,
+            // 「间隔」指的是**周期**而不是间隙,否则 5s 的设置实际会变成 9s 一轮。
+            //
+            // 取 `min` 而不是直接用 `hunt_interval`:抢货**永远不该比常规轮询更慢**。
+            // 把它调到大于轮询间隔(比如为了收敛请求密度调到 60s,而轮询是 30s)
+            // 本意是「别抢那么凶」,直接用的话会变成「缺货时反而看得更少」。
+            // 顺带这也给出了干净的关闭方式:调到 ≥ 轮询间隔即等于不提速。
             let elapsed = (engine::now_ts() - started).max(0);
-            let wait = (interval - elapsed).max(1) as u64;
+            let base = if hunt.active() { hunt_interval.min(interval) } else { interval };
+            let wait = (base - elapsed).max(1) as u64;
             tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     });

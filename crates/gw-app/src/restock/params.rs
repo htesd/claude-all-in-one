@@ -73,6 +73,18 @@ pub const BOUNDS: &[Bound] = &[
         label: "新号宽限 秒", hint: "刚上号还没跑过请求,这段时间内一律算健康" },
     Bound { key: "lead_time_secs", kind: "int", min: 0.0, max: 3600.0,
         label: "提前量 秒", hint: "活号预计还剩这么久就提前下单。0 = 关(提前买会折掉新号同样长的寿命)" },
+    Bound { key: "hunt_interval_secs", kind: "int", min: 2.0, max: 300.0,
+        label: "抢货探测间隔 秒",
+        hint: "缺货且该买时改用这个间隔重探。号稀缺时慢一秒就被别人买走" },
+    Bound { key: "hunt_max_secs", kind: "int", min: 0.0, max: 86400.0,
+        label: "抢货最长时长 秒", hint: "连续抢这么久还没货就退回常规轮询。0 = 一直抢" },
+    Bound { key: "notify_url", kind: "url", min: 0.0, max: 500.0,
+        label: "通知 Webhook",
+        hint: "缺货久了/抢到号/熔断时回调它。按域名自动适配企业微信、钉钉、飞书、Slack,其余发通用 JSON。留空 = 不通知" },
+    Bound { key: "notify_after_secs", kind: "int", min: 0.0, max: 86400.0,
+        label: "缺货多久后通知 秒", hint: "连续抢货超过这么久仍没抢到就回调。0 = 不发缺货通知" },
+    Bound { key: "notify_min_gap_secs", kind: "int", min: 60.0, max: 86400.0,
+        label: "同类通知最小间隔 秒", hint: "同一种事件两次回调之间至少隔这么久,免得刷屏" },
 ];
 
 fn d_false() -> bool { false }
@@ -97,6 +109,13 @@ fn d_lifetime() -> i64 { 2700 }
 fn d_unit_cost() -> f64 { 0.04 }
 fn d_throughput() -> f64 { 1900.0 }
 fn d_zero_i() -> i64 { 0 }
+/// 抢货间隔 **5 秒**:对方接口往返 3.4–4.2s,5s 已接近「上一轮刚回来就发下一轮」。
+/// 再快只是在等待同一个响应,不会更早看见货,却会翻倍地增加被限流的风险。
+fn d_hunt() -> i64 { 5 }
+/// 缺货 10 分钟才通知。断货几分钟是常态(近 7 天 854 轮),分钟级就叫人等于让人学会忽略。
+fn d_notify_after() -> i64 { 600 }
+fn d_notify_gap() -> i64 { 1800 }
+fn d_empty() -> String { String::new() }
 fn d_peak_start() -> String { "09:00".into() }
 fn d_peak_end() -> String { "02:00".into() }
 fn d_offset() -> i64 { 480 }
@@ -227,6 +246,37 @@ pub struct Params {
     /// 提前 180s 是拿 6.7% 的产出换 2% 的连续性,净亏。将来若判断连续性更值钱再开。
     #[serde(default = "d_zero_i")]
     pub lead_time_secs: i64,
+
+    // ───────────────────── 抢货 ─────────────────────
+    //
+    // 2026-08-06 起速刷号变稀缺:货一上架就被别人买走,常规 30s 轮询几乎必然错过。
+    // 「缺货」与「不该买」是两种完全不同的状态,前者要的是**盯着**,后者要的是**别动**。
+    // 所以只在「闸门全过、就差有货」时才提速 —— 那时每多等一秒都是纯损失,
+    // 而其它任何跳过理由(不在窗口、需求撑不起、日上限)提速都只是白打对方接口。
+    /// 缺货且该买时的重探间隔(秒)。
+    #[serde(default = "d_hunt")]
+    pub hunt_interval_secs: i64,
+    /// 连续抢货的时长上限(秒),超了就退回常规轮询。**0 = 不限**。
+    ///
+    /// 默认不限是有意的:实测断供能连着 4.7 小时,而那 4.7 小时里池子是空的 ——
+    /// 「抢累了就歇会儿」在这里等于「主动放弃最要紧的那几个小时」。
+    /// 留这个旋钮是为了对方限流时能人工收敛,不是为了日常省请求。
+    #[serde(default = "d_zero_i")]
+    pub hunt_max_secs: i64,
+
+    // ───────────────────── 通知 ─────────────────────
+    /// 事件回调地址。**留空 = 完全不发**(默认)。
+    ///
+    /// 有它是因为抢货是**可能失败**的:对方长时间没货时,系统已经尽力了,
+    /// 剩下的只能是人去别处找货 —— 而人得先知道。
+    #[serde(default = "d_empty")]
+    pub notify_url: String,
+    /// 连续抢货超过这么久仍没抢到就回调一次。**0 = 不发缺货通知**。
+    #[serde(default = "d_notify_after")]
+    pub notify_after_secs: i64,
+    /// 同一类事件两次回调的最小间隔(秒)。断供期间每 5 秒来一条会让人直接静音。
+    #[serde(default = "d_notify_gap")]
+    pub notify_min_gap_secs: i64,
 }
 
 impl Default for Params {
@@ -329,6 +379,24 @@ pub fn coerce(key: &str, raw: &serde_json::Value) -> Result<serde_json::Value, S
             let m = hhmm_to_minutes(s).ok_or_else(|| format!("{} 格式非法(要 HH:MM)", b.label))?;
             Ok(serde_json::Value::from(format!("{:02}:{:02}", m / 60, m % 60)))
         }
+        // 空串是合法值,意思是「不配」。`max` 当成字符长度上限用。
+        //
+        // 只认 http/https:填错协议(或手滑粘了一段 `curl -X POST ...`)的后果是每次
+        // 事件都在日志里失败一次,而通知的全部意义就是「出事时人能知道」——
+        // 一个从来发不出去的通知比没有通知更坏。
+        "url" => {
+            let s = raw.as_str().ok_or_else(|| format!("{} 需要字符串", b.label))?.trim();
+            if s.is_empty() {
+                return Ok(serde_json::Value::from(""));
+            }
+            if !(s.starts_with("http://") || s.starts_with("https://")) {
+                return Err(format!("{} 必须以 http:// 或 https:// 开头", b.label));
+            }
+            if s.chars().count() as f64 > b.max {
+                return Err(format!("{} 最长 {} 个字符", b.label, b.max));
+            }
+            Ok(serde_json::Value::from(s))
+        }
         "int" | "float" => {
             let n = raw
                 .as_f64()
@@ -364,6 +432,38 @@ mod tests {
             p.min_balance_reserve_cny, 0.0,
             "保留额是在本单价格之上再留的,默认 40 会让 ¥58 买不了 ¥21 的号"
         );
+    }
+
+    #[test]
+    fn 抢货与通知的默认值不改变任何既有行为() {
+        let p = Params::default();
+        assert_eq!(p.hunt_interval_secs, 5, "缺货时 5s 重探;对方往返 3–4s,再快只是在等同一个响应");
+        assert_eq!(p.hunt_max_secs, 0, "0 = 一直抢。实测断供能连着 4.7 小时,那时最不该歇");
+        assert!(p.notify_url.is_empty(), "没填地址就一条都不发 —— 默认不许对外发请求");
+        assert_eq!(p.notify_min_gap_secs, 1800);
+    }
+
+    #[test]
+    fn 通知地址只收http开头的且空串合法() {
+        let ok = |s: &str| coerce("notify_url", &serde_json::json!(s));
+        assert_eq!(ok("").unwrap(), serde_json::json!(""), "空 = 不配,是合法值");
+        assert_eq!(ok("  ").unwrap(), serde_json::json!(""), "只有空白也当成不配");
+        assert!(ok("https://qyapi.weixin.qq.com/x?key=1").is_ok());
+        assert!(ok("http://127.0.0.1:9000/hook").is_ok(), "自建中转常在 loopback");
+        // 填错协议的后果是每次事件都在日志里失败一次,而通知的意义就是「出事时人能知道」。
+        assert!(ok("ftp://x/y").is_err());
+        assert!(ok("qyapi.weixin.qq.com/x").is_err(), "少了协议头的粘贴很常见,必须当场拒绝");
+        assert!(coerce("notify_url", &serde_json::json!(123)).is_err());
+        assert!(ok(&format!("https://x/{}", "a".repeat(600))).is_err(), "超长要拒绝");
+    }
+
+    #[test]
+    fn 抢货间隔的下限挡住把自己打成限流的配置() {
+        assert!(coerce("hunt_interval_secs", &serde_json::json!(1)).is_err());
+        assert!(coerce("hunt_interval_secs", &serde_json::json!(2)).is_ok());
+        assert!(coerce("hunt_interval_secs", &serde_json::json!(301)).is_err());
+        // 0 是「不限时长」的合法值,不能被下限挡掉。
+        assert!(coerce("hunt_max_secs", &serde_json::json!(0)).is_ok());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use gw_store::{MembershipOutcome, SqliteStore};
 
 use super::drop::{max_total_cny_for, new_order_id, BoughtKey};
 use super::forecast;
+use super::notify;
 use super::params::Params;
 use super::registry::{self, SupplierCfg};
 use super::supplier::{rank_shelves, BuyOutcome, Shelf, Supplier, Survey};
@@ -27,6 +28,13 @@ pub const KEY_SNAPSHOT: &str = "restock_snapshot";
 pub const KEY_BREAKER: &str = "restock_breaker";
 /// 连续「买到却没上号」的次数。
 pub const KEY_FAIL_STREAK: &str = "restock_import_fail_streak";
+/// 抢货实况 `{since, probes}`,非抢货期间为空串。
+///
+/// 落库而不是只留在循环的内存里,是因为**面板与循环不在同一个执行体**:
+/// admin 读不到后台任务的局部变量。而抢货期间恰恰是**不写决策流水**的
+/// (见 `run_once_opts`),没有这个键的话面板上会连着几小时一动不动 ——
+/// 那正是 2026-08-03 那次「功能做了但用户从来没看到」的同一种失败。
+pub const KEY_HUNT: &str = "restock_hunt";
 
 /// 一轮决策的结论。
 #[derive(Debug, Clone, Default)]
@@ -41,6 +49,14 @@ pub struct Decision {
     pub balance_cny: Option<f64>,
     /// 选中的货架与本单参数。`act == true` 时必然是 `Some`。
     pub candidate: Option<Candidate>,
+    /// **闸门全过、就差有货**。抢货模式的唯一触发条件。
+    ///
+    /// 必须是结构化字段而不是拿 `reason` 去匹配字符串:那句话是给人看的,
+    /// 改一个字就会让提速悄悄失效,而失效的表现是「一切正常,只是又没抢到」。
+    ///
+    /// 与「有货但过不了闸门」严格区分 —— 后者提速毫无意义(闸门不会因为多问几次
+    /// 就放行),只会白白增加对方的请求密度。
+    pub out_of_stock: bool,
 }
 
 impl Decision {
@@ -834,6 +850,9 @@ impl Engine {
             } else {
                 failed.iter().map(|(i, e)| format!("{i}: {e}")).collect::<Vec<_>>().join("; ")
             };
+            // ⚠️ 这里**不**置 `out_of_stock`:询价全失败时最可能的原因恰恰是对方在限流
+            // 我们,而抢货模式会把请求密度再提高 6 倍。让它退回常规轮询是自动的退避 ——
+            // 「问不到」与「问到了但没货」必须走相反的方向。
             return Decision {
                 healthy: Some(health.healthy),
                 ..Decision::skip(format!("所有货源询价失败,本轮跳过 —— {why}"))
@@ -852,6 +871,9 @@ impl Engine {
                     healthy: Some(health.healthy),
                     stock: Some(total_stock),
                     balance_cny: Some(total_balance),
+                    // 走到这里意味着前面每一道闸门都放行了,唯独没选出货架。
+                    // 「一件都没有」才值得盯着 —— 有货却被闸门否掉时再问一遍还是同一个答案。
+                    out_of_stock: total_stock <= 0,
                     ..Decision::skip(format!("无可买货架 —— {why}"))
                 }
             }
@@ -886,6 +908,7 @@ impl Engine {
             price_usd: Some(cand.shelf.unit_price_cny / p.rate_cap.max(0.01)),
             balance_cny: Some(cand.balance_cny),
             candidate: Some(cand),
+            out_of_stock: false,
         }
     }
 
@@ -965,6 +988,18 @@ impl Engine {
     // ───────────────────────── 执行 ─────────────────────────
 
     pub async fn run_once(&self, force: bool) -> Decision {
+        self.run_once_opts(force, true).await
+    }
+
+    /// `log_skips == false` 时**不写跳过流水、不打 info 日志**,只保留返回值。
+    ///
+    /// 给抢货模式用:5 秒一轮、断供能连着 4.7 小时 → 一次断供就是三千多条一模一样的
+    /// 「所有货源都没有库存」。那不只是占地方,它会把**决策流水这个工具本身**毁掉 ——
+    /// 面板上翻十页看不到一条有信息量的记录,等于没有流水。
+    ///
+    /// 抢货的可见性由另一种形态提供:进入/退出各记一条,带**次数与时长**
+    /// (见 `restock::spawn`)。那两条比三千条更能回答「刚才断了多久」。
+    pub async fn run_once_opts(&self, force: bool, log_skips: bool) -> Decision {
         // 花钱临界区从**读预算**开始,而不是从下单开始 —— `evaluate` 里那次
         // `restock_spent_since` 与后面的 `restock_create_order` 必须在同一把锁内,
         // 否则两个执行体会先后读到同一个 `spent`,各自认为「还有额度」再各自下单。
@@ -975,14 +1010,18 @@ impl Engine {
         // 按限价计入,所以卡死那一单的钱不会被下一个执行体当成没花过。
         let Some(_guard) = self.enter_purchase_section() else {
             let d = Decision::skip("另一个执行体正在补货(花钱锁被占),本轮跳过");
-            self.log("skip", &d);
-            tracing::info!("补货跳过: {}", d.reason);
+            if log_skips {
+                self.log("skip", &d);
+                tracing::info!("补货跳过: {}", d.reason);
+            }
             return d;
         };
         let d = self.evaluate(force).await;
         if !d.act {
-            self.log("skip", &d);
-            tracing::info!("补货跳过: {}", d.reason);
+            if log_skips {
+                self.log("skip", &d);
+                tracing::info!("补货跳过: {}", d.reason);
+            }
             return d;
         }
         let p = self.params();
@@ -1196,6 +1235,13 @@ impl Engine {
             let _ = self.store.upsert_kv(&registry::breaker_key(id), &msg);
             self.log_msg("error", &format!("{id} 已熔断: {msg}"));
             tracing::error!("补货:货源 {id} 熔断,暂停从它购买 —— {msg}");
+            // 熔断 = 这家从此不再被选中,直到人手动解除。没人盯日志,
+            // 而「为什么这几个小时一个号都没补」的答案就藏在这一行里。
+            self.notify_detached(
+                notify::EV_BREAKER,
+                format!("【补货熔断】货源 {id} 已停用:{msg}\n面板「解除熔断」后才会恢复从它购买。"),
+                serde_json::json!({ "supplier": id, "reason": msg, "scope": "supplier" }),
+            );
         }
     }
 
@@ -1224,9 +1270,29 @@ impl Engine {
             return;
         }
 
+        // 出口网关。**这一段在 2026-08-06 之前是不存在的** —— `p.egress` 有默认值
+        // "auto"、有设置项、有前端下拉,但补货路径直接调 store.create_account(),
+        // 从没读过它,于是每个自动买来的号都落在直连(服务器主 IP)上。
+        // 后果实测:直连的 42 个号里 25 个被 AWS TEMPORARILY_SUSPENDED(59.5%),
+        // 而同期走代理池的 11 个一个没封 —— 上游是按出口 IP 把它们关联起来一锅端的。
+        // 手动导入(admin/accounts.rs)一直是对的,只有这条路径漏了。
+        let mut egress_picker =
+            crate::admin::accounts::EgressPicker::build(&self.store, Some(&p.egress));
+
         let mut new_ids = Vec::new();
         for acc in &parsed {
-            let extra = serde_json::Value::Object(acc.extra.clone()).to_string();
+            let mut extra_map = acc.extra.clone();
+            // 已带 proxy 的不动(导出文件自带出口的情形),其余按 picker 分配。
+            let has_proxy = crate::admin::accounts::account_proxy(
+                &serde_json::Value::Object(extra_map.clone()).to_string(),
+            )
+            .is_some();
+            if !has_proxy {
+                if let Some(url) = egress_picker.next() {
+                    extra_map.insert("proxy".into(), serde_json::json!(url));
+                }
+            }
+            let extra = serde_json::Value::Object(extra_map).to_string();
             match self.store.create_account(
                 &acc.account_id,
                 &p.import_group,
@@ -1334,6 +1400,12 @@ impl Engine {
             let _ = self.store.upsert_kv(KEY_BREAKER, &msg);
             self.log_msg("error", &format!("熔断触发: {msg}"));
             tracing::error!("补货:熔断触发,已停止自动购买 —— {msg}");
+            // 全局熔断比单家熔断严重得多:买到号却上不了号,钱花了没东西。
+            self.notify_detached(
+                notify::EV_BREAKER,
+                format!("【补货全局熔断】已停止一切自动购买:{msg}\n通常是「买到却没上号」,请到面板查订单与决策流水。"),
+                serde_json::json!({ "reason": msg, "scope": "global" }),
+            );
         }
     }
 
@@ -1559,7 +1631,7 @@ impl Engine {
         });
     }
 
-    fn log_msg(&self, action: &str, reason: &str) {
+    pub(crate) fn log_msg(&self, action: &str, reason: &str) {
         let _ = self.store.restock_log_decision(&RestockDecision {
             ts: now_ts(),
             action: action.into(),
@@ -1569,6 +1641,68 @@ impl Engine {
             price_usd: None,
             balance_cny: None,
             detail: String::new(),
+        });
+    }
+
+    // ───────────────────────── 通知 ─────────────────────────
+
+    /// 发一条事件回调,**按事件分组节流**。
+    ///
+    /// 节流状态落在 `settings` 表而不是进程内存里:抢货循环会随 router 重启而重来,
+    /// 内存计数一重启就归零,于是每次部署都会补发一轮通知 —— 而部署往往正发生在
+    /// 出事之后,那时最不需要的就是重复告警。
+    ///
+    /// **永不返回错误**:通知失败的正确后果是「人没收到消息」,不是「补货停了」。
+    pub async fn notify(&self, event: &str, text: &str, payload: serde_json::Value) {
+        let p = self.params();
+        if p.notify_url.trim().is_empty() {
+            return;
+        }
+        let key = notify::throttle_key(event);
+        let now = now_ts();
+        let last: i64 = self
+            .store
+            .get_kv(&key)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if now - last < p.notify_min_gap_secs.max(1) {
+            tracing::debug!("补货:通知 {event} 被节流(距上次 {}s)", now - last);
+            return;
+        }
+        // **先记时间再发送**:发送要几秒,期间可能又触发一次同类事件。
+        // 后记的话两条会一起挤过节流门。
+        let _ = self.store.upsert_kv(&key, &now.to_string());
+        let mut payload = payload;
+        if let Some(m) = payload.as_object_mut() {
+            m.insert("event".into(), serde_json::json!(event));
+            m.insert("ts".into(), serde_json::json!(now));
+        }
+        match notify::send(&self.http, &p.notify_url, text, payload).await {
+            Ok(()) => tracing::info!("补货:已回调通知 {event}"),
+            // 地址里带着机器人 key,`notify::send` 已经把它从错误里剥掉了。
+            Err(e) => tracing::warn!("补货:通知 {event} 发送失败: {e}"),
+        }
+    }
+
+    /// 同步上下文里发通知(熔断路径)。
+    ///
+    /// 单独一条而不是把 `trip_supplier` 改成 async:那两个函数被 `buy_and_onboard`
+    /// 的好几条错误分支调用,改签名会把「熔断」这件事的调用点全部搅动一遍,
+    /// 而熔断路径是整套补货里最不该在改动中出错的地方。
+    fn notify_detached(&self, event: &'static str, text: String, payload: serde_json::Value) {
+        // Engine 里除 store 外都是可克隆的轻量句柄,单独造一个只为发通知的实例
+        // 比给整个 Engine 加 Arc<Self> 约束简单。
+        let store = self.store.clone();
+        let http = self.http.clone();
+        let workers = self.workers.clone();
+        let suppliers = self.suppliers.clone();
+        let roster = self.roster.clone();
+        let holder = self.holder.clone();
+        tokio::spawn(async move {
+            let eng = Engine { store, suppliers, roster, workers, http, holder };
+            eng.notify(event, &text, payload).await;
         });
     }
 }
@@ -1683,6 +1817,67 @@ mod tests {
     use std::collections::HashMap;
 
     const NOW: i64 = 1_785_800_000;
+
+    // ───────────────────── 出口网关:自动补货必须分配代理 ─────────────────────
+
+    fn store_with_pool(pool: &[&str]) -> gw_store::SqliteStore {
+        let store = gw_store::SqliteStore::open_in_memory().unwrap();
+        let json = serde_json::json!({ "egress_pool": pool }).to_string();
+        store.upsert_settings(&json).unwrap();
+        store
+    }
+
+    /// `egress:"auto"` 必须真的发出池里的出口,并且**在同一批内轮换**。
+    ///
+    /// 这条守的是 2026-08-06 查出来的事故:自动补货的号全落在直连(服务器主 IP)上,
+    /// 被 AWS 按出口 IP 关联,直连的 42 个里 25 个被 TEMPORARILY_SUSPENDED(59.5%),
+    /// 同期走代理池的 11 个一个没封。
+    #[test]
+    fn 自动分配必须发出池里的出口且同批内轮换() {
+        let store = store_with_pool(&["http://a:1", "http://b:2"]);
+        let mut picker = crate::admin::accounts::EgressPicker::build(&store, Some("auto"));
+        let got: Vec<_> = (0..4).filter_map(|_| picker.next()).collect();
+        assert_eq!(got.len(), 4, "每个号都必须拿到出口,拿不到就是又回到直连了");
+        assert_eq!(
+            got.iter().filter(|u| *u == "http://a:1").count(),
+            2,
+            "同一批导入必须铺开,不能全堆在第一个出口上(那等于只用了一个 IP)"
+        );
+    }
+
+    /// 补货默认参数就是 "auto" —— 这个默认值曾经形同虚设(见下面那条结构测试)。
+    #[test]
+    fn 补货默认出口是auto而不是直连() {
+        let p: Params = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.egress, "auto");
+    }
+
+    /// 结构不变量:补货的建号路径**必须**先经过 `EgressPicker`。
+    ///
+    /// 行为测试在这里救不了命 —— 这个 bug 是「整段代码不存在」。`p.egress` 有默认值、
+    /// 有设置项、有前端下拉,唯独 `onboard()` 从没读过它,直接 `create_account()` 了事,
+    /// 于是每个自动买来的号都走直连。参数看着是配好的,面板上一切正常,只有逐个翻
+    /// 账号的 `extra.proxy` 才看得出来。谁哪天重构掉这一段,这条当天变红。
+    #[test]
+    fn 补货建号前必须先分配出口() {
+        let src = include_str!("engine.rs");
+        let onboard = src
+            .split("async fn onboard(")
+            .nth(1)
+            .expect("onboard() 还在吗?改名了就把这条测试一起改");
+        // 锚在真实调用 `self.store.create_account(` 上,不是裸的 `create_account(` ——
+        // 后者会匹配到上面那段解释这个 bug 的注释,于是测试红在自己的文档上。
+        let create_at = onboard
+            .find("self.store.create_account(")
+            .expect("onboard 应该建号");
+        let picker_at = onboard
+            .find("EgressPicker::build(")
+            .expect("补货建号前必须先构造 EgressPicker,否则新号全部直连");
+        assert!(
+            picker_at < create_at,
+            "EgressPicker 必须在 create_account 之前构造,否则分配不到 extra.proxy 上"
+        );
+    }
 
     fn row(id: &str, reason: &str, disabled: bool) -> RuntimeRow {
         RuntimeRow { account_id: id.into(), reason: reason.into(), disabled }
