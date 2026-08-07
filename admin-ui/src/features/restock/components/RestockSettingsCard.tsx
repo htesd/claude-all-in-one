@@ -51,8 +51,10 @@ export function RestockSettingsCard() {
       const cur = data.values[b.key]
       if (b.kind === 'bool') {
         if (Boolean(raw) !== Boolean(cur)) patch[b.key] = Boolean(raw)
-      } else if (b.kind === 'hhmm') {
-        if (String(raw) !== String(cur)) patch[b.key] = String(raw)
+      } else if (b.kind === 'hhmm' || b.kind === 'url') {
+        // url 要 trim：粘贴 webhook 时带上尾随空格很常见，而后端只认严格前缀。
+        const next = b.kind === 'url' ? String(raw).trim() : String(raw)
+        if (next !== String(cur)) patch[b.key] = next
       } else {
         const n = Number(raw)
         if (Number.isFinite(n) && n !== Number(cur)) patch[b.key] = n
@@ -86,9 +88,21 @@ export function RestockSettingsCard() {
   )
 
   const field = (b: ParamBound) => (
-    <div key={b.key} className="space-y-1.5">
+    // webhook 地址独占一整行：挤在三列数字里只能看见开头十几个字符，
+    // 而「填错了」恰恰只在末尾（key 少一位）看得出来。
+    <div key={b.key} className={`space-y-1.5 ${b.kind === 'url' ? 'sm:col-span-2 lg:col-span-3' : ''}`}>
       <label className="text-xs font-medium text-muted-foreground">{b.label}</label>
-      {b.kind === 'hhmm' ? (
+      {b.kind === 'url' ? (
+        <input
+          type="url"
+          inputMode="url"
+          placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+          value={String(form?.[b.key] ?? '')}
+          onChange={(e) => set(b.key, e.target.value)}
+          disabled={isLoading || form === null}
+          className={inputClass}
+        />
+      ) : b.kind === 'hhmm' ? (
         <input
           type="time"
           value={String(form?.[b.key] ?? '')}

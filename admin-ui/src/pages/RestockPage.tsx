@@ -55,8 +55,19 @@ export default function RestockPage() {
   const off = credits?.utc_offset_minutes ?? 480
   const snap = state?.snapshot ?? {}
   const suppliers = snap.suppliers ?? []
-  const banners: { tone: 'warn' | 'bad'; text: string }[] = []
+  const banners: { tone: 'info' | 'warn' | 'bad'; text: string }[] = []
   if (state) {
+    // 抢货排在最前：它回答的是「系统现在在干什么」。抢货期间后端不写决策流水，
+    // 没有这一条的话面板看起来就是「几小时没动静」——与真卡住无法区分。
+    if (state.hunt) {
+      const h = state.hunt
+      const mins = Math.floor(h.waited_secs / 60)
+      const secs = h.waited_secs % 60
+      banners.push({
+        tone: 'info',
+        text: `${t('restock.hunt.banner')} — 已 ${mins} 分 ${secs} 秒，探测 ${h.probes} 次，每 ${h.interval_secs}s 一轮${h.notified ? '（已回调通知）' : ''}`,
+      })
+    }
     if (!state.configured) banners.push({ tone: 'warn', text: t('restock.notConfigured') })
     if (state.dry_run) banners.push({ tone: 'warn', text: t('restock.banner.dryRun') })
     if (state.breaker)
@@ -99,6 +110,7 @@ export default function RestockPage() {
           <Badge variant={state?.enabled ? 'success' : 'muted'}>
             {state?.enabled ? t('restock.state.on') : t('restock.state.off')}
           </Badge>
+          {state?.hunt && <Badge variant="warning">{t('restock.hunt.badge')}</Badge>}
           {state?.lease_holder && (
             <span className="text-xs text-muted-foreground">
               {t('restock.lease')}: <code>{state.lease_holder}</code>
@@ -114,7 +126,9 @@ export default function RestockPage() {
           className={`rounded-xl px-4 py-3 text-sm ${
             b.tone === 'bad'
               ? 'bg-destructive/10 text-destructive'
-              : 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
+              : b.tone === 'info'
+                ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300'
+                : 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
           }`}
         >
           {b.text}

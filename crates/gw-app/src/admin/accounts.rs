@@ -22,8 +22,8 @@ use serde::Deserialize;
 use super::{internal_error, redact_proxy_url, validate_proxy_url, AdminState};
 
 /// 从设置 overlay 读 `egress_pool`(trim、去空);解析失败/未配置 → 空 Vec。
-fn read_egress_pool(st: &AdminState) -> Vec<String> {
-    let overlay: SystemSettings = match st.store.get_settings() {
+pub(crate) fn read_egress_pool(store: &gw_store::SqliteStore) -> Vec<String> {
+    let overlay: SystemSettings = match store.get_settings() {
         Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_default(),
         _ => SystemSettings::default(),
     };
@@ -37,7 +37,7 @@ fn read_egress_pool(st: &AdminState) -> Vec<String> {
 }
 
 /// 取账号 extra JSON 里非空的 `proxy`;无/空 → None。
-fn account_proxy(extra_json: &str) -> Option<String> {
+pub(crate) fn account_proxy(extra_json: &str) -> Option<String> {
     let extra: serde_json::Map<String, serde_json::Value> = serde_json::from_str(extra_json).ok()?;
     extra
         .get("proxy")
@@ -50,20 +50,20 @@ fn account_proxy(extra_json: &str) -> Option<String> {
 /// 出口池「最少使用」分配器:把新号粘到当前分配最少的池 URL,使账号均衡铺满 N 个出口 IP
 /// (每号固定一个,粘性)。计数初值 = 现有账号已分配到各池 URL 的数量;每分配一次本地计数 +1,
 /// 保证同一批导入内也均匀(而非全堆到第一个)。
-struct EgressAssigner {
+pub(crate) struct EgressAssigner {
     /// (池 URL, 当前已分配账号数)。
     counts: Vec<(String, usize)>,
 }
 
 impl EgressAssigner {
     /// 从设置 `egress_pool` + 现有账号分布构造;池为空/未配置 → None(不自动分配)。
-    fn from_settings(st: &AdminState) -> Option<Self> {
-        let pool = read_egress_pool(st);
+    fn from_settings(store: &gw_store::SqliteStore) -> Option<Self> {
+        let pool = read_egress_pool(store);
         if pool.is_empty() {
             return None;
         }
         let mut counts: Vec<(String, usize)> = pool.into_iter().map(|u| (u, 0usize)).collect();
-        if let Ok(rows) = st.store.list_accounts() {
+        if let Ok(rows) = store.list_accounts() {
             for row in &rows {
                 if let Some(p) = account_proxy(&row.extra) {
                     if let Some(c) = counts.iter_mut().find(|(u, _)| *u == p) {
@@ -92,31 +92,52 @@ impl EgressAssigner {
 /// - `None`/`""`/`"direct"` → 直连(不设 proxy);
 /// - `"auto"` → 最少使用自动分配(`EgressAssigner`,把号均衡铺满各网关);
 /// - 数字索引 → `egress_pool[i]`(选定网关,本批所有新号都用它)。
-enum EgressPicker {
+pub(crate) enum EgressPicker {
     Direct,
     Fixed(String),
     Auto(EgressAssigner),
 }
 
 impl EgressPicker {
-    fn build(st: &AdminState, sel: Option<&str>) -> Self {
-        let pool = read_egress_pool(st);
+    /// ⚠️ 退回直连**必须报错**,不能像 2026-08-06 之前那样静默发生。
+    ///
+    /// 那次的代价:`egress:"auto"` 遇到空池时无声变直连,42 个自动补货的号全部
+    /// 从服务器主 IP 出去,被 AWS 按出口 IP 关联,**59.5% 被 TEMPORARILY_SUSPENDED**
+    /// (同期走代理池的 11 个号一个没封)。面板上一切正常,只有逐个翻账号的
+    /// `extra.proxy` 才看得出来。请求方明确要了一个出口却拿到直连,是配置事故,
+    /// 不是可以默默降级的默认值。
+    pub(crate) fn build(store: &gw_store::SqliteStore, sel: Option<&str>) -> Self {
+        let pool = read_egress_pool(store);
         match sel.map(str::trim) {
             None | Some("") | Some("direct") => EgressPicker::Direct,
-            Some("auto") => match EgressAssigner::from_settings(st) {
+            Some("auto") => match EgressAssigner::from_settings(store) {
                 Some(a) => EgressPicker::Auto(a),
-                None => EgressPicker::Direct,
+                None => {
+                    tracing::error!(
+                        "出口分配失败:请求 egress=auto 但 egress_pool 为空/不可读 —— \
+                         本批账号将全部走直连(服务器主 IP)。同 IP 上的号会被上游关联封禁, \
+                         请在设置里配置 egress_pool。"
+                    );
+                    EgressPicker::Direct
+                }
             },
             Some(s) => match s.parse::<usize>() {
                 Ok(i) if i < pool.len() => EgressPicker::Fixed(pool[i].clone()),
                 // 无效索引(网关被删/越界)→ 退回直连,绝不乱投到错误出口。
-                _ => EgressPicker::Direct,
+                _ => {
+                    tracing::error!(
+                        egress = s,
+                        pool_len = pool.len(),
+                        "出口分配失败:egress 索引越界或非法(网关被删?)—— 本批账号将全部走直连"
+                    );
+                    EgressPicker::Direct
+                }
             },
         }
     }
 
     /// 取本账号应写入 `extra.proxy` 的 URL(直连=None;选定=固定;自动=最少使用)。
-    fn next(&mut self) -> Option<String> {
+    pub(crate) fn next(&mut self) -> Option<String> {
         match self {
             EgressPicker::Direct => None,
             EgressPicker::Fixed(u) => Some(u.clone()),
@@ -362,7 +383,7 @@ async fn create_account(
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
     if !has_proxy {
-        if let Some(url) = EgressPicker::build(&st, body.egress.as_deref()).next() {
+        if let Some(url) = EgressPicker::build(&st.store, body.egress.as_deref()).next() {
             extra_map.insert("proxy".into(), serde_json::json!(url));
         }
     }
@@ -539,7 +560,7 @@ async fn oauth_start(
     // 出口解析:统一按 egress 选择(显式网关/自动均衡/直连)。direct=本机出口 IP——caio 各 worker
     // 均 network_mode:host 同机,故 direct 对该组所有 worker 是同一 IP;非 direct(proxy)则各 worker
     // 都用同一 proxy 串 → 同 IP。换码与落库用同一 proxy 值,铸=刷=发同 IP(见 client_for_proxy)。
-    let proxy: Option<String> = EgressPicker::build(&st, body.egress.as_deref()).next();
+    let proxy: Option<String> = EgressPicker::build(&st.store, body.egress.as_deref()).next();
     let (verifier, challenge) = gw_dario::oauth::gen_pkce();
     let state = gw_dario::oauth::gen_state();
     let authorize_url = gw_dario::oauth::build_authorize_url(&challenge, &state);
@@ -843,7 +864,7 @@ async fn import_accounts(
 
     // 上号选择的出口网关(直连/自动均衡/选定网关);显式 batch_proxy 仍优先,
     // 已存在号合并不动 proxy。
-    let mut egress_picker = EgressPicker::build(&st, body.egress.as_deref());
+    let mut egress_picker = EgressPicker::build(&st.store, body.egress.as_deref());
 
     let mut created = 0u32;
     let mut merged = 0u32;
@@ -996,7 +1017,7 @@ async fn rebalance_egress(
     State(st): State<AdminState>,
     Json(body): Json<RebalanceEgressBody>,
 ) -> axum::response::Response {
-    let pool = read_egress_pool(&st);
+    let pool = read_egress_pool(&st.store);
     if pool.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "未配置 egress_pool(出口池),无法均衡");
     }

@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gw_store::SqliteStore;
 
-mod accounts;
+pub(crate) mod accounts;
 mod groups;
 mod keys;
 mod logs;

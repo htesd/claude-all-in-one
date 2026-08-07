@@ -31,12 +31,21 @@ export interface RestockParams {
   liveness_window_secs: number
   new_account_grace_secs: number
   lead_time_secs: number
+  /** 缺货且该买时的重探间隔（秒）。号稀缺时慢一秒就被别人买走。 */
+  hunt_interval_secs: number
+  /** 连续抢货的时长上限（秒）；0 = 一直抢。 */
+  hunt_max_secs: number
+  /** 事件回调地址。空 = 不通知。按域名自动适配企业微信/钉钉/飞书/Slack。 */
+  notify_url: string
+  /** 连续缺货多久后回调一次；0 = 不发缺货通知。 */
+  notify_after_secs: number
+  notify_min_gap_secs: number
 }
 
 /** 参数上下限。后端 BOUNDS 表的投影，前端据此渲染表单并做前置校验。 */
 export interface ParamBound {
   key: keyof RestockParams
-  kind: 'bool' | 'int' | 'float' | 'hhmm'
+  kind: 'bool' | 'int' | 'float' | 'hhmm' | 'url'
   min: number
   max: number
   label: string
@@ -163,8 +172,30 @@ export interface RestockState {
   orphan_orders: number
   /** 哪个进程持有补货租约。生产有多个 router，这个数能确认互斥生效了。 */
   lease_holder: string | null
+  /**
+   * 抢货实况。`null` = 不在抢货。
+   *
+   * 抢货期间后端**不写决策流水**（5 秒一轮会把流水刷成几千条一样的话），
+   * 所以这是面板上唯一能看出「系统正在盯着，不是卡住了」的地方。
+   * 心跳过期的残留会被后端判成 null，前端不用自己算过期。
+   */
+  hunt: RestockHunt | null
   snapshot: RestockSnapshot
   decisions: RestockDecisionRow[]
+}
+
+/** 一轮正在进行的抢货。 */
+export interface RestockHunt {
+  /** 本轮抢货起始时刻（epoch 秒）。 */
+  since: number
+  /** 已经抢了多久（秒）。 */
+  waited_secs: number
+  /** 本轮共探测了多少次。 */
+  probes: number
+  /** 当前生效的重探间隔（秒）。 */
+  interval_secs: number
+  /** 是否已经就「抢不到」回调通知过。 */
+  notified: boolean
 }
 
 export interface CreditPoint {

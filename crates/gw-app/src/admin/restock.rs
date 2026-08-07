@@ -5,7 +5,8 @@
 //! - `PUT  /restock/params`     改参数,即时生效无需重启
 //! - `GET  /restock/credits`    积分曲线 + 按周预测 + 画像
 //! - `GET  /restock/accounts`   ksk_ 账号清单(带成本与积分)
-//! - `POST /restock/buy-now`    手动补一个(仍受花钱闸门约束)
+//! - `POST /restock/buy-now`    手动补一个(force:越过自动化闸门,仍受花钱闸门约束)
+//! - `POST /restock/wake`       外部到货监控的回调入口(**不 force**,闸门全部照常)
 //! - `POST /restock/reset-breaker`
 //!
 //! 鉴权由 `admin_api_router` 的 `route_layer` 统一加,这里不写。
@@ -32,6 +33,7 @@ pub fn router() -> Router<AdminState> {
         .route("/restock/credits", get(credits))
         .route("/restock/accounts", get(accounts))
         .route("/restock/buy-now", post(buy_now))
+        .route("/restock/wake", post(wake))
         .route("/restock/reset-breaker", post(reset_breaker))
 }
 
@@ -90,6 +92,33 @@ fn read_params(st: &AdminState) -> params::Params {
         .unwrap_or_default()
 }
 
+/// 抢货实况。**心跳过期即视为没在抢货** —— 后台循环被 SIGKILL 时那个键会原样
+/// 留在库里,只看它的存在会让面板永远显示「正在抢货」,而那是最难察觉的一种错:
+/// 它看起来正是「系统在努力」的样子。
+///
+/// 阈值取 5 分钟:抢货间隔上限是 300s,一轮决策外层超时 120s,合起来最坏一轮
+/// 可能要 7 分钟才写下一次心跳。取 5 分钟会让极端配置偶尔闪一下「没在抢」,
+/// 那个方向是安全的(少报),反过来会长期误报。
+fn read_hunt(st: &AdminState, now: i64) -> serde_json::Value {
+    const MAX_STALE_SECS: i64 = 300;
+    let raw = st.store.get_kv(engine::KEY_HUNT).ok().flatten().unwrap_or_default();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return serde_json::Value::Null;
+    };
+    let at = v.get("at").and_then(|x| x.as_i64()).unwrap_or(0);
+    if now - at > MAX_STALE_SECS {
+        return serde_json::Value::Null;
+    }
+    let since = v.get("since").and_then(|x| x.as_i64()).unwrap_or(now);
+    serde_json::json!({
+        "since": since,
+        "waited_secs": (now - since).max(0),
+        "probes": v.get("probes").and_then(|x| x.as_i64()).unwrap_or(0),
+        "interval_secs": v.get("interval_secs").and_then(|x| x.as_i64()).unwrap_or(0),
+        "notified": v.get("notified").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
+}
+
 // ───────────────────────── 实况 ─────────────────────────
 
 async fn state(State(st): State<AdminState>) -> axum::response::Response {
@@ -115,6 +144,7 @@ async fn state(State(st): State<AdminState>) -> axum::response::Response {
     let orphans = st.store.restock_orphan_orders().map(|v| v.len()).unwrap_or(0);
     let in_flight = st.store.restock_pending_count().unwrap_or(0);
     let holder = st.store.restock_lease_holder().ok().flatten();
+    let hunt = read_hunt(&st, now);
 
     Json(serde_json::json!({
         "configured": configured,
@@ -135,6 +165,9 @@ async fn state(State(st): State<AdminState>) -> axum::response::Response {
         "in_flight_orders": in_flight,
         // 哪个进程在跑补货。生产上有多个 router,这个数能让人确认互斥真的生效了。
         "lease_holder": holder,
+        // 抢货实况。`null` = 不在抢货。抢货期间**不写决策流水**,面板只能靠它
+        // 知道「系统正在盯着,不是卡住了」。
+        "hunt": hunt,
         "snapshot": snap,
         "decisions": decisions,
     }))
@@ -568,6 +601,34 @@ async fn buy_now(State(st): State<AdminState>) -> axum::response::Response {
     .into_response()
 }
 
+/// 外部到货监控的**回调入口**:「有货了,现在去看一眼」。
+///
+/// 与 [`buy_now`] 的区别只有一个,但很关键:**`force = false`**,所有闸门照常。
+/// 语义是「你告诉我有货,我按自己的规则决定买不买」,而不是「你说买就买」。
+/// 一个盯着上架页面的脚本不知道我方的日预算、需求速率、熔断状态,
+/// 让它 force 等于把花钱的判断交给外部。
+///
+/// 存在的理由:两家货源都**没有**到货通知能力(2026-08-06 核过 drop 前端,
+/// API-Key 那套接口里只有查询与下单;`/api/v1/*` 只认会话 cookie,不适合无人值守)。
+/// 所以「对方通知我」这条路走不通,只剩「别人替我盯着,盯到了叫我」。
+/// 抢货模式已经把自探测压到 5 秒,这个端点是给能比 5 秒更快的外部信号用的。
+///
+/// 鉴权走 admin token(与其它端点同一层),没有另开一套弱口令入口。
+async fn wake(State(st): State<AdminState>) -> axum::response::Response {
+    let Some(eng) = engine_of(&st) else {
+        return not_configured();
+    };
+    let d = eng.run_once(false).await;
+    let p = read_params(&st);
+    eng.refresh_snapshot(0, true).await;
+    Json(serde_json::json!({
+        "act": d.act,
+        "out_of_stock": d.out_of_stock,
+        "message": if p.dry_run && d.act { format!("[DRY-RUN] {}", d.reason) } else { d.reason },
+    }))
+    .into_response()
+}
+
 /// 解除熔断。**一次清干净**:全局的那一个,加名册上每一家自己的。
 ///
 /// 不做成「逐家解除」是因为这个按钮的语义是人已经看过原因、决定继续 ——
@@ -638,6 +699,74 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn 抢货实况过期就不再显示为正在抢货() {
+        let (app, store) = app();
+        // 心跳是刚刚 → 显示。
+        let fresh = serde_json::json!({
+            "since": crate::restock::engine::now_ts() - 120, "at": crate::restock::engine::now_ts(),
+            "probes": 24, "interval_secs": 5, "notified": false,
+        });
+        store.upsert_kv(crate::restock::engine::KEY_HUNT, &fresh.to_string()).unwrap();
+        let v = body_json(app.clone().oneshot(req("GET", "/restock/state", None)).await.unwrap()).await;
+        assert_eq!(v["hunt"]["probes"], 24);
+        assert!(v["hunt"]["waited_secs"].as_i64().unwrap() >= 120);
+
+        // 心跳过期(进程被 SIGKILL 留下的残留)→ 必须判成没在抢货。
+        // 反过来会让面板永远显示「系统在努力」,而那是最难察觉的一种错。
+        let stale = serde_json::json!({
+            "since": crate::restock::engine::now_ts() - 9000, "at": crate::restock::engine::now_ts() - 8000, "probes": 900,
+        });
+        store.upsert_kv(crate::restock::engine::KEY_HUNT, &stale.to_string()).unwrap();
+        let v = body_json(app.clone().oneshot(req("GET", "/restock/state", None)).await.unwrap()).await;
+        assert!(v["hunt"].is_null(), "过期的抢货实况必须消失,实际: {}", v["hunt"]);
+
+        // 空串(正常退出抢货时写的)也是「没在抢」。
+        store.upsert_kv(crate::restock::engine::KEY_HUNT, "").unwrap();
+        let v = body_json(app.oneshot(req("GET", "/restock/state", None)).await.unwrap()).await;
+        assert!(v["hunt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn 到货回调入口要鉴权且未配置时不花钱() {
+        let (app, _store) = app();
+        // 外部监控拿不到 admin token 就进不来 —— 这个入口会触发一次真实决策。
+        let unauth = axum::http::Request::builder()
+            .method("POST")
+            .uri("/restock/wake")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(unauth).await.unwrap().status(), 401);
+
+        let resp = app.oneshot(req("POST", "/restock/wake", None)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_json(resp).await["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn 通知地址能存能取而不是被当成未知键拒掉() {
+        let (app, store) = app();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/restock/params",
+                Some(r#"{"notify_url":"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=k"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let saved = store.get_kv(gw_store::SqliteStore::KEY_RESTOCK_PARAMS).unwrap().unwrap();
+        assert!(saved.contains("qyapi.weixin.qq.com"));
+
+        // 协议头写错要当场 400,而不是存下来每次事件都静默失败。
+        let bad = app
+            .oneshot(req("PUT", "/restock/params", Some(r#"{"notify_url":"qyapi.weixin.qq.com/x"}"#)))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 400);
     }
 
     #[tokio::test]
