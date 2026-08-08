@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { diffMemberships, sortAccounts } from './lib'
+import {
+  buildCursorExtra,
+  diffMemberships,
+  providerTabLabel,
+  quotaKindForProvider,
+  sortAccounts,
+} from './lib'
 import type { AccountGroupMembership, AccountRow } from './types'
 
 /** 只填排序用得到的字段，其余给最小合法值。 */
@@ -50,6 +56,69 @@ describe('账号列表排序', () => {
 
   it('空列表不炸', () => {
     expect(sortAccounts([], 'created_desc')).toEqual([])
+  })
+})
+
+describe('provider 展示标签(筛选器选项与表格 provider 列共用)', () => {
+  it('已知 provider 映射到用户惯用短标签', () => {
+    expect(providerTabLabel('kiro')).toBe('Kiro')
+    expect(providerTabLabel('claude-dario')).toBe('ccmax')
+    expect(providerTabLabel('cursor')).toBe('Cursor')
+  })
+
+  it('空 provider 显示占位符,未知 provider 原样返回', () => {
+    expect(providerTabLabel('')).toBe('—')
+    expect(providerTabLabel('claude-subprocess')).toBe('claude-subprocess')
+  })
+})
+
+describe('provider 配额口径(决定账号页配额列语义)', () => {
+  it('kiro = 积分,claude-dario = 5h/7d 窗口,cursor = 无配额概念', () => {
+    expect(quotaKindForProvider('kiro')).toBe('credits')
+    expect(quotaKindForProvider('claude-dario')).toBe('windows')
+    // Cursor 是订阅制,后端不采集配额数字 —— 用 'none' 让表头不谎称「积分」、单元格恒为 —
+    expect(quotaKindForProvider('cursor')).toBe('none')
+  })
+
+  it('未知 provider 回落积分口径(历史行为)', () => {
+    expect(quotaKindForProvider('')).toBe('credits')
+    expect(quotaKindForProvider('claude-subprocess')).toBe('credits')
+  })
+})
+
+describe('Cursor 建号 extra 组装(字段名与后端 CURSOR_ACCOUNT_SCHEMA 一一对应)', () => {
+  it('只填必填项：extra 只有 access_token(且 trim)', () => {
+    expect(buildCursorExtra({ access_token: '  jwt.x.y  ' })).toEqual({ access_token: 'jwt.x.y' })
+  })
+
+  it('可选字段 trim 后为空一律省略——空串会顶掉后端「留空 = 派生/默认」语义', () => {
+    const extra = buildCursorExtra({
+      access_token: 'jwt',
+      refresh_token: '   ',
+      machine_id: '',
+      mac_machine_id: undefined,
+      config_version: ' ',
+      timezone: '',
+      proxy: '  ',
+    })
+    expect(extra).toEqual({ access_token: 'jwt' })
+  })
+
+  it('填了的可选字段保留并 trim', () => {
+    const extra = buildCursorExtra({
+      access_token: 'jwt',
+      refresh_token: ' rt ',
+      machine_id: ' a'.repeat(1) + 'b'.repeat(63),
+      timezone: ' America/Los_Angeles ',
+      proxy: ' socks5://127.0.0.1:1080 ',
+    })
+    expect(extra).toEqual({
+      access_token: 'jwt',
+      refresh_token: 'rt',
+      machine_id: `a${'b'.repeat(63)}`,
+      timezone: 'America/Los_Angeles',
+      proxy: 'socks5://127.0.0.1:1080',
+    })
   })
 })
 

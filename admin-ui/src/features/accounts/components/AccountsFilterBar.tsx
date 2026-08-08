@@ -1,7 +1,7 @@
 import { Segment } from '@/components/ui/segment'
 import { useI18n } from '@/lib/i18n'
 
-import type { AccountSortKey } from '../lib'
+import { providerTabLabel, type AccountSortKey } from '../lib'
 
 export type StatusFilter = 'all' | 'ok' | 'abnormal' | 'disabled'
 export type TierFilter = 'all' | 'PRO' | 'POWER' | 'FREE' | 'OTHER'
@@ -55,7 +55,7 @@ export function AccountsFilterBar({
 
   const providerOptions = [
     { value: 'all', label: t('filter.providerAll') },
-    ...providers.map((p) => ({ value: p.provider, label: `${p.provider} (${p.count})` })),
+    ...providers.map((p) => ({ value: p.provider, label: `${providerTabLabel(p.provider)} (${p.count})` })),
   ]
 
   const tierOptions: Array<{ value: TierFilter; label: string }> = [

@@ -51,8 +51,16 @@ export function AccountsTable({
     { label: t('table.group') },
     { label: t('table.provider') },
     { label: t('table.status') },
-    // 配额列头随口径切换:积分(Kiro) ↔ 限额 5h/7d(ccmax/dario)。
-    { label: quotaKind === 'windows' ? t('table.quotaWindows') : t('table.credits'), right: true },
+    // 配额列头随口径切换:积分(Kiro) ↔ 限额 5h/7d(ccmax/dario) ↔ 通用「限额」(cursor 等无配额概念的 provider,单元格恒为 —)。
+    {
+      label:
+        quotaKind === 'windows'
+          ? t('table.quotaWindows')
+          : quotaKind === 'credits'
+            ? t('table.credits')
+            : t('table.quota'),
+      right: true,
+    },
     { label: t('table.concurrency'), right: true },
     { label: t('table.queue'), right: true },
     { label: t('table.priority'), right: true },
