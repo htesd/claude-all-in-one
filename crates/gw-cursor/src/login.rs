@@ -17,11 +17,16 @@
 //!      200 → { accessToken, refreshToken, authId?, selectedTeamId? }
 //! ```
 //!
-//! ## 与 [`crate::auth`] 刷新流的一个关键区别
+//! ## 与 [`crate::auth`] 刷新流的区别:字段结构不同,但值一样
 //!
-//! 刷新响应里**没有** `refresh_token` 字段(新 access_token 兼任);而登录轮询响应里
-//! `accessToken` 与 `refreshToken` 是**两个独立字段**(bundle: `se.accessToken && se.refreshToken`)。
-//! 别把两处的处理逻辑合并。
+//! - **刷新**响应里**没有** `refresh_token` 字段,新 access_token 兼任
+//!   (`storeAccessRefreshToken(c.access_token, c.access_token)`)。
+//! - **登录**响应里 `accessToken` 与 `refreshToken` 是**两个独立字段**
+//!   (`se.accessToken && se.refreshToken`),所以解析逻辑不能合并。
+//!
+//! ⚠️ 但 2026-08-08 真号实测:登录返回的**两个值是相同的**(各 415 字符、逐字符相等)。
+//! 也就是说 Cursor 侧压根就是同一个 JWT 兼任两种角色,只是登录接口把它填了两遍。
+//! **别据此去做"两者必须不同"的校验或去重** —— 那会把正常登录判成异常。
 //!
 //! ## 为什么不照抄真客户端的轮询节奏
 //!
@@ -269,6 +274,25 @@ mod tests {
                 auth_id: Some("auth|123".into()),
             }
         );
+    }
+
+    /// 真号实测:登录返回的两个 token **值相同**。这是正常的(Cursor 侧本来就是
+    /// 同一个 JWT 兼任两种角色),解析必须原样接受,**不能**去重或判为异常。
+    #[test]
+    fn identical_tokens_are_valid_not_an_error() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.e30.sig";
+        let body = serde_json::json!({"accessToken": jwt, "refreshToken": jwt}).to_string();
+        match parse_poll_body(&body).unwrap() {
+            PollOutcome::Done {
+                access_token,
+                refresh_token,
+                ..
+            } => {
+                assert_eq!(access_token, refresh_token, "两值相同是实测的正常形态");
+                assert_eq!(access_token, jwt);
+            }
+            other => panic!("两值相同不该被判成 {other:?}"),
+        }
     }
 
     #[test]
