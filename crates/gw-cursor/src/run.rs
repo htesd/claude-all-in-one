@@ -793,22 +793,23 @@ pub fn build_frame0(
         // ⚠️ 「上下文声明」是出不出字的开关,不是可选装饰(见 TURN_CONTEXT)。
         // 但**它在两种轮次里住在不同地方**:首轮挂轮内 `1.2.1.2`,后续轮改挂会话级
         // `1.2.17`(抓包实物 turn2 的 `1.2.1` 里根本没有 `.2`)。所以这里只在首轮发。
-        if i == last && phase.is_opening() {
+        // ⭐ **两种轮次都挂在这里。** 2026-08-08 实测三个变体(见 PROTOCOL §17):
+        //   A 后续轮发 `1.2.17.9`         → 挂起(只剩 10s 心跳)
+        //   B 后续轮什么都不发            → 2s 返回但**丢历史**
+        //   C 后续轮也挂轮内 `1.2.1.2`    → ✅ 出字 + 记得历史 + 98.7% 缓存命中
+        // 早先「后续轮改挂会话级 1.2.17」的判断是错的 —— 那是照抄真客户端的
+        // 位置,但真客户端那个块里有 FileSync 上传过的 blob 哈希,我们没有;
+        // 半个块(只有 `.9`)比不发更糟,服务端会等一个永远不来的 blob。
+        if i == last {
             turn.message(TURN_CONTEXT, &detail);
         }
         conv.message(CONV_TURN, &turn);
     }
-    if phase.is_continuation() {
-        // 后续轮的上下文声明在 `1.2.17`。
-        //
-        // ⚠️ **只发 `.9`,绝不发 `{1..8}` 的 blob 哈希**:那些哈希指向真客户端通过
-        // FileSyncService 上传过的内容,我们没上传过,一发就是
-        // `invalid_argument: Failed to resolve request context blobs`(实测)。
-        // 没有哈希就没有要解析的 blob,只留 `.9` 环境详情。
-        let mut ctx17 = Writer::new();
-        ctx17.message(CTX17_DETAIL, &detail);
-        conv.message(CONV_CONTEXT, &ctx17);
-    }
+    // ⚠️ **永远不发 `1.2.17`**(会话级上下文块)。真客户端后续轮发它,但里面是 4 个
+    // 经 FileSyncService 上传的 blob 哈希;我们一个都没上传:
+    //   带哈希 → `invalid_argument: Failed to resolve request context blobs`
+    //   只发 `.9` 不带哈希 → 服务端静默等一个永不到来的 blob,10s 心跳到超时
+    // 声明改挂轮内 `1.2.1.2`(上面那段),两种轮次同一个位置。
     body.message(BODY_CONVERSATION, &conv);
 
     // 1.4 空 bytes(抓包里恒为 bin[0])
@@ -1835,7 +1836,7 @@ mod tests {
     /// 历史在服务端手里(按 `1.5` 持有)。重发历史既浪费也可能被当成新内容 ——
     /// 抓包实物 turn2 的 `1.2.1` 就只有一条,且里面**没有** `.2`。
     #[test]
-    fn 后续轮只发新消息且上下文声明改挂会话级() {
+    fn 后续轮只发新消息但上下文声明仍挂轮内() {
         let turns = vec![
             Turn { text: "第一问".into(), is_user: true },
             Turn { text: "第一答".into(), is_user: false },
@@ -1858,15 +1859,16 @@ mod tests {
         assert_eq!(seen.len(), 1, "后续轮只该发一条消息,实际 {}", seen.len());
         let m = dig(seen[0], &[TURN_MESSAGE]).unwrap();
         assert_eq!(string_at(m, MSG_TEXT).as_deref(), Some("第二问"), "发的必须是最新那条");
-        assert!(dig(seen[0], &[TURN_CONTEXT]).is_none(), "后续轮轮内不该有 1.2.1.2");
-
-        // 上下文声明改挂 1.2.17.9,且**不带 blob 哈希**(我们没上传过任何 blob)。
-        let ctx = dig(conv, &[CONV_CONTEXT]).expect("后续轮必须有 1.2.17");
-        let det = dig(ctx, &[CTX17_DETAIL]).expect("1.2.17.9 必须在");
+        // ⭐ 上下文声明**仍在轮内** 1.2.1.2 —— 这是 2026-08-08 实测出来的唯一可用形态
+        // (挪到会话级 1.2.17 会让上游静默挂起,见 PROTOCOL §17)。
+        let det = dig(seen[0], &[TURN_CONTEXT]).expect("后续轮轮内必须有 1.2.1.2");
         assert_eq!(string_at(det, DET_SYSTEM_PROMPT).as_deref(), Some("sys"));
-        for h in [1u32, 3, 5, 7] {
-            assert!(dig(ctx, &[h]).is_none(), "绝不能发 blob 哈希 1.2.17.{h}");
-        }
+
+        // 且**绝不发** 1.2.17:那个块要求 FileSync 上传过的 blob 哈希。
+        assert!(
+            dig(conv, &[CONV_CONTEXT]).is_none(),
+            "1.2.17 一旦出现,服务端会等一个我们永远不会上传的 blob"
+        );
     }
 
     /// 多轮时上下文块只挂**最后一轮**:与真客户端一致,也避免几十 KB 重复。

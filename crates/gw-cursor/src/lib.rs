@@ -24,7 +24,7 @@
 //! 已支持:多轮(历史折叠)、tool_use 往返(参数含数字/布尔/对象/数组)、
 //! thinking 透传、图像(内联)、PDF(我方抽文本层)、上游自报 usage。
 //!
-//! 未做:有状态会话(`CURSOR_STATEFUL` 后仍会静默挂起,见 PROTOCOL §12.5)、
+//! 未做:FileSyncService blob 上传(L2 文件附件)、
 //! Cursor 内建工具的代执行(**有意不做**:那等于跑模型选定的 shell 命令)。
 
 pub mod auth;
@@ -216,12 +216,17 @@ struct ConvEntry {
 impl ConvRegistry {
     /// `CURSOR_STATEFUL=1` 才启用。见 [`ConvRegistry::stateful`]。
     fn from_env() -> Self {
-        let stateful = std::env::var("CURSOR_STATEFUL").as_deref() == Ok("1");
-        if stateful {
-            tracing::warn!(
-                "⚠️ CURSOR_STATEFUL=1:有状态会话仍是**未跑通**的实验路径(后续轮会静默挂起,\
-                 见 PROTOCOL §12.5)。生产请关掉"
-            );
+        // 2026-08-08 起**默认开启**:后续轮只发新消息,历史由服务端按 `1.5` 自持。
+        // 实测两个事实跨 4 轮全部记住,且缓存命中率 32.6% → 49.8%(单轮最高 98.7%)。
+        // 之前默认关是因为后续轮会静默挂起,根因已定位(上下文声明被错误地挪到了
+        // 会话级 `1.2.17`,见 PROTOCOL §17)。
+        //
+        // `CURSOR_STATEFUL=0` 退回每轮全量重铺 —— 留这条退路是因为
+        // "服务端记不记得" 这件事我方无法验证,只能靠模型答得对不对间接判断;
+        // 万一上游改了行为,关掉它至少还是正确的(只是贵)。
+        let stateful = std::env::var("CURSOR_STATEFUL").as_deref() != Ok("0");
+        if !stateful {
+            tracing::warn!("CURSOR_STATEFUL=0:每轮重铺全量历史(正确但更贵,且吃不到上游缓存)");
         }
         Self {
             inner: Mutex::new(HashMap::new()),
@@ -246,13 +251,8 @@ impl ConvRegistry {
     /// 判定本次该用哪种形态。**任何不确定都返回 `Opening`** —— 降级只多花 token,
     /// 而错判 `Continuation` 会让模型丢失上下文且不报错。
     fn phase_for(&self, conversation_id: &str, account_id: &str) -> run::Phase {
-        // ⚠️ **默认关闭。** 后续轮形态(只发新消息 + `1.2.17.9`)目前会让上游
-        // 200 接受后永远只发心跳 —— 与缺上下文声明时同一种静默挂起。仍缺的东西
-        // 见 PROTOCOL §12.5(最可疑:我方从不发 `1.2.17.{1..8}` 的 blob 哈希,
-        // 而那要先跑通 FileSyncService)。
-        //
-        // 在它被证明能用之前,一律走 `Opening` + 历史折叠(见 `chat::fold_history`)——
-        // 那条路已实测多轮正确。`CURSOR_STATEFUL=1` 打开继续实验。
+        // 关掉时一律走 `Opening` + 历史折叠(见 `chat::fold_history`)——
+        // 那条路更贵但同样正确。
         if !self.stateful {
             return run::Phase::Opening;
         }
