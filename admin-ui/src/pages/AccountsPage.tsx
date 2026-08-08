@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, KeyRound, Upload, Users } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, KeyRound, MousePointer2, Upload, Users } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorNote } from '@/components/ui/error-note'
@@ -15,6 +15,7 @@ import {
   AccountsPagination,
   type PageSize,
 } from '@/features/accounts/components/AccountsPagination'
+import { CursorAccountDialog } from '@/features/accounts/components/CursorAccountDialog'
 import { EditAccountDialog } from '@/features/accounts/components/EditAccountDialog'
 import { ImportAccountsDialog } from '@/features/accounts/components/ImportAccountsDialog'
 import { OAuthAccountDialog } from '@/features/accounts/components/OAuthAccountDialog'
@@ -55,6 +56,7 @@ export default function AccountsPage() {
 
   const [importOpen, setImportOpen] = useState(false)
   const [oauthOpen, setOauthOpen] = useState(false)
+  const [cursorOpen, setCursorOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   // 刷新 token 成功的轻量反馈（无 toast 库）：账号 + 新有效期。本地态而非派生自
   // refreshMutation.isSuccess——后者会在其它 mutation 成功后残留旧账号（审查 3 名 reviewer）。
@@ -85,13 +87,14 @@ export default function AccountsPage() {
     [runtimeQuery.data],
   )
 
-  // 按 provider 统计（含计数），kiro→ccmax→其余排序
+  // 按 provider 统计（含计数），kiro→ccmax→cursor→其余排序
   const providers = useMemo(() => {
     const counts = new Map<string, number>()
     for (const row of accountsQuery.data ?? []) {
       counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1)
     }
-    const rank = (p: string) => (p === 'kiro' ? 0 : p === 'claude-dario' ? 1 : 2)
+    const rank = (p: string) =>
+      p === 'kiro' ? 0 : p === 'claude-dario' ? 1 : p === 'cursor' ? 2 : 3
     return [...counts.entries()]
       .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
       .map(([provider, count]) => ({ provider, count }))
@@ -235,7 +238,7 @@ export default function AccountsPage() {
           <h1 className="mt-2 font-display text-4xl font-black tracking-[-0.04em]">{t('accounts.title')}</h1>
           <p className="mt-2 text-sm text-muted-foreground">{t('accounts.subtitle')}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" onClick={() => setImportOpen(true)}>
             <Upload className="h-4 w-4" />
             {t('accounts.import')}
@@ -243,6 +246,10 @@ export default function AccountsPage() {
           <Button variant="outline" onClick={() => setOauthOpen(true)}>
             <KeyRound className="h-4 w-4" />
             {t('accounts.oauth')}
+          </Button>
+          <Button variant="outline" onClick={() => setCursorOpen(true)}>
+            <MousePointer2 className="h-4 w-4" />
+            {t('accounts.cursor')}
           </Button>
         </div>
       </header>
@@ -360,6 +367,7 @@ export default function AccountsPage() {
 
       <ImportAccountsDialog open={importOpen} onClose={() => setImportOpen(false)} />
       <OAuthAccountDialog open={oauthOpen} onClose={() => setOauthOpen(false)} />
+      <CursorAccountDialog open={cursorOpen} onClose={() => setCursorOpen(false)} />
       <EditAccountDialog
         open={editingRow !== null}
         row={editingRow}

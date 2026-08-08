@@ -151,12 +151,15 @@ export function isQuotaLow(remaining: number, limit: number): boolean {
 }
 
 /** 配额展示口径:'windows' = 滚动窗口利用率(5h/7d,Claude OAuth/ccmax);
- *  'credits' = 积分剩余/上限(Kiro)。决定账号页该 tab 的配额列语义。 */
-export type QuotaKind = 'credits' | 'windows'
+ *  'credits' = 积分剩余/上限(Kiro);'none' = 无配额概念(Cursor 订阅制,后端不采集)。 */
+export type QuotaKind = 'credits' | 'windows' | 'none'
 
-/** provider → 配额口径。dario(claude-dario)无积分概念,只有 5h/7d 利用率窗口。 */
+/** provider → 配额口径。dario(claude-dario)无积分概念,只有 5h/7d 利用率窗口;
+ *  cursor 是订阅制、后端不采集配额数字,配额列恒为 —,用 'none' 免得表头误称「积分」。 */
 export function quotaKindForProvider(provider: string): QuotaKind {
-  return provider === 'claude-dario' ? 'windows' : 'credits'
+  if (provider === 'claude-dario') return 'windows'
+  if (provider === 'cursor') return 'none'
+  return 'credits'
 }
 
 /**
@@ -238,9 +241,47 @@ export function providerTabLabel(provider: string): string {
       return 'Kiro'
     case 'claude-dario':
       return 'ccmax'
+    case 'cursor':
+      return 'Cursor'
     case '':
       return '—'
     default:
       return provider
   }
+}
+
+/**
+ * Cursor 建号表单的原始输入（均为未 trim 的字符串；access_token 必填，其余可空）。
+ * 字段名与后端 CURSOR_ACCOUNT_SCHEMA 一一对应。
+ */
+export interface CursorExtraInput {
+  access_token: string
+  refresh_token?: string
+  machine_id?: string
+  mac_machine_id?: string
+  config_version?: string
+  timezone?: string
+  proxy?: string
+}
+
+/**
+ * Cursor 建号的 extra 组装：access_token 必填（调用方已校验非空）；
+ * 可选字段 trim 后为空一律**省略**——空串会顶掉后端「留空 = 派生/默认」的语义
+ * （machine_id/mac_machine_id 按 token 派生、config_version 每会话取新、
+ *  timezone 按 Asia/Shanghai、proxy 走 worker 默认出口）。
+ */
+export function buildCursorExtra(input: CursorExtraInput): Record<string, unknown> {
+  const extra: Record<string, unknown> = { access_token: input.access_token.trim() }
+  for (const key of [
+    'refresh_token',
+    'machine_id',
+    'mac_machine_id',
+    'config_version',
+    'timezone',
+    'proxy',
+  ] as const) {
+    const value = input[key]?.trim()
+    if (value) extra[key] = value
+  }
+  return extra
 }

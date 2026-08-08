@@ -9,7 +9,14 @@ import { GroupChip } from '@/features/groups/components/GroupChip'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
-import { deriveAccountStatus, formatCredits, isQuotaLow, priorityToTier, type QuotaKind } from '../lib'
+import {
+  deriveAccountStatus,
+  formatCredits,
+  isQuotaLow,
+  priorityToTier,
+  providerTabLabel,
+  type QuotaKind,
+} from '../lib'
 import type { AccountRow, AccountRuntimeEntry } from '../types'
 import { AccountStatusBadge } from './AccountStatusBadge'
 
@@ -27,7 +34,7 @@ interface AccountTableRowProps {
   runtimeState: RuntimeQueryState
   /** 分组名 -> 颜色（来自 /groups）。一个号可属多个组，所以传整张表而不是单个颜色。 */
   groupColors: Map<string, string>
-  /** 配额列口径(随所属 tab):'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario)。 */
+  /** 配额列口径(随所属 tab):'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario);'none'=无配额概念(Cursor)。 */
   quotaKind: QuotaKind
   /** 本行是否有进行中的 mutation（按钮置灰防连点）。 */
   busy: boolean
@@ -103,8 +110,8 @@ export function AccountTableRow({
         )}
       </TD>
 
-      {/* provider */}
-      <TD className="text-muted-foreground">{row.provider || '—'}</TD>
+      {/* provider：走 providerTabLabel,与筛选器选项同一处维护(kiro→Kiro / claude-dario→ccmax / cursor→Cursor) */}
+      <TD className="text-muted-foreground">{providerTabLabel(row.provider)}</TD>
 
       {/* 运行状态徽章（merge 配置 + runtime） */}
       <TD>
@@ -124,10 +131,14 @@ export function AccountTableRow({
 
       {/* 配额列:口径随所属 tab。
           - windows(ccmax/dario):5h/7d 滚动窗口利用率%;无数据(未跑过流量/查询中)显示 —
-          - credits(Kiro):积分剩余/上限(来自 getUsageLimits) */}
+          - credits(Kiro):积分剩余/上限(来自 getUsageLimits)
+          - none(cursor 等):订阅制无配额概念、后端不采集,恒为 — */}
       <TD className="text-right">
         {(() => {
           if (runtimeState === 'loading') return <Skeleton className="ml-auto h-4 w-16" />
+          if (quotaKind === 'none') {
+            return <span className="text-muted-foreground">—</span>
+          }
           const quota = runtime?.online ? runtime.status.quota : undefined
 
           if (quotaKind === 'windows') {
