@@ -220,6 +220,9 @@ pub fn router() -> Router<AdminState> {
         .route("/accounts", get(list_accounts).post(create_account))
         .route("/accounts/oauth/start", post(oauth_start))
         .route("/accounts/oauth/complete", post(oauth_complete))
+        // Cursor 官方登录流(PKCE + 轮询):start 拿链接,poll 由前端按秒级重复调用。
+        .route("/accounts/cursor/login/start", post(cursor_login_start))
+        .route("/accounts/cursor/login/poll", post(cursor_login_poll))
         .route("/accounts/import", post(import_accounts))
         .route("/accounts/import-apikeys", post(import_apikeys))
         .route("/accounts/rebalance-egress", post(rebalance_egress))
@@ -746,6 +749,258 @@ async fn oauth_complete(
         Ok(false) => api_error(StatusCode::CONFLICT, "account_id 已存在"),
         Err(e) => internal_error(e),
     }
+}
+
+// ── Cursor 官方登录流(PKCE + 轮询)────────────────────────────────────────────
+//
+// 与 dario 的 OAuth 上号是同一个形状(start 给链接 → 人肉授权 → 换凭据落库),
+// 但有两处本质差异,决定了不能复用那套代码:
+//
+// **① 轮询是多次的。** dario 的 `complete` 拿 code 一次换完,`take_pending` 单次
+// 取出即删。Cursor 是操作员点授权前上游一直回 404,前端要反复 poll —— 所以这里
+// 用 `peek`(读而不删)+ 成功落库后才 `remove`。
+//
+// **② 不扇给 worker。** dario 必须由目标 worker 换码(它的 token 与铸造出口 IP 绑定);
+// Cursor 的 `/auth/poll` 是普通 HTTPS,router 直接调即可。但**出口纪律照旧**:
+// 轮询走的 proxy 必须与该号将来 refresh/chat 的 proxy 是同一个值,否则铸/发 IP 不一致
+// (见 §7 防关联)。所以 start 就把 `EgressPicker` 选定的 proxy 冻在会话里,
+// poll 与落库都用它。
+
+/// 待完成的 Cursor 登录会话(进程内存,**绝不落库、绝不进日志**)。
+struct PendingCursorLogin {
+    /// PKCE verifier —— 秘密,只发给上游轮询端点,不回给前端。
+    flow: gw_cursor::login::LoginFlow,
+    /// 冻结的出口(None=直连)。轮询与落库同一个值 → 铸=刷=发同 IP。
+    proxy: Option<String>,
+    account_id: String,
+    group: String,
+    max_concurrency: i64,
+    priority: i64,
+    created_at: std::time::Instant,
+}
+
+/// 登录窗口。比 dario 的 10 分钟略长:Cursor 登录可能要过邮箱验证码/2FA。
+const CURSOR_LOGIN_TTL_SECS: u64 = 900;
+const CURSOR_LOGIN_MAX: usize = 64;
+
+fn cursor_pending() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, PendingCursorLogin>,
+> {
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, PendingCursorLogin>>,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cursor_sweep(m: &mut std::collections::HashMap<String, PendingCursorLogin>) {
+    m.retain(|_, v| v.created_at.elapsed().as_secs() < CURSOR_LOGIN_TTL_SECS);
+}
+
+/// 腾出一个位置:先清过期,仍达上限则淘汰最旧。
+///
+/// 抽成对**任意 map** 生效的函数(而不是直接操作全局表),是为了能在单测里
+/// 用自己的 map 验上限行为 —— 全局表是进程级 `OnceLock`,在里面灌 64 个会话
+/// 会把并发跑的其它测试的会话挤掉,那种测试互相打架排查起来极其费时(踩过)。
+fn cursor_make_room(m: &mut std::collections::HashMap<String, PendingCursorLogin>, cap: usize) {
+    cursor_sweep(m);
+    while m.len() >= cap {
+        let Some(oldest) = m.iter().min_by_key(|(_, v)| v.created_at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        m.remove(&oldest);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CursorLoginStartBody {
+    account_id: String,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<i64>,
+    /// 缺省 100(低优先)。cursor 是订阅号,没有 Kiro 那种档位概念。
+    #[serde(default)]
+    priority: Option<i64>,
+    /// ""/缺省/"direct"=直连;"auto"=自动均衡;数字=egress_pool 索引。
+    #[serde(default)]
+    egress: Option<String>,
+}
+
+/// `POST /accounts/cursor/login/start` —— 生成登录链接。**不发任何上游请求。**
+async fn cursor_login_start(
+    State(st): State<AdminState>,
+    Json(body): Json<CursorLoginStartBody>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&body.account_id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    // 提前挡重名:别让操作员在浏览器登完了才撞 409(照 dario 的教训)。
+    match st.store.get_account(&body.account_id) {
+        Ok(Some(_)) => return api_error(StatusCode::CONFLICT, "account_id 已存在"),
+        Ok(None) => {}
+        Err(e) => return internal_error(e),
+    }
+    let group = body.group.as_deref().unwrap_or("").to_string();
+    if let Err(resp) = require_real_group(&st, &group) {
+        return resp;
+    }
+
+    let proxy: Option<String> = EgressPicker::build(&st.store, body.egress.as_deref()).next();
+    let flow = gw_cursor::login::start();
+    let login_url = flow.login_url.clone();
+    let flow_id = flow.uuid.clone();
+    {
+        let mut m = cursor_pending().lock().unwrap_or_else(|e| e.into_inner());
+        cursor_make_room(&mut m, CURSOR_LOGIN_MAX);
+        m.insert(
+            flow_id.clone(),
+            PendingCursorLogin {
+                flow,
+                proxy,
+                account_id: body.account_id,
+                group,
+                max_concurrency: body.max_concurrency.unwrap_or(2),
+                priority: body.priority.unwrap_or(100),
+                created_at: std::time::Instant::now(),
+            },
+        );
+    }
+    // ⚠️ 只回 login_url 与 flow_id,**绝不回 verifier**(那是 PKCE 的秘密)。
+    Json(serde_json::json!({
+        "login_url": login_url,
+        "flow_id": flow_id,
+        "expires_in_sec": CURSOR_LOGIN_TTL_SECS,
+        "poll_interval_sec": gw_cursor::login::POLL_INTERVAL_SECS,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CursorLoginPollBody {
+    flow_id: String,
+}
+
+/// `POST /accounts/cursor/login/poll` —— 问一次「授权好了吗」。
+///
+/// 前端按 `poll_interval_sec` 反复调。三种回应:
+///   `{"status":"pending"}`  还没授权,继续问
+///   `{"status":"done", ...账号行}`  已落库(201)
+///   4xx/5xx  终态失败(会话已清)
+async fn cursor_login_poll(
+    State(st): State<AdminState>,
+    Json(body): Json<CursorLoginPollBody>,
+) -> axum::response::Response {
+    // 读而不删:未授权时会话必须留着给下一次 poll。
+    let (flow, proxy) = {
+        let mut m = cursor_pending().lock().unwrap_or_else(|e| e.into_inner());
+        cursor_sweep(&mut m);
+        match m.get(&body.flow_id) {
+            Some(p) => (p.flow.clone(), p.proxy.clone()),
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "登录会话已过期或无效(超过 15 分钟/已完成/router 重启过),请重新发起",
+                )
+            }
+        }
+    };
+
+    // 轮询必须走该号冻结的出口 —— 与将来 refresh/chat 同 IP。
+    let client = match build_login_client(proxy.as_deref()) {
+        Ok(c) => c,
+        Err(e) => return internal_error(e),
+    };
+    let outcome = match gw_cursor::login::poll_once(&client, &flow).await {
+        Ok(o) => o,
+        Err(e) => {
+            // 上游明确拒绝(如企业策略)是终态,清掉会话免得前端一直问。
+            if e.kind == gw_core::error::UpstreamErrorKind::TokenInvalid {
+                let mut m = cursor_pending().lock().unwrap_or_else(|x| x.into_inner());
+                m.remove(&body.flow_id);
+                return api_error(StatusCode::BAD_REQUEST, &e.message);
+            }
+            // 网络抖动等瞬时错误:保留会话,让前端继续轮询。
+            return api_error(StatusCode::BAD_GATEWAY, &e.message);
+        }
+    };
+
+    let (access_token, refresh_token) = match outcome {
+        gw_cursor::login::PollOutcome::Pending => {
+            return Json(serde_json::json!({"status": "pending"})).into_response()
+        }
+        gw_cursor::login::PollOutcome::Done {
+            access_token,
+            refresh_token,
+            ..
+        } => (access_token, refresh_token),
+    };
+
+    // 拿到凭据了 —— 从这里起会话用完即弃(无论落库成败,凭据已在手,重试 poll 也拿不到第二次)。
+    let Some(pending) = ({
+        let mut m = cursor_pending().lock().unwrap_or_else(|e| e.into_inner());
+        m.remove(&body.flow_id)
+    }) else {
+        return api_error(StatusCode::BAD_REQUEST, "登录会话已被并发完成");
+    };
+
+    let mut extra = serde_json::Map::new();
+    extra.insert("access_token".into(), serde_json::json!(access_token));
+    extra.insert("refresh_token".into(), serde_json::json!(refresh_token));
+    extra.insert("priority".into(), serde_json::json!(pending.priority));
+    if let Some(p) = &pending.proxy {
+        extra.insert("proxy".into(), serde_json::json!(p));
+    }
+    // 记下 token 过期时刻,让 has_fresh_token 能主动续期而不是等 401(见 gw_cursor::auth)。
+    if let Some(exp) = gw_cursor::auth::token_expires_at(&access_token) {
+        extra.insert(
+            "expires_at".into(),
+            serde_json::json!(gw_cursor::auth::format_unix_utc(exp)),
+        );
+    }
+    let extra_json = match serde_json::to_string(&extra) {
+        Ok(s) => s,
+        Err(e) => return internal_error(e),
+    };
+    match st.store.create_account(
+        &pending.account_id,
+        &pending.group,
+        "cursor",
+        pending.max_concurrency,
+        &extra_json,
+    ) {
+        Ok(true) => {
+            // 主动 /sync 目标组,消除「上号后 30s 内按号操作报无人持有」的窗口。
+            for w in st.workers.iter().filter(|w| w.account_group == pending.group) {
+                let url = format!("http://{}/sync", w.listen);
+                let _ = st.http.post(&url).send().await;
+            }
+            match st.store.get_account(&pending.account_id) {
+                Ok(Some(row)) => {
+                    let mut v = redacted_view(row, None);
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("status".into(), serde_json::json!("done"));
+                    }
+                    (StatusCode::CREATED, Json(v)).into_response()
+                }
+                Ok(None) => internal_error("上号后读取不到账号"),
+                Err(e) => internal_error(e),
+            }
+        }
+        Ok(false) => api_error(StatusCode::CONFLICT, "account_id 已存在"),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// 轮询用的 HTTP client:绑定该号冻结的出口。
+///
+/// 不用 `st.http` —— 那是 2 秒超时的管理面客户端,而轮询要走代理打境外站点
+/// (`quota_account` 就是踩了这个坑,超时被误判成「worker 离线」)。
+fn build_login_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20));
+    if let Some(url) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
+        b = b.proxy(reqwest::Proxy::all(url)?);
+    }
+    Ok(b.build()?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2450,6 +2705,166 @@ mod tests {
         let (status, _v) = start(&app, "dario-x", "").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "无 worker 的组应在 start 即拒");
     }
+
+    // ── Cursor 官方登录流 ───────────────────────────────────────────────────
+
+    async fn cursor_start(
+        app: &axum::Router,
+        account_id: &str,
+        group: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "account_id": account_id, "group": group }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/cursor/login/start", Some(&body)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_body(resp).await)
+    }
+
+    async fn cursor_poll(app: &axum::Router, flow_id: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "flow_id": flow_id }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/accounts/cursor/login/poll", Some(&body)))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_body(resp).await)
+    }
+
+    /// start 是纯本地的:不探 worker、不发上游请求,所以空组也该成功 ——
+    /// 与 dario 不同(那个必须由目标 worker 铸 token,故 start 就要求组里有 worker)。
+    #[tokio::test]
+    async fn cursor_login_start_returns_url_without_touching_upstream() {
+        let (app, _store) = app_with_workers(vec![]);
+        let (status, v) = cursor_start(&app, "cursor-a", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let url = v["login_url"].as_str().unwrap();
+        assert!(url.starts_with("https://cursor.com/loginDeepControl"));
+        assert!(url.contains("challenge="));
+        assert!(url.contains("mode=login"));
+        assert!(!v["flow_id"].as_str().unwrap().is_empty());
+        assert!(v["poll_interval_sec"].as_u64().unwrap() >= 1);
+    }
+
+    /// ⚠️ 安全红线:PKCE verifier **绝不能出现在响应里**(它一旦泄漏,PKCE 就白做了)。
+    #[tokio::test]
+    async fn cursor_login_start_never_leaks_verifier() {
+        let (app, _store) = app_with_workers(vec![]);
+        let (_s, v) = cursor_start(&app, "cursor-b", "").await;
+        let flow_id = v["flow_id"].as_str().unwrap().to_string();
+        let verifier = {
+            let m = crate::admin::accounts::cursor_pending().lock().unwrap();
+            m.get(&flow_id).unwrap().flow.verifier.clone()
+        };
+        assert_eq!(verifier.len(), 43, "verifier 应是 base64url(32B)");
+        let whole = serde_json::to_string(&v).unwrap();
+        assert!(!whole.contains(&verifier), "响应体泄漏了 verifier");
+        assert!(!whole.contains("verifier"), "响应里连字段名都不该有");
+    }
+
+    /// 重名要在**操作员打开浏览器之前**就挡掉(照 dario 的教训:别让人登完才撞 409)。
+    #[tokio::test]
+    async fn cursor_login_start_rejects_duplicate_before_browser() {
+        let (app, store) = app_with_workers(vec![]);
+        store
+            .create_account("cursor-dup", "", "cursor", 2, "{}")
+            .unwrap();
+        let (status, _v) = cursor_start(&app, "cursor-dup", "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cursor_login_start_validates_account_id() {
+        let (app, _store) = app_with_workers(vec![]);
+        let (status, _v) = cursor_start(&app, "bad id!", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// 未知/过期 flow_id → 400,且**不打上游**。
+    #[tokio::test]
+    async fn cursor_login_poll_rejects_unknown_flow() {
+        let (app, _store) = app_with_workers(vec![]);
+        let (status, v) = cursor_poll(&app, "no-such-flow").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v.to_string().contains("过期") || v.to_string().contains("无效"));
+    }
+
+    /// 瞬时失败(网络抖动/上游不可达)**不能**清掉会话 —— 轮询天然要问很多次,
+    /// 这是与 dario `take_pending`(单次取出即删)最关键的差异。
+    ///
+    /// 断言的是**行为契约**而非全局表内容:会话表是进程级 `OnceLock`,同一二进制里
+    /// `..._sessions_are_bounded` 会灌满它并淘汰最旧项,直接查表会与那条打架(踩过)。
+    /// 所以连 poll 两次,断言第二次**不是** 400「会话已过期」。
+    #[tokio::test]
+    async fn cursor_login_transient_failure_keeps_session() {
+        let (app, _store) = app_with_workers(vec![]);
+        let (_s, v) = cursor_start(&app, "cursor-keep", "").await;
+        let flow_id = v["flow_id"].as_str().unwrap().to_string();
+        let (first, _b1) = cursor_poll(&app, &flow_id).await;
+        let (second, _b2) = cursor_poll(&app, &flow_id).await;
+        // 无外网 → 两次都 502;有外网 → 两次都 200 pending。无论哪种,
+        // 第二次都不该变 400(那意味着第一次把会话吃掉了)。
+        assert_ne!(
+            second,
+            StatusCode::BAD_REQUEST,
+            "第一次 poll 之后会话就没了(first={first}),后续轮询全废"
+        );
+        assert_eq!(first, second, "同一会话连续两次 poll 的结果应一致");
+    }
+
+    /// 会话表有硬上限:灌满后淘汰**最旧**的,内存有界。
+    ///
+    /// 用自己的 map 测 `cursor_make_room`,**不碰进程级全局表** —— 在全局表里灌
+    /// 64 个会话会挤掉并发跑的其它测试的会话,那种 flaky 极难定位(为此排查了四轮)。
+    #[test]
+    fn cursor_login_room_making_evicts_oldest_and_bounds_memory() {
+        use std::collections::HashMap;
+        let mut m: HashMap<String, crate::admin::accounts::PendingCursorLogin> = HashMap::new();
+        let cap = 4usize;
+        // 灌 cap+6 个,每个 created_at 递增(靠 sleep 太慢,直接构造递增时刻)
+        let base = std::time::Instant::now();
+        for i in 0..(cap + 6) {
+            crate::admin::accounts::cursor_make_room(&mut m, cap);
+            m.insert(
+                format!("flow-{i}"),
+                crate::admin::accounts::PendingCursorLogin {
+                    flow: gw_cursor::login::start(),
+                    proxy: None,
+                    account_id: format!("a{i}"),
+                    group: String::new(),
+                    max_concurrency: 2,
+                    priority: 100,
+                    // 越晚插入的越新
+                    created_at: base + std::time::Duration::from_millis(i as u64),
+                },
+            );
+            assert!(m.len() <= cap, "第 {i} 轮后 {} 个,超过上限 {cap}", m.len());
+        }
+        // 留下的必须是**最新**那批,最旧的已被淘汰
+        assert!(!m.contains_key("flow-0"), "最旧的应被淘汰");
+        assert!(m.contains_key(&format!("flow-{}", cap + 5)), "最新的应留下");
+    }
+
+    #[tokio::test]
+    async fn cursor_login_endpoints_require_auth() {
+        for path in ["/accounts/cursor/login/start", "/accounts/cursor/login/poll"] {
+            let (app, _) = app();
+            let r = Request::builder()
+                .method("POST")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.oneshot(r).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} 必须鉴权"
+            );
+        }
+    }
+    // CHUNK_ANCHOR_CURSOR_LOGIN_TESTS
     // CHUNK_ANCHOR_OAUTH_TESTS2
 
     /// start 命中真实 claude-dario 组 → 返回 authorize_url + state。
