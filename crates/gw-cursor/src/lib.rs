@@ -28,6 +28,7 @@
 //! Cursor 内建工具的代执行(**有意不做**:那等于跑模型选定的 shell 命令)。
 
 pub mod auth;
+pub mod login;
 mod chat;
 mod config;
 mod models;

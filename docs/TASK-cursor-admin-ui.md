@@ -271,3 +271,72 @@ docker run --rm -v "$PWD/admin-ui":/app -w /app oven/bun:1 bash -c "bun install 
 ## 8. 一句话总结
 
 **后端全通了，就差后台界面。**改 3 处硬编码 provider 名 + 新建 1 个建号对话框 + 补 i18n 两份词条 + 补测试。不要碰 Rust，不要为实验性开关做 UI，不要编造后端接口。
+
+---
+
+## 9. 追加任务：官方登录上号（推荐入口）
+
+> 2026-08-08 新增。后端两个端点已实现并通过测试，**只差前端**。
+> 手填表单那条路（§4/§5.4）**保留不动** —— 应急、或从别处拿到凭据时用。
+> dario 现在也是两条并存：OAuth 授权 + 折叠的「粘贴 credentials.json」旁路。
+
+Cursor 客户端自己的登录是 **PKCE + 轮询**，已完整复刻。操作员不用再去翻
+`state.vscdb` 抄两个 JWT，点一下 → 浏览器授权 → 自动落库。
+
+### 9.1 两个端点
+
+**`POST /admin/api/accounts/cursor/login/start`**
+
+```jsonc
+// 请求
+{ "account_id": "cursor-01", "group": "G0", "max_concurrency": 2,
+  "priority": 100, "egress": "auto" }
+// 响应 200
+{ "login_url": "https://cursor.com/loginDeepControl?challenge=…&uuid=…",
+  "flow_id": "5e693464-…",     // 后续 poll 用它
+  "expires_in_sec": 900,
+  "poll_interval_sec": 2 }
+```
+
+纯本地，不发上游请求。会前置校验：account_id 合法性、**重名（409）**、分组真实存在
+—— 故意做在这一步，别让操作员登完浏览器才撞错。
+
+**`POST /admin/api/accounts/cursor/login/poll`**
+
+```jsonc
+// 请求
+{ "flow_id": "5e693464-…" }
+
+// 还没授权 → 200
+{ "status": "pending" }
+
+// 授权好了 → 201，账号已落库，body 是账号行（含 "status": "done"）
+{ "status": "done", "account_id": "cursor-01", "provider": "cursor", … }
+
+// 终态失败 → 4xx（会话已清，别再轮询）
+// 瞬时失败 → 502（会话保留，继续轮询）
+```
+
+### 9.2 前端要做的
+
+把「Cursor 上号」按钮改成**两步**（照 `OAuthAccountDialog` 的两步范式）：
+
+1. **第一步**：填 account_id / 分组 / 并发 / 优先级 / 出口 → 调 start
+   → 显示 `login_url`（给个「复制」和「在浏览器打开」按钮，`OAuthAccountDialog`
+   已有复制按钮可抄）
+2. **第二步**：按 `poll_interval_sec` 轮询 poll，直到 `done`（关闭弹窗 + 刷新列表）
+   或 4xx（显示错误）。给个进度提示和「取消」。
+
+⚠️ **几条要注意的**：
+
+- **轮询要有上限**，别无限转。窗口是 `expires_in_sec`（900 秒）；
+  超时就提示「登录超时，请重新发起」。
+- **502 要继续轮询**，不要当失败停下 —— 那是网络抖动，会话还在。
+  只有 4xx 才是终态。
+- **`flow_id` 不是密钥**，但也别打进 URL 或日志。
+- 手填表单那条路仍要保留（可以做成同一个弹窗里的两个 tab，或折叠旁路）。
+
+### 9.3 用不到的东西
+
+后端**没有**「取消登录」端点。用户点取消就前端停止轮询即可，
+会话会自己在 15 分钟后过期。不用为它加接口。
