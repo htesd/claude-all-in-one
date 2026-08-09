@@ -287,12 +287,21 @@ impl CredentialState {
         Some(RPM_WINDOW.saturating_sub(now.duration_since(front)))
     }
 
-    /// 记一次选中。只对设了上限的号记账,避免给不限速的号(企业号)白加内存。
+    /// 记一次调用。只对设了上限的号记账,避免给不限速的号(企业号)白加内存。
     fn rpm_note_selected(&mut self, now: Instant) {
         if rpm_limit(&self.account).is_none() {
             return;
         }
         self.rpm_hits.push_back(now);
+    }
+
+    /// 退还最近一次预留(选号成功但 `try_lease` 没拿到 permit → 没发出上游调用)。
+    /// 退最新那条而不是最老的:最老的是别人的真实调用,退错会让配额虚高。
+    fn rpm_refund_latest(&mut self) {
+        if rpm_limit(&self.account).is_none() {
+            return;
+        }
+        self.rpm_hits.pop_back();
     }
 }
 
@@ -962,25 +971,39 @@ impl AccountScheduler {
             }
         };
 
-        // 选中即更新 last_selected_at(让 LRU 反映实时负载,新会话才轮转)。
+        // 选中即更新 last_selected_at(让 LRU 反映实时负载,新会话才轮转),
+        // 并**在同一把锁内预留一个 RPM 名额**。
         //
-        // ⚠️ RPM **不在这里记**。记在选号时有两个致命缺陷(对抗审查 gpt-5.6-sol 抓到):
-        // ① 同一个 lease 会多次调用上游 —— token 刷新重试、profileArn 修复重试、
-        //    Overloaded 同号退避(见 worker/mod.rs 的 provider.chat 各调用点),
-        //    只记一次会让实际调用数**数倍**超过 rpm_limit,定频防封直接失效;
-        // ② permit 满时选号会失败重选别的号,那次没发出任何上游请求却已扣掉配额,
-        //    健康号被虚假限流近 60 秒。
-        // 正确位置是**真正发起上游调用之处**,见 [`Self::note_upstream_call`]。
+        // 为什么必须在这里预留(对抗审查第二轮 [高]):`note_upstream_call` 只累加、
+        // 不拒绝。若只在真正发调用时才记,账号仅剩 1 个名额时**多个并发请求**会在
+        // 第一个记账之前全部通过 `eligible_ids` 的检查 → 实际调用突破 rpm_limit,
+        // 突发幅度可达 `max_concurrency`。检查与占位必须原子。
+        //
+        // 预留可能被退还:`try_lease` 拿不到 permit 时没发出任何上游调用,
+        // 由调用方 `rpm_refund_latest` 退回(见 `acquire_in_group`)。
+        // 同一 lease 上的**重试**则额外各记一次,见 [`Self::note_upstream_call`]。
         if let Some(e) = entries.get_mut(&chosen) {
             e.last_selected_at = Some(now);
+            e.rpm_note_selected(now);
         }
         Some(chosen)
     }
 
-    /// 记一次**真实发出的上游调用**(定频记账的唯一入口)。
+    /// 退还一次 RPM 预留(选号成功但没拿到 permit,故未发出上游调用)。
+    fn rpm_refund(&self, account_id: &str) {
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.get_mut(account_id) {
+            e.rpm_refund_latest();
+        }
+    }
+
+    /// 记一次**额外的**上游调用(同一个 lease 上的第 2、3… 次)。
     ///
-    /// 必须在每个真正打上游的地方调用 —— 包括同一个 lease 上的**重试**
-    /// (token 刷新后重试、profileArn 修复后重试、Overloaded 退避重试)。
+    /// 语义要点:选号时已经**预留**了第一次调用的名额(见 `select_id`),所以主链路的
+    /// 首发调用**不该**再调本方法 —— 否则一次调用扣两格。本方法只用于同一 lease 上的
+    /// 追加调用:token 刷新后重试、profileArn 修复后重试、Overloaded 退避的每一次重试、
+    /// web search 的每一次续轮、人工探针(它不经过 select_id,故自己占一格)。
+    ///
     /// 漏调一处 = 该路径的调用不计入 RPM = 号可能因超频被封。
     pub fn note_upstream_call(&self, account_id: &str) {
         let now = Instant::now();
@@ -1285,21 +1308,35 @@ impl AccountScheduler {
                         {
                             // 队列已满则不排,立刻报错 —— 再挤进来只是陪跑到超时,
                             // 客户等更久、结果一样。容量随可排队号的并发动态变化。
-                            if queue_slot.is_none() {
-                                match self.try_enter_queue(cap) {
-                                    Some(slot) => queue_slot = Some(slot),
-                                    None => return Err(AcquireError::AllBusy),
-                                }
+                            // 队列满(含 cap==0)则**不在这里报错**:等待理由可能纯粹是
+                            // RPM ——`queue_probe` 刻意不把 RPM 满的号计入 cap(那容量吃不下),
+                            // 于是"全部号都开排队且只是 RPM 满"会得到 cap==0 →
+                            // try_enter_queue 失败。旧代码在这里 `return AllBusy`,让下面的
+                            // rpm_soonest 分支**永远到不了**,请求立刻 503(对抗审查第二轮 [高])。
+                            // 改为跌落:若确有 RPM 等待理由,由下面那条分支接管;否则才报错。
+                            let admitted = queue_slot.is_some()
+                                || match self.try_enter_queue(cap) {
+                                    Some(slot) => {
+                                        queue_slot = Some(slot);
+                                        true
+                                    }
+                                    None => false,
+                                };
+                            if admitted {
+                                // 上限 200ms:期间可能有并发槽先释放,早点回来重选;
+                                // 下限 10ms:d 接近 0 时不空转。
+                                tokio::time::sleep(d.clamp(
+                                    Duration::from_millis(10),
+                                    Duration::from_millis(200),
+                                ))
+                                .await;
+                                busy.clear();
+                                continue;
                             }
-                            // 上限 200ms:期间可能有并发槽先释放,早点回来重选;
-                            // 下限 10ms:d 接近 0 时不空转。
-                            tokio::time::sleep(d.clamp(
-                                Duration::from_millis(10),
-                                Duration::from_millis(200),
-                            ))
-                            .await;
-                            busy.clear();
-                            continue;
+                            // 没排上且没有 RPM 理由 → 真的满了,报可重试错误。
+                            if rpm_soonest.is_none() {
+                                return Err(AcquireError::AllBusy);
+                            }
                         }
                     }
                 }
@@ -1336,7 +1373,9 @@ impl AccountScheduler {
             match self.try_lease(&id) {
                 Some(lease) => return Ok(lease),
                 None => {
-                    // 并发满:标 busy,换号重试。
+                    // 并发满:标 busy,换号重试。选号时预留的 RPM 名额要**退还** ——
+                    // 这一轮没有发出任何上游调用,不退会让健康号被虚假限流近 60 秒。
+                    self.rpm_refund(&id);
                     busy.insert(id);
                     attempts += 1;
                 }
@@ -2354,13 +2393,11 @@ mod tests {
     // 付费 social 号同期 `RateLimited`=0、`EmptyResponse`=0:上游**不发预警**,第一个
     // 信号就是封号,所以所有"等上游软信号再退避"的冷却参数在它们身上从不执行。
 
-    /// 取号 + 模拟"真的打了一次上游"(记账入口在 `note_upstream_call`,
-    /// 生产里由 worker/mod.rs 的各 provider.chat 调用点触发)。
+    /// 取号 = 首发调用的名额在 `select_id` 里**已预留**,所以这里不再额外记账。
+    /// (生产里 `note_upstream_call` 只用于同一 lease 上的追加调用。)
     async fn acquire_and_call(s: &AccountScheduler, key: &str) -> String {
         let l = s.acquire(Some(key)).await.unwrap();
-        let id = l.account_id().to_string();
-        s.note_upstream_call(&id);
-        id
+        l.account_id().to_string()
     }
 
     #[tokio::test]
@@ -2380,10 +2417,9 @@ mod tests {
         let s = sched(vec![racct("a", 10, 0, 3), acct("lo", 10, Some(100))]);
         let lease = s.acquire(Some("s")).await.unwrap();
         assert_eq!(lease.account_id(), "a");
-        // 一次选号 → 三次上游调用(首发 + 两次同号重试)。
-        for _ in 0..3 {
-            s.note_upstream_call("a");
-        }
+        // 一次选号 = 首发调用(名额已预留)+ 两次同号重试(各记一次)= 共 3 次。
+        s.note_upstream_call("a");
+        s.note_upstream_call("a");
         drop(lease);
         let snap = s.status_snapshot();
         let a = snap.iter().find(|x| x.account_id == "a").unwrap();
@@ -2392,14 +2428,41 @@ mod tests {
         assert_eq!(acquire_and_call(&s, "s2").await, "lo", "配额满 → 降到兜底号");
     }
 
+    /// **并发准入必须原子**(对抗审查第二轮 [高]):只剩 1 个名额时,多个并发请求
+    /// 不得在第一个记账之前全部通过检查 —— 那会让实际调用突破 rpm_limit,
+    /// 突发幅度可达 `max_concurrency`(生产上是 100)。
+    #[tokio::test]
+    async fn rpm_admission_is_atomic_under_concurrency() {
+        // hi 有 20 个 permit 但 rpm 只剩 3 → 并发打 10 个,只有 3 个能落在 hi。
+        let s = std::sync::Arc::new(sched(vec![racct("hi", 20, 0, 3), acct("lo", 20, Some(100))]));
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let s2 = s.clone();
+            handles.push(tokio::spawn(async move {
+                let l = s2.acquire(Some(&format!("s{i}"))).await.unwrap();
+                let id = l.account_id().to_string();
+                // 持住 lease 直到全部取完,确保不是靠 permit 释放来串行化。
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                id
+            }));
+        }
+        let mut on_hi = 0;
+        for h in handles {
+            if h.await.unwrap() == "hi" {
+                on_hi += 1;
+            }
+        }
+        assert_eq!(on_hi, 3, "只剩 3 个名额,不该有第 4 个请求落在 hi(实际 {on_hi})");
+        assert_eq!(s.status_snapshot().iter().find(|x| x.account_id == "hi").unwrap().rpm_used, 3);
+    }
+
     /// permit 抢不到而重选别的号时,**不该**扣掉本号配额 —— 没发出任何上游请求。
     #[tokio::test]
     async fn rpm_not_consumed_when_lease_fails_no_upstream_call() {
         // hi 只有 1 个 permit 且被占住 → 第二个请求会重选到 lo,hi 不该扣配额。
         let s = sched(vec![racct("hi", 1, 0, 5), acct("lo", 10, Some(100))]);
         let hog = s.acquire(Some("hog")).await.unwrap();
-        assert_eq!(hog.account_id(), "hi");
-        s.note_upstream_call("hi"); // 占位者真的打了一次
+        assert_eq!(hog.account_id(), "hi"); // 占位者的名额已在选号时预留
         let second = s.acquire(Some("s2")).await.unwrap();
         assert_eq!(second.account_id(), "lo", "hi permit 满 → 落 lo");
         let snap = s.status_snapshot();
@@ -2451,8 +2514,7 @@ mod tests {
         // 唯一的号,rpm=1:第二个请求必须等而不是 503。
         let s = AccountScheduler::new(vec![racct("only", 10, 0, 1)], &cfg);
         let first = s.acquire(Some("s1")).await.unwrap();
-        s.note_upstream_call("only");
-        drop(first);
+        drop(first); // 名额已在选号时预留,drop lease 不退还
         let err = match s.acquire(Some("s2")).await {
             Ok(l) => panic!("窗口 60s 远超 300ms 预算,不该拿到号: {}", l.account_id()),
             Err(e) => e,
@@ -2488,8 +2550,7 @@ mod tests {
             &cfg,
         );
         let used = s2.acquire_in_group(Some("s1"), |_| true, None, true).await.unwrap();
-        s2.note_upstream_call("hi2");
-        drop(used);
+        drop(used); // rpm=1 已在选号时用掉
         let t0 = Instant::now();
         let b = s2.acquire_in_group(Some("s2"), |_| true, None, true).await.unwrap();
         assert_eq!(b.account_id(), "lo2", "高层 RPM 满 → 降层兜底");
