@@ -2442,10 +2442,6 @@ async fn chat_once_corrected(
     req: &ChatRequest,
     ctx: &CallCtx,
 ) -> Result<gw_core::provider::ChatStream, gw_core::error::UpstreamError> {
-    // 定频记账:每一次**真实发出**的上游调用都要记,含 Overloaded 同号退避的每一次重试
-    // (本函数是那条退避循环的单一入口)。记在发出之前 —— 失败的调用一样会被上游计入
-    // 频率画像,不该因为我方失败就不算。
-    st.scheduler.note_upstream_call(&ctx.account.account_id);
     match st.provider.chat(req.clone(), ctx).await {
         Ok(s) => Ok(s),
         Err(mut e) => {
@@ -2507,6 +2503,9 @@ async fn chat_with_overload_backoff(
         Err(e) => return Err(e),
     };
     for (i, base_ms) in OVERLOAD_BACKOFF_MS.iter().enumerate() {
+        // 定频记账:首发那一次的名额已在 select_id 预留,这里记的是**追加**的重试。
+        // 记在发出之前 —— 上游已收到但返回错误的调用一样计入它的频率画像。
+        st.scheduler.note_upstream_call(account_id);
         let wait = jittered(*base_ms);
         tracing::info!(
             account = %account_id, model = %req.model, attempt = i + 1,
