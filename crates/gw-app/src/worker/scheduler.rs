@@ -623,6 +623,88 @@ impl AccountScheduler {
         (paced_rank < best_selectable?).then_some(wait)
     }
 
+    /// 「降层前先等**排队号**」的判定:更高优先层若有 `queue_enabled` 的号正在冷却、
+    /// 且能在 `budget` 内自愈,返回其中最早到期的剩余时间;否则 `None`(照常降层)。
+    ///
+    /// 为什么需要它、而 [`Self::tier_hold_wait`] 不够:后者只认 `paced_until`(429 节流
+    /// 窗口)。但排队号撞 429 走**二值冷却**的情形很常见 —— 关了 `rate_limit_pace_ms`、
+    /// 或撞上 `rate_limit_pace_max_strikes` 熔断退回冷却时都是。生产 G0 高优层 29 个号
+    /// 全部 `queue_enabled`、冷却 2s,于是每次 429 都把一批量漏给只有 31 个 permit 的
+    /// 低优兜底池,把本已半死的兜底号打到封禁(2026-08-09 用户报障)。
+    ///
+    /// 口径(用户原话):"只要我有排队模式的号,低优先就不应该吃流量;如果没有,那高优先
+    /// 的正常掉到低优先"。所以:
+    /// - 只保护 `queue_enabled` 的号 —— 普通高优号冷却仍立即降层(既有语义,见
+    ///   `tier_hold_ignores_cooled_down_top_tier`)。
+    /// - 只等**预算内会回来**的冷却。1h 封禁(`suspended_cooldown`)远超预算 → 降层,
+    ///   这正是"如果没有"的那一半。
+    /// - 同层已有号能立刻服务时不等:等的意义只在于不降层。
+    /// - 谓词与 [`Self::eligible_ids`] 逐条对齐,**只放开 disabled 那一条**,否则会为一个
+    ///   根本选不中的号(不支持本模型/非本组/permit 满)干等,把省钱变成客户干等。
+    ///
+    /// 锁只在本方法内持有,**不跨 `await`**:调用方拿到时长后才睡。
+    fn queue_tier_hold_wait(
+        &self,
+        exclude: &HashSet<String>,
+        now: Instant,
+        supports: &dyn Fn(&Account) -> bool,
+        view: Option<&GroupView>,
+        budget: Duration,
+    ) -> Option<Duration> {
+        let entries = self.entries.lock();
+        // 此刻就能选中的最高优先层 = 「不等的话会落到哪一层」的基线。口径必须与
+        // `select_id`/`eligible_ids` 一致,否则会误判"不等就会掉到哪层"。
+        let mut best_selectable: Option<i64> = None;
+        // 仅因冷却不可选的排队号里,最高优先层 + 该层最早到期时间。
+        let mut best_cooling: Option<(i64, Duration)> = None;
+        for e in entries.values() {
+            if exclude.contains(&e.account.account_id) || !supports(&e.account) {
+                continue;
+            }
+            let Some(rank) = rank_of(view, e) else { continue };
+            if e.disabled {
+                // 只有开了排队、且是**冷却类**(会自愈)的禁用才构成等待理由。
+                // 额度跑干 / config 禁用不会自己回来,等它等于干等到超时。
+                if !queue_enabled(&e.account)
+                    || !e.disabled_reason.map(|r| r.is_cooldown()).unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(until) = e.disabled_until else { continue };
+                let d = until.saturating_duration_since(now);
+                // 已到期(sweep 还没跑到)不算冷却;超预算的(如 1h 封禁)直接放弃。
+                if d.is_zero() || d > budget {
+                    continue;
+                }
+                // 等一个 permit 已满的号是白等:冷却过去了照样租不到。理由同
+                // `tier_hold_wait` / `best_available_higher` 用 `available_permits()`。
+                if e.semaphore.available_permits() == 0 {
+                    continue;
+                }
+                let better = match best_cooling {
+                    None => true,
+                    Some((r, m)) => rank < r || (rank == r && d < m),
+                };
+                if better {
+                    best_cooling = Some((rank, d));
+                }
+            } else if e.paced_until.map(|t| now >= t).unwrap_or(true) {
+                // 与 eligible_ids 同口径:未禁用且不在节流窗口内 = 此刻可选。
+                if best_selectable.map(|r| rank < r).unwrap_or(true) {
+                    best_selectable = Some(rank);
+                }
+            }
+        }
+        let (cooling_rank, wait) = best_cooling?;
+        match best_selectable {
+            // 此刻一个号都选不出:交给 `select_id` 的 else 分支(既有 queue/paced 等待
+            // 逻辑),这里不拦 —— 重复拦截会让两套预算叠加。
+            None => None,
+            // 只有当「不等就会降到更低层」时才等。
+            Some(sel) => (cooling_rank < sel).then_some(wait),
+        }
+    }
+
     /// 分层 LRU:在合格集合里取**最高优先级层**(组内 rank 最小),层内选 last_selected_at
     /// 最旧者(None 视为最久未用,平局按 id)。返回选中 id。调用方保证 ids 非空。
     fn tiered_lru(
@@ -887,6 +969,37 @@ impl AccountScheduler {
                         // 抖动:同一个号上的多个等待者同时醒来会一起打上游、再撞一片 429。
                         let jitter = Duration::from_millis((n % 7) * 8);
                         let wait = (d + jitter).max(MIN_TIER_HOLD).min(remaining);
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                }
+            }
+
+            // 降层前先等**排队号的冷却**:排队号(自购速刷号)撞 429 走二值冷却时,
+            // 上面的 `tier_hold_wait` 管不到(它只认节流窗口),于是量会漏给低优兜底池。
+            // 预算用 `queue_wait`(排队开关本身的预算)而非 `tier_hold` —— 冷却是秒级,
+            // 而 `tier_hold_ms` 是为几百毫秒的节流窗口设的,拿它当预算等于永不生效。
+            //
+            // 与下方 `select_id` else 分支里的排队等待**不重复**:那条只在"一个号都选不出"
+            // 时触发,而本闸门治的正是"低优号可选、于是高优号的冷却根本没人等"。
+            // 同样刻意**不消耗 `attempts`**(那是 busy 换号的预算)、**不 `busy.clear()`**
+            // (busy 里是 permit 满的号,与冷却无关),理由同上面的 tier_hold 分支。
+            if !queue_wait.is_zero() {
+                let remaining = queue_wait.saturating_sub(started.elapsed());
+                if remaining >= MIN_TIER_HOLD {
+                    if let Some(d) =
+                        self.queue_tier_hold_wait(&busy, now, &supports, view, remaining)
+                    {
+                        let n = self
+                            .tier_held_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // 抖动同上:一批等待者同时醒来会一起打上游、再撞一片 429。
+                        let jitter = Duration::from_millis((n % 7) * 8);
+                        // 上限 200ms 后回来重选:期间可能有同层号先恢复或 permit 释放,
+                        // 早点回来比睡满整段更快;冷却未到则下一轮继续等(受 remaining 收敛)。
+                        let wait = (d + jitter)
+                            .clamp(MIN_TIER_HOLD, Duration::from_millis(200))
+                            .min(remaining);
                         tokio::time::sleep(wait).await;
                         continue;
                     }
@@ -1911,6 +2024,162 @@ mod tests {
         let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
         assert_eq!(lease.account_id(), "lo");
         assert!(t0.elapsed() < Duration::from_millis(80), "冷却态不归 tier hold 管: {:?}", t0.elapsed());
+    }
+
+    /// **只要还有排队模式的高优先号会在预算内回来,就不许降层。**
+    ///
+    /// 用户口径(2026-08-09):"只要我有排队模式的号,低优先就不应该吃流量;如果没有,
+    /// 那高优先的正常掉到低优先"。排队号(`queue_enabled`)是自购速刷号:它们撞 429 是
+    /// 跨租户竞争,冷却几秒就回来 —— 这几秒把量送给低优兜底池,等于用被封风险换几秒延迟。
+    ///
+    /// 与 [`Self::tier_hold_wait`] 的区别:那个只认 `paced_until`(429 节流窗口),
+    /// 冷却态(`disabled` + cooldown)一律立即降层。可 `rate_limit_pace_max_strikes`
+    /// 熔断后、以及 `queue_enabled` 但未开节流的号,撞 429 走的正是二值冷却分支 ——
+    /// 生产上 G0 高优层 29 个号全是 `queue_enabled`,冷却 2s,于是每次 429 都漏一批量
+    /// 到只有 31 个 permit 的低优层,把本已半死的兜底号打到封禁。
+    #[tokio::test]
+    async fn queue_tier_hold_waits_for_cooling_queue_account_instead_of_descending() {
+        let cfg = SchedulerConfig {
+            // 走**二值冷却**(不是节流):pace 关掉,冷却 200ms —— 预算内会自愈。
+            rate_limit_pace_ms: 0,
+            rate_limit_cooldown_secs: 1,
+            queue_wait_ms: 2_000,
+            ..SchedulerConfig::default()
+        };
+        // hi = 排队号挂最高层;lo = 普通兜底号。
+        let s = AccountScheduler::new(vec![qacct_p("hi", 10, 0), acct("lo", 10, Some(100))], &cfg);
+        s.report_failure("hi", UpstreamErrorKind::RateLimited);
+        assert!(
+            s.status_snapshot().iter().find(|x| x.account_id == "hi").unwrap().disabled,
+            "前提:hi 走的是二值冷却(disabled),不是节流"
+        );
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(
+            lease.account_id(),
+            "hi",
+            "排队号冷却中且预算内会回来 → 必须等它,不许把量送给低优兜底号"
+        );
+        assert!(t0.elapsed() >= Duration::from_millis(500), "应等过冷却: {:?}", t0.elapsed());
+    }
+
+    /// 边界:排队号的冷却**超出预算**时照常降层 —— 用户口径的后半句
+    /// "如果没有,那高优先的正常掉到低优先"。1h 封禁属于这一类。
+    #[tokio::test]
+    async fn queue_tier_hold_descends_when_cooldown_exceeds_budget() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 0,
+            rate_limit_cooldown_secs: 600, // 远超预算
+            queue_wait_ms: 200,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct_p("hi", 10, 0), acct("lo", 10, Some(100))], &cfg);
+        s.report_failure("hi", UpstreamErrorKind::RateLimited);
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(lease.account_id(), "lo", "排队号短期回不来 → 正常降层兜底");
+        assert!(t0.elapsed() < Duration::from_secs(1), "不该傻等满 600s: {:?}", t0.elapsed());
+    }
+
+    /// 封禁(1h)不该把请求钉在高层等 —— `suspended_cooldown` 远超预算,必须降层。
+    #[tokio::test]
+    async fn queue_tier_hold_descends_on_long_ban() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 0,
+            queue_wait_ms: 300,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct_p("hi", 10, 0), acct("lo", 10, Some(100))], &cfg);
+        s.report_failure("hi", UpstreamErrorKind::TemporarilyBlocked);
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(lease.account_id(), "lo", "1h 封禁远超预算 → 降层");
+        assert!(t0.elapsed() < Duration::from_secs(1), "不该等封禁: {:?}", t0.elapsed());
+    }
+
+    /// 最坏情形:整个高优层都被封 1h(2026-08-09 生产上 12/12 就是这样)。
+    /// 必须**立刻**降层兜底,绝不能把请求钉住等一小时。
+    #[tokio::test]
+    async fn queue_tier_hold_descends_immediately_when_whole_top_tier_banned() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 0,
+            queue_wait_ms: 15_000, // 与生产同值
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(
+            vec![qacct_p("hi-1", 10, 0), qacct_p("hi-2", 10, 0), acct("lo", 10, Some(100))],
+            &cfg,
+        );
+        s.report_failure("hi-1", UpstreamErrorKind::TemporarilyBlocked);
+        s.report_failure("hi-2", UpstreamErrorKind::TemporarilyBlocked);
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(lease.account_id(), "lo", "高优层全封 → 必须降层,不能钉住等 1h");
+        assert!(t0.elapsed() < Duration::from_millis(300), "不该等: {:?}", t0.elapsed());
+    }
+
+    /// 冷却比 `queue_wait` 预算长时,等待**总时长受预算收敛**,不会累积超发。
+    #[tokio::test]
+    async fn queue_tier_hold_total_wait_bounded_by_budget() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 0,
+            rate_limit_cooldown_secs: 3, // 3s 冷却 > 600ms 预算
+            queue_wait_ms: 600,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(vec![qacct_p("hi", 10, 0), acct("lo", 10, Some(100))], &cfg);
+        s.report_failure("hi", UpstreamErrorKind::RateLimited);
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(lease.account_id(), "lo", "预算内等不回来 → 降层");
+        // 200ms 分片多轮循环,但总时长必须收敛到预算附近(留足 CI 抖动余量)。
+        assert!(t0.elapsed() < Duration::from_millis(1_500), "总等待超发: {:?}", t0.elapsed());
+    }
+
+    /// **不开排队的高优号不受此闸门管** —— 保持既有语义(见
+    /// `tier_hold_ignores_cooled_down_top_tier`):普通高优号冷却即降层。
+    #[tokio::test]
+    async fn queue_tier_hold_ignores_non_queue_top_tier() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 0,
+            rate_limit_cooldown_secs: 1,
+            queue_wait_ms: 2_000,
+            ..SchedulerConfig::default()
+        };
+        // hi **不开**排队 → 不在闸门保护范围内。
+        let s = AccountScheduler::new(vec![acct("hi", 10, Some(0)), acct("lo", 10, Some(100))], &cfg);
+        s.report_failure("hi", UpstreamErrorKind::RateLimited);
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(lease.account_id(), "lo", "非排队号冷却 → 立即降层(既有语义不变)");
+        assert!(t0.elapsed() < Duration::from_millis(200), "不该等: {:?}", t0.elapsed());
+    }
+
+    /// 同层还有排队号能立刻服务时**不等** —— 等的意义只在于"不降层"。
+    #[tokio::test]
+    async fn queue_tier_hold_does_not_wait_when_same_tier_has_free_account() {
+        let cfg = SchedulerConfig {
+            rate_limit_pace_ms: 0,
+            rate_limit_cooldown_secs: 1,
+            queue_wait_ms: 2_000,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(
+            vec![qacct_p("hi-1", 10, 0), qacct_p("hi-2", 10, 0), acct("lo", 10, Some(100))],
+            &cfg,
+        );
+        s.report_failure("hi-1", UpstreamErrorKind::RateLimited);
+
+        let t0 = Instant::now();
+        let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
+        assert_eq!(lease.account_id(), "hi-2", "同层有空闲号 → 直接用它,不等不降层");
+        assert!(t0.elapsed() < Duration::from_millis(200), "不该等: {:?}", t0.elapsed());
     }
 
     /// 高层号**并发满**时不等:窗口过去了照样租不到,等只是把延迟加给客户。
