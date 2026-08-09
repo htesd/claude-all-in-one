@@ -698,6 +698,11 @@ impl AccountScheduler {
                 // 基线要与 `select_id` 的口径逐字节一致,否则会误判"不等就会掉到哪层"。
                 Some(_) if e.semaphore.available_permits() == 0 => continue,
                 Some(d) => {
+                    // 节流窗口过去后 RPM 仍打满 → 照样选不中,等它只是徒增延迟
+                    // (对抗审查 [中]:候选侧漏了这一条,而基线侧已经检查了)。
+                    if e.rpm_wait(now).is_some_and(|r| r > d) {
+                        continue;
+                    }
                     let better = match best_paced {
                         None => true,
                         Some((r, m)) => rank < r || (rank == r && d < m),
@@ -750,13 +755,16 @@ impl AccountScheduler {
         supports: &dyn Fn(&Account) -> bool,
         view: Option<&GroupView>,
         budget: Duration,
-    ) -> Option<Duration> {
+    ) -> Option<(Duration, usize)> {
         let mut entries = self.entries.lock();
         // 此刻就能选中的最高优先层 = 「不等的话会落到哪一层」的基线。口径必须与
         // `select_id`/`eligible_ids` 一致,否则会误判"不等就会掉到哪层"。
         let mut best_selectable: Option<i64> = None;
         // 仅因冷却不可选的排队号里,最高优先层 + 该层最早到期时间。
         let mut best_cooling: Option<(i64, Duration)> = None;
+        // 队列准入容量。口径与 `queue_probe` 一致:只算**开了排队且预算内会回来**的号 ——
+        // 撑大 cap 会让等待者远超真实吞吐、全部排到超时。
+        let mut cap: usize = 0;
         for e in entries.values_mut() {
             if exclude.contains(&e.account.account_id) || !supports(&e.account) {
                 continue;
@@ -781,6 +789,14 @@ impl AccountScheduler {
                 if e.semaphore.available_permits() == 0 {
                     continue;
                 }
+                // 冷却到点时 RPM 仍打满 → 照样选不中,等它是白等(对抗审查 [中])。
+                // 比较的是**冷却结束那一刻**的配额:rpm_wait 是从现在起的剩余,
+                // 若它比冷却更久,说明冷却结束时配额还没滑出窗口。
+                if e.rpm_wait(now).is_some_and(|r| r > d) {
+                    continue;
+                }
+                // 这个号预算内会回来 → 它的并发计入队列准入容量(口径同 queue_probe)。
+                cap = cap.saturating_add(e.account.max_concurrency as usize);
                 let better = match best_cooling {
                     None => true,
                     Some((r, m)) => rank < r || (rank == r && d < m),
@@ -799,11 +815,11 @@ impl AccountScheduler {
         }
         let (cooling_rank, wait) = best_cooling?;
         match best_selectable {
-            // 此刻一个号都选不出:交给 `select_id` 的 else 分支(既有 queue/paced 等待
+            // 此刻一个号都选不出:交给 `select_id` 的 else 分支(既有 queue/paced/rpm 等待
             // 逻辑),这里不拦 —— 重复拦截会让两套预算叠加。
             None => None,
             // 只有当「不等就会降到更低层」时才等。
-            Some(sel) => (cooling_rank < sel).then_some(wait),
+            Some(sel) => (cooling_rank < sel).then_some((wait, cap)),
         }
     }
 
@@ -946,18 +962,32 @@ impl AccountScheduler {
             }
         };
 
-        // 选中即更新 last_selected_at(让 LRU 反映实时负载,新会话才轮转)+ 记一次 RPM。
+        // 选中即更新 last_selected_at(让 LRU 反映实时负载,新会话才轮转)。
         //
-        // RPM 记在**选中**这一刻,而不是 try_lease 成功或请求完成:
-        // - 记在完成:一个请求跑 20s,这 20s 内选中的号全部漏过闸门(实测单号 53 次/分钟
-        //   正是这么来的);
-        // - 记在 try_lease 成功:permit 满时会重选别的号,但本号已经"选中过"——不记会让
-        //   高并发号的计数系统性偏低。宁可略微保守(多记一次)也不能漏记:漏记 = 号被封。
+        // ⚠️ RPM **不在这里记**。记在选号时有两个致命缺陷(对抗审查 gpt-5.6-sol 抓到):
+        // ① 同一个 lease 会多次调用上游 —— token 刷新重试、profileArn 修复重试、
+        //    Overloaded 同号退避(见 worker/mod.rs 的 provider.chat 各调用点),
+        //    只记一次会让实际调用数**数倍**超过 rpm_limit,定频防封直接失效;
+        // ② permit 满时选号会失败重选别的号,那次没发出任何上游请求却已扣掉配额,
+        //    健康号被虚假限流近 60 秒。
+        // 正确位置是**真正发起上游调用之处**,见 [`Self::note_upstream_call`]。
         if let Some(e) = entries.get_mut(&chosen) {
             e.last_selected_at = Some(now);
-            e.rpm_note_selected(now);
         }
         Some(chosen)
+    }
+
+    /// 记一次**真实发出的上游调用**(定频记账的唯一入口)。
+    ///
+    /// 必须在每个真正打上游的地方调用 —— 包括同一个 lease 上的**重试**
+    /// (token 刷新后重试、profileArn 修复后重试、Overloaded 退避重试)。
+    /// 漏调一处 = 该路径的调用不计入 RPM = 号可能因超频被封。
+    pub fn note_upstream_call(&self, account_id: &str) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        if let Some(e) = entries.get_mut(account_id) {
+            e.rpm_note_selected(now);
+        }
     }
 
     /// 取选中账号的并发许可 + 账号副本。permit 满返回 `Ok(None)`(调用方标 busy 重试);
@@ -1096,21 +1126,42 @@ impl AccountScheduler {
             if !queue_wait.is_zero() {
                 let remaining = queue_wait.saturating_sub(started.elapsed());
                 if remaining >= MIN_TIER_HOLD {
-                    if let Some(d) =
+                    if let Some((d, cap)) =
                         self.queue_tier_hold_wait(&busy, now, &supports, view, remaining)
                     {
-                        let n = self
-                            .tier_held_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // 抖动同上:一批等待者同时醒来会一起打上游、再撞一片 429。
-                        let jitter = Duration::from_millis((n % 7) * 8);
-                        // 上限 200ms 后回来重选:期间可能有同层号先恢复或 permit 释放,
-                        // 早点回来比睡满整段更快;冷却未到则下一轮继续等(受 remaining 收敛)。
-                        let wait = (d + jitter)
-                            .clamp(MIN_TIER_HOLD, Duration::from_millis(200))
-                            .min(remaining);
-                        tokio::time::sleep(wait).await;
-                        continue;
+                        // **必须走队列准入**(对抗审查 [高]):否则任意数量的请求都能在这里
+                        // 无界睡眠 —— sleeping future / 连接堆积,冷却结束时惊群一起打上游
+                        // 再撞一片 429,而面板的 waiting/queued_total 全程显示 0(失真)。
+                        // 队列已满就**不等、直接降层**:这个闸门是"省钱优化",不该为它
+                        // 把请求拖到超时。降层本身是用户认可的兜底路径。
+                        // 队列已满 → **不等**,直接跌落到下面的 select_id 正常降层。
+                        // 这个闸门是"省钱优化",不该为它把请求拖到超时;降层本身就是
+                        // 用户认可的兜底路径。不 return AllBusy —— 低优号很可能还能服务。
+                        let admitted = queue_slot.is_some()
+                            || match self.try_enter_queue(cap) {
+                                Some(slot) => {
+                                    queue_slot = Some(slot);
+                                    true
+                                }
+                                None => false,
+                            };
+                        // 队列满就不等,落到下面的 select_id 常规降层。
+                        // 不消耗 `attempts`:什么都没尝试过,扣预算会凭空缩短重试机会。
+                        if admitted {
+                            let n = self
+                                .tier_held_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // 抖动:一批等待者同时醒来会一起打上游、再撞一片 429。
+                            let jitter = Duration::from_millis((n % 7) * 8);
+                            // 上限 200ms 后回来重选:期间可能有同层号先恢复或 permit 释放,
+                            // 早点回来比睡满整段更快;冷却未到则下一轮继续等(受 remaining 收敛)。
+                            let wait = (d + jitter)
+                                .clamp(MIN_TIER_HOLD, Duration::from_millis(200))
+                                .min(remaining);
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        tracing::debug!("队列已满,放弃等高优排队号,按常规降层");
                     }
                 }
             }
@@ -1120,7 +1171,14 @@ impl AccountScheduler {
                 // 占满)" vs "全禁用"。计数都只看**支持该模型**的号——不支持的号既救不了
                 // busy 等待,也不该让错误从 NoModelSupport 误报成 AllDisabled。
                 // `member_any`/`avail_*` 额外过一遍视图:非成员对本组不存在。
-                let (supported_any, member_any, avail_total, avail_not_busy, paced_soonest) = {
+                let (
+                    supported_any,
+                    member_any,
+                    avail_total,
+                    avail_not_busy,
+                    paced_soonest,
+                    rpm_soonest,
+                ) = {
                     let mut entries = self.entries.lock();
                     let mut any = false;
                     let mut member_any = false;
@@ -1130,6 +1188,11 @@ impl AccountScheduler {
                     // 否则它既被 select_id 跳过、又被算进 avail_total,两边都不认领,
                     // 最后掉进 AllDisabled 分支把 503 抛给客户(本用例抓到的真实缺陷)。
                     let mut paced: Option<Duration> = None;
+                    // RPM 等待**单独统计**,不与 paced 合并(对抗审查 gpt-5.6-sol [高]):
+                    // paced 分支每轮只睡 ≤50ms 且消耗一次 `attempts`,那对几百毫秒的 429
+                    // 窗口合适;但 RPM 等待是**秒级**(最长 60s),混进去会在恢复前把
+                    // `attempts`(total×5)烧光 → 误报 AllBusy,还绕过队列容量控制。
+                    let mut rpm_soonest: Option<Duration> = None;
                     for e in entries.values_mut() {
                         if !supports(&e.account) {
                             continue;
@@ -1143,13 +1206,14 @@ impl AccountScheduler {
                             continue;
                         }
                         avail += 1;
-                        // RPM 打满与 429 节流**同一类软状态**:号没下线、到点自己回来。
-                        // 必须和 paced 一起归进 `paced_soonest`,否则它既被 select_id 跳过、
-                        // 又被算进 avail_total,两边都不认领 → 掉进 AllDisabled 把 503 抛给
-                        // 客户。等一小会儿配额滑出窗口才是对的。
+                        // RPM 打满:号没下线、到点自己回来(与 paced 同属软状态),必须被
+                        // 某个分支认领 —— 否则它既被 select_id 跳过、又被算进 avail_total,
+                        // 两边都不认领 → 掉进 AllDisabled 把 503 抛给客户。
                         if let Some(d) = e.rpm_wait(now) {
-                            if d > Duration::ZERO && paced.map(|m| d < m).unwrap_or(true) {
-                                paced = Some(d);
+                            if d > Duration::ZERO
+                                && rpm_soonest.map(|m| d < m).unwrap_or(true)
+                            {
+                                rpm_soonest = Some(d);
                             }
                             continue;
                         }
@@ -1167,7 +1231,7 @@ impl AccountScheduler {
                             not_busy += 1;
                         }
                     }
-                    (any, member_any, avail, not_busy, paced)
+                    (any, member_any, avail, not_busy, paced, rpm_soonest)
                 };
                 if !supported_any {
                     return Err(AcquireError::NoModelSupport);
@@ -1239,6 +1303,33 @@ impl AccountScheduler {
                         }
                     }
                 }
+                // 全组都被自己的 RPM 闸卡住:配额一定会滑出窗口,等它,别把 503 抛给客户。
+                //
+                // 位置在 queue 分支**之后**:那条分支只认 `queue_enabled` 的号,而 RPM 可以
+                // 设在任何号上(付费号恰恰不开排队),所以必须自己兜底。
+                //
+                // 与上面 paced 分支的关键差别 —— **不消耗 `attempts`**:RPM 等待是秒级,
+                // 消耗预算会在配额恢复前先被判 AllBusy(对抗审查 [高])。循环终止改由
+                // `queue_wait` 预算保证:超出即落到下面的 AllDisabled。
+                // 分片 200ms 回来重选:期间可能有别的号恢复或 permit 释放,比睡满更快。
+                if !queue_wait.is_zero() {
+                    if let Some(d) = rpm_soonest {
+                        let elapsed = started.elapsed();
+                        if elapsed < queue_wait {
+                            let remaining = queue_wait - elapsed;
+                            // 配额恢复需要的时间超过整个预算 → 白等,直接降级报错。
+                            if d <= remaining {
+                                tokio::time::sleep(d.clamp(
+                                    Duration::from_millis(10),
+                                    Duration::from_millis(200),
+                                ))
+                                .await;
+                                busy.clear();
+                                continue;
+                            }
+                        }
+                    }
+                }
                 return Err(AcquireError::AllDisabled);
             };
 
@@ -1257,7 +1348,7 @@ impl AccountScheduler {
     /// 只算**开了排队且当前可服务**的号,跑干/禁用的不计入 —— 否则面板会显示一个
     /// 根本吃不下的容量,运维照它判断就会误以为还有余量。
     pub fn queue_stats(&self) -> QueueStats {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         let mut st = QueueStats {
             waiting: self.waiting.load(std::sync::atomic::Ordering::Relaxed),
             queued_total: self.queued_total.load(std::sync::atomic::Ordering::Relaxed),
@@ -1265,12 +1356,15 @@ impl AccountScheduler {
             tier_held_total: self.tier_held_total.load(std::sync::atomic::Ordering::Relaxed),
             ..Default::default()
         };
-        for e in entries.values() {
+        let now = Instant::now();
+        for e in entries.values_mut() {
             if !queue_enabled(&e.account) {
                 continue;
             }
             st.enabled_accounts += 1;
-            if !e.disabled {
+            // 口径必须与 `queue_probe` 一致(对抗审查 [低]):RPM 打满的号此刻**吃不下**,
+            // 按满并发计入会让 /health 报出并不存在的可服务容量,误导容量与事故判断。
+            if !e.disabled && !e.rpm_exhausted(now) {
                 st.capacity = st.capacity.saturating_add(e.account.max_concurrency as usize);
             }
         }
@@ -1594,7 +1688,14 @@ impl AccountScheduler {
         e.failure_count = 0;
         e.empty_window_start = None;
         e.empty_count_in_window = 0;
-        tracing::info!(account = %id, "admin reset:清运行时禁用与计数");
+        // 429 节流窗口与 strikes 也要清 —— "救号"就该让它立刻可用。
+        e.paced_until = None;
+        e.rate_limit_strikes = 0;
+        // RPM 滑动窗口同样清空(对抗审查 [中]):不清的话 admin reset 返回成功、
+        // 面板显示已启用,号却仍被自己的 RPM 闸挡在选号池外直到旧 hit 自然过期,
+        // 运维完全看不出原因。
+        e.rpm_hits.clear();
+        tracing::info!(account = %id, "admin reset:清运行时禁用与计数(含节流/RPM 窗口)");
         true
     }
 
@@ -2253,16 +2354,57 @@ mod tests {
     // 付费 social 号同期 `RateLimited`=0、`EmptyResponse`=0:上游**不发预警**,第一个
     // 信号就是封号,所以所有"等上游软信号再退避"的冷却参数在它们身上从不执行。
 
+    /// 取号 + 模拟"真的打了一次上游"(记账入口在 `note_upstream_call`,
+    /// 生产里由 worker/mod.rs 的各 provider.chat 调用点触发)。
+    async fn acquire_and_call(s: &AccountScheduler, key: &str) -> String {
+        let l = s.acquire(Some(key)).await.unwrap();
+        let id = l.account_id().to_string();
+        s.note_upstream_call(&id);
+        id
+    }
+
     #[tokio::test]
     async fn rpm_limit_blocks_selection_after_quota_used_up() {
-        // rpm=2:两次选中后该号本窗口内不可选,请求落到不限速的兜底号。
+        // rpm=2:两次真实调用后该号本窗口内不可选,请求落到不限速的兜底号。
         let s = sched(vec![racct("hi", 10, 0, 2), acct("lo", 10, Some(100))]);
-        let a = s.acquire(Some("s1")).await.unwrap();
-        assert_eq!(a.account_id(), "hi", "第 1 次:配额充足");
-        let b = s.acquire(Some("s2")).await.unwrap();
-        assert_eq!(b.account_id(), "hi", "第 2 次:配额刚好用完");
-        let c = s.acquire(Some("s3")).await.unwrap();
-        assert_eq!(c.account_id(), "lo", "第 3 次:RPM 打满 → 不选它");
+        assert_eq!(acquire_and_call(&s, "s1").await, "hi", "第 1 次:配额充足");
+        assert_eq!(acquire_and_call(&s, "s2").await, "hi", "第 2 次:配额刚好用完");
+        assert_eq!(acquire_and_call(&s, "s3").await, "lo", "第 3 次:RPM 打满 → 不选它");
+    }
+
+    /// **同一个 lease 上的重试也必须计数**(对抗审查抓到的最严重缺陷):
+    /// token 刷新重试 / profileArn 修复重试 / Overloaded 退避都会在同号再打一次上游,
+    /// 只按"选号次数"记账会让实际调用数数倍超限,定频防封失效。
+    #[tokio::test]
+    async fn rpm_counts_every_upstream_call_not_just_selections() {
+        let s = sched(vec![racct("a", 10, 0, 3), acct("lo", 10, Some(100))]);
+        let lease = s.acquire(Some("s")).await.unwrap();
+        assert_eq!(lease.account_id(), "a");
+        // 一次选号 → 三次上游调用(首发 + 两次同号重试)。
+        for _ in 0..3 {
+            s.note_upstream_call("a");
+        }
+        drop(lease);
+        let snap = s.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert_eq!(a.rpm_used, 3, "三次真实调用必须记三次");
+        // 配额已满 → 下一个请求不该再选它。
+        assert_eq!(acquire_and_call(&s, "s2").await, "lo", "配额满 → 降到兜底号");
+    }
+
+    /// permit 抢不到而重选别的号时,**不该**扣掉本号配额 —— 没发出任何上游请求。
+    #[tokio::test]
+    async fn rpm_not_consumed_when_lease_fails_no_upstream_call() {
+        // hi 只有 1 个 permit 且被占住 → 第二个请求会重选到 lo,hi 不该扣配额。
+        let s = sched(vec![racct("hi", 1, 0, 5), acct("lo", 10, Some(100))]);
+        let hog = s.acquire(Some("hog")).await.unwrap();
+        assert_eq!(hog.account_id(), "hi");
+        s.note_upstream_call("hi"); // 占位者真的打了一次
+        let second = s.acquire(Some("s2")).await.unwrap();
+        assert_eq!(second.account_id(), "lo", "hi permit 满 → 落 lo");
+        let snap = s.status_snapshot();
+        let hi = snap.iter().find(|x| x.account_id == "hi").unwrap();
+        assert_eq!(hi.rpm_used, 1, "只有真实发出的那 1 次被计,选号失败不扣配额");
     }
 
     #[tokio::test]
@@ -2270,8 +2412,8 @@ mod tests {
         // 不设 rpm_limit 的号(企业号现状)行为完全不变:连打 20 次都还选它。
         let s = sched(vec![acct("only", 50, Some(0))]);
         for i in 0..20 {
-            let l = s.acquire(Some(&format!("s{i}"))).await.unwrap();
-            assert_eq!(l.account_id(), "only", "第 {} 次不该被限", i + 1);
+            let id = acquire_and_call(&s, &format!("s{i}")).await;
+            assert_eq!(id, "only", "第 {} 次不该被限", i + 1);
         }
         let snap = s.status_snapshot();
         assert_eq!(snap[0].rpm_limit, None, "未设上限");
@@ -2283,8 +2425,7 @@ mod tests {
         // 0 / 负数视为"不限"而不是"一次都不许"——后者会让一个笔误静默停掉一个号。
         for bad in [0i64, -1] {
             let s = sched(vec![racct("a", 4, 0, bad)]);
-            let l = s.acquire(Some("s")).await.unwrap();
-            assert_eq!(l.account_id(), "a", "rpm_limit={bad} 应视为不限");
+            assert_eq!(acquire_and_call(&s, "s").await, "a", "rpm_limit={bad} 应视为不限");
             assert_eq!(s.status_snapshot()[0].rpm_limit, None);
         }
     }
@@ -2293,7 +2434,7 @@ mod tests {
     async fn rpm_used_is_visible_in_snapshot_for_diagnosis() {
         // 面板必须能看出"号显示正常却不吃流量"的原因,否则无法运维。
         let s = sched(vec![racct("a", 10, 0, 5), acct("b", 10, Some(100))]);
-        let _l = s.acquire(Some("s1")).await.unwrap();
+        assert_eq!(acquire_and_call(&s, "s1").await, "a");
         let snap = s.status_snapshot();
         let a = snap.iter().find(|x| x.account_id == "a").unwrap();
         assert_eq!(a.rpm_limit, Some(5));
@@ -2309,7 +2450,9 @@ mod tests {
         let cfg = SchedulerConfig { queue_wait_ms: 300, ..SchedulerConfig::default() };
         // 唯一的号,rpm=1:第二个请求必须等而不是 503。
         let s = AccountScheduler::new(vec![racct("only", 10, 0, 1)], &cfg);
-        let _first = s.acquire(Some("s1")).await.unwrap();
+        let first = s.acquire(Some("s1")).await.unwrap();
+        s.note_upstream_call("only");
+        drop(first);
         let err = match s.acquire(Some("s2")).await {
             Ok(l) => panic!("窗口 60s 远超 300ms 预算,不该拿到号: {}", l.account_id()),
             Err(e) => e,
@@ -2344,7 +2487,9 @@ mod tests {
             vec![racct("hi2", 10, 0, 1), acct("lo2", 10, Some(100))],
             &cfg,
         );
-        let _used = s2.acquire_in_group(Some("s1"), |_| true, None, true).await.unwrap();
+        let used = s2.acquire_in_group(Some("s1"), |_| true, None, true).await.unwrap();
+        s2.note_upstream_call("hi2");
+        drop(used);
         let t0 = Instant::now();
         let b = s2.acquire_in_group(Some("s2"), |_| true, None, true).await.unwrap();
         assert_eq!(b.account_id(), "lo2", "高层 RPM 满 → 降层兜底");

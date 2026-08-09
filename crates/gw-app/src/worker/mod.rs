@@ -2241,6 +2241,8 @@ async fn messages(
                             session_id: affinity_key.clone().unwrap_or_default(),
                             cache_key: affinity_key.clone().unwrap_or_default(),
                         };
+                        // 定频记账:这是同一个 lease 上的**第二次**上游调用,不记就会超频。
+                        st.scheduler.note_upstream_call(&retry_ctx.account.account_id);
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
                                 if let Some(spec) =
@@ -2293,6 +2295,9 @@ async fn messages(
                                                     .clone()
                                                     .unwrap_or_default(),
                                             };
+                                            // 定频记账:profileArn 修复后的重试同样是一次真实上游调用。
+                                            st.scheduler
+                                                .note_upstream_call(&heal_ctx.account.account_id);
                                             match st.provider.chat(req.clone(), &heal_ctx).await {
                                                 Ok(stream) => {
                                                     if let Some(spec) =
@@ -2434,6 +2439,10 @@ async fn chat_once_corrected(
     req: &ChatRequest,
     ctx: &CallCtx,
 ) -> Result<gw_core::provider::ChatStream, gw_core::error::UpstreamError> {
+    // 定频记账:每一次**真实发出**的上游调用都要记,含 Overloaded 同号退避的每一次重试
+    // (本函数是那条退避循环的单一入口)。记在发出之前 —— 失败的调用一样会被上游计入
+    // 频率画像,不该因为我方失败就不算。
+    st.scheduler.note_upstream_call(&ctx.account.account_id);
     match st.provider.chat(req.clone(), ctx).await {
         Ok(s) => Ok(s),
         Err(mut e) => {
