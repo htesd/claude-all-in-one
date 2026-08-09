@@ -150,6 +150,31 @@ fn queue_enabled(a: &Account) -> bool {
         .unwrap_or(false)
 }
 
+/// 该账号的**每分钟调用上限**(`extra.rpm_limit`);`None` = 不限(默认,行为与本开关
+/// 引入前逐字节相同)。`<= 0` 视为不限 —— 0 若当成"一次都不许"会让运维一个笔误
+/// 静默停掉一个号,而"不限"是这个字段缺席时的既有语义。
+///
+/// **为什么必须有这个闸,而 `max_concurrency` 顶不上**:并发限的是"同时几个",
+/// 不是"一分钟几个"。一个 `max_concurrency=2` 的号,每请求 ~14s,一分钟能轮转 8 轮 ——
+/// 2026-08-09 线上实测单个付费号一分钟被打 16 次,全程并发从未越过 2。
+///
+/// **为什么不能等上游信号**:实测近 3 天 social(付费)号收到的 `RateLimited` = **0 次**、
+/// `EmptyResponse` = **0 次**,却有 17 次 403 直接封禁(7 个号全灭)。Kiro 对这类号
+/// 不发限流预警,第一个信号就是封号 —— 所有挂在"上游先给软信号"前提上的冷却参数
+/// (`rate_limit_cooldown_secs`/`empty_response_*`)在它们身上**从不执行**。
+/// 唯一能救的办法是我方主动定频。
+///
+/// 放 `extra` 而**不是** `SystemSettings`:后者在 2026-07-31 之前的镜像里带
+/// `deny_unknown_fields`,加字段会让回滚变成全量 503(见 `gw_core::config` 的硬警告)。
+/// 且 RPM 本就该按凭据类型分别设:付费 social 号保守,企业号可以不设。
+fn rpm_limit(a: &Account) -> Option<u32> {
+    a.extra
+        .get("rpm_limit")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .map(|n| n.min(u32::MAX as i64) as u32)
+}
+
 /// 单账号运行态(并发槽 + 禁用/冷却 + LRU + 失败计数)。🟢 对齐 kiro.rs CredentialEntry。
 /// 429 节流用的两个字段见 `paced_until` / `rate_limit_strikes`。
 struct CredentialState {
@@ -191,6 +216,15 @@ struct CredentialState {
     empty_window_start: Option<Instant>,
     /// 当前窗口内 empty 次数。
     empty_count_in_window: u32,
+    /// RPM 滑动窗口:最近若干次**选中**时刻(升序)。见 [`rpm_limit`]。
+    ///
+    /// 用滑动窗口而非固定窗口:固定窗口允许"窗口末尾打满 + 下窗口开头再打满"的
+    /// 双倍突发(RPM=6 能在 2 秒内过 12 个),而封号看的正是这种瞬时节奏。
+    /// 长度天然被上限截断(超过 limit 条就 pop 掉最老的),所以不会无界增长。
+    ///
+    /// 记的是**选中**(select)而不是完成:一个请求跑 20 秒,按完成计会让 20 秒内
+    /// 选中的号全部漏过闸门。
+    rpm_hits: std::collections::VecDeque<Instant>,
 }
 
 impl CredentialState {
@@ -215,8 +249,50 @@ impl CredentialState {
             rate_limit_strikes: 0,
             empty_window_start: None,
             empty_count_in_window: 0,
+            rpm_hits: std::collections::VecDeque::new(),
             account,
         }
+    }
+
+    /// RPM 窗口内已用次数;顺带丢弃过期条目(懒清理,不需要后台任务)。
+    /// 未设上限的号恒返回 0,不产生任何簿记开销。
+    fn rpm_used(&mut self, now: Instant) -> u32 {
+        if rpm_limit(&self.account).is_none() {
+            return 0;
+        }
+        while let Some(front) = self.rpm_hits.front() {
+            if now.duration_since(*front) >= RPM_WINDOW {
+                self.rpm_hits.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.rpm_hits.len() as u32
+    }
+
+    /// 该号此刻是否已打满 RPM 配额。
+    fn rpm_exhausted(&mut self, now: Instant) -> bool {
+        match rpm_limit(&self.account) {
+            None => false,
+            Some(limit) => self.rpm_used(now) >= limit,
+        }
+    }
+
+    /// 配额恢复一格的剩余时间(最老那条滑出窗口的时刻);没打满则 `None`。
+    fn rpm_wait(&mut self, now: Instant) -> Option<Duration> {
+        if !self.rpm_exhausted(now) {
+            return None;
+        }
+        let front = *self.rpm_hits.front()?;
+        Some(RPM_WINDOW.saturating_sub(now.duration_since(front)))
+    }
+
+    /// 记一次选中。只对设了上限的号记账,避免给不限速的号(企业号)白加内存。
+    fn rpm_note_selected(&mut self, now: Instant) {
+        if rpm_limit(&self.account).is_none() {
+            return;
+        }
+        self.rpm_hits.push_back(now);
     }
 }
 
@@ -237,6 +313,11 @@ pub struct AccountStatusSnapshot {
     pub max_concurrency: u32,
     /// 该号是否开了「排队等冷却」(`extra.queue_enabled`)。面板逐号展示 + 可开关。
     pub queue_enabled: bool,
+    /// 该号的每分钟上限(`extra.rpm_limit`);`None` = 不限。
+    pub rpm_limit: Option<u32>,
+    /// 滑动窗口内已用次数。运维据此判断「号是不是被自己的 RPM 闸卡住」——
+    /// 否则面板上它显示"正常"却不吃流量,查不出原因。
+    pub rpm_used: u32,
 }
 
 /// 全组的排队实况(面板展示用)。
@@ -285,6 +366,9 @@ const MIGRATE_UP_DEBOUNCE: Duration = Duration::from_secs(60);
 /// 永远不越过配置的 `tier_hold_ms` —— 否则「先裁到剩余预算、再取 max(下限)」会在
 /// 预算尾部系统性超发。
 const MIN_TIER_HOLD: Duration = Duration::from_millis(10);
+
+/// RPM 滑动窗口长度。见 [`rpm_limit`] 与 [`CredentialState::rpm_hits`]。
+const RPM_WINDOW: Duration = Duration::from_secs(60);
 
 /// `(账号, 模型)` 不可用标记(INVALID_MODEL_ID)的存活时长:到期后重新放行该号服务该
 /// 模型(重探一次)。AWS 把新模型滚动到该区域后自动恢复;重探即使仍不支持也只失败 1 次
@@ -538,27 +622,38 @@ impl AccountScheduler {
         }
     }
 
-    /// 合格账号 id 集:未禁用 + 不在 exclude(busy)内 + 支持本次模型 + **是本组成员**。
-    /// `view = None`(未分组请求)时与本次重构之前逐字节等价。
+    /// 合格账号 id 集:未禁用 + 不在 exclude(busy)内 + 支持本次模型 + **是本组成员**
+    /// + **本分钟 RPM 配额未打满**。`view = None`(未分组请求)时与重构之前逐字节等价。
+    ///
+    /// 取 `&mut` 是因为 RPM 窗口做懒清理(见 [`CredentialState::rpm_used`]):不设上限的号
+    /// 直接短路返回,不产生任何簿记开销,所以对既有部署零影响。
     fn eligible_ids(
-        entries: &HashMap<String, CredentialState>,
+        entries: &mut HashMap<String, CredentialState>,
         exclude: &HashSet<String>,
         now: Instant,
         supports: &dyn Fn(&Account) -> bool,
         view: Option<&GroupView>,
     ) -> Vec<String> {
-        entries
-            .values()
-            .filter(|e| {
-                !e.disabled
-                    // 429 节流窗口内不选它,但它**没下线** —— 到点即恢复,不需要 sweep。
-                    && e.paced_until.map(|t| now >= t).unwrap_or(true)
-                    && !exclude.contains(&e.account.account_id)
-                    && supports(&e.account)
-                    && rank_of(view, e).is_some()
-            })
-            .map(|e| e.account.account_id.clone())
-            .collect()
+        let mut out = Vec::new();
+        for e in entries.values_mut() {
+            let basic = !e.disabled
+                // 429 节流窗口内不选它,但它**没下线** —— 到点即恢复,不需要 sweep。
+                && e.paced_until.map(|t| now >= t).unwrap_or(true)
+                && !exclude.contains(&e.account.account_id)
+                && supports(&e.account)
+                && rank_of(view, e).is_some();
+            if !basic {
+                continue;
+            }
+            // RPM 打满的号本轮不可选。**必须排在上面的判定之后**:先排除掉压根选不中的号,
+            // 免得为它们做窗口清理。与 `paced_until` 一样是"没下线、到点自己回来"的软状态,
+            // 不进 `/health` 禁用统计、不让整组被判 AllDisabled。
+            if e.rpm_exhausted(now) {
+                continue;
+            }
+            out.push(e.account.account_id.clone());
+        }
+        out
     }
 
     /// 「降层前先等」的判定:若**更高优先层**存在仅因 429 节流而暂不可选的号,返回其中
@@ -582,12 +677,12 @@ impl AccountScheduler {
         supports: &dyn Fn(&Account) -> bool,
         view: Option<&GroupView>,
     ) -> Option<Duration> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         // 此刻就能选中的最高优先层 = 「不等的话会落到哪一层」的基线。
         let mut best_selectable: Option<i64> = None;
         // 仅因节流不可选的最高优先层 + 该层最早到期时间 = 「等一下能拿到什么」。
         let mut best_paced: Option<(i64, Duration)> = None;
-        for e in entries.values() {
+        for e in entries.values_mut() {
             if e.disabled || exclude.contains(&e.account.account_id) || !supports(&e.account) {
                 continue;
             }
@@ -612,6 +707,11 @@ impl AccountScheduler {
                     }
                 }
                 None => {
+                    // RPM 打满的号此刻**选不中**,不能算进基线 —— 否则会误判"不等也不降层"。
+                    // 这是基线与 `select_id`/`eligible_ids` 口径一致的一部分。
+                    if e.rpm_exhausted(now) {
+                        continue;
+                    }
                     if best_selectable.map(|r| rank < r).unwrap_or(true) {
                         best_selectable = Some(rank);
                     }
@@ -651,13 +751,13 @@ impl AccountScheduler {
         view: Option<&GroupView>,
         budget: Duration,
     ) -> Option<Duration> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         // 此刻就能选中的最高优先层 = 「不等的话会落到哪一层」的基线。口径必须与
         // `select_id`/`eligible_ids` 一致,否则会误判"不等就会掉到哪层"。
         let mut best_selectable: Option<i64> = None;
         // 仅因冷却不可选的排队号里,最高优先层 + 该层最早到期时间。
         let mut best_cooling: Option<(i64, Duration)> = None;
-        for e in entries.values() {
+        for e in entries.values_mut() {
             if exclude.contains(&e.account.account_id) || !supports(&e.account) {
                 continue;
             }
@@ -688,8 +788,10 @@ impl AccountScheduler {
                 if better {
                     best_cooling = Some((rank, d));
                 }
-            } else if e.paced_until.map(|t| now >= t).unwrap_or(true) {
-                // 与 eligible_ids 同口径:未禁用且不在节流窗口内 = 此刻可选。
+            } else if e.paced_until.map(|t| now >= t).unwrap_or(true) && !e.rpm_exhausted(now) {
+                // 与 eligible_ids 同口径:未禁用 + 不在节流窗口内 + RPM 未打满 = 此刻可选。
+                // RPM 那一条必须带上,否则一个被 RPM 卡住的低层号会被当成"基线可选",
+                // 让闸门误判"不等也不会降层"从而放行降层 —— 正好放跑要防的那个场景。
                 if best_selectable.map(|r| rank < r).unwrap_or(true) {
                     best_selectable = Some(rank);
                 }
@@ -780,7 +882,7 @@ impl AccountScheduler {
     ) -> Option<String> {
         let mut entries = self.entries.lock();
         Self::heal_cooldowns(&mut entries, now);
-        let eligible = Self::eligible_ids(&entries, exclude, now, supports, view);
+        let eligible = Self::eligible_ids(&mut entries, exclude, now, supports, view);
         if eligible.is_empty() {
             return None;
         }
@@ -844,9 +946,16 @@ impl AccountScheduler {
             }
         };
 
-        // 选中即更新 last_selected_at(让 LRU 反映实时负载,新会话才轮转)。
+        // 选中即更新 last_selected_at(让 LRU 反映实时负载,新会话才轮转)+ 记一次 RPM。
+        //
+        // RPM 记在**选中**这一刻,而不是 try_lease 成功或请求完成:
+        // - 记在完成:一个请求跑 20s,这 20s 内选中的号全部漏过闸门(实测单号 53 次/分钟
+        //   正是这么来的);
+        // - 记在 try_lease 成功:permit 满时会重选别的号,但本号已经"选中过"——不记会让
+        //   高并发号的计数系统性偏低。宁可略微保守(多记一次)也不能漏记:漏记 = 号被封。
         if let Some(e) = entries.get_mut(&chosen) {
             e.last_selected_at = Some(now);
+            e.rpm_note_selected(now);
         }
         Some(chosen)
     }
@@ -1012,7 +1121,7 @@ impl AccountScheduler {
                 // busy 等待,也不该让错误从 NoModelSupport 误报成 AllDisabled。
                 // `member_any`/`avail_*` 额外过一遍视图:非成员对本组不存在。
                 let (supported_any, member_any, avail_total, avail_not_busy, paced_soonest) = {
-                    let entries = self.entries.lock();
+                    let mut entries = self.entries.lock();
                     let mut any = false;
                     let mut member_any = false;
                     let mut avail = 0usize;
@@ -1021,7 +1130,7 @@ impl AccountScheduler {
                     // 否则它既被 select_id 跳过、又被算进 avail_total,两边都不认领,
                     // 最后掉进 AllDisabled 分支把 503 抛给客户(本用例抓到的真实缺陷)。
                     let mut paced: Option<Duration> = None;
-                    for e in entries.values() {
+                    for e in entries.values_mut() {
                         if !supports(&e.account) {
                             continue;
                         }
@@ -1034,6 +1143,16 @@ impl AccountScheduler {
                             continue;
                         }
                         avail += 1;
+                        // RPM 打满与 429 节流**同一类软状态**:号没下线、到点自己回来。
+                        // 必须和 paced 一起归进 `paced_soonest`,否则它既被 select_id 跳过、
+                        // 又被算进 avail_total,两边都不认领 → 掉进 AllDisabled 把 503 抛给
+                        // 客户。等一小会儿配额滑出窗口才是对的。
+                        if let Some(d) = e.rpm_wait(now) {
+                            if d > Duration::ZERO && paced.map(|m| d < m).unwrap_or(true) {
+                                paced = Some(d);
+                            }
+                            continue;
+                        }
                         if let Some(until) = e.paced_until {
                             let d = until.saturating_duration_since(now);
                             if d > Duration::ZERO {
@@ -1193,14 +1312,23 @@ impl AccountScheduler {
         now: Instant,
         budget: Duration,
     ) -> Option<(Duration, usize)> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         let mut soonest: Option<Duration> = None;
         let mut cap: usize = 0;
-        for e in entries.values() {
+        for e in entries.values_mut() {
             if !supports(&e.account) || rank_of(view, e).is_none() || !queue_enabled(&e.account) {
                 continue;
             }
             if !e.disabled {
+                // RPM 打满:号还活着,但本窗口内**吃不下**了。既是等待理由(配额会滑出窗口),
+                // 也**不得按满并发计入容量** —— 否则一个被 RPM 卡住的号会把 cap 撑大,
+                // 等待者远超真实吞吐,全部排到超时(正是排队开关本要防的堆积)。
+                if let Some(d) = e.rpm_wait(now) {
+                    if d > Duration::ZERO && d <= budget && soonest.map(|m| d < m).unwrap_or(true) {
+                        soonest = Some(d);
+                    }
+                    continue;
+                }
                 // 正在服务的号:并发全额计入容量。
                 cap = cap.saturating_add(e.account.max_concurrency as usize);
                 // 号没下线但在 429 节流窗口内:这是**最常见**的"等一下就有"情形,
@@ -1385,9 +1513,8 @@ impl AccountScheduler {
         let now = Instant::now();
         let mut entries = self.entries.lock();
         Self::heal_cooldowns(&mut entries, now);
-        let entries = &*entries;
         let mut snap: Vec<AccountStatusSnapshot> = entries
-            .values()
+            .values_mut()
             .map(|e| {
                 let reason = match e.disabled_reason {
                     Some(DisabledReason::RateLimited) => "rate_limited",
@@ -1412,6 +1539,8 @@ impl AccountScheduler {
                     available_permits: e.semaphore.available_permits(),
                     max_concurrency: e.account.max_concurrency,
                     queue_enabled: queue_enabled(&e.account),
+                    rpm_limit: rpm_limit(&e.account),
+                    rpm_used: e.rpm_used(now),
                 }
             })
             .collect();
@@ -1678,6 +1807,20 @@ mod tests {
 
     fn sched(accounts: Vec<Arc<Account>>) -> AccountScheduler {
         AccountScheduler::new(accounts, &SchedulerConfig::default())
+    }
+
+    /// 带 RPM 上限的号(付费号形态:低并发 + 定频)。
+    fn racct(id: &str, concurrency: u32, priority: i64, rpm: i64) -> Arc<Account> {
+        let mut extra = BTreeMap::new();
+        extra.insert("priority".to_string(), serde_json::json!(priority));
+        extra.insert("rpm_limit".to_string(), serde_json::json!(rpm));
+        Arc::new(Account {
+            account_id: id.to_string(),
+            provider: "kiro".into(),
+            max_concurrency: concurrency,
+            disabled: false,
+            extra,
+        })
     }
 
     /// 默认连续失败禁用阈值(配置默认值,测试断言用)。
@@ -2098,6 +2241,114 @@ mod tests {
         let lease = s.acquire_in_group(Some("s"), |_| true, None, true).await.unwrap();
         assert_eq!(lease.account_id(), "lo", "1h 封禁远超预算 → 降层");
         assert!(t0.elapsed() < Duration::from_secs(1), "不该等封禁: {:?}", t0.elapsed());
+    }
+
+    // ─────────────────────────── RPM 定频闸门 ───────────────────────────
+    //
+    // 背景(2026-08-09 实测):`kiro-apikey-a3863547bf6b` 一生 75 分钟、2037 次调用,
+    // 均值 27 次/分、峰值 53 次/分,随后收到
+    //   403 {"reason":"TEMPORARILY_SUSPENDED","message":"...We detected unusual user
+    //        activity and locked it as a security precaution..."}
+    // 全程 `max_concurrency` 从未被突破 —— 并发限的是"同时几个",管不了"一分钟几个"。
+    // 付费 social 号同期 `RateLimited`=0、`EmptyResponse`=0:上游**不发预警**,第一个
+    // 信号就是封号,所以所有"等上游软信号再退避"的冷却参数在它们身上从不执行。
+
+    #[tokio::test]
+    async fn rpm_limit_blocks_selection_after_quota_used_up() {
+        // rpm=2:两次选中后该号本窗口内不可选,请求落到不限速的兜底号。
+        let s = sched(vec![racct("hi", 10, 0, 2), acct("lo", 10, Some(100))]);
+        let a = s.acquire(Some("s1")).await.unwrap();
+        assert_eq!(a.account_id(), "hi", "第 1 次:配额充足");
+        let b = s.acquire(Some("s2")).await.unwrap();
+        assert_eq!(b.account_id(), "hi", "第 2 次:配额刚好用完");
+        let c = s.acquire(Some("s3")).await.unwrap();
+        assert_eq!(c.account_id(), "lo", "第 3 次:RPM 打满 → 不选它");
+    }
+
+    #[tokio::test]
+    async fn rpm_unset_means_unlimited_zero_overhead() {
+        // 不设 rpm_limit 的号(企业号现状)行为完全不变:连打 20 次都还选它。
+        let s = sched(vec![acct("only", 50, Some(0))]);
+        for i in 0..20 {
+            let l = s.acquire(Some(&format!("s{i}"))).await.unwrap();
+            assert_eq!(l.account_id(), "only", "第 {} 次不该被限", i + 1);
+        }
+        let snap = s.status_snapshot();
+        assert_eq!(snap[0].rpm_limit, None, "未设上限");
+        assert_eq!(snap[0].rpm_used, 0, "未设上限的号不记账(零开销)");
+    }
+
+    #[tokio::test]
+    async fn rpm_limit_zero_or_negative_means_unlimited_not_zero_quota() {
+        // 0 / 负数视为"不限"而不是"一次都不许"——后者会让一个笔误静默停掉一个号。
+        for bad in [0i64, -1] {
+            let s = sched(vec![racct("a", 4, 0, bad)]);
+            let l = s.acquire(Some("s")).await.unwrap();
+            assert_eq!(l.account_id(), "a", "rpm_limit={bad} 应视为不限");
+            assert_eq!(s.status_snapshot()[0].rpm_limit, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn rpm_used_is_visible_in_snapshot_for_diagnosis() {
+        // 面板必须能看出"号显示正常却不吃流量"的原因,否则无法运维。
+        let s = sched(vec![racct("a", 10, 0, 5), acct("b", 10, Some(100))]);
+        let _l = s.acquire(Some("s1")).await.unwrap();
+        let snap = s.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert_eq!(a.rpm_limit, Some(5));
+        assert_eq!(a.rpm_used, 1, "选中一次即计一次");
+        assert!(!a.disabled, "RPM 卡住**不等于**禁用:不进 /health 统计");
+        assert_eq!(a.reason, "", "不该有 disabled_reason");
+    }
+
+    /// 全组都被 RPM 卡住时**不得**报 503:配额会滑出窗口,等一小会儿即可。
+    /// 这是与 `paced_until` 同类的软状态,若两边都不认领就会掉进 AllDisabled。
+    #[tokio::test]
+    async fn rpm_exhausted_whole_group_waits_instead_of_503() {
+        let cfg = SchedulerConfig { queue_wait_ms: 300, ..SchedulerConfig::default() };
+        // 唯一的号,rpm=1:第二个请求必须等而不是 503。
+        let s = AccountScheduler::new(vec![racct("only", 10, 0, 1)], &cfg);
+        let _first = s.acquire(Some("s1")).await.unwrap();
+        let err = match s.acquire(Some("s2")).await {
+            Ok(l) => panic!("窗口 60s 远超 300ms 预算,不该拿到号: {}", l.account_id()),
+            Err(e) => e,
+        };
+        // 预算内等不到 → 报可重试错误,但**绝不能**是 NoModelSupport(400,客户端不重试)。
+        assert!(
+            matches!(err, AcquireError::AllDisabled | AcquireError::AllBusy),
+            "应是可重试类错误,实际={err:?}"
+        );
+    }
+
+    /// RPM 闸门不该把请求钉在高层:高层被 RPM 卡住时,正常降层到兜底号。
+    #[tokio::test]
+    async fn rpm_exhausted_top_tier_descends_not_holds() {
+        let cfg = SchedulerConfig {
+            queue_wait_ms: 15_000,
+            tier_hold_ms: 300,
+            tier_hold_window_ms: 2_000,
+            ..SchedulerConfig::default()
+        };
+        let s = AccountScheduler::new(
+            vec![qacct_p("hi", 10, 0), acct("lo", 10, Some(100))],
+            &cfg,
+        );
+        // hi 无 rpm 限制,先确认正常走高层。
+        let a = s.acquire_in_group(Some("s1"), |_| true, None, true).await.unwrap();
+        assert_eq!(a.account_id(), "hi");
+        drop(a);
+
+        // 换一组:高层带 rpm=1 且已用满 → 应降层,不该干等 60s。
+        let s2 = AccountScheduler::new(
+            vec![racct("hi2", 10, 0, 1), acct("lo2", 10, Some(100))],
+            &cfg,
+        );
+        let _used = s2.acquire_in_group(Some("s1"), |_| true, None, true).await.unwrap();
+        let t0 = Instant::now();
+        let b = s2.acquire_in_group(Some("s2"), |_| true, None, true).await.unwrap();
+        assert_eq!(b.account_id(), "lo2", "高层 RPM 满 → 降层兜底");
+        assert!(t0.elapsed() < Duration::from_millis(400), "不该等满窗口: {:?}", t0.elapsed());
     }
 
     /// 最坏情形:整个高优层都被封 1h(2026-08-09 生产上 12/12 就是这样)。
