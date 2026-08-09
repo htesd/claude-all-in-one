@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildCursorExtra,
+  buildProviderTabs,
   diffMemberships,
   providerTabLabel,
   quotaKindForProvider,
@@ -227,5 +228,61 @@ describe('成员边差集(编辑账号时决定发哪些请求)', () => {
     )
     expect(diff.upserts).toEqual([])
     expect(diff.removals).toEqual(['G0', 'GLOW'])
+  })
+})
+
+describe('provider 筛选项', () => {
+  /** 指定 provider 的行（其余字段取最小合法值）。 */
+  function pRow(account_id: string, provider: string): AccountRow {
+    return { ...row(account_id, 1), provider }
+  }
+
+  it('库里一个 cursor 号都没有时，Cursor 标签仍然出现（计数 0）', () => {
+    // 2026-08-09 线上就是这个形态：kiro=380 / claude-dario=2 / cursor=0。
+    // 旧实现按现有账号 GROUP BY，Cursor 标签不出现，看起来像"部署缺了东西"，
+    // 而"能不能上第一个 cursor 号"恰恰是要验证的第一件事。
+    const tabs = buildProviderTabs([pRow('k1', 'kiro'), pRow('d1', 'claude-dario')])
+    expect(tabs).toEqual([
+      { provider: 'kiro', count: 1 },
+      { provider: 'claude-dario', count: 1 },
+      { provider: 'cursor', count: 0 },
+    ])
+  })
+
+  it('库里完全没有账号时，三个已知 provider 全部常驻', () => {
+    expect(buildProviderTabs([]).map((t) => t.provider)).toEqual([
+      'kiro',
+      'claude-dario',
+      'cursor',
+    ])
+    expect(buildProviderTabs(undefined).every((t) => t.count === 0)).toBe(true)
+  })
+
+  it('顺序固定 kiro→ccmax→cursor，与输入顺序无关', () => {
+    const tabs = buildProviderTabs([pRow('c1', 'cursor'), pRow('k1', 'kiro')])
+    expect(tabs.map((t) => t.provider)).toEqual(['kiro', 'claude-dario', 'cursor'])
+  })
+
+  it('计数正确累加', () => {
+    const tabs = buildProviderTabs([
+      pRow('k1', 'kiro'),
+      pRow('k2', 'kiro'),
+      pRow('c1', 'cursor'),
+    ])
+    expect(tabs.find((t) => t.provider === 'kiro')?.count).toBe(2)
+    expect(tabs.find((t) => t.provider === 'cursor')?.count).toBe(1)
+    expect(tabs.find((t) => t.provider === 'claude-dario')?.count).toBe(0)
+  })
+
+  it('后端新增而前端还没跟上的 provider 不被吞掉，排在已知项之后', () => {
+    const tabs = buildProviderTabs([pRow('x1', 'zeta'), pRow('y1', 'acme'), pRow('k1', 'kiro')])
+    expect(tabs.map((t) => t.provider)).toEqual([
+      'kiro',
+      'claude-dario',
+      'cursor',
+      'acme',
+      'zeta',
+    ])
+    expect(tabs.find((t) => t.provider === 'zeta')?.count).toBe(1)
   })
 })
