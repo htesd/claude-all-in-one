@@ -251,6 +251,38 @@ export function providerTabLabel(provider: string): string {
 }
 
 /**
+ * 账号页 provider 筛选项：**后端支持的 provider 常驻**，计数为 0 也照样列出。
+ *
+ * 原先只按库里现有账号 `GROUP BY provider`，于是新接的通道在上第一个号之前
+ * 筛选条里根本不出现 —— 而"能不能上号"恰恰是要验证的第一件事（2026-08-09
+ * cursor 上线即遇到：只看到 Kiro / ccmax，让人以为部署缺了东西）。
+ *
+ * `KNOWN_PROVIDERS` 按 Kiro→ccmax→Cursor 排；库里出现的未知 provider（后端新增
+ * 但前端还没跟上）追加在后面并按名字排序，不会因为不在名单里就被吞掉。
+ */
+export const KNOWN_PROVIDERS = ['kiro', 'claude-dario', 'cursor'] as const
+
+export interface ProviderTab {
+  provider: string
+  count: number
+}
+
+export function buildProviderTabs(rows: AccountRow[] | undefined): ProviderTab[] {
+  const counts = new Map<string, number>()
+  for (const p of KNOWN_PROVIDERS) counts.set(p, 0)
+  for (const row of rows ?? []) {
+    counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1)
+  }
+  const rank = (p: string) => {
+    const i = (KNOWN_PROVIDERS as readonly string[]).indexOf(p)
+    return i === -1 ? KNOWN_PROVIDERS.length : i
+  }
+  return [...counts.entries()]
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+    .map(([provider, count]) => ({ provider, count }))
+}
+
+/**
  * Cursor 建号表单的原始输入（均为未 trim 的字符串；access_token 必填，其余可空）。
  * 字段名与后端 CURSOR_ACCOUNT_SCHEMA 一一对应。
  */

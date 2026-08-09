@@ -30,6 +30,7 @@ import {
 import type { RefreshAccountResult } from '@/features/accounts/api'
 import {
   accountStatusBucket,
+  buildProviderTabs,
   deriveAccountStatus,
   deriveTier,
   mergeRuntimeByAccount,
@@ -87,18 +88,8 @@ export default function AccountsPage() {
     [runtimeQuery.data],
   )
 
-  // 按 provider 统计（含计数），kiro→ccmax→cursor→其余排序
-  const providers = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const row of accountsQuery.data ?? []) {
-      counts.set(row.provider, (counts.get(row.provider) ?? 0) + 1)
-    }
-    const rank = (p: string) =>
-      p === 'kiro' ? 0 : p === 'claude-dario' ? 1 : p === 'cursor' ? 2 : 3
-    return [...counts.entries()]
-      .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
-      .map(([provider, count]) => ({ provider, count }))
-  }, [accountsQuery.data])
+  // provider 筛选项：已知 provider 常驻（计数 0 也列），kiro→ccmax→cursor→未知
+  const providers = useMemo(() => buildProviderTabs(accountsQuery.data), [accountsQuery.data])
 
   // 检查是否有 kiro 账号（决定是否展示档位筛选）
   const hasKiroAccounts = useMemo(
@@ -172,9 +163,13 @@ export default function AccountsPage() {
     return filteredRows.slice(start, start + pageSize)
   }, [filteredRows, currentPage, pageSize])
 
-  // 当前 provider 的配额口径（按 providerFilter 决定；'all' 时回落第一个 provider）
+  // 当前 provider 的配额口径（按 providerFilter 决定；'all' 时回落第一个**有号**的 provider）。
+  // 注意必须 count > 0：providers 现在含计数为 0 的常驻项，取 providers[0] 会恒为 kiro,
+  // 于是一台只有 cursor 号的机器配额表头会误称「积分」（cursor 是订阅制、无配额数字）。
   const effectiveProviderForQuota =
-    providerFilter !== 'all' ? providerFilter : (providers[0]?.provider ?? '')
+    providerFilter !== 'all'
+      ? providerFilter
+      : (providers.find((p) => p.count > 0)?.provider ?? '')
   const quotaKind = quotaKindForProvider(effectiveProviderForQuota)
 
   // 轮询失败但还有旧数据时继续按旧数据展示（配合下方警示条）；完全没数据才降级

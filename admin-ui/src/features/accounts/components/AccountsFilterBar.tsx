@@ -1,7 +1,7 @@
 import { Segment } from '@/components/ui/segment'
 import { useI18n } from '@/lib/i18n'
 
-import { providerTabLabel, type AccountSortKey } from '../lib'
+import { providerTabLabel, type AccountSortKey, type ProviderTab } from '../lib'
 
 export type StatusFilter = 'all' | 'ok' | 'abnormal' | 'disabled'
 export type TierFilter = 'all' | 'PRO' | 'POWER' | 'FREE' | 'OTHER'
@@ -14,8 +14,8 @@ interface AccountsFilterBarProps {
   /** 当前提供方筛选值（'all' = 全部）。 */
   providerFilter: string
   onProviderChange: (v: string) => void
-  /** 数据中实际存在的 provider 列表（含计数），用于渲染选项。 */
-  providers: Array<{ provider: string; count: number }>
+  /** provider 选项（含计数）。已知 provider 常驻，计数可为 0；见 lib.buildProviderTabs。 */
+  providers: ProviderTab[]
 
   /** 当前订阅档筛选值（'all' = 全部）。 */
   tierFilter: TierFilter
@@ -77,13 +77,11 @@ export function AccountsFilterBar({
         <Segment options={statusOptions} value={statusFilter} onChange={onStatusChange} />
       </div>
 
-      {/* 提供方 */}
-      {providers.length >= 1 && (
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-medium text-muted-foreground">{t('filter.provider')}</span>
-          <Segment options={providerOptions} value={providerFilter} onChange={onProviderChange} />
-        </div>
-      )}
+      {/* 提供方：已知 provider 常驻（含计数 0），故无需再判空 */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-muted-foreground">{t('filter.provider')}</span>
+        <Segment options={providerOptions} value={providerFilter} onChange={onProviderChange} />
+      </div>
 
       {/* 订阅档：仅在 kiro/all 且有可选档位时展示 */}
       {showTierFilter && tiers.length > 0 && (
