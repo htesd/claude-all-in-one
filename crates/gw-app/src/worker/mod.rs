@@ -1617,6 +1617,9 @@ async fn probe_account(
     };
 
     let started = std::time::Instant::now();
+    // 定频记账:人工探针也是一次真实的上游调用。虽然低频,但不记的话运维探一个
+    // 已接近上限的号就可能把它推过阈值 —— 而定频闸门存在的意义正是防这个。
+    st.scheduler.note_upstream_call(&ctx.account.account_id);
     let stream = match st.provider.chat(req, &ctx).await {
         Ok(s) => s,
         Err(e) => {
@@ -3014,7 +3017,20 @@ async fn finish_web_search_response(
 ) -> axum::response::Response {
     let account = ctx.account.clone();
     let account_id = account.account_id.clone();
-    match crate::websearch::run_loop(st.provider.clone(), &ctx, req, spec, first_stream).await {
+    // 定频记账回调:web search 的每一次续轮上游调用都要计入该号的 RPM。
+    let st_for_rpm = st.clone();
+    let acct_for_rpm = account_id.clone();
+    let on_call = move || st_for_rpm.scheduler.note_upstream_call(&acct_for_rpm);
+    match crate::websearch::run_loop(
+        st.provider.clone(),
+        &ctx,
+        req,
+        spec,
+        first_stream,
+        &on_call,
+    )
+    .await
+    {
         Ok((events, usage)) => {
             let synth = crate::websearch::synth_stream(events, usage);
             finish_response(st, lease, synth, req, client_key, account, started_at).await
