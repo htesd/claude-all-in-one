@@ -9,7 +9,8 @@
 //! - 累加 base + 激活的 freeTrial/bonus 得总 used / limit(对齐 kiro.rs 便捷方法)。
 //!
 //! 旧形态(`q.{region}.amazonaws.com/getUsageLimits`,带 `resourceType`)保留在
-//! `KIRO_LEGACY_QUOTA_ENDPOINT=1` 后面 —— 它在 1.0.212 的 bundle 里虽然仍有 SDK 代码,
+//! `KIRO_LEGACY_QUOTA_ENDPOINT=1` 或 `KIRO_LEGACY_WIRE=1`(总开关,见 wire_profile)
+//! 后面 —— 它在 1.0.212 的 bundle 里虽然仍有 SDK 代码,
 //! 但**没有任何调用点**(全树只有一处 `new yh(`,走的是 control-plane)。
 
 use gw_core::account::Account;
@@ -135,7 +136,8 @@ pub(crate) fn control_plane_host(region: &str) -> String {
 }
 
 /// 解析配额端点。默认走 1.0.212 真实客户端的 control-plane 形态;
-/// `KIRO_LEGACY_QUOTA_ENDPOINT=1` 切回旧的 `q.*.amazonaws.com`(应急回退,不改镜像)。
+/// `KIRO_LEGACY_QUOTA_ENDPOINT=1` 或 `KIRO_LEGACY_WIRE=1`(总开关,见 wire_profile)
+/// 切回旧的 `q.*.amazonaws.com`(应急回退,不改镜像)。
 ///
 /// 证据(`extensions/kiro.kiro-agent/dist/extension.js`,1.0.212):
 /// - 域名解析器 `bi2` `:217247` → `https://management.${region}.kiro.dev`;
@@ -153,7 +155,10 @@ pub(crate) fn control_plane_host(region: &str) -> String {
 /// 连那个"runtime client"也被 `cpsConfigs`(`:389260`)指到了 `management.*.kiro.dev`。
 /// 所以本次迁移的结论不变,只是理由要说准:换的是**域名**,不是"操作没人用了"。
 pub(crate) fn quota_endpoint(region: &str) -> QuotaEndpoint {
-    quota_endpoint_from(region, gw_core::env_flag("KIRO_LEGACY_QUOTA_ENDPOINT"))
+    quota_endpoint_from(
+        region,
+        gw_core::env_flag("KIRO_LEGACY_QUOTA_ENDPOINT") || crate::wire_profile::legacy_wire(),
+    )
 }
 
 /// 纯逻辑(开关注入便于测试;读 env 的测试会与并行用例互相污染)。

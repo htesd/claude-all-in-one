@@ -18,24 +18,31 @@ use crate::kiro_types::tool::{ToolResult, ToolUseEntry};
 /// **服务端目前仍然认旧标签**(同日实测:旧标签 xhigh 出 2651 个 reasoning 帧,比新字段的
 /// 1406 还深),但对齐客户端形态优先于那点深度差 —— 长期不同步的封号代价更大。
 ///
-/// `KIRO_LEGACY_THINKING_TAGS=1` 可切回旧行为(新字段与旧标签同时发过实测:2052 帧,
-/// 介于两者之间,不会互相顶掉,所以回退开关是安全的)。
+/// 两条恢复路径(任一即开):
+/// - `KIRO_LEGACY_THINKING_TAGS=1` —— 只恢复标签(新字段照发,实测两者同发 2052 帧,
+///   介于两者之间,不会互相顶掉)。混搭形态,仅作应急。
+/// - `KIRO_LEGACY_WIRE=1`(推荐,见 wire_profile)—— 整体回退旧线缆形态:
+///   标签恢复 + 结构化字段停发 + UA/端点/其余字段一起回到 0.12.155 时代。
 ///
 /// ⚠️ **关掉它不是无代价的**:当 `KIRO_THINKING_IN_HISTORY0` 同时开着时,标签落在
 /// `history[0]` —— 那是缓存前缀的**第一块**。从"有标签"切到"无标签"会让所有在途会话
 /// 下一轮从第一个 token 起全部 miss(500k 上下文约 5-6 积分 vs 命中 2-3)。
-/// 所以这个切换必须**低峰单独做**,见 [`warn_if_prefix_breaking`]。
+/// 所以这个切换必须**低峰单独做**,见 [`warn_if_prefix_breaking`]。反向切换
+/// (无标签 → 有标签,例如打开 legacy 总开关)同理,也是一次性全量 miss。
 pub(super) fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if !gw_core::env_flag("KIRO_LEGACY_THINKING_TAGS") {
+    let legacy = crate::wire_profile::legacy_wire();
+    if !legacy && !gw_core::env_flag("KIRO_LEGACY_THINKING_TAGS") {
         return None;
     }
-    build_thinking_prefix(req)
+    // 旧标签词表只有随 legacy 总开关整体回退时才启用(max→xhigh);
+    // 单独开 KIRO_LEGACY_THINKING_TAGS 的混搭形态保持 58b6f27 以来的既有行为(max 原样)。
+    build_thinking_prefix(req, legacy)
 }
 
 /// 启动/首次转换时对**会击穿缓存前缀的 env 组合**大声告警一次。
 ///
 /// 危险组合:`KIRO_THINKING_IN_HISTORY0` 开着(标签写进 history[0])但
-/// `KIRO_LEGACY_THINKING_TAGS` 关着(不再生成标签)—— 等于把前缀第一块改了。
+/// 标签生成关着(两个开关都没开)—— 等于把前缀第一块改了。
 /// 这个组合在升级时**极容易被无声触发**(镜像换了、env 没跟着改),而后果是
 /// 全量会话下一轮缓存未命中,直接体现在积分账单上。宁可日志吵一次。
 fn warn_if_prefix_breaking() {
@@ -43,6 +50,7 @@ fn warn_if_prefix_breaking() {
     ONCE.call_once(|| {
         if gw_core::env_flag("KIRO_THINKING_IN_HISTORY0")
             && !gw_core::env_flag("KIRO_LEGACY_THINKING_TAGS")
+            && !crate::wire_profile::legacy_wire()
         {
             tracing::warn!(
                 "KIRO_THINKING_IN_HISTORY0 已开但 KIRO_LEGACY_THINKING_TAGS 未开：\
@@ -56,7 +64,10 @@ fn warn_if_prefix_breaking() {
 
 /// 旧标签的**纯**构造(不读 env)。拆出来是为了让回退路径仍可被测试直接覆盖 ——
 /// 用 env 开关的测试会与并行用例互相污染。
-fn build_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+///
+/// `legacy_vocab`:是否启用旧词表(max→xhigh)。只随 `KIRO_LEGACY_WIRE` 总开关开;
+/// 单独开 `KIRO_LEGACY_THINKING_TAGS` 的混搭形态传 false,保持既有字节不变。
+fn build_thinking_prefix(req: &MessagesRequest, legacy_vocab: bool) -> Option<String> {
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
@@ -76,6 +87,16 @@ fn build_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                     "非法 thinking effort，已回退默认档位"
                 );
             }
+            // 旧标签词表没有 `max` —— 它是 1.0.212 才出现在 enum 里的档位,旧客户端
+            // 时代(caio 07-28 前)在线缆上只发过 low/medium/high/xhigh,`max` 被当作
+            // xhigh 的同义词映射。整体回退旧形态时词表也回到那个时代(结构化字段路径
+            // 不受影响,仍发真 max)。
+            let effort = if legacy_vocab && effort == "max" {
+                tracing::debug!("legacy 文本标签词表无 max,已按旧行为写作 xhigh");
+                "xhigh"
+            } else {
+                effort
+            };
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -704,8 +725,18 @@ mod strip_tests {
 #[cfg(test)]
 mod thinking_prefix_tests {
     // 测回退路径的**纯**构造:generate_thinking_prefix 需 env 开关,并行用例下会互相污染。
-    use super::build_thinking_prefix as generate_thinking_prefix;
+    use super::build_thinking_prefix;
     use crate::anthropic_types::{MessagesRequest, OutputConfig, Thinking};
+
+    /// 混搭形态(只开 KIRO_LEGACY_THINKING_TAGS):保持既有字节,max 原样。
+    fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+        build_thinking_prefix(req, false)
+    }
+
+    /// 整体 legacy 形态(KIRO_LEGACY_WIRE):旧词表,max→xhigh。
+    fn generate_thinking_prefix_legacy(req: &MessagesRequest) -> Option<String> {
+        build_thinking_prefix(req, true)
+    }
 
     fn adaptive_req(effort: Option<&str>) -> MessagesRequest {
         MessagesRequest {
@@ -752,5 +783,22 @@ mod thinking_prefix_tests {
         let want = format!("<thinking_effort>{}</thinking_effort>",
                            crate::anthropic_types::DEFAULT_EFFORT);
         assert!(p.contains(&want), "实际={p}");
+    }
+
+    #[test]
+    fn max_is_written_as_xhigh_in_legacy_tag_vocabulary() {
+        // 旧文本标签词表没有 max(1.0.212 才进 enum):整体 legacy 形态把 max 写回 xhigh,
+        // 与 07-28 前生产实际发出的字节一致。结构化字段路径不受影响(thinking_policy 有对应用例)。
+        let p = generate_thinking_prefix_legacy(&adaptive_req(Some("max"))).unwrap();
+        assert!(p.contains("<thinking_effort>xhigh</thinking_effort>"), "实际={p}");
+        assert!(!p.contains("max"), "max 不该出现在旧标签里:{p}");
+    }
+
+    #[test]
+    fn max_passes_through_in_mixed_mode() {
+        // 只开 KIRO_LEGACY_THINKING_TAGS 的混搭形态:保持 58b6f27 以来的既有行为,
+        // max 原样进标签 —— 总开关关掉时任何路径都不许有字节变化。
+        let p = generate_thinking_prefix(&adaptive_req(Some("max"))).unwrap();
+        assert!(p.contains("<thinking_effort>max</thinking_effort>"), "实际={p}");
     }
 }

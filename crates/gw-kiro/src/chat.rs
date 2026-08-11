@@ -101,12 +101,22 @@ pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
         Ok(c) => c,
         Err(e) => return format!("<转换失败: {e}>"),
     };
+    // legacy 线缆形态:思考强度走旧文本标签(结构化字段不发,发了就是时代错位的混搭),
+    // body 顶层 agentMode 省略(0.12.155 时代没有该字段)。见 wire_profile。
+    let legacy = crate::wire_profile::legacy_wire();
     let kiro_req = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: crate::headers::resolve_profile_arn(account),
-        additional_model_request_fields:
-            crate::thinking_policy::additional_model_request_fields(&messages_req),
-        agent_mode: crate::kiro_types::request::DEFAULT_AGENT_MODE.to_string(),
+        additional_model_request_fields: if legacy {
+            None
+        } else {
+            crate::thinking_policy::additional_model_request_fields(&messages_req)
+        },
+        agent_mode: if legacy {
+            None
+        } else {
+            Some(crate::kiro_types::request::DEFAULT_AGENT_MODE.to_string())
+        },
     };
     serde_json::to_string_pretty(&kiro_req).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
 }
@@ -173,15 +183,26 @@ pub async fn chat_stream(
     // 3. 组装顶层 KiroRequest(注入 profileArn:显式值 > 按 idp 固定兜底,对齐 static_flow)
     let profile_arn = crate::headers::resolve_profile_arn(&account);
     // 思考强度走 1.0.212 的结构化字段(旧的正文文本标签见 converter::history 的开关)。
-    let amrf = crate::thinking_policy::additional_model_request_fields(&messages_req);
-    if let Some(v) = &amrf {
-        tracing::debug!(model = %messages_req.model, fields = %v, "additionalModelRequestFields");
-    }
+    // legacy 线缆形态:结构化字段与 body 顶层 agentMode 都不发(见 wire_profile)。
+    let legacy = crate::wire_profile::legacy_wire();
+    let amrf = if legacy {
+        None
+    } else {
+        let amrf = crate::thinking_policy::additional_model_request_fields(&messages_req);
+        if let Some(v) = &amrf {
+            tracing::debug!(model = %messages_req.model, fields = %v, "additionalModelRequestFields");
+        }
+        amrf
+    };
     let mut kiro_req = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: profile_arn.clone(),
         additional_model_request_fields: amrf,
-        agent_mode: crate::kiro_types::request::DEFAULT_AGENT_MODE.to_string(),
+        agent_mode: if legacy {
+            None
+        } else {
+            Some(crate::kiro_types::request::DEFAULT_AGENT_MODE.to_string())
+        },
     };
     let mut body = serde_json::to_string(&kiro_req)
         .map_err(|e| UpstreamError::new(UpstreamErrorKind::Other, format!("序列化 KiroRequest 失败: {e}")))?;
@@ -1111,7 +1132,7 @@ mod tests {
                     "claude-opus-4.8",
                 )))
                 .with_history(vec![Message::User(HistoryUserMessage { user_input_message: hist })]);
-            KiroRequest { conversation_state: cs, profile_arn: None, additional_model_request_fields: None, agent_mode: "vibe".into() }
+            KiroRequest { conversation_state: cs, profile_arn: None, additional_model_request_fields: None, agent_mode: Some("vibe".into()) }
         }
 
         #[test]
@@ -1151,7 +1172,7 @@ mod tests {
                     "claude-opus-4.8",
                 )))
                 .with_history(vec![Message::User(HistoryUserMessage { user_input_message: hist })]);
-            let mut req = KiroRequest { conversation_state: cs, profile_arn: None, additional_model_request_fields: None, agent_mode: "vibe".into() };
+            let mut req = KiroRequest { conversation_state: cs, profile_arn: None, additional_model_request_fields: None, agent_mode: Some("vibe".into()) };
             let body = serde_json::to_string(&req).unwrap();
             let err = enforce_body_limit(&mut req, body, 10_000).unwrap_err();
             assert_eq!(err.kind, UpstreamErrorKind::BadRequest, "无媒体可剔应 BadRequest");

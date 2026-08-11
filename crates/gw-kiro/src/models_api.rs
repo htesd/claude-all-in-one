@@ -86,6 +86,9 @@ pub async fn list_available_models(
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_REGION);
     let host = format!("management.{region}.kiro.dev");
+    // 注意:本调用**不随** `KIRO_LEGACY_WIRE` 回退域名 —— ListAvailableModels 是 1.0.212
+    // 时代才有的操作,旧 `q.*` 域上没有对应物;且它只由 admin 手动触发(账号页"拉取模型"),
+    // 不在逐请求热路径上,不构成形态指纹。回退旧形态时这里是有意保留的例外(见 wire_profile)。
     let machine = machine_id::generate_from_account(account);
     let version = headers::kiro_version(account);
     // 与 getUsageLimits 同一个 control-plane client(同 serviceId / 同包版本)。

@@ -23,7 +23,10 @@ pub(crate) const AWS_SDK_VERSION: &str = "1.0.34";
 /// 2026-07-28 对齐真实客户端:deb `kiro 1.0.212-1784842874`,`product.json` version=1.0.212
 /// (commit 8848ae36,build 2026-07-23)。UA 拼法未变,仍是
 /// `KiroIDE-${kiroVersion}-${machineId}`(`extension.js:374150`)。
-pub(crate) const DEFAULT_KIRO_VERSION: &str = "1.0.212";
+pub(crate) const CURRENT_KIRO_VERSION: &str = "1.0.212";
+/// 2026-07-28 之前的旧默认版本。`KIRO_LEGACY_WIRE=1`(见 wire_profile)时 UA 回到它,
+/// 与旧报文形态配套 —— 版本号和报文形态必须同属一个时代,混搭是最差形态。
+pub(crate) const LEGACY_KIRO_VERSION: &str = "0.12.155";
 /// UA 里的系统/Node 版本,逐字对齐 static_flow `DEFAULT_SYSTEM_VERSION`/`DEFAULT_NODE_VERSION`。
 pub(crate) const DEFAULT_SYSTEM_VERSION: &str = "darwin#24.6.0";
 pub(crate) const DEFAULT_NODE_VERSION: &str = "22.22.0";
@@ -108,28 +111,43 @@ pub(crate) fn idc_refresh_user_agents(version: &str) -> (String, String) {
     (x_amz, ua)
 }
 
-/// 账号的有效 Kiro 客户端版本(extra 覆盖 > 默认)。
+/// 账号的有效 Kiro 客户端版本(extra 覆盖 > 当前形态默认)。
 ///
-/// ⚠️ **覆盖只改 UA 里自报的版本号,不会把报文形态一起改回去。** body 里的
-/// `agentMode` / `additionalModelRequestFields`、配额走的 control-plane 端点,
-/// 都是 1.0.212 形态且**无条件**发送。所以把某个账号钉到旧版本,得到的是
-/// 「自称 0.12.155、行为却是 1.0.212」的混搭 —— 现实中不存在的组合,比不改更容易被识别。
+/// ⚠️ **覆盖只改 UA 里自报的版本号,不会把报文形态一起改回去。** body 形态、
+/// 配额端点等都跟着 `KIRO_LEGACY_WIRE` 总开关走(见 wire_profile)。把单个账号
+/// 钉到与总开关不一致的版本,得到的是「自称 A 版本、行为却是 B 版本」的混搭 ——
+/// 现实中不存在的组合,比不改更容易被识别。要回旧形态就用总开关整体回。
 ///
-/// 保留这个字段是留一条将来支持多形态时的口子;在那之前,不等于默认版本就告警一次。
+/// 保留这个字段是留一条将来支持多形态时的口子;在那之前,不等于生效默认版本就告警一次。
 /// (2026-07-28 生产实测 222 个账号**无一**设置该字段,故此处只警示不改行为。)
 pub(crate) fn kiro_version(account: &Account) -> String {
+    let default = default_kiro_version();
     match account.extra_str("kiro_version").filter(|v| !v.is_empty()) {
-        Some(v) if v != DEFAULT_KIRO_VERSION => {
-            warn_version_mismatch(v);
+        Some(v) if v != default => {
+            warn_version_mismatch(v, default);
             v.to_string()
         }
         Some(v) => v.to_string(),
-        None => DEFAULT_KIRO_VERSION.to_string(),
+        None => default.to_string(),
+    }
+}
+
+/// 当前生效的默认版本:legacy 总开关开 → 旧版本,否则现行版本。
+pub(crate) fn default_kiro_version() -> &'static str {
+    default_version_for(crate::wire_profile::legacy_wire())
+}
+
+/// 纯逻辑(开关注入便于测试;读 env 的测试会与并行用例互相污染)。
+fn default_version_for(legacy: bool) -> &'static str {
+    if legacy {
+        LEGACY_KIRO_VERSION
+    } else {
+        CURRENT_KIRO_VERSION
     }
 }
 
 /// 每个偏离版本只吼一次,避免逐请求刷屏。
-fn warn_version_mismatch(v: &str) {
+fn warn_version_mismatch(v: &str, wire_default: &'static str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -141,7 +159,7 @@ fn warn_version_mismatch(v: &str) {
     if g.insert(v.to_string()) {
         tracing::warn!(
             account_kiro_version = v,
-            wire_shape_version = DEFAULT_KIRO_VERSION,
+            wire_shape_version = wire_default,
             "账号钉了非默认 kiro_version：UA 自报该版本，但报文形态与端点仍是默认版本的，\
              这是现实中不存在的组合。除非确知在做什么，否则请清掉该字段。"
         );
@@ -331,6 +349,14 @@ mod tests {
             runtime_base_url_from("eu-central-1", None, false),
             "https://runtime.eu-central-1.kiro.dev"
         );
+    }
+
+    #[test]
+    fn default_version_tracks_wire_profile() {
+        // 版本号必须跟报文形态同属一个时代:legacy 开 → 0.12.155,关 → 1.0.212。
+        assert_eq!(default_version_for(false), CURRENT_KIRO_VERSION);
+        assert_eq!(default_version_for(true), LEGACY_KIRO_VERSION);
+        assert_eq!(LEGACY_KIRO_VERSION, "0.12.155", "旧默认版本钉死,改动即改形态");
     }
 
     #[test]

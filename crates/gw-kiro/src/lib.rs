@@ -33,6 +33,7 @@ pub mod import;
 pub mod token;
 pub mod usage;
 pub mod usage_limits;
+pub mod wire_profile;
 
 use std::sync::Arc;
 
