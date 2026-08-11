@@ -104,7 +104,10 @@ pub struct UserInputMessage {
     /// 历史消息一直是对的(`is_default_context`),只有当前消息漏了。
     ///
     /// 缓存安全:当前消息位于前缀**之后**,改它不动已缓存的 history 前缀。
-    #[serde(default, skip_serializing_if = "is_default_context")]
+    ///
+    /// `KIRO_LEGACY_WIRE=1` 时谓词恢复旧行为(空也照发 `{}`,见
+    /// [`skip_current_message_context`])—— 旧形态(0.12.155 时代)这个字段是无条件发送的。
+    #[serde(default, skip_serializing_if = "skip_current_message_context")]
     pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
@@ -372,6 +375,23 @@ fn is_default_context(ctx: &UserInputMessageContext) -> bool {
     ctx.tools.is_empty() && ctx.tool_results.is_empty()
 }
 
+/// 当前消息( [`UserInputMessage`] )空 context 的省略谓词。
+///
+/// 1.0.212 形态:空即省略(对齐真客户端)。`KIRO_LEGACY_WIRE=1`:空也照发 `{}`
+/// —— 那才是 0.12.155 时代的旧行为。历史消息( [`UserMessage`] )两个时代都省略,
+/// 仍走上面的 [`is_default_context`],不经过这里。
+///
+/// serde 谓词无法注入参数,只能在序列化点读 env(每次序列化一次 getenv,
+/// 与 converter/history.rs 热路径的现有 env 读取同口径);决策本体拆成纯函数以便测试。
+fn skip_current_message_context(ctx: &UserInputMessageContext) -> bool {
+    skip_context_decision(is_default_context(ctx), crate::wire_profile::legacy_wire())
+}
+
+/// 纯逻辑:空 context 且非 legacy 形态才省略。
+fn skip_context_decision(is_default: bool, legacy: bool) -> bool {
+    is_default && !legacy
+}
+
 impl UserMessage {
     /// 创建新的用户消息
     pub fn new(content: impl Into<String>, model_id: impl Into<String>) -> Self {
@@ -453,6 +473,15 @@ impl AssistantMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_context_decision_truth_table() {
+        // 1.0.212 形态(legacy=false):空省略、非空发;legacy 形态:空也照发。
+        assert!(skip_context_decision(true, false), "1.0.212 空 context 省略");
+        assert!(!skip_context_decision(false, false), "非空必发");
+        assert!(!skip_context_decision(true, true), "legacy 空 context 照发");
+        assert!(!skip_context_decision(false, true), "legacy 非空必发");
+    }
 
     #[test]
     fn test_conversation_state_new() {

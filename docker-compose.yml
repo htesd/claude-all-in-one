@@ -33,6 +33,10 @@ services:
     environment:
       - RUST_LOG=info
       - KIRO_THINKING_IN_HISTORY0=1
+      # 旧线缆形态总开关(0.12.155 时代报文形态,见 crates/gw-kiro/src/wire_profile.rs)。
+      # 打开 = 整体回退 2026-07-28 之前的上游报文;删掉即恢复 1.0.212 形态。
+      # 注意:与 KIRO_THINKING_IN_HISTORY0 同开时,首次切换会让在途会话下一轮缓存 miss 一次。
+      # - KIRO_LEGACY_WIRE=1
 
   # ── dario(Claude OAuth sidecar)独立通道 ────────────────────────────────
   # 与 kiro 通道完全隔离:独立 instances-dario.yaml(router 不跨组路由),独立

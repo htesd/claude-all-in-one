@@ -1,5 +1,56 @@
 # Changelog
 
+## [kiro-legacy-wire-switch] - 2026-08-11
+
+`KIRO_LEGACY_WIRE=1`:Kiro 上游报文**整体**退回 2026-07-28(`58b6f27` 对齐 1.0.212)
+之前的线缆形态。默认关 = 现状一字节不变。gw-kiro 相关测试全绿。
+
+### 背景
+
+08 上旬 PRO+ 付费号批量 TEMPORARILY_SUSPENDED(实测 0/35 申诉恢复 = 永封)。
+周末调查(`.ban-investigation.md`,E1–E8)未锁定根因,但"07-28 线缆形态变更引入
+新指纹"在可疑内因里排位靠前:旧形态(UA 0.12.155 时代)跑了几个月无大规模封号。
+本开关是最低成本的可逆判别实验 —— 不用 git revert,这两周的新功能
+(ListAvailableModels/模型目录/RPM 闸门/conversationId 加盐等)全部保留。
+
+### 总开关协调的维度(只支持两种自洽形态,杜绝混搭)
+
+| 维度 | 默认(1.0.212) | legacy(0.12.155 时代) |
+|---|---|---|
+| UA 自报版本 | 1.0.212 | 0.12.155 |
+| body 顶层 `agentMode` | 必发 `"vibe"` | 不发 |
+| `additionalModelRequestFields` | 按策略发 | 不发(改走旧文本标签) |
+| 当前消息空 `userInputMessageContext` | 省略 | 补发 `{}` |
+| 思考强度载体 | 结构化字段 | `<thinking_mode>/<thinking_effort>` 标签 |
+| 配额/profiles 控制面域名 | management.*.kiro.dev | q.*.amazonaws.com |
+
+### 实现要点
+
+- 新增 `gw-kiro::wire_profile`:总开关与形态说明的单一出处。形态切换全部落在
+  **构造点与 serde 谓词**上(chat.rs 置 None、conversation.rs 谓词读开关),
+  不做序列化后改写 —— struct 字段顺序就是线缆字节顺序(与真客户端 key 顺序
+  逐字对齐过),二次 Value 往返会排成字母序,反而偏离金标准。
+- legacy 下旧文本标签词表同步回旧:`max` 写作 `xhigh`(max 是 1.0.212 才进
+  enum 的档,旧线缆从未出现)。该翻译**只**随总开关生效;单独开
+  `KIRO_LEGACY_THINKING_TAGS` 的混搭路径保持既有字节(max 原样)。
+- `KIRO_LEGACY_THINKING_TAGS` / `KIRO_LEGACY_QUOTA_ENDPOINT` 两个细粒度开关
+  保留原语义(只翻单一维度,作应急);总开关与它们是 OR 关系。
+
+### 刻意的例外(功能保留,不回退)
+
+- `ListAvailableModels` 继续走 management 域(旧域无此操作;admin 手动触发,
+  不在逐请求热路径)。
+- conversationId 按账号加盐(08-07 防关联修复)不回退。
+- 思考预算下限 8192、默认档位 high 是策略(值),不是协议形态,保留。
+
+### 部署注意
+
+- 开关只需加在 **worker**(报文在 worker 侧生成);router 不碰上游。
+- 生产 worker 开着 `KIRO_THINKING_IN_HISTORY0=1`:若当前 env 没有
+  `KIRO_LEGACY_THINKING_TAGS=1`(即现在不发标签),开总开关会让标签重新注入
+  history[0] = 缓存前缀第一块字节变化,在途会话下一轮全量 miss 一次。低峰切换。
+  若当前已设 `KIRO_LEGACY_THINKING_TAGS=1`,则前缀无变化,随时可切。
+
 ## [cursor-review-fixes-2] - 2026-08-07
 
 把审查里剩下的 12 条做掉。全量 **1148 项测试通过**。
