@@ -1652,6 +1652,8 @@ async fn probe_account(
                         break;
                     }
                     Some(Ok(gw_core::provider::StreamItem::Usage(_))) => {}
+                    // 探针只认首个文本即断流,掐流信号与探针判定无关,忽略。
+                    Some(Ok(gw_core::provider::StreamItem::UpstreamCut)) => {}
                     Some(Ok(gw_core::provider::StreamItem::Sse(ev))) => {
                         if let Some(t) = ev
                             .data
@@ -3126,6 +3128,9 @@ async fn collect_response(
             Ok(StreamItem::Usage(u)) => {
                 last_usage = Some(u);
             }
+            // 非流式抽干:掐流信号只对流式主链路的软冷却有意义,这里忽略
+            // (响应完整性由下方的 message_stop 折叠校验兜底,行为不变)。
+            Ok(StreamItem::UpstreamCut) => {}
             Err(e) => {
                 // 对外只发中性文案(见 upstream_error_response),原文必须在这里落日志,
                 // 否则这条路径的上游报文就彻底没人记了。
@@ -3367,6 +3372,16 @@ fn stream_response(
         /// 故本标志与 `saw_message_stop` **只**影响请求日志的 success/error_kind,
         /// 绝不参与账号生命周期上报。
         idle_aborted: bool,
+        /// provider 显式上报过「上游静默掐流」(`StreamItem::UpstreamCut`,目前仅 Kiro:
+        /// 见过真实上游 payload 但未收终止事件就 EOF)。实测是封号前兆。
+        ///
+        /// ⚠️ 与 `idle_aborted` 同款隔离纪律,且**更严**:Drop 里它走独立分支——
+        /// 跳过 `report_success`(它会清 failure_count/429 strikes/paced_until,
+        /// 等于改写健康状态,codex 对抗评审#2),也绝不走 report_failure;
+        /// 只喂 scheduler 的软冷却(report_upstream_cut)与请求日志 error_kind。
+        upstream_cut: bool,
+        /// 选号时的软冷却代际快照(随 lease 携带),Drop 上报时原样带回。
+        cut_epoch: u64,
         /// 当前开着的内容块(决定保活帧的形态)。
         open_block: Option<OpenBlock>,
         /// 最近一次收到上游事件的时刻(空闲时长的基准)。
@@ -3386,7 +3401,16 @@ fn stream_response(
             let account_ok = !self.saw_error;
             if !self.reported {
                 self.reported = true;
-                if account_ok {
+                if self.upstream_cut && account_ok {
+                    // upstream_cut 独立分支:与健康/禁用体系完全隔离——
+                    // **跳过** report_success(它会清 failure_count/429
+                    // strikes/paced_until,等于把掐流当成成功去改写健康状态,
+                    // codex 对抗评审#2),也绝不走 report_failure。
+                    // 只喂软冷却信号;代际不符(账号已 reset/重启用)由调度器丢弃。
+                    self.st
+                        .scheduler
+                        .report_upstream_cut(&self.account_id, self.cut_epoch);
+                } else if account_ok {
                     self.st.scheduler.report_success(&self.account_id);
                 } else {
                     self.st
@@ -3405,6 +3429,10 @@ fn stream_response(
             // 一片干净,故障却真实存在,只能靠翻 `success=1 AND output_tokens=0` 的空流才发现。
             let incomplete = if self.idle_aborted {
                 Some("upstream_idle_abort")
+            } else if self.upstream_cut {
+                // 上游静默掐流(封号前兆):即使 provider 合成了 message_stop 收尾,
+                // 也按 upstream_cut 落库(替代 incomplete_stream),供面板聚合分析。
+                Some("upstream_cut")
             } else if !self.saw_message_stop {
                 Some("incomplete_stream")
             } else {
@@ -3421,7 +3449,7 @@ fn stream_response(
                     model = %self.model,
                     duration_ms = ?duration_ms,
                     kind,
-                    "流未走到 message_stop,按未完成收尾(**不**影响账号健康)"
+                    "流按未完成口径收尾(**不**影响账号健康)"
                 );
             }
             // status_code 记的是**实际发出过的 HTTP 状态**,故仍按 account_ok 判定——
@@ -3483,6 +3511,7 @@ fn stream_response(
         account_id,
         model,
         client_key,
+        cut_epoch: lease.cut_epoch,
         _lease: lease,
         inner: stream,
         saw_error: false,
@@ -3497,6 +3526,7 @@ fn stream_response(
         resp_bytes: 0,
         saw_message_stop: false,
         idle_aborted: false,
+        upstream_cut: false,
         open_block: None,
         last_event_at: std::time::Instant::now(),
     };
@@ -3554,6 +3584,12 @@ fn stream_response(
                 }
             };
             match item {
+                Some(Ok(StreamItem::UpstreamCut)) => {
+                    // provider 显式上报的「上游静默掐流」前兆:只置标志,**不转发客户端**
+                    // (它不是 Anthropic SSE 事件)。收尾在 StreamCtx::drop 的独立分支处理。
+                    ctx.upstream_cut = true;
+                    continue;
+                }
                 Some(Ok(StreamItem::Sse(mut ev))) => {
                     // 首个转发事件时刻 = TTFB(请求日志 #③)。
                     if ctx.first_byte_at.is_none() {
@@ -4711,5 +4747,123 @@ mod tests {
             STREAM_IDLE_ABORT > OBSERVED_CLIENT_IDLE_TIMEOUT,
             "硬上限不该早于客户端自己的阈值,那样这次改动等于没做"
         );
+    }
+
+    /// mock provider:chat 恒返回空流(本测试不走 chat,StreamCtx 的流由测试直接构造)。
+    struct CutStreamMockProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for CutStreamMockProvider {
+        fn family(&self) -> &'static str {
+            "kiro"
+        }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] {
+            &[]
+        }
+        async fn list_models(
+            &self,
+        ) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> {
+            Ok(vec![])
+        }
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _ctx: &CallCtx,
+        ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+            Ok(chat_stream(vec![]))
+        }
+        async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
+            Ok(account.clone())
+        }
+    }
+
+    /// upstream_cut(静默掐流前兆)收尾纪律:只喂软冷却 + 请求日志 error_kind,
+    /// 客户端 finale 原样送达,健康/禁用体系零变化(2026-07-25 事故 + 评审#2)。
+    #[tokio::test]
+    async fn upstream_cut_stream_feeds_soft_drain_only() {
+        let provider: Arc<dyn Provider> = Arc::new(CutStreamMockProvider);
+        let st = Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider,
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(
+                vec![Arc::new(acct(&[]))],
+                &gw_core::config::SchedulerConfig::default(),
+            ),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        });
+        // 模拟 Kiro 掐流:payload 已出,provider 报 UpstreamCut 后仍合成完整 finale。
+        let cut_stream = || {
+            chat_stream(vec![
+                Ok(StreamItem::Sse(SseEvent::new(
+                    "message_start",
+                    serde_json::json!({"message":{"id":"m","content":[]}}),
+                ))),
+                Ok(StreamItem::Sse(SseEvent::new(
+                    "content_block_delta",
+                    serde_json::json!({"index":0,"delta":{"type":"text_delta","text":"半截"}}),
+                ))),
+                Ok(StreamItem::UpstreamCut),
+                Ok(StreamItem::Sse(SseEvent::new(
+                    "message_delta",
+                    serde_json::json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+                ))),
+                Ok(StreamItem::Sse(SseEvent::new("message_stop", serde_json::json!({})))),
+                Ok(StreamItem::Usage(ChatUsage {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                    ..Default::default()
+                })),
+            ])
+        };
+        // 第一次掐流:未达阈值(默认 2),不进 draining;客户端仍收到完整 finale。
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            cut_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(body.contains("message_stop"), "合成 finale 应照常转发客户端");
+        assert!(!body.contains("upstream_cut"), "UpstreamCut 绝不泄漏给客户端");
+        assert!(!st.scheduler.is_draining("a"), "单次 cut 未达阈值,不进 draining");
+        let snap = st.scheduler.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(!a.disabled, "掐流绝不进禁用体系");
+        // 第二次掐流:窗口内达阈值 → draining;但单号池 fail-open 仍能拿到 lease。
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            cut_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+        );
+        let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        assert!(st.scheduler.is_draining("a"), "窗口内两次 cut 应进软冷却");
+        let snap = st.scheduler.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(!a.disabled, "draining 不等于禁用,健康面板不受影响");
+        let lease = st.scheduler.acquire(None).await.unwrap();
+        assert_eq!(lease.account_id(), "a", "normal 全空时 fail-open:draining 号仍服务");
     }
 }

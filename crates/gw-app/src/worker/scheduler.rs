@@ -225,6 +225,16 @@ struct CredentialState {
     /// 记的是**选中**(select)而不是完成:一个请求跑 20 秒,按完成计会让 20 秒内
     /// 选中的号全部漏过闸门。
     rpm_hits: std::collections::VecDeque<Instant>,
+    /// upstream_cut 滑窗(软冷却信号,见 [`AccountScheduler::report_upstream_cut`])。
+    /// 有界:只保留窗口内的戳,且条数封顶 [`CUTS_CAP`]。懒清理,无后台任务。
+    cuts: std::collections::VecDeque<Instant>,
+    /// 软冷却截止时刻:期间该号**不接新会话**(已有亲和仍粘着;normal 全空时
+    /// fail-open 仍可用,见 select_id 的 normal/draining 拆分)。
+    drain_until: Option<Instant>,
+    /// 软冷却代际:reset / 配置重启用 / 移除后重新加入时换发新号并清空
+    /// cuts/drain_until。lease 选号时快照;迟到的旧代际上报一律丢弃,
+    /// 防止老流的 Drop 把前兆记到「救回来」的新运行态上(codex 对抗评审#7)。
+    epoch: u64,
 }
 
 impl CredentialState {
@@ -250,6 +260,9 @@ impl CredentialState {
             empty_window_start: None,
             empty_count_in_window: 0,
             rpm_hits: std::collections::VecDeque::new(),
+            cuts: std::collections::VecDeque::new(),
+            drain_until: None,
+            epoch: next_cut_epoch(),
             account,
         }
     }
@@ -392,6 +405,54 @@ const MODEL_UNAVAILABLE_TTL: Duration = Duration::from_secs(6 * 3600);
 /// (如 5s)则簇内空隙就漏掉,退回逐个禁号。
 const MODEL_OVERLOAD_WINDOW: Duration = Duration::from_secs(60);
 
+/// upstream_cut 滑窗条数硬上限(个位数):窗口剪枝之外的第二道有界护栏。
+const CUTS_CAP: usize = 8;
+
+/// 软冷却代际发号器(进程内单调递增)。新 entry、reset、配置重启用都取新号:
+/// 「移除再加入」会得到全新 entry,若代际从 0 重启,旧 lease 的快照就可能撞上
+/// 新 entry 的代际,把老流迟到的 upstream_cut 记到新运行态(codex 对抗评审#7)。
+static CUT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_cut_epoch() -> u64 {
+    CUT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// draining 软冷却参数(env OnceLock,对齐 KIRO_MIN_THINKING_BUDGET 模式)。
+///
+/// **不进 SystemSettings**:旧镜像对设置项 deny_unknown_fields,加字段会让回滚
+/// 旧镜像时全量 503(仓库既有硬警告)。非法/0/负值 → warn + 默认值(fail-open,
+/// 绝不能把坏配置解释成"立即冷却",codex 对抗评审#6 边界)。
+#[derive(Clone, Copy)]
+struct DrainTuning {
+    /// upstream_cut 滑窗长度(默认 600s)。
+    window: Duration,
+    /// 窗口内达此次数进 draining(默认 2)。
+    threshold: u32,
+    /// 单次 draining 时长(默认 1500s;使用时 clamp 到 ≤ 亲和 TTL)。
+    secs: Duration,
+}
+
+fn drain_tuning() -> DrainTuning {
+    static V: std::sync::OnceLock<DrainTuning> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        fn env_secs(name: &str, default: u64) -> u64 {
+            match std::env::var(name).ok().map(|s| s.trim().parse::<u64>()) {
+                Some(Ok(v)) if v > 0 => v,
+                Some(_) => {
+                    tracing::warn!("{name} 非法/非正,回退默认值 {default}");
+                    default
+                }
+                None => default,
+            }
+        }
+        DrainTuning {
+            window: Duration::from_secs(env_secs("KIRO_DRAIN_WINDOW_SECS", 600)),
+            threshold: env_secs("KIRO_DRAIN_THRESHOLD", 2) as u32,
+            secs: Duration::from_secs(env_secs("KIRO_DRAIN_SECS", 1500)),
+        }
+    })
+}
+
 /// 会话亲和记录:session_key → 当前 primary 账号(带 TTL 淘汰)。
 /// v52:只留 primary + last_access,删 alt/streak(「落在哪个号就认哪个号」)。
 struct AffinityEntry {
@@ -409,6 +470,9 @@ pub struct AccountLease {
     pub account: Arc<Account>,
     /// 并发许可:持有到响应流结束;Drop 自动归还信号量。
     _permit: OwnedSemaphorePermit,
+    /// 选号时刻的软冷却代际快照。upstream_cut 上报随身携带,代际不符即丢弃
+    /// (见 [`CredentialState::epoch`] 与 [`AccountScheduler::report_upstream_cut`])。
+    pub cut_epoch: u64,
 }
 
 impl AccountLease {
@@ -912,8 +976,44 @@ impl AccountScheduler {
             return None;
         }
 
+        // ── draining 软冷却拆分(codex 对抗评审#5)──
+        // 既有谓词(RPM/排除/模型能力)已在 eligible_ids 全部跑完,
+        // 这里只把合格集**分组**不过滤:draining 是偏好不是封禁。
+        // 顺带对到期的 drain_until 做懒清理(软冷却无后台任务,只在选号/上报时观察)。
+        let mut normal: Vec<String> = Vec::with_capacity(eligible.len());
+        let mut draining: Vec<String> = Vec::new();
+        for id in &eligible {
+            match entries.get_mut(id).and_then(|e| {
+                let d = e.drain_until?;
+                if now < d {
+                    Some(true)
+                } else {
+                    e.drain_until = None;
+                    e.cuts.clear();
+                    tracing::info!(account = %id, "软冷却到期,退出 draining");
+                    Some(false)
+                }
+            }) {
+                Some(true) => draining.push(id.clone()),
+                _ => normal.push(id.clone()),
+            }
+        }
+        // 无会话亲和的新请求优先 normal;normal 全空才 fail-open 用 draining
+        // (两组都来自 eligible,不绕过任何既有闸门——宁可服务也不全池 503)。
+        let pool = if normal.is_empty() {
+            if !draining.is_empty() {
+                tracing::debug!(
+                    draining = draining.len(),
+                    "合格集全部处于软冷却,fail-open 仍从 draining 选号"
+                );
+            }
+            &eligible
+        } else {
+            &normal
+        };
+
         let chosen = match session_key {
-            None => Self::tiered_lru(&entries, &eligible, view),
+            None => Self::tiered_lru(&entries, pool, view),
             Some(key) => {
                 let affinity_ttl = self.tuning.read().affinity_ttl;
                 let mut map = self.affinity.lock();
@@ -921,7 +1021,7 @@ impl AccountScheduler {
                 let eligible_set: HashSet<&String> = eligible.iter().collect();
                 match map.get_mut(key) {
                     None => {
-                        let id = Self::tiered_lru(&entries, &eligible, view);
+                        let id = Self::tiered_lru(&entries, pool, view);
                         map.insert(
                             key.to_string(),
                             AffinityEntry { primary: id.clone(), last_access: now, last_upgrade: None },
@@ -931,9 +1031,13 @@ impl AccountScheduler {
                     Some(ent) => {
                         ent.last_access = now;
                         if eligible_set.contains(&ent.primary) {
-                            // primary 当下可用。同层保持 v52 粘着(缓存热);但若 primary 落在
+                            // primary 当下可用:**即使 primary 在 draining 也保持粘着**
+                            // (冷却期内会话不挪窝,上游看到的是同会话重试,正常行为)。
+                            // 同层保持 v52 粘着(缓存热);但若 primary 落在
                             // 低优先级层、而此刻更高层**有空闲 permit**,则向上迁移一次并转正
                             // ——让高优先级号被积极使用。高层饱和 / 已在最高层 → 维持粘着。
+                            // 向上迁移目标从 **normal** 里挑(排除 draining,评审#5):
+                            // 不能把会话迁到一个正在软冷却的号上。
                             // 去抖:距上次向上迁移不足 MIGRATE_UP_DEBOUNCE 则**不再迁**(cooled=false
                             // 时连 best_available_higher 扫描都跳过),把跨层横跳频率硬上限到
                             // 1 次/窗口/会话,防高层饱和线附近的橡皮筋抖动(见该常量注释)。
@@ -945,7 +1049,7 @@ impl AccountScheduler {
                             let target = if cooled {
                                 Self::best_available_higher(
                                     &entries,
-                                    &eligible,
+                                    &normal,
                                     primary_priority,
                                     view,
                                 )
@@ -962,7 +1066,8 @@ impl AccountScheduler {
                             }
                         } else {
                             // primary 不可用 → 立即改选并当场转正,永不迁回(下沉/同层横切同理)。
-                            let id = Self::tiered_lru(&entries, &eligible, view);
+                            // 改选同样优先 normal,normal 全空才 fail-open 到 draining。
+                            let id = Self::tiered_lru(&entries, pool, view);
                             ent.primary = id.clone();
                             id
                         }
@@ -1016,13 +1121,13 @@ impl AccountScheduler {
     /// 取选中账号的并发许可 + 账号副本。permit 满返回 `Ok(None)`(调用方标 busy 重试);
     /// 账号不存在返回 `Ok(None)`。
     fn try_lease(&self, id: &str) -> Option<AccountLease> {
-        let (sem, account) = {
+        let (sem, account, cut_epoch) = {
             let entries = self.entries.lock();
             let e = entries.get(id)?;
-            (e.semaphore.clone(), e.account.clone())
+            (e.semaphore.clone(), e.account.clone(), e.epoch)
         };
         match sem.try_acquire_owned() {
-            Ok(permit) => Some(AccountLease { account, _permit: permit }),
+            Ok(permit) => Some(AccountLease { account, _permit: permit, cut_epoch }),
             Err(_) => None,
         }
     }
@@ -1574,6 +1679,11 @@ impl AccountScheduler {
                         } else {
                             tracing::info!(account = %acc.account_id, "sync:配置启用(清运行时禁用)");
                             e.failure_count = 0;
+                            // 软冷却同理:重启用 = 新运行态,换发代际使在途旧请求的
+                            // upstream_cut 上报失效,冷却状态清零(评审#7)。
+                            e.epoch = next_cut_epoch();
+                            e.cuts.clear();
+                            e.drain_until = None;
                         }
                     }
                     // 内存 extra 未持久化(刷新回写失败):跳过配置覆盖,保住新 token;
@@ -1734,6 +1844,11 @@ impl AccountScheduler {
         // 面板显示已启用,号却仍被自己的 RPM 闸挡在选号池外直到旧 hit 自然过期,
         // 运维完全看不出原因。
         e.rpm_hits.clear();
+        // 软冷却同样换发新代际并清空:reset 后的号是「新运行态」,老流迟到的
+        // upstream_cut 上报按代际不符丢弃(见 report_upstream_cut,评审#7)。
+        e.epoch = next_cut_epoch();
+        e.cuts.clear();
+        e.drain_until = None;
         tracing::info!(account = %id, "admin reset:清运行时禁用与计数(含节流/RPM 窗口)");
         true
     }
@@ -1753,6 +1868,88 @@ impl AccountScheduler {
             e.rate_limit_strikes = 0;
             e.paced_until = None;
         }
+    }
+
+    /// 上报一次「上游静默掐流」前兆(provider 显式信号,见 `StreamItem::UpstreamCut`)。
+    ///
+    /// 软冷却:滑窗内累计达阈值 → 该号进入 draining(**不接新会话**;已有亲和仍粘着;
+    /// normal 全空时 fail-open 仍服务)。与既有健康/禁用体系**完全隔离**:不碰
+    /// failure_count / disabled / 429 节流,失败方向永远安全
+    /// (2026-07-25 激进信号接入健康上报、35 秒禁光 7 个号的事故教训)。
+    ///
+    /// `epoch` = lease 选号时的软冷却代际快照;reset / 配置重启用 / 移除后重新加入
+    /// 都会换发新代际并清空 cuts/drain_until,旧代际的迟到上报一律丢弃
+    /// (老流的 Drop 不得把前兆记到「救回来」的新运行态上,codex 对抗评审#7)。
+    pub fn report_upstream_cut(&self, id: &str, epoch: u64) {
+        let t = drain_tuning();
+        // drain 时长 clamp 到 ≤ 亲和 TTL:冷却期若比亲和 TTL 还长,指向该号的会话
+        // 会先掉出亲和、被 perceived 成新会话而遭排除,「同会话重试仍路由回它」的
+        // 反检测设计就失效了(codex 对抗评审#6)。
+        let affinity_ttl = self.tuning.read().affinity_ttl;
+        let secs = if t.secs > affinity_ttl {
+            tracing::warn!(
+                drain_secs = t.secs.as_secs(),
+                affinity_ttl_secs = affinity_ttl.as_secs(),
+                "KIRO_DRAIN_SECS 超过亲和 TTL,已 clamp(过长会让会话在冷却期内掉出亲和)"
+            );
+            affinity_ttl
+        } else {
+            t.secs
+        };
+        self.report_upstream_cut_at(id, epoch, Instant::now(), t.window, t.threshold, secs);
+    }
+
+    /// [`Self::report_upstream_cut`] 的参数注入内核(测试用固定时钟/参数驱动)。
+    fn report_upstream_cut_at(
+        &self,
+        id: &str,
+        epoch: u64,
+        now: Instant,
+        window: Duration,
+        threshold: u32,
+        secs: Duration,
+    ) {
+        let mut entries = self.entries.lock();
+        let Some(e) = entries.get_mut(id) else { return };
+        if epoch != e.epoch {
+            tracing::debug!(account = %id, "丢弃旧代际的 upstream_cut 上报(reset/重启用后的迟到回声)");
+            return;
+        }
+        // 滑窗剪枝 + 有界 push(双保险:窗口外的丢弃,条数再封顶 CUTS_CAP)。
+        while e.cuts.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            e.cuts.pop_front();
+        }
+        e.cuts.push_back(now);
+        while e.cuts.len() > CUTS_CAP {
+            e.cuts.pop_front();
+        }
+        if e.cuts.len() as u32 >= threshold {
+            // 每次命中都续期(前兆仍在出现 = 上游还在掐,冷却跟着延续)。
+            e.drain_until = Some(now + secs);
+            tracing::info!(
+                account = %id,
+                cuts = e.cuts.len(),
+                drain_secs = secs.as_secs(),
+                "upstream_cut 滑窗达阈值,进入软冷却(draining:不接新会话,已有亲和保持)"
+            );
+        }
+    }
+
+    /// 该号此刻是否处于软冷却(draining)。仅观测/测试用;选号路径在
+    /// `select_id` 内联判定(同一把锁里分组,不额外加锁)。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_draining(&self, id: &str) -> bool {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .get(id)
+            .is_some_and(|e| e.drain_until.is_some_and(|t| now < t))
+    }
+
+    /// 读账号当前软冷却代际(测试与无 lease 路径快照用)。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn current_cut_epoch(&self, id: &str) -> u64 {
+        self.entries.lock().get(id).map(|e| e.epoch).unwrap_or(0)
     }
 
     /// 上报一次失败,按 [`UpstreamErrorKind`] 映射生命周期动作(冷却/禁用/计数)。
@@ -3552,5 +3749,123 @@ mod tests {
         let t = AcquireError::GroupEmpty.to_string();
         assert!(!t.is_empty());
         assert_ne!(t, AcquireError::NoModelSupport.to_string());
+    }
+
+    // ───── upstream_cut 软冷却(draining)─────
+
+    /// 以**当前代际**在窗口内连报 `n` 次 cut(默认口径:600s 窗 / 阈值 2 / 1500s 冷却)。
+    fn report_cuts(s: &AccountScheduler, id: &str, n: u32) {
+        let epoch = s.current_cut_epoch(id);
+        let now = Instant::now();
+        for _ in 0..n {
+            s.report_upstream_cut_at(id, epoch, now, Duration::from_secs(600), 2, Duration::from_secs(1500));
+        }
+    }
+
+    #[test]
+    fn upstream_cut_below_threshold_not_draining() {
+        let s = sched(vec![acct("a", 1, Some(100))]);
+        report_cuts(&s, "a", 1);
+        assert!(!s.is_draining("a"), "未达阈值不进软冷却");
+    }
+
+    #[test]
+    fn upstream_cut_threshold_triggers_drain() {
+        let s = sched(vec![acct("a", 1, Some(100))]);
+        report_cuts(&s, "a", 2);
+        assert!(s.is_draining("a"), "窗口内达阈值应进软冷却");
+    }
+
+    #[test]
+    fn upstream_cut_window_expiry_does_not_accumulate() {
+        let s = sched(vec![acct("a", 1, Some(100))]);
+        let epoch = s.current_cut_epoch("a");
+        let t0 = Instant::now();
+        let window = Duration::from_secs(600);
+        s.report_upstream_cut_at("a", epoch, t0, window, 2, Duration::from_secs(1500));
+        // 第二次已在窗口外:第一次被剪掉,窗口内只剩 1 次 → 不触发。
+        s.report_upstream_cut_at(
+            "a",
+            epoch,
+            t0 + window + Duration::from_secs(1),
+            window,
+            2,
+            Duration::from_secs(1500),
+        );
+        assert!(!s.is_draining("a"), "窗口外的 cut 不得累计");
+    }
+
+    #[test]
+    fn upstream_cut_stale_epoch_is_dropped() {
+        let s = sched(vec![acct("a", 1, Some(100))]);
+        let epoch = s.current_cut_epoch("a");
+        let now = Instant::now();
+        // 代际不符:报多少次都丢弃。
+        for _ in 0..3 {
+            s.report_upstream_cut_at("a", epoch + 1000, now, Duration::from_secs(600), 2, Duration::from_secs(1500));
+        }
+        assert!(!s.is_draining("a"), "代际不符的上报必须丢弃");
+        // reset 换发新代际并清空冷却态;旧代际的迟到上报继续被丢弃。
+        assert!(s.reset_account("a"));
+        let new_epoch = s.current_cut_epoch("a");
+        assert_ne!(epoch, new_epoch, "reset 必须换发软冷却代际");
+        for _ in 0..2 {
+            s.report_upstream_cut_at("a", epoch, now, Duration::from_secs(600), 2, Duration::from_secs(1500));
+        }
+        assert!(!s.is_draining("a"), "reset 后旧代际上报不得生效");
+        // 新代际正常累计。
+        report_cuts(&s, "a", 2);
+        assert!(s.is_draining("a"));
+    }
+
+    #[tokio::test]
+    async fn draining_new_session_prefers_normal_account() {
+        let s = sched(vec![acct("a", 1, Some(100)), acct("b", 1, Some(100))]);
+        report_cuts(&s, "a", 2);
+        let lease = s.acquire(None).await.unwrap();
+        assert_eq!(lease.account_id(), "b", "无亲和新会话优先 normal 号");
+    }
+
+    #[tokio::test]
+    async fn draining_fail_open_when_normal_empty() {
+        let s = sched(vec![acct("a", 1, Some(100))]);
+        report_cuts(&s, "a", 2);
+        let lease = s.acquire(None).await.unwrap();
+        assert_eq!(lease.account_id(), "a", "normal 全空 fail-open:draining 仍服务,不全池 503");
+    }
+
+    #[tokio::test]
+    async fn draining_keeps_existing_affinity_sticky() {
+        let s = sched(vec![acct("a", 1, Some(100)), acct("b", 1, Some(100))]);
+        // 先把会话钉到 a(同层 LRU 平局按 id 序,"a" < "b")。
+        let l1 = s.acquire(Some("s")).await.unwrap();
+        assert_eq!(l1.account_id(), "a");
+        drop(l1);
+        report_cuts(&s, "a", 2);
+        let l2 = s.acquire(Some("s")).await.unwrap();
+        assert_eq!(l2.account_id(), "a", "已有亲和:primary draining 也保持粘着");
+    }
+
+    #[tokio::test]
+    async fn draining_does_not_bypass_disabled_gate() {
+        // a 配置禁用 + draining:fail-open 也不得复活禁用号(draining 不绕过任何既有闸门)。
+        let s = sched(vec![acct_disabled("a", true), acct("b", 1, Some(100))]);
+        report_cuts(&s, "a", 2);
+        let lease = s.acquire(None).await.unwrap();
+        assert_eq!(lease.account_id(), "b");
+    }
+
+    #[tokio::test]
+    async fn draining_still_respects_rpm_gate() {
+        // 两个号都 draining;a 的 RPM 打满后,fail-open 也不得再选它。
+        let s = sched(vec![racct("a", 2, 100, 1), acct("b", 2, Some(100))]);
+        report_cuts(&s, "a", 2);
+        report_cuts(&s, "b", 2);
+        // 全部 draining → fail-open;同层 LRU 平局按 id → a(消耗 a 唯一一格 RPM)。
+        let l1 = s.acquire(None).await.unwrap();
+        assert_eq!(l1.account_id(), "a");
+        drop(l1);
+        let l2 = s.acquire(None).await.unwrap();
+        assert_eq!(l2.account_id(), "b", "RPM 打满的 draining 号不得被 fail-open 选中");
     }
 }

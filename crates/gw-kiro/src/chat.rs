@@ -824,6 +824,16 @@ fn async_stream_like(
         // 二者落进请求日志的"真 / credit"列,供前端看每条请求的真实命中与真实成本来优化缓存。
         let mut real_cache_read: i64 = 0;
         let mut metering_credit: f64 = 0.0;
+        // upstream_cut 检测(封号前兆软信号,StreamItem::UpstreamCut 的发射条件):
+        // - saw_upstream_payload:见过**真实上游事件帧**(不含我方合成的 message_start;
+        //   合成首帧在读上游字节前就发出,拿它当"上游已接受"会把空响应误判成掐流,
+        //   codex 对抗评审#3)。
+        // - saw_terminal:见过正常终止信号 = metadataEvent(带 stopReason,Kiro 正常
+        //   收尾帧)/ meteringEvent(流末尾的原生计费帧)/ 上游显式 stop 条件
+        //   (ContentLengthExceeded、context 超限 → stop_reason 置位)。
+        // EOF 时 saw_upstream_payload && !saw_terminal → 流是被上游**静默掐断**的。
+        let mut saw_upstream_payload = false;
+        let mut saw_terminal = false;
         let window = crate::converter::get_context_window_size(&model);
         futures::pin_mut!(byte_stream);
 
@@ -883,6 +893,10 @@ fn async_stream_like(
                             }
                             _ => {}
                         }
+                        // 走到这里 = 真实解出的上游事件帧(exception/error 帧已在上面
+                        // 提前 return/continue;ContentLengthExceeded 虽 continue 跳过本行,
+                        // 但它会置 stop_reason,按终止信号处理,不影响判定)。
+                        saw_upstream_payload = true;
                         let evt = frame.event_type().map(|s| s.to_string());
                         match evt.as_deref() {
                             Some("assistantResponseEvent") => {
@@ -974,11 +988,19 @@ fn async_stream_like(
                                 // Kiro 原生计费(真号本次真实积分消耗,单位通常 "credit")。v53 不靠它
                                 // 反推缓存,但留作请求日志的"真实 credit"信号——判断 Kiro 服务端有没有
                                 // 应用缓存折扣、每条请求真号到底烧了多少。仅记录,不参与上报计费。
+                                // 流末尾帧:见过它 = 上游完整跑完了本次计费,视作正常终止信号。
+                                saw_terminal = true;
                                 if let Ok(v) = frame.payload_as_json::<serde_json::Value>() {
                                     if let Some(u) = v.get("usage").and_then(|x| x.as_f64()) {
                                         metering_credit = u;
                                     }
                                 }
+                            }
+                            Some("metadataEvent") => {
+                                // Kiro 正常收尾帧(带 stopReason):**正常终止信号**。
+                                // 它的缺席正是「静默掐流」的判据(见收尾处 UpstreamCut 发射)。
+                                // stopReason 的具体值不进 SSE(收尾仍按既有优先级推导 stop_reason)。
+                                saw_terminal = true;
                             }
                             // event-type 异常名兜底(:message-type=event 但 event-type 是异常名
                             // 的奇异帧;常规异常帧已在上方按 :message-type 路由)。
@@ -1011,6 +1033,21 @@ fn async_stream_like(
                     }
                 }
             }
+        }
+
+        // --- upstream_cut 发射(封号前兆软信号,only-EOF 路径)---
+        // 判定:见过真实上游事件帧,但直到底层 EOF 都没见到任何正常终止信号
+        // (metadataEvent / meteringEvent / 显式 stop 条件)→ 流是被上游静默掐断的,
+        // 而非正常收尾。实测这种流之后 4-20 分钟账号吃 TEMPORARILY_SUSPENDED。
+        // worker 收到后只记录 + 软冷却,不转发客户端;下方 finish 合成收尾照常发出
+        // (客户端仍拿到完整形态的消息,掐流事实由 error_kind=upstream_cut 落库)。
+        // 只发一次;正常 finish 路径(有终止信号)不发。
+        // 传输错误(读流 Err)不发:那条路已有 Err → report_failure 的既有口径兜底,
+        // 再发会让同一次故障进两套体系(codex 对抗评审#2:隔离原则)。
+        if saw_upstream_payload && !saw_terminal && stop_reason.is_none() {
+            tracing::warn!(model = %model,
+                "上游静默掐流:见过 payload 但无终止事件就 EOF,上报 upstream_cut");
+            let _ = tx.send(Ok(StreamItem::UpstreamCut)).await;
         }
 
         // --- 收尾:关掉任何开着的块(thinking/text)+ thinking-only 兜底 ---
@@ -1922,5 +1959,99 @@ mod tests {
         let delta = evs.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
         assert!(items.iter().any(|i| matches!(i, Ok(StreamItem::Usage(_)))));
+    }
+
+    // ---- upstream_cut(静默掐流前兆)发射条件 ----
+
+    #[tokio::test]
+    async fn silent_cut_after_payload_emits_upstream_cut_once() {
+        // 掐流形态:见过真实上游 payload,但无终止事件就 EOF。
+        let f = es_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            r#"{"content":"半截回答"}"#.as_bytes(),
+        );
+        let items = run_stream(vec![f], false).await;
+        let cuts = items
+            .iter()
+            .filter(|i| matches!(i, Ok(StreamItem::UpstreamCut)))
+            .count();
+        assert_eq!(cuts, 1, "掐流应恰好上报一次 UpstreamCut");
+        // UpstreamCut 在合成收尾之前发出;客户端侧 finale 仍完整(行为不变)。
+        let pos_cut = items
+            .iter()
+            .position(|i| matches!(i, Ok(StreamItem::UpstreamCut)))
+            .unwrap();
+        let pos_stop = items
+            .iter()
+            .position(|i| matches!(i, Ok(StreamItem::Sse(e)) if e.event == "message_stop"))
+            .expect("掐流后仍合成 message_stop 收尾");
+        assert!(pos_cut < pos_stop, "UpstreamCut 必须先于合成收尾");
+    }
+
+    #[tokio::test]
+    async fn normal_finale_with_metadata_event_emits_no_cut() {
+        // 正常收尾:metadataEvent(带 stopReason)是终止信号,不算掐流。
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            r#"{"content":"完整回答"}"#.as_bytes(),
+        );
+        let f2 = es_frame(
+            &[(":message-type", "event"), (":event-type", "metadataEvent")],
+            br#"{"stopReason":"end_turn"}"#,
+        );
+        let items = run_stream(vec![f1, f2], false).await;
+        assert!(
+            !items.iter().any(|i| matches!(i, Ok(StreamItem::UpstreamCut))),
+            "有终止事件的正常收尾不得报 UpstreamCut"
+        );
+        let evs = sse_events(&items);
+        assert!(evs.iter().any(|e| e.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn metering_event_marks_terminal_no_cut() {
+        // meteringEvent 是流末尾的原生计费帧:见过 = 上游完整跑完,不算掐流。
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            r#"{"content":"完整回答"}"#.as_bytes(),
+        );
+        let f2 = es_frame(
+            &[(":message-type", "event"), (":event-type", "meteringEvent")],
+            br#"{"usage":1.5,"unit":"credit"}"#,
+        );
+        let items = run_stream(vec![f1, f2], false).await;
+        assert!(
+            !items.iter().any(|i| matches!(i, Ok(StreamItem::UpstreamCut))),
+            "meteringEvent 已属终止信号"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_condition_emits_no_cut() {
+        // ContentLengthExceeded = 上游显式声明的终止条件(max_tokens),非掐流。
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            br#"{"content":"partial output"}"#,
+        );
+        let f2 = es_frame(
+            &[(":message-type", "exception"), (":exception-type", "ContentLengthExceededException")],
+            br#"{"message":"Input is too long"}"#,
+        );
+        let items = run_stream(vec![f1, f2], false).await;
+        assert!(
+            !items.iter().any(|i| matches!(i, Ok(StreamItem::UpstreamCut))),
+            "显式 stop 条件的截断不得报 UpstreamCut"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_upstream_emits_no_cut() {
+        // 零 payload(连合成首帧外的真实上游帧都没有)→ 空响应,不是掐流:
+        // 上游可能压根没接受请求,不能记到封号前兆上(评审#3)。
+        let items = run_stream(vec![], false).await;
+        assert!(
+            !items.iter().any(|i| matches!(i, Ok(StreamItem::UpstreamCut))),
+            "无真实 payload 不算掐流"
+        );
     }
 }

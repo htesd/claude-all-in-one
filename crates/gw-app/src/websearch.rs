@@ -449,6 +449,8 @@ async fn collect(mut stream: ChatStream) -> Result<(Vec<SseEvent>, ChatUsage), U
                 events.push(ev);
             }
             Ok(StreamItem::Usage(u)) => usage = u,
+            // 掐流信号(仅 Kiro 发):websearch 回环只关心事件与用量,忽略。
+            Ok(StreamItem::UpstreamCut) => {}
             Err(e) => return Err(e),
         }
     }

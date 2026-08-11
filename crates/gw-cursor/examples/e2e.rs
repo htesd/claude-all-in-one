@@ -212,6 +212,8 @@ async fn main() {
                     }
                 }
                 Ok(StreamItem::Usage(u)) => eprintln!("[usage output_tokens={}]", u.output_tokens),
+                // cursor provider 永不发送该变体(opt-in,仅 Kiro);列出仅为穷举完备。
+                Ok(StreamItem::UpstreamCut) => {}
                 Err(e) => {
                     eprintln!("\n流错误: {e:?}");
                     std::process::exit(1);

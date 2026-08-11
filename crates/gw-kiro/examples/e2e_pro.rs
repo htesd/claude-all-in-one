@@ -147,6 +147,7 @@ async fn run_nonstream_fold(
         match item {
             Ok(StreamItem::Sse(ev)) => events.push(ev),
             Ok(StreamItem::Usage(_)) => {}
+            Ok(StreamItem::UpstreamCut) => eprintln!("    [fold] upstream_cut(静默掐流信号)"),
             Err(e) => {
                 eprintln!("    [fold] 流错误: {e}");
                 return;
@@ -226,6 +227,7 @@ async fn run_and_report(
                     u.input_tokens, u.output_tokens, u.cache_read_tokens
                 );
             }
+            Ok(StreamItem::UpstreamCut) => eprintln!("    [{label}] upstream_cut(静默掐流信号)"),
             Err(e) => err = Some(e.to_string()),
         }
     }
