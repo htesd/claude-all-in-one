@@ -184,6 +184,17 @@ pub enum StreamItem {
     Sse(SseEvent),
     /// 结构化终结用量(gw-app 路由到 UsageSink,不转发客户端)。
     Usage(ChatUsage),
+    /// 「上游静默掐流」信号(provider **显式 opt-in** 上报,目前仅 Kiro 发出):
+    /// 见过真实上游 payload 之后,底层流在**未收到正常终止事件**的情况下 EOF。
+    /// 这是实测的封号前兆(长思考流被掐后 4-20 分钟吃 TEMPORARILY_SUSPENDED)。
+    ///
+    /// gw-app 收到后**只记录**(请求日志 error_kind=upstream_cut + scheduler 软冷却),
+    /// 绝不转发客户端,也绝不进健康/禁用体系。其它 provider 永不发送,行为不变。
+    ///
+    /// 不能由 worker 的泛型 `None` 推断:provider 可能在底层 EOF 后自己合成
+    /// message_stop 收尾(如 Kiro 的 tracker.finish()),把真正的掐流掩盖掉
+    /// (codex 对抗评审#1/#3)。
+    UpstreamCut,
 }
 
 /// Provider::chat 返回的事件流。
