@@ -190,6 +190,9 @@ async fn put_settings(
     let serde_json::Value::Object(patch) = body else {
         return api_error(StatusCode::BAD_REQUEST, "请求体应为 JSON 对象");
     };
+    // 本次 patch 的键集合:未知键拒绝只针对它们(见下方校验)。owned 拷贝,
+    // 不持有对 patch 的借用(下面要 move 它)。
+    let patch_keys: std::collections::HashSet<String> = patch.keys().cloned().collect();
 
     // 现有 overlay(原始 JSON map)→ 合并 patch:null 删键、非 null 设键。
     let mut overlay_map: serde_json::Map<String, serde_json::Value> = match st.store.get_settings() {
@@ -199,7 +202,51 @@ async fn put_settings(
     };
     for (k, v) in patch {
         if v.is_null() {
+            // null = 删该 overlay 字段回 YAML 默认。拼错保护对 null 同样生效
+            // (复审 [中]):只有「进入合并前 overlay 里已存在」的键允许 null 清理;
+            // 压根不存在的**未知**键(多是拼错,如 `max_failure`)必须照拒 ——
+            // 否则 null 会绕过下方的 unknown 校验。已知字段的 null(无残留时
+            // 是 no-op 重置)不受影响。
+            if !overlay_map.contains_key(&k) {
+                let probe = serde_json::from_value::<SystemSettings>(serde_json::json!({
+                    k.clone(): serde_json::Value::Null
+                }))
+                .unwrap_or_default();
+                if probe.unknown.contains_key(&k) {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("未知设置字段: {k}"),
+                    );
+                }
+            }
             overlay_map.remove(&k);
+            continue;
+        }
+        // cursor_tool_guard:内建工具护栏的策略句。空串=清除回内置默认。
+        //
+        // 长度在**写侧**就拦:worker 侧的 `set_tool_guard_policy` 也拦,但那是
+        // 「存进去了、每个 worker 各自拒绝并沿用上一份」——面板上看不出保存的值
+        // 从来没生效过。写侧拦掉才有即时反馈。上限与 gw-cursor 侧同源。
+        if k == "cursor_tool_guard" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => {
+                    const MAX_CHARS: usize = 2000;
+                    let n = s.trim().chars().count();
+                    if n > MAX_CHARS {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!("cursor_tool_guard 过长({n} 字符,上限 {MAX_CHARS})"),
+                        );
+                    }
+                    overlay_map.insert(k, serde_json::json!(s.trim()));
+                }
+                None => {
+                    return api_error(StatusCode::BAD_REQUEST, "cursor_tool_guard 须为字符串")
+                }
+            }
             continue;
         }
         // default_proxy:空串=清除;非空=写入边界校验 + 归一(fail-closed,审查 Skeptic#2)。
@@ -285,11 +332,19 @@ async fn put_settings(
     // (它同时卡死了 worker 读侧的容错,一个陌生 key 就让整份 overlay 归零 → 全量 503,
     // 见该结构体的文档),保护改由**写侧**承担:`unknown` 装的就是没被任何字段认领的 key。
     //
-    // ⚠️ 这道闸是 overlay 里**唯一**的拼错防线 —— 读侧现在只告警不拒绝。
-    if !overlay.unknown.is_empty() {
+    // 拒绝范围 = **本次 patch** 里的未知键(对抗审核 [中]):overlay 里残留的「更新镜像
+    // 写入、本版本不认识」的键**原样保留** —— 否则回滚到旧 router 后,库里残留的新字段
+    // 会让任何普通设置写入都被整体 400 锁死,运维还没有正常手段清理。拼错保护不变:
+    // 拼错的键必然出现在本次 patch 里。要清残留键,显式 PUT `{"那个键": null}` 即可。
+    let bad: Vec<&str> = overlay
+        .unknown_keys()
+        .into_iter()
+        .filter(|k| patch_keys.contains(*k))
+        .collect();
+    if !bad.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
-            &format!("未知设置字段: {}", overlay.unknown_keys().join(", ")),
+            &format!("未知设置字段: {}", bad.join(", ")),
         );
     }
 
@@ -514,6 +569,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "未知字段应 400");
+    }
+
+    #[tokio::test]
+    async fn put_tolerates_preexisting_unknown_keys_from_newer_image() {
+        let (app, store) = app();
+        // 模拟「更新的镜像写入过新字段,随后回滚到本镜像」:overlay 里残留本版本
+        // 不认识的键。此时普通设置写入不该被整体锁死(对抗审核 [中])。
+        store.upsert_settings(r#"{"future_new_field": 1}"#).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": 3}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "与本次 patch 无关的残留未知键不该锁死写入");
+        let v = body_json(resp).await;
+        assert_eq!(v["max_failures"], 3);
+        // 残留键仍躺在库里(读侧宽容),可随时用 null 显式清掉。
+        let j = store.get_settings().unwrap().unwrap();
+        assert!(j.contains("future_new_field"), "与本 patch 无关的键应原样保留");
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"future_new_field": null}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "null 显式清理残留键要可用");
+        let j = store.get_settings().unwrap().unwrap();
+        assert!(!j.contains("future_new_field"));
+        // 但本次 patch 里拼错的 key 照样拒(拼错保护不变)。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": 1}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn put_null_for_nonexistent_unknown_key_is_rejected() {
+        let (app, _store) = app();
+        // 复审 [中]:`{"拼错键": null}` 不得绕过拼错保护 —— null 在合并前删除,
+        // 到不了 unknown 校验,所以 null 分支里要单独探一次。
+        let resp = app
+            .clone()
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failure": null}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "不存在的未知键 + null = 拼错,应 400");
+        // 已知字段的 null(无残留时的 no-op 重置)不受影响。
+        let resp = app
+            .oneshot(req("PUT", "/settings", Some(r#"{"max_failures": null}"#)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "已知字段的 null 重置照常");
     }
 
     #[tokio::test]

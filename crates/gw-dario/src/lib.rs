@@ -256,7 +256,7 @@ mod tests {
         fn acct(proxy: Option<&str>) -> Account {
             let mut e = BTreeMap::new();
             if let Some(p) = proxy { e.insert("proxy".into(), serde_json::json!(p)); }
-            Account { account_id: "d1".into(), provider: "claude-dario".into(), max_concurrency: 2, disabled: false, extra: e }
+            Account { account_id: "d1".into(), provider: "claude-dario".into(), max_concurrency: 2, disabled: false, created_at: 0, extra: e }
         }
         let p = DarioProvider::new(DarioConfig::default());
         // 无 proxy → Ok(worker 默认出口),缓存不增长。

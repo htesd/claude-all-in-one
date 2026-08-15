@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use crate::account::{Account, FieldSpec};
-use crate::error::UpstreamError;
+use crate::error::{UpstreamError, UpstreamErrorKind};
 use crate::model::ModelInfo;
 
 /// 一次对话请求(Anthropic-native)。
@@ -133,6 +133,29 @@ pub struct AccountQuota {
     /// Anthropic OAuth/Max 没有只读用量接口、也不给积分上限,只在 `/v1/messages` 响应头
     /// (`anthropic-ratelimit-unified-5h/7d-utilization`)给利用率,故用本字段承载。
     pub windows: Vec<QuotaWindow>,
+    /// 超额(on-demand / usage-based)额度快照。`None` = 该 provider 无此概念或未查到。
+    /// 与 `used`/`limit`(**套餐内**额度)是两笔独立的账:套餐用尽后才开始吃超额。
+    pub on_demand: Option<OnDemandQuota>,
+}
+
+/// 超额(on-demand / usage-based pricing)额度快照。
+///
+/// Cursor 侧对应 `DashboardService/GetHardLimit`(开关 + 上限)与
+/// `GetCurrentPeriodUsage.spendLimitUsage`(本账期已用超额)。金额统一**美元**口径
+/// (上游 `hard_limit` 是美元整数、`spendLimitUsage` 是美分,已在 provider 内换算)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OnDemandQuota {
+    /// 是否已开启超额。上游 `no_usage_based_allowed` 取反。
+    pub enabled: bool,
+    /// 超额上限(美元)。`None` = 未开启或上游未给。
+    ///
+    /// 上游用 i32 上限(2147483647)表示「不限额」,provider 侧归一为
+    /// [`Self::unlimited`] = true 且此字段为 `None`,避免把哨兵值当真额度显示。
+    pub limit: Option<f64>,
+    /// 本账期已用超额(美元)。上游零值字段缺省,故 `0.0` 是正常值而非「未知」。
+    pub used: f64,
+    /// 是否「不限额」(上游哨兵值 i32::MAX)。
+    pub unlimited: bool,
 }
 
 /// 单个用量窗口(5h / 7d 等滚动窗口的利用率快照)。
@@ -158,6 +181,7 @@ impl AccountQuota {
             percent_used,
             currency: None,
             windows: Vec::new(),
+            on_demand: None,
         }
     }
 
@@ -173,6 +197,7 @@ impl AccountQuota {
             percent_used,
             currency: label,
             windows,
+            on_demand: None,
         }
     }
 }
@@ -310,6 +335,32 @@ pub trait Provider: Send + Sync {
         _account: &Account,
     ) -> Result<Option<AccountQuota>, UpstreamError> {
         Ok(None)
+    }
+
+    /// 是否支持设置超额(on-demand)额度。默认 `false`。
+    ///
+    /// 与 [`Self::set_on_demand_limit`] 必须同进退:只覆盖其中一个就是在撒谎
+    /// (面板会给不支持的 provider 渲染出一个必然失败的入口)。
+    fn on_demand_supported(&self) -> bool {
+        false
+    }
+
+    /// 设置账号的超额(on-demand)额度上限。`limit_usd = None`/`Some(0)` = **关闭**超额。
+    ///
+    /// ⚠️ 与 [`Self::account_quota`] 的只读契约不同,这是**写**操作:它改的是上游账号的
+    /// 计费设置(开启后套餐用尽将产生真实费用)。调用方必须是显式的运维动作,
+    /// 绝不能放进任何轮询/自动路径。
+    ///
+    /// 默认返回 `Unsupported` 错误。**出口契约**同 refresh:与该账号发包走同一出口。
+    async fn set_on_demand_limit(
+        &self,
+        _account: &Account,
+        _limit_usd: Option<u32>,
+    ) -> Result<(), UpstreamError> {
+        Err(UpstreamError::new(
+            UpstreamErrorKind::Other,
+            "该 provider 不支持设置超额额度",
+        ))
     }
 
     /// 拉取上游**模型目录**(只读;Kiro 的 `ListAvailableModels`)。返回 `Ok(None)` =

@@ -146,6 +146,7 @@ mod tests {
             provider: "claude-dario".into(),
             max_concurrency: 2,
             disabled: false,
+            created_at: 0,
             extra: e,
         }
     }

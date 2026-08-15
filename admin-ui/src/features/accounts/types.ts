@@ -47,6 +47,12 @@ export interface AccountRow {
    * 旧缓存响应可能缺失 → 缺省视为 false（关）。
    */
   queue_enabled?: boolean
+  /**
+   * 模型白名单（`extra.model_allowlist`，后端顶层回显）。
+   * 规范化后的字符串数组（小写，条目为 Run 侧模型名或「前缀*」）；
+   * null / 缺失 = 不限。旧缓存响应可能缺失 → 视为不限。
+   */
+  model_allowlist?: string[] | null
 }
 
 /** POST /accounts 请求体（注意：这里的分组字段叫 `group`，PATCH 才是 `group_name`）。 */
@@ -86,6 +92,14 @@ export interface UpdateAccountPayload {
   proxy_url?: string
   /** 排队开关。不传=不动；走后端定点合并，绝不碰凭据。 */
   queue_enabled?: boolean
+  /**
+   * 模型白名单（逗号分隔串，UI 输入形态）。
+   * - 非空 = 设置（后端校验：通配符只许末尾、非法字符 400；规范化成 JSON 数组落库）
+   * - 空字符串 `""` = 清除（不限）
+   * - 不传 = 不动
+   * 走后端定点合并，绝不碰凭据。
+   */
+  model_allowlist?: string
 }
 
 /** worker 侧账号不可用原因枚举（'' = 无）。 */
@@ -96,6 +110,8 @@ export type AccountUnavailableReason =
   | 'quota_exhausted'
   | 'invalid_refresh_token'
   | 'too_many_failures'
+  | 'temporarily_suspended'
+  | 'suspended_retired'
   | 'config'
 
 /** 一个用量窗口(如 dario 的 5h / 7d 滚动窗口),利用率%。 */
@@ -108,7 +124,7 @@ export interface QuotaWindow {
   reset_at?: number | null
 }
 
-/** 账号配额只读快照;尚未查到时为 null。Kiro=积分(used/limit);dario=利用率窗口(windows)。 */
+/** 账号配额只读快照;尚未查到时为 null。Kiro=积分(used/limit);Cursor=官方账期美元;dario=利用率窗口(windows)。 */
 export interface AccountQuota {
   /** 已用额度(Credits)。 */
   used: number
@@ -122,6 +138,56 @@ export interface AccountQuota {
   label?: string | null
   /** 多窗口利用率(dario 的 5h/7d);空/缺省 = 基于积分的 provider(Kiro),走 remaining/limit 显示。 */
   windows?: QuotaWindow[]
+  /** 超额(on-demand)额度;null/缺省 = 该 provider 无此概念或未查到。 */
+  on_demand?: OnDemandQuota | null
+}
+
+/**
+ * 超额(on-demand / usage-based)额度快照。金额单位**美元**。
+ *
+ * 与 `AccountQuota.used/limit`(套餐内额度)是两笔独立的账:套餐用尽后才吃超额。
+ * 目前只有 Cursor 有(`DashboardService/GetHardLimit` + `spendLimitUsage`)。
+ */
+export interface OnDemandQuota {
+  /** 是否已开启超额。 */
+  enabled: boolean
+  /** 超额上限(美元);null = 未开启 / 不限额 / 上游未给。 */
+  limit?: number | null
+  /** 本账期已用超额(美元)。0 是正常值(未产生超额消费),不是"未知"。 */
+  used: number
+  /** 是否不限额(上游用 i32 上限表示)。 */
+  unlimited: boolean
+}
+
+/** 一条 (账号,模型) 不可用标记(INVALID_MODEL_ID)的运行时快照。 */
+export interface ModelUnavailableMark {
+  model: string
+  /** 标记剩余存活秒数(到期自动重探)。 */
+  remaining_secs: number
+}
+
+/** GET /accounts/{id}/models/local 单个模型条目(静态目录 + 档位支持判断 + 已学标记)。 */
+export interface AccountModelEntry {
+  id: string
+  /** 目录显示名；上游未给时为 null。 */
+  display_name: string | null
+  /** 该账号订阅档位是否静态支持此模型。 */
+  supported: boolean
+  /** 已学 INVALID_MODEL_ID 标记的剩余秒数（查询时快照）；无标记为 null（0 = 即将到期,仍算标记中）。 */
+  mark_remaining_secs: number | null
+  /** 后端结论:supported 且无标记。三态细分用 deriveModelAvailability 重算。 */
+  available: boolean
+}
+
+/**
+ * GET /accounts/{id}/models/local 响应：账号可用模型清单。
+ * **纯本地认知**(未观察到拒绝 ≠ 上游保证),全程零上游调用。
+ */
+export interface AccountModelsLocalResult {
+  account_id: string
+  models: AccountModelEntry[]
+  /** 目录外的标记(上游新模型/请求变体名打不中目录行),单独透出。 */
+  off_catalog_marks: ModelUnavailableMark[]
 }
 
 export interface AccountRuntimeStatus {
@@ -137,6 +203,12 @@ export interface AccountRuntimeStatus {
   quota?: AccountQuota | null
   /** 该号是否开了排队（worker 侧实时值；旧 worker 可能缺失 → 视为 false）。 */
   queue_enabled?: boolean
+  /** 连续 suspend 退避档位；旧 worker 缺失 → undefined。 */
+  suspend_streak?: number
+  /** 是否处于复活观察期（单飞）；旧 worker 缺失 → undefined/false。 */
+  probation?: boolean
+  /** 当前生效的 (账号,模型) 不可用标记；旧 worker 缺失 → undefined（视为无标记）。 */
+  model_unavailable?: ModelUnavailableMark[]
 }
 
 /**
@@ -219,8 +291,11 @@ export type AccountDisplayStatus =
   | { kind: 'disabled' }
   | { kind: 'offline' }
   | { kind: 'ok' }
+  | { kind: 'probation' }
   | { kind: 'rate_limited'; secs: number }
   | { kind: 'empty_response'; secs: number }
+  | { kind: 'suspended'; secs: number }
+  | { kind: 'retired' }
   | { kind: 'quota_exhausted' }
   | { kind: 'invalid_refresh_token' }
   | { kind: 'too_many_failures' }

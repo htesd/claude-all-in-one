@@ -12,22 +12,25 @@
 //!
 //! - `agentn.api5.cursor.sh` —— 推理(`AgentService/Run`),BiDi 流。
 //! - `api2.cursor.sh` —— unary 服务:`ServerConfigService/GetServerConfig`(取
-//!   `config_version`)与 OAuth `/oauth/token`(刷新)。
+//!   `config_version`)、OAuth `/oauth/token`(刷新)、以及
+//!   `DashboardService/GetCurrentPeriodUsage`(官方账期用量,admin 配额列)。
 //!
 //! ## 防关联(PROTOCOL §7)
 //!
 //! 每号一套**冻结**的身份:token / machineId / macMachineId / session-id /
 //! client-key / checksum / config-version,加**一个独立出口**。刷新与发包必须同出口 ——
 //! 这条在本 crate 里由 [`CursorProvider::client_for`] 保证:`chat`、`GetServerConfig`、
-//! `refresh_auth` 三条路径都从它取 client。
+//! `refresh_auth`、`account_quota` 四条路径都从它取 client。
 //!
 //! 已支持:多轮(历史折叠)、tool_use 往返(参数含数字/布尔/对象/数组)、
-//! thinking 透传、图像(内联)、PDF(我方抽文本层)、上游自报 usage。
+//! thinking 透传(含 Claude Code `adaptive`)、图像(内联)、PDF(我方抽文本层)、
+//! 上游自报 usage、官方账期用量查询。
 //!
 //! 未做:FileSyncService blob 上传(L2 文件附件)、
 //! Cursor 内建工具的代执行(**有意不做**:那等于跑模型选定的 shell 命令)。
 
 pub mod auth;
+pub mod cache_sim;
 pub mod login;
 mod chat;
 mod config;
@@ -35,7 +38,83 @@ mod models;
 mod pdf;
 mod protobuf;
 pub mod run;
+pub mod usage;
 pub mod wire;
+
+// 模型目录热追加(worker 30s 设置环回写;见 models::set_extra_models)。
+pub use models::set_extra_models;
+
+/// 内建工具护栏的**策略句**默认值(见 [`chat`] 里 `builtin_tool_guard` 的模块文档)。
+///
+/// 只有这几句自然语言是热配置的;工具闭集与能力替代表由代码按本次请求的 `tools`
+/// 固定生成,配置里没有占位符可拼错。
+///
+/// 2026-08-13 首版刻意**不含**「否则回答会被截断」这类后果威胁,也不点名
+/// 「Cursor 内建的终端/文件读写」—— 理由见 `builtin_tool_guard` 文档的
+/// 「刻意没有写进去的东西」一节。要试那两个变体,改设置项即可,不用重新部署。
+pub const DEFAULT_TOOL_GUARD_POLICY: &str = "清单里没有的能力,直接向用户说明你需要什么、\
+     并请他提供 —— 不要尝试调用清单外的工具(那些调用不会返回任何结果),\
+     也不要向用户解释这套工具命名规则。";
+
+/// 热配置的护栏策略句上限。够写三五句中文,又不至于让一次误粘贴把每个请求的
+/// 系统提示顶掉几千 token。
+const TOOL_GUARD_POLICY_MAX_CHARS: usize = 2000;
+
+/// 护栏策略句(进程级全局)。`None` = 未配 / 配置非法 → 用
+/// [`DEFAULT_TOOL_GUARD_POLICY`]。
+///
+/// 存 `Arc<str>` 而不是 `String`:读侧(每个请求都读)拿快照后**立刻放锁**,
+/// 绝不在拼几 KB 长提示的过程里持着锁。
+static TOOL_GUARD_POLICY: std::sync::RwLock<Option<Arc<str>>> =
+    std::sync::RwLock::new(None);
+
+/// 当前生效的护栏策略句。
+pub fn tool_guard_policy() -> Arc<str> {
+    // 快照即放锁(读守卫在表达式结束就 drop)。
+    let snap = TOOL_GUARD_POLICY.read().ok().and_then(|g| g.clone());
+    snap.unwrap_or_else(|| Arc::from(DEFAULT_TOOL_GUARD_POLICY))
+}
+
+/// 热应用护栏策略句(worker 30s 设置环调用)。空 = 回内置默认。
+///
+/// 校验失败**返回 Err 并保留上一份有效值**,绝不静默切回默认 —— 那会让一次误配置
+/// 表现成「护栏悄悄变了一版」,而这道护栏的效果正在被按小时对比。
+/// 非 cursor 进程从不读它,写到它身上是无害 no-op(与 `set_extra_models` 同)。
+pub fn set_tool_guard_policy(text: &str) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > TOOL_GUARD_POLICY_MAX_CHARS {
+        return Err(format!(
+            "护栏策略句过长({} 字符,上限 {})",
+            trimmed.chars().count(),
+            TOOL_GUARD_POLICY_MAX_CHARS
+        ));
+    }
+    let next = (!trimmed.is_empty()).then(|| Arc::from(trimmed));
+    match TOOL_GUARD_POLICY.write() {
+        Ok(mut g) => {
+            *g = next;
+            Ok(())
+        }
+        Err(_) => Err("护栏策略句锁已中毒".to_string()),
+    }
+}
+
+/// 串行化「改护栏策略句」的测试。它是**进程级全局**,并发跑的测试会互相顶掉对方的
+/// 配置(与 `models::CATALOG_TEST_LOCK` 同一个理由:`EXTRA_MODELS` 也是全局)。
+#[cfg(test)]
+pub(crate) static GUARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 当前策略句的短指纹,给 `/health` 与内建收口日志回显。
+///
+/// **只回显指纹不回显全文**:全文会跟着 worker 的健康快照到处走,而它是每个请求
+/// 都发给上游的系统提示的一部分。指纹足够回答「线上跑的是哪一版、从什么时候起」,
+/// 这正是按版本分桶比对收口率需要的那一个字段。
+pub fn tool_guard_rev() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(tool_guard_policy().as_bytes());
+    h.finalize()[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,7 +124,7 @@ use async_trait::async_trait;
 use gw_core::account::{Account, FieldSpec, FieldType};
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
 use gw_core::model::ModelInfo;
-use gw_core::provider::{CallCtx, ChatRequest, ChatStream, Provider};
+use gw_core::provider::{AccountQuota, CallCtx, ChatRequest, ChatStream, Provider};
 
 /// config_version 缓存 TTL:真 IDE 按 poll interval(分钟级)刷新,取 2 分钟保守值,
 /// 既避免每次 chat 都打一发 GetServerConfig,又能跟上服务端轮换。
@@ -91,6 +170,11 @@ const CURSOR_ACCOUNT_SCHEMA: &[FieldSpec] = &[
         .with_help("x-cursor-timezone,如 Asia/Shanghai / America/Los_Angeles。应与该号出口 IP 的地理位置一致,否则是关联特征。留空按 Asia/Shanghai"),
     FieldSpec::new("proxy", "出口代理", FieldType::String, false)
         .with_help("该账号专属出口(http/https/socks5)。防关联硬要求:推理、取 config、刷新 token 全走它。留空走 worker 默认出口"),
+    // 账号级模型白名单(2026-08-13 落地,此前休眠)。评审提的语义坑已按规格修:
+    // 缺失/null = 不限,空表/类型错 = 全禁(fail-closed),字段改名 model_allowlist,
+    // 规范存储 JSON 字符串数组(admin PATCH 写侧归一,CSV 只当输入形态)。
+    FieldSpec::new("model_allowlist", "可用模型白名单", FieldType::String, false)
+        .with_help("该号允许服务的模型,逗号分隔;条目是 Run 侧模型名或「前缀*」(星号仅限末尾),如 default,composer*,grok*。留空 = 不限"),
 ];
 
 #[derive(Debug, Clone)]
@@ -184,6 +268,10 @@ pub struct CursorProvider {
     config_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 服务端已建立的会话。见 [`ConvRegistry`]。
     conversations: Arc<ConvRegistry>,
+    /// 服务端 write_args 推来的资产(带图请求的附件副本)。见 [`AssetStore`]。
+    assets: Arc<AssetStore>,
+    /// 「上一轮被内建工具截断」的待发纠偏标记(见 [`TruncationNotices`])。
+    notices: Arc<TruncationNotices>,
 }
 
 /// 会话在**服务端**是否已经建立,以及建在哪个号上。
@@ -247,6 +335,160 @@ impl ConvRegistry {
 /// 取 2 小时是保守值:宁可多铺一次历史(代价=一次全量上下文),
 /// 也不要拿着过期的记录发 `Continuation`(代价=模型看不到历史却毫无报错)。
 const CONV_TTL: Duration = Duration::from_secs(2 * 3600);
+
+/// 服务端「写盘」调用(`write_args`)的内存兜底,**只认 `/assets/` 资产路径**。
+///
+/// 带图请求的服务端流程(2026-08-10 实物帧 + opencodex 的 `agent.v1` schema 核对):
+/// 服务端用内建 write 把附件字节推给客户端「落盘」(`/assets/attach-N-<uuid>.png`),
+/// 模型随后用内建 read 读同一路径把图看进去。真 IDE 有真磁盘所以无感;
+/// 我们没有 —— write 存这里,read 从这里回。不回执的代价是服务端 90s 心跳死等
+/// (带图请求全模型 502 的第二阶段病因)。
+///
+/// 按 conversation_id 分组、与 [`CONV_TTL`] 同寿命:服务端会话忘了,
+/// 资产副本也没用了。存的是**我们自己刚发上去的附件字节**,不是用户新数据。
+#[derive(Default, Debug)]
+pub(crate) struct AssetStore {
+    inner: Mutex<HashMap<String, ConvAssets>>,
+}
+
+#[derive(Debug)]
+struct ConvAssets {
+    files: HashMap<String, Vec<u8>>,
+    total: usize,
+    at: Instant,
+}
+
+/// 单文件/单会话上限:与 chat.rs 的附件闸同值(服务端推来的本就是我们发上去的附件,
+/// 只会更小不会更大;真超了说明上游行为变了,宁可丢资产也不放内存炸弹)。
+const ASSET_FILE_CAP: usize = 12 * 1024 * 1024;
+const ASSET_CONV_CAP: usize = 24 * 1024 * 1024;
+/// provider 级总闸:会话闸 × 会话数在两小时内可以无界增长(每个新 conversation_id
+/// 都是新桶),必须有全局上限。超了按最久未触的会话逐桶驱逐。
+const ASSET_GLOBAL_CAP: usize = 256 * 1024 * 1024;
+
+impl AssetStore {
+    /// 锁:毒化即恢复(同 [`ConvRegistry`] 的理由:纯缓存,不能让它变成全 provider 的 panic 点)。
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, ConvAssets>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 存一份资产。超上限(单文件/单会话/全局驱逐后仍放不下)返回 `false` ——
+    /// 调用方仍回执成功(别因我方内存策略把整轮搞死),但后续 read 会落空,日志里要留痕。
+    fn put(&self, conv: &str, path: &str, bytes: &[u8]) -> bool {
+        if bytes.len() > ASSET_FILE_CAP {
+            return false;
+        }
+        let mut map = self.map();
+        // 顺手清过期:这张表按会话增长,没人清就是内存泄漏。
+        map.retain(|_, e| e.at.elapsed() < CONV_TTL);
+        // **先过单会话闸**:这道闸不过,写入本来就要拒,不能先为别人驱逐牺牲品。
+        let (conv_total, old) = map
+            .get(conv)
+            .map(|e| (e.total, e.files.get(path).map_or(0, |v| v.len())))
+            .unwrap_or((0, 0));
+        if conv_total - old + bytes.len() > ASSET_CONV_CAP {
+            return false;
+        }
+        // 再过全局闸:按最久未触逐桶驱逐。当前会话**显式排除** —— 把自己的桶
+        // 逐掉再新建一个写入,同会话原有资产全灭,后续 read 全落空。
+        let mut global: usize = map.values().map(|e| e.total).sum();
+        // 投影要扣掉同路径旧值:覆盖写不是净增。
+        while global - old + bytes.len() > ASSET_GLOBAL_CAP {
+            let Some(oldest) = map
+                .iter()
+                .filter(|(k, _)| k.as_str() != conv)
+                .min_by_key(|(_, e)| e.at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(e) = map.remove(&oldest) {
+                global -= e.total;
+            }
+        }
+        if global - old + bytes.len() > ASSET_GLOBAL_CAP {
+            return false;
+        }
+        let e = map.entry(conv.to_string()).or_insert_with(|| ConvAssets {
+            files: HashMap::new(),
+            total: 0,
+            at: Instant::now(),
+        });
+        e.at = Instant::now();
+        e.total = e.total - old + bytes.len();
+        e.files.insert(path.to_string(), bytes.to_vec());
+        true
+    }
+
+    /// 取一份资产(模型 read 时回图)。不存在 → `None`(调用方走原来的收口);
+    /// 过期桶**顺手删掉** —— 只读路径不能把过期数据留到地老天荒。
+    fn get(&self, conv: &str, path: &str) -> Option<Vec<u8>> {
+        let mut map = self.map();
+        let e = map.get_mut(conv)?;
+        if e.at.elapsed() >= CONV_TTL {
+            map.remove(conv);
+            return None;
+        }
+        e.at = Instant::now();
+        e.files.get(path).cloned()
+    }
+}
+
+/// 「上一轮被内建工具截断」的待发纠偏标记,按 conversation 存。
+///
+/// ## 为什么不挂在 [`ConvRegistry`] 上
+///
+/// `ConvRegistry` 整张表被 `stateful` 开关门控(`CURSOR_STATEFUL=0` 时根本不写),
+/// 而纠偏与有状态会话无关:客户端每轮都重传全量历史,那段半截回答**在两种模式下
+/// 都在上下文里**,模型两种模式下都会重复撞墙。挂进去等于让一个退路开关顺手
+/// 关掉一个不相干的修复。
+///
+/// ## 为什么按 conversation 而不按 (conversation, 账号)
+///
+/// 触发重复调用的是**客户端历史里那段半截回答**,不是服务端会话状态。换号之后
+/// 客户端照样把它重传上来,风险不变,所以标记不该跟着账号失效。
+///
+/// 语义是**取走即消费**:只对紧接着的下一轮生效。留着不清会让同一段话术在整个
+/// 会话里反复出现,而模型早就照做了 —— 那就变成噪声。
+#[derive(Debug, Default)]
+pub struct TruncationNotices {
+    inner: Mutex<HashMap<String, (Option<&'static str>, Instant)>>,
+}
+
+/// 纠偏标记的存活时间。短到只覆盖「用户看到半截回答、马上追问」这一下;
+/// 隔了半小时才回来的那次,上下文早变了,那句「你上一轮…」会指错地方。
+const NOTICE_TTL: Duration = Duration::from_secs(600);
+/// 标记表的条数上限(防一个爬虫式客户端把它顶爆)。超了先清过期,还超就整表丢弃 ——
+/// 纠偏是尽力而为的优化,丢标记只是少一次提醒,绝不能变成内存泄漏。
+const NOTICE_MAX: usize = 4096;
+
+impl TruncationNotices {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Option<&'static str>, Instant)>> {
+        // 锁中毒也要能继续:纠偏丢了只是少一次提醒,不该把整条推理路径带崩。
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 记下「这个会话上一轮被内建工具截断了」。`cap` = 认得出的能力说法,`None` = 认不出。
+    pub fn record(&self, conversation_id: &str, cap: Option<&'static str>) {
+        if conversation_id.is_empty() {
+            return;
+        }
+        let mut map = self.map();
+        map.retain(|_, (_, at)| at.elapsed() < NOTICE_TTL);
+        if map.len() >= NOTICE_MAX {
+            tracing::warn!(entries = map.len(), "cursor 纠偏标记表超上限,整表丢弃");
+            map.clear();
+        }
+        map.insert(conversation_id.to_string(), (cap, Instant::now()));
+    }
+
+    /// 取走标记(消费语义)。过期的当不存在。
+    pub fn take(&self, conversation_id: &str) -> Option<Option<&'static str>> {
+        let mut map = self.map();
+        let (cap, at) = map.remove(conversation_id)?;
+        (at.elapsed() < NOTICE_TTL).then_some(cap)
+    }
+}
 
 impl ConvRegistry {
     /// 判定本次该用哪种形态。**任何不确定都返回 `Opening`** —— 降级只多花 token,
@@ -317,6 +559,8 @@ impl CursorProvider {
             config_cache: Mutex::new(HashMap::new()),
             config_gates: Mutex::new(HashMap::new()),
             conversations: Arc::new(ConvRegistry::from_env()),
+            assets: Arc::new(AssetStore::default()),
+            notices: Arc::new(TruncationNotices::default()),
         }
     }
 
@@ -613,6 +857,20 @@ impl Provider for CursorProvider {
         Ok(models::list())
     }
 
+    /// 账号级模型权限过滤(`extra.models` 白名单,语义见
+    /// [`models::account_supports`])。
+    ///
+    /// Cursor 账号的模型权限不齐:一部分号只有 `composer`/`default`/`grok`,
+    /// claude / gpt 要另外的计费额度。不过滤时每个 claude 请求都可能落到没权限的号上,
+    /// 换来一次 `ERROR_RATE_LIMITED_CHANGEABLE` —— 调度层会记 `(号,模型)` 6h 不可用
+    /// 并换号,但那是先赔一次失败才学会,且每次 TTL 过期要重赔。
+    ///
+    /// 调度器在锁内对每个候选号调用,所以这里**必须无副作用且快**:
+    /// 只读 `extra`,不查上游。
+    fn account_supports_model(&self, account: &Account, model: &str) -> bool {
+        models::account_supports(account, model)
+    }
+
     /// 会话亲和键。**必须覆盖** —— 不覆盖的后果见
     /// [`chat::affinity_key_from_body`](crate::chat) 的文档:trait 默认的 `None` 会让
     /// worker 把 `CallCtx.session_id`/`cache_key` 装成空串,进而让上游 `1.5` 与
@@ -671,9 +929,14 @@ impl Provider for CursorProvider {
                     .conversations
                     .phase_for(&conversation_id, &ctx.account.account_id),
                 conversation_id: conversation_id.clone(),
+                // 与 token/machine_id/phase 同源:都从这一个 ctx.account 取,
+                // 调度换号时缓存键跟着换(服务端会话 per-account,换号=冷启动)。
+                account_id: ctx.account.account_id.clone(),
                 shape: self.tuning.shape,
                 context_frames: self.tuning.context_frames,
                 keep_stream_open: self.tuning.keep_stream_open,
+                assets: self.assets.clone(),
+                notices: self.notices.clone(),
             },
             req,
             // 只在**成功收尾**后才登记会话已建立。失败时清掉,下次从首轮重铺 ——
@@ -751,12 +1014,73 @@ impl Provider for CursorProvider {
         tracing::info!(account = %account.account_id, "cursor token 已刷新");
         Ok(updated)
     }
+
+    /// 官方账期用量(只读 `GetCurrentPeriodUsage` + `GetHardLimit`)。走账号专属出口,
+    /// 与推理同 IP。
+    async fn account_quota(
+        &self,
+        account: &Account,
+    ) -> Result<Option<AccountQuota>, UpstreamError> {
+        let client = self.client_for(account)?;
+        let mut q = usage::get_account_quota(&client, account, &self.cfg.api_host).await?;
+        // 超额开关/上限来自 GetHardLimit(用量接口只在**已开启**时给数字,推不出开关态)。
+        //
+        // 这一跳失败**不能**让整个配额查询失败:套餐额度是账号页的主信息,不该被一个
+        // 附加字段拖垮(超额那栏退化成"—")。
+        match usage::get_on_demand(&client, account, &self.cfg.api_host).await {
+            Ok(od) => {
+                // 已用金额只有用量接口有,GetHardLimit 不带 → 从上一步的结果里接回来,
+                // 否则会把已用覆盖成 0。
+                let used = q.on_demand.as_ref().map(|p| p.used).unwrap_or(0.0);
+                q.on_demand = Some(gw_core::provider::OnDemandQuota { used, ..od });
+            }
+            Err(e) => tracing::debug!(account = %account.account_id,
+                "cursor GetHardLimit 失败,超额开关未知(不影响套餐额度): {e}"),
+        }
+        Ok(Some(q))
+    }
+
+    fn on_demand_supported(&self) -> bool {
+        true
+    }
+
+    /// 设超额额度(`SetHardLimit`)。**写操作**,只由 admin 显式调用。
+    async fn set_on_demand_limit(
+        &self,
+        account: &Account,
+        limit_usd: Option<u32>,
+    ) -> Result<(), UpstreamError> {
+        let client = self.client_for(account)?;
+        usage::set_on_demand(&client, account, &self.cfg.api_host, limit_usd).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// 资产库:同会话写后可读、跨会话隔离、容量闸挡内存炸弹。
+    #[test]
+    fn 资产库存取与上限() {
+        let s = AssetStore::default();
+        assert!(s.put("c1", "/assets/a.png", b"123"));
+        assert_eq!(s.get("c1", "/assets/a.png").as_deref(), Some(&b"123"[..]));
+        // 跨会话隔离:同路径另一个会话取不到。
+        assert!(s.get("c2", "/assets/a.png").is_none());
+        // 覆盖同路径:总量按差值更新,不被旧值重复计数。
+        assert!(s.put("c1", "/assets/a.png", b"12345"));
+        assert_eq!(s.get("c1", "/assets/a.png").as_deref(), Some(&b"12345"[..]));
+        // 单文件超限直接拒。
+        assert!(!s.put("c1", "/assets/big.png", &vec![0u8; ASSET_FILE_CAP + 1]));
+        assert!(s.get("c1", "/assets/big.png").is_none());
+        // 单会话总量超限也拒:两个 12MB 各自没过单文件闸,但合计超 24MB 会话闸。
+        assert!(s.put("c1", "/assets/f1.bin", &vec![0u8; ASSET_FILE_CAP]));
+        assert!(!s.put("c1", "/assets/f2.bin", &vec![0u8; ASSET_FILE_CAP]));
+        assert!(s.get("c1", "/assets/f2.bin").is_none());
+        // 没存过的路径永远取不到(调用方据此走收口)。
+        assert!(s.get("c1", "/etc/passwd").is_none());
+    }
 
     fn acct(pairs: &[(&str, &str)]) -> Account {
         let mut e = BTreeMap::new();
@@ -768,6 +1092,7 @@ mod tests {
             provider: "cursor".into(),
             max_concurrency: 2,
             disabled: false,
+            created_at: 0,
             extra: e,
         }
     }
@@ -817,6 +1142,11 @@ mod tests {
             let spec = s.iter().find(|x| x.name == f).unwrap();
             assert!(matches!(spec.field_type, FieldType::Password), "{f} 应为 Password");
         }
+        // 模型白名单已定稿落地(2026-08-13):字段名 model_allowlist,
+        // 缺失/null=不限、空表/类型错=全禁,匹配器在 gw-core。旧键名 `models`
+        // 从未有账号配过,不留兼容 —— schema 里绝不能再出现旧键。
+        assert!(has("model_allowlist"), "白名单字段该进 schema 了(语义已定稿)");
+        assert!(!has("models"), "旧键名不许复活");
     }
 
     #[test]

@@ -122,6 +122,7 @@ async fn main() {
         provider: "cursor".to_string(),
         max_concurrency: 2,
         disabled: false,
+        created_at: 0,
         extra,
     };
 

@@ -343,6 +343,11 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
     let mut app = Router::new()
         .route("/v1/messages", post(forward))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        // OpenAI 线缆:router 只做鉴权 + 选 worker + **字节透传**,协议转换全在 worker
+        // (转换要双向,出站得反解 SSE —— 放这里没有任何好处)。
+        // 这两条路径在非 cursor 的 worker 上不存在,worker 会回 404,原样透回客户端。
+        .route("/v1/chat/completions", post(forward_openai_chat))
+        .route("/v1/responses", post(forward_openai_responses))
         .route("/v1/models", get(forward_models))
         .route("/health", get(health))
         .with_state(state);
@@ -442,10 +447,42 @@ async fn count_tokens(
     Json(serde_json::json!({"input_tokens": tokens})).into_response()
 }
 
+/// worker 侧的对外路径。router 逐字节透传,只用它决定 POST 到 worker 的哪条路由。
+const PATH_MESSAGES: &str = "/v1/messages";
+const PATH_OPENAI_CHAT: &str = "/v1/chat/completions";
+const PATH_OPENAI_RESPONSES: &str = "/v1/responses";
+
 async fn forward(
     State(st): State<Arc<RouterState>>,
     headers: HeaderMap,
     body: Bytes,
+) -> axum::response::Response {
+    forward_to(st, headers, body, PATH_MESSAGES).await
+}
+
+/// `POST /v1/chat/completions` —— 与 [`forward`] 同一条转发路径,只换 worker 侧的 URL。
+async fn forward_openai_chat(
+    State(st): State<Arc<RouterState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    forward_to(st, headers, body, PATH_OPENAI_CHAT).await
+}
+
+/// `POST /v1/responses` —— 同上。
+async fn forward_openai_responses(
+    State(st): State<Arc<RouterState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    forward_to(st, headers, body, PATH_OPENAI_RESPONSES).await
+}
+
+async fn forward_to(
+    st: Arc<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+    path: &'static str,
 ) -> axum::response::Response {
     // ① 鉴权(拿到客户 key 用于归属 + 分组用于派发)。
     let authed = match authorize(&st, &headers).await {
@@ -458,15 +495,11 @@ async fn forward(
 
     // ② 在该分组的 worker 子集内选号(会话亲和)。子集为空 = 该组无对应 worker:
     // 明确 503,而非静默把请求错喂给别组 worker(此前数据面无组逻辑的根因)。
-    let session_id = parse_session_id(&body);
+    let session_id = parse_session_id(&body, path);
     let target = pick_worker(&st, session_id.as_deref(), group);
     let Some(target) = target else {
         tracing::warn!(group, "请求命中无可用 worker 的分组,拒绝");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            CLIENT_UNAVAILABLE,
-        )
-            .into_response();
+        return wire_unavailable(path, StatusCode::SERVICE_UNAVAILABLE);
     };
 
     // ③ 转发(流式透传)。send() 失败 = worker 进程可能已挂但仍在配置里(连接拒绝):
@@ -475,15 +508,82 @@ async fn forward(
     // client 未设总超时,Err 基本是 connect 级错误,重复送达上游的风险可忽略。
     let mut target = target;
     let mut failed_over = false;
+    // 已经因「无此协议入口」被排除掉的实例(与连接失败的 `failed_over` 分开计数)。
+    let mut tried: Vec<u32> = Vec::new();
     loop {
-        match send_messages_to_worker(&st, &target, &headers, &body, client_key.as_deref(), Some(group))
-            .await
+        match send_messages_to_worker(
+            &st,
+            &target,
+            &headers,
+            &body,
+            client_key.as_deref(),
+            Some(group),
+            path,
+        )
+        .await
         {
+            // 404 + OpenAI 路径 = 这个 worker 的 provider 家族没挂 OpenAI 入口。
+            //
+            // router 的拓扑模型里没有 provider family(它读 instances.yaml,family 在
+            // accounts.yaml 的组里),所以选 worker 时无法按「协议能力」过滤。分组的 owner
+            // 集合若同时含 cursor 与非 cursor worker,按负载就可能选中挂不了的那个。
+            // 而 404 对 reqwest 是**成功响应** —— 不做处理的话客户拿到 404、
+            // 且会话还会继续亲和到这个永远 404 的 worker(对抗评审 Architect#6)。
+            // 复用既有故障转移:它会丢弃指向该实例的亲和并在同组其余 worker 里重选。
+            // 404 + OpenAI 路径 = 这个 worker 的 provider 家族没挂 OpenAI 入口。
+            //
+            // router 的拓扑模型里没有 provider family(它读 instances.yaml,family 在
+            // accounts.yaml 的组里),所以选 worker 时无法按「协议能力」过滤。分组的 owner
+            // 集合若同时含 cursor 与非 cursor worker,按负载就可能选中挂不了的那个。
+            // 而 404 对 reqwest 是**成功响应** —— 不做处理的话客户拿到 404、
+            // 且会话还会继续亲和到这个永远 404 的 worker(对抗评审 Architect#6)。
+            //
+            // ⚠️ 这里**不能**和下面的连接失败共用一个 `failed_over` 布尔:mixed-family 组下
+            // A=kiro、B=dario、C=cursor,只重试一次会在 B 上宣告失败,可用的 C 从未试过
+            // (对抗评审 Minimalist#3)。故按「试过哪些实例」逐个排除,直到穷尽同组候选。
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::NOT_FOUND && path != PATH_MESSAGES =>
+            {
+                tried.push(target.instance);
+                match capability_failover(&st, session_id.as_deref(), group, &tried) {
+                    Some(t) => {
+                        tracing::warn!(
+                            from = target.instance, to = t.instance, path,
+                            "worker 无此协议入口(404),换同组其余 worker 重发"
+                        );
+                        target = t;
+                    }
+                    // 同组的 worker 全试过了:这是配置问题(该组没有支持本协议的 worker)。
+                    // 原样把 404 交回客户端 —— 它的语义正是「这个端点在这里不存在」。
+                    None => {
+                        tracing::warn!(group, path, tried = ?tried,
+                            "该分组没有支持本协议的 worker");
+                        return proxy_response(resp);
+                    }
+                }
+            }
             Ok(resp) => return proxy_response(resp),
             Err(e) => {
                 tracing::error!(instance = target.instance, "转发到 worker 失败: {e}");
+                // OpenAI 路径:连接失败与「无此协议入口」共用**同一个** `tried` 排除集。
+                // 分开算的后果:A 不支持协议(进 tried)、B 连接失败(走 failover_target,
+                // 它只排除 B、不看 tried)→ 可能又选回 A → 最终 502,而真正可用的 C
+                // 从头到尾没被试过(对抗评审 Skeptic#5 后半)。
+                // Anthropic 路径保持原来那套(单次 failed_over + failover_target),逐字节不变。
+                if path != PATH_MESSAGES {
+                    tried.push(target.instance);
+                    match capability_failover(&st, session_id.as_deref(), group, &tried) {
+                        Some(t) => {
+                            tracing::warn!(from = target.instance, to = t.instance,
+                                "故障转移:换 worker 重发(已排除 {} 个实例)", tried.len());
+                            target = t;
+                            continue;
+                        }
+                        None => return wire_unavailable(path, StatusCode::BAD_GATEWAY),
+                    }
+                }
                 if failed_over {
-                    return (StatusCode::BAD_GATEWAY, CLIENT_UNAVAILABLE).into_response();
+                    return wire_unavailable(path, StatusCode::BAD_GATEWAY);
                 }
                 match failover_target(&st, session_id.as_deref(), group, target.instance) {
                     Some(t) => {
@@ -492,9 +592,7 @@ async fn forward(
                         target = t;
                         failed_over = true;
                     }
-                    None => {
-                        return (StatusCode::BAD_GATEWAY, CLIENT_UNAVAILABLE).into_response()
-                    }
+                    None => return wire_unavailable(path, StatusCode::BAD_GATEWAY),
                 }
             }
         }
@@ -510,8 +608,9 @@ async fn send_messages_to_worker(
     body: &Bytes,
     client_key: Option<&str>,
     group: Option<&str>,
+    path: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let url = format!("{}/v1/messages", target.base_url);
+    let url = format!("{}{path}", target.base_url);
     let mut req = st.http.post(&url).body(body.clone());
     if let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE) {
         req = req.header(axum::http::header::CONTENT_TYPE, ct);
@@ -541,6 +640,71 @@ fn proxy_response(resp: reqwest::Response) -> axum::response::Response {
     builder
         .body(body)
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "构造响应失败").into_response())
+}
+
+/// router 侧「服务不可用」的**按线缆**响应体。
+///
+/// 旧实现一律回纯文本 [`CLIENT_UNAVAILABLE`]。对 Anthropic 客户端这是既有行为(不动),
+/// 但 OpenAI SDK / NewAPI 会按 `{"error":{...}}` schema 解码 —— 拿到纯文本就只能报
+/// 一个「无法解析上游响应」,把「池子暂时没号」这个明确原因彻底盖掉
+/// (对抗评审 Minimalist#4)。文案仍是同一句中性话,不泄露分组名/账号池形态。
+fn wire_unavailable(path: &str, code: StatusCode) -> axum::response::Response {
+    if path == PATH_MESSAGES {
+        // Anthropic 路径**逐字节**保持旧行为(纯文本)。
+        return (code, CLIENT_UNAVAILABLE).into_response();
+    }
+    (
+        code,
+        Json(gw_core::openai::openai_error_body(
+            code.as_u16(),
+            CLIENT_UNAVAILABLE,
+            None,
+            None,
+        )),
+    )
+        .into_response()
+}
+
+/// 「无此协议入口」的故障转移:在同组里挑一个**还没试过**的 worker。
+///
+/// 与 [`failover_target`] 的区别是它按 `tried` 列表排除多个实例(那个只排除一个),
+/// 因为 mixed-family 分组里可能连着撞好几个不支持的 worker。同样会丢弃指向被排除实例的
+/// 会话亲和 —— 不丢的话这条会话会一直被钉在 404 的 worker 上。
+fn capability_failover(
+    st: &RouterState,
+    session_id: Option<&str>,
+    group: &str,
+    tried: &[u32],
+) -> Option<WorkerTarget> {
+    let owners = owners_for(st, group);
+    let candidates: Vec<WorkerTarget> = st
+        .workers
+        .iter()
+        .filter(|w| owners.iter().any(|o| o == &w.account_group) && !tried.contains(&w.instance))
+        .cloned()
+        .collect();
+    // ⚠️ 键必须走 [`affinity_key`](`group + NUL + sid`)。第一版这里用了**裸 sid**:
+    // 于是既没删掉那条指向 404 worker 的真条目、又插了一条没人会查的幽灵条目 ——
+    // 会话下一轮照样打到 404 的 worker 上,故障转移形同虚设(对抗评审 Skeptic#5)。
+    //
+    // 删+插在**同一把锁**内完成:分两次加锁会让并发请求在中间插进来互相覆盖。
+    let mut aff = st.affinity.lock();
+    if let Some(sid) = session_id {
+        aff.entries.remove(&affinity_key(group, sid));
+    }
+    // 与 `failover_target` 同口径按活跃负载选,而不是取候选表第一个 ——
+    // 取第一个会让同组所有会话在同一个 worker 上堆起来。
+    let chosen = least_loaded_locked(&candidates, &aff.entries)?;
+    if let Some(sid) = session_id {
+        aff.entries.insert(
+            affinity_key(group, sid),
+            AffinityEntry {
+                instance: chosen.instance,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+    Some(chosen)
 }
 
 /// 转发失败后的故障转移:丢弃指向故障实例的会话亲和,在**同组的其余** worker 里按
@@ -751,8 +915,21 @@ fn least_loaded_locked(
 /// **与 worker 选号同源**的 conversationId 派生(system 锚点 + 前2条 user 哈希)。这样
 /// router(选 worker)和 worker(选组内账号)、cache_sim(命中估算)三处用**同一会话键**,
 /// 同会话稳定钉同 worker→同账号→缓存热(审查 #131①:统一身份链)。仍提不到才 None(轮转)。
-fn parse_session_id(body: &Bytes) -> Option<String> {
+/// 从请求体派生会话键。**按路径分派,不靠试解析猜协议。**
+///
+/// 为什么不能试解析:ChatCompletions 的 `messages`(role + content)在结构上与
+/// Anthropic Messages 兼容,带 `max_tokens` 时 `affinity_key_from_body` 会**解析成功**,
+/// 于是 OpenAI 专用的锚根本轮不到执行 —— 走哪条路取决于客户端恰好带了哪些字段,
+/// 这种「靠形状猜协议」的行为在客户端换个 SDK 时就会静默改变(对抗评审 Architect#7)。
+/// 路径是权威的:router 自己就是按路径挂的 handler。
+fn parse_session_id(body: &Bytes, path: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if path != PATH_MESSAGES {
+        // OpenAI 线缆:只作用于 router 的 **session→worker** 亲和。worker 侧的
+        // **账号**亲和是在协议转换之后由 `Provider::affinity_key` 从 Anthropic body
+        // 派生的,与这里无关 —— 两层各管一件事,不必共享同一个键。
+        return gw_core::openai::session_hint(&v);
+    }
     if let Some(user_id) = v.get("metadata").and_then(|m| m.get("user_id")).and_then(|u| u.as_str()) {
         if let Some(sid) = extract_session_from_metadata(user_id) {
             return Some(sid);
@@ -916,6 +1093,76 @@ mod tests {
         assert_eq!(v["status"], "ok");
     }
 
+    /// OpenAI 形状的请求体也要能派生会话,否则同一会话会在同组 worker 之间弹,
+    /// 把下游的账号亲和整个打散(那层才是保上游 prefix cache 的)。
+    #[test]
+    fn openai_请求体也能派生会话_且同会话稳定() {
+        let chat = |q1: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "model": "grok-4.5",
+                    "messages": [
+                        {"role": "system", "content": "S"},
+                        {"role": "user", "content": q1},
+                        {"role": "assistant", "content": "A1"},
+                        {"role": "user", "content": "Q2"},
+                    ]
+                })
+                .to_string(),
+            )
+        };
+        let a = parse_session_id(&chat("Q1"), PATH_OPENAI_CHAT).expect("OpenAI body 必须能派生会话");
+        // 同一会话再追一轮:锚(system + 前两条 user)没变 → 派生结果必须一样。
+        let longer = Bytes::from(
+            serde_json::json!({
+                "model": "grok-4.5",
+                "messages": [
+                    {"role": "system", "content": "S"},
+                    {"role": "user", "content": "Q1"},
+                    {"role": "assistant", "content": "A1"},
+                    {"role": "user", "content": "Q2"},
+                    {"role": "assistant", "content": "A2"},
+                    {"role": "user", "content": "Q3"},
+                ]
+            })
+            .to_string(),
+        );
+        assert_eq!(a, parse_session_id(&longer, PATH_OPENAI_CHAT).unwrap());
+        // 换个会话(换开场问题)就该换 worker 候选。
+        assert_ne!(a, parse_session_id(&chat("另一个开场"), PATH_OPENAI_CHAT).unwrap());
+        // Anthropic 路径**不走** OpenAI 锚:同一份 body 走两条路径不该得到同一个键。
+        // (走 Anthropic 路径时它要么被 kiro 派生成另一个键、要么根本解析不出来 ——
+        // 取决于客户端恰好带了哪些可选字段,这种脆弱性正是「按路径分派」要消掉的。)
+        assert_ne!(
+            Some(a.clone()),
+            parse_session_id(&chat("Q1"), PATH_MESSAGES),
+            "协议判定必须看路径,不能靠试解析请求体"
+        );
+
+        // Responses 形状同理。
+        let resp_body = Bytes::from(
+            serde_json::json!({"model":"m","instructions":"I","input":"hello"}).to_string(),
+        );
+        assert!(parse_session_id(&resp_body, PATH_OPENAI_RESPONSES).is_some());
+    }
+
+    /// Anthropic 请求体的派生路径**没变**:仍优先 metadata.user_id,其次 kiro 派生。
+    #[test]
+    fn anthropic_请求体仍走原来的两条派生路径() {
+        let with_meta = Bytes::from(
+            serde_json::json!({
+                "model":"m","messages":[{"role":"user","content":"hi"}],
+                "metadata": {"user_id": "user_abc_session_deadbeef"}
+            })
+            .to_string(),
+        );
+        let sid = parse_session_id(&with_meta, PATH_MESSAGES).unwrap();
+        assert_eq!(
+            sid, "session_deadbeef",
+            "metadata.user_id 优先级最高,不能被新回退顶掉"
+        );
+    }
+
     #[test]
     fn extract_bearer_accepts_x_api_key_and_authorization() {
         // Anthropic 标准头(NewAPI Claude 渠道 / Anthropic SDK / Claude Code 都发这个)。
@@ -958,7 +1205,7 @@ mod tests {
             })
             .to_string(),
         );
-        assert_eq!(parse_session_id(&body), Some("sess-xyz".into()));
+        assert_eq!(parse_session_id(&body, PATH_MESSAGES), Some("sess-xyz".into()));
     }
 
     /// 用与生产 router/worker 同形的 layer(读 SystemConfig 的有效上限)验证 DefaultBodyLimit
@@ -1031,7 +1278,7 @@ mod tests {
     #[test]
     fn parse_session_none_when_absent() {
         let body = Bytes::from(serde_json::json!({"model": "m"}).to_string());
-        assert_eq!(parse_session_id(&body), None);
+        assert_eq!(parse_session_id(&body, PATH_MESSAGES), None);
     }
 
     #[test]
@@ -1047,8 +1294,8 @@ mod tests {
                 .to_string(),
             )
         };
-        let k1 = parse_session_id(&mk());
-        let k2 = parse_session_id(&mk());
+        let k1 = parse_session_id(&mk(), PATH_MESSAGES);
+        let k2 = parse_session_id(&mk(), PATH_MESSAGES);
         assert!(k1.is_some(), "有 messages 时应派生出会话键");
         assert_eq!(k1, k2, "同内容派生的会话键必须稳定");
     }

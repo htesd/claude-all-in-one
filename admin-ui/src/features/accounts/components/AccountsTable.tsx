@@ -20,6 +20,8 @@ interface AccountsTableProps {
   groupColors: Map<string, string>
   /** 配额列口径:'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario)。决定列头与单元格渲染。 */
   quotaKind: QuotaKind
+  /** 是否显示超额（on-demand）列 —— 仅支持的 provider（Cursor）为 true。 */
+  showOnDemand: boolean
   /** 当前有 mutation 进行中的 account_id（仅该行操作置灰）。 */
   busyId: string | null
   onToggleDisabled: (row: AccountRow) => void
@@ -27,6 +29,9 @@ interface AccountsTableProps {
   onDelete: (id: string) => void
   onReset: (id: string) => void
   onRefresh: (id: string) => void
+  onViewModels: (row: AccountRow) => void
+  /** 打开超额额度设置弹窗。 */
+  onEditOnDemand: (row: AccountRow) => void
 }
 
 /** 账号列表玻璃卡表格：配置行 + worker 运行态的 merge 视图。 */
@@ -37,12 +42,15 @@ export function AccountsTable({
   runtimeState,
   groupColors,
   quotaKind,
+  showOnDemand,
   busyId,
   onToggleDisabled,
   onEdit,
   onDelete,
   onReset,
   onRefresh,
+  onViewModels,
+  onEditOnDemand,
 }: AccountsTableProps) {
   const { t } = useI18n()
 
@@ -51,7 +59,7 @@ export function AccountsTable({
     { label: t('table.group') },
     { label: t('table.provider') },
     { label: t('table.status') },
-    // 配额列头随口径切换:积分(Kiro) ↔ 限额 5h/7d(ccmax/dario) ↔ 通用「限额」(cursor 等无配额概念的 provider,单元格恒为 —)。
+    // 配额列头随口径切换:积分/美元(Kiro·Cursor) ↔ 限额 5h/7d(ccmax/dario) ↔ 通用「限额」。
     {
       label:
         quotaKind === 'windows'
@@ -61,6 +69,9 @@ export function AccountsTable({
             : t('table.quota'),
       right: true,
     },
+    // 超额列只在支持的 provider(目前仅 Cursor)出现:别的 provider 没这概念,
+    // 常驻一列全是「—」纯属噪音。
+    ...(showOnDemand ? [{ label: t('table.onDemand'), right: true }] : []),
     { label: t('table.concurrency'), right: true },
     { label: t('table.queue'), right: true },
     { label: t('table.priority'), right: true },
@@ -116,12 +127,15 @@ export function AccountsTable({
                 runtimeState={runtimeState}
                 groupColors={groupColors}
                 quotaKind={quotaKind}
+                showOnDemand={showOnDemand}
                 busy={busyId === row.account_id}
                 onToggleDisabled={onToggleDisabled}
                 onEdit={onEdit}
                 onDelete={onDelete}
                 onReset={onReset}
                 onRefresh={onRefresh}
+                onViewModels={onViewModels}
+                onEditOnDemand={onEditOnDemand}
               />
             ))
           )}

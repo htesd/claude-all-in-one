@@ -254,6 +254,7 @@ mod tests {
             provider: "kiro".into(),
             max_concurrency: 1,
             disabled: false,
+            created_at: 0,
             extra: map,
         })
     }

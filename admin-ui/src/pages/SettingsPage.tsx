@@ -7,12 +7,20 @@ import { ErrorNote } from '@/components/ui/error-note'
 import { RestockSettingsCard } from '@/features/restock/components/RestockSettingsCard'
 import { WorkerEffectiveCard } from '@/features/settings/components/WorkerEffectiveCard'
 import { useSettings, useUpdateSettings } from '@/features/settings/hooks'
+import { useGroups } from '@/features/groups/hooks'
 import type { SystemSettings, SystemSettingsPatch, ThinkingEffort } from '@/features/settings/types'
 import { THINKING_EFFORTS } from '@/features/settings/types'
 import { useI18n } from '@/lib/i18n'
 
 const inputClass =
   'w-full rounded-2xl border bg-input px-4 py-2.5 text-sm text-foreground outline-none transition-colors placeholder:text-muted-foreground'
+
+/** 一行分组暖机策略的表单态(数字以字符串存储,提交时解析)。 */
+interface WarmupPolicyRow {
+  group: string
+  rpm: string
+  hours: string
+}
 
 /** 表单内部状态：数字字段均以字符串存储，提交时解析。 */
 interface FormState {
@@ -32,7 +40,17 @@ interface FormState {
   affinity_ttl_secs: string
   max_failures: string
   max_switch_attempts: string
+  /** RPM 闸等待预算(毫秒)。 */
+  rpm_wait_ms: string
   quota_poll_enabled: boolean
+  /** 低优先新号暖机(全局两期,按分组策略未覆盖的组走这里)。 */
+  warmup_enabled: boolean
+  warmup_phase1_hours: string
+  warmup_phase1_rpm: string
+  warmup_phase2_hours: string
+  warmup_phase2_rpm: string
+  /** 按分组的暖机策略编辑行。 */
+  warmup_policies: WarmupPolicyRow[]
   image_enabled: boolean
   image_max_long_edge: string
   image_max_pixels_single: string
@@ -63,7 +81,19 @@ function settingsToForm(s: SystemSettings): FormState {
     affinity_ttl_secs: String(s.affinity_ttl_secs),
     max_failures: String(s.max_failures),
     max_switch_attempts: String(s.max_switch_attempts),
+    // 以下字段旧版本后端可能不返回,与 default_thinking_effort 同口径地补基线默认。
+    rpm_wait_ms: String(s.rpm_wait_ms ?? 10000),
     quota_poll_enabled: s.quota_poll_enabled,
+    warmup_enabled: s.warmup_enabled ?? true,
+    warmup_phase1_hours: String(s.warmup_phase1_hours ?? 2),
+    warmup_phase1_rpm: String(s.warmup_phase1_rpm ?? 2),
+    warmup_phase2_hours: String(s.warmup_phase2_hours ?? 24),
+    warmup_phase2_rpm: String(s.warmup_phase2_rpm ?? 6),
+    warmup_policies: Object.entries(s.warmup_group_policies ?? {}).map(([group, p]) => ({
+      group,
+      rpm: String(p.rpm),
+      hours: String(p.hours),
+    })),
     image_enabled: s.image_enabled,
     image_max_long_edge: String(s.image_max_long_edge),
     image_max_pixels_single: String(s.image_max_pixels_single),
@@ -156,6 +186,54 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
     }
   }
 
+  // 新增字段(旧版本后端可能不返回):与「基线默认」比较,避免对旧后端捎带未知字段
+  // (与 default_thinking_effort 的 ?? 兜底比较同口径)。
+  // 解析用 Number+isInteger 而非 parseInt:'1e3' / '2.5' 这类输入不该被静默截断
+  // (对抗审核 [中]);非法值=不提交该字段(与既有 NaN 跳过口径一致)。
+  const strictInt = (s: string): number | null => {
+    const n = Number(s)
+    return s.trim() !== '' && Number.isInteger(n) && n >= 0 ? n : null
+  }
+  const newIntFields: Array<[keyof FormState, keyof SystemSettings, number]> = [
+    ['rpm_wait_ms', 'rpm_wait_ms', 10000],
+    ['warmup_phase1_hours', 'warmup_phase1_hours', 2],
+    ['warmup_phase1_rpm', 'warmup_phase1_rpm', 2],
+    ['warmup_phase2_hours', 'warmup_phase2_hours', 24],
+    ['warmup_phase2_rpm', 'warmup_phase2_rpm', 6],
+  ]
+  for (const [fk, sk, def] of newIntFields) {
+    const parsed = strictInt(form[fk] as string)
+    if (parsed !== null && parsed !== ((original[sk] as number | undefined) ?? def)) {
+      ;(patch as Record<string, unknown>)[sk] = parsed
+    }
+  }
+  if (form.warmup_enabled !== (original.warmup_enabled ?? true)) {
+    patch.warmup_enabled = form.warmup_enabled
+  }
+
+  // 按分组暖机策略:编辑行 → map(空组名/非法数字行丢弃;同组名后行覆盖前行,
+  // 但 UI 已在下拉里排除其他行已用的组名,正常路径到不了覆盖)。
+  const policyMap: Record<string, { rpm: number; hours: number }> = {}
+  for (const row of form.warmup_policies) {
+    const group = row.group.trim()
+    const rpm = strictInt(row.rpm)
+    const hours = strictInt(row.hours)
+    if (group === '' || rpm === null || hours === null) continue
+    policyMap[group] = { rpm, hours }
+  }
+  const serverPolicies = original.warmup_group_policies ?? {}
+  const samePolicies =
+    Object.keys(policyMap).length === Object.keys(serverPolicies).length &&
+    Object.entries(policyMap).every(([g, p]) => {
+      const sp = serverPolicies[g]
+      return sp !== undefined && sp.rpm === p.rpm && sp.hours === p.hours
+    })
+  if (!samePolicies) {
+    // 空表发 **显式空 map** 而不是 null:null 的语义是「删 overlay 回 YAML 基线」,
+    // 若 YAML 配了非空策略,删完全部行保存后策略会复活(对抗审核 [中])。
+    patch.warmup_group_policies = policyMap
+  }
+
   // 枚举字段(档位):只在变了才回传。比较对象必须与 settingsToForm 同一口径地补默认值 ——
   // 直接跟原始响应比，遇到不返回该字段的旧后端就会 `'high' !== undefined` 恒成立，于是
   // 哪怕用户只改了代理也会捎带这个字段，被旧后端的 deny_unknown_fields 判 400，整个保存失败。
@@ -169,10 +247,12 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
 export default function SettingsPage() {
   const { t } = useI18n()
   const { data, isLoading, error: loadError } = useSettings()
+  const { data: groups } = useGroups()
   const mutation = useUpdateSettings()
 
   const [form, setForm] = useState<FormState | null>(null)
   const [saved, setSaved] = useState(false)
+  const [formError, setFormError] = useState<string | null>(null)
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // 首次加载完成时初始化表单
@@ -187,9 +267,55 @@ export default function SettingsPage() {
     setForm((prev) => (prev === null ? prev : { ...prev, [key]: value }))
   }
 
+  // 分组暖机策略行的增删改(不走 set():它是数组不是标量)。
+  const setPolicyRow = (idx: number, patch: Partial<WarmupPolicyRow>) => {
+    setSaved(false)
+    setForm((prev) =>
+      prev === null
+        ? prev
+        : {
+            ...prev,
+            warmup_policies: prev.warmup_policies.map((r, i) =>
+              i === idx ? { ...r, ...patch } : r,
+            ),
+          },
+    )
+  }
+  const addPolicyRow = () => {
+    setSaved(false)
+    setForm((prev) =>
+      prev === null
+        ? prev
+        : { ...prev, warmup_policies: [...prev.warmup_policies, { group: '', rpm: '2', hours: '24' }] },
+    )
+  }
+  const removePolicyRow = (idx: number) => {
+    setSaved(false)
+    setForm((prev) =>
+      prev === null
+        ? prev
+        : { ...prev, warmup_policies: prev.warmup_policies.filter((_, i) => i !== idx) },
+    )
+  }
+
+  // 下拉选项 = 现有分组 ∪ 策略里已在用的组名(组被删后策略仍可辨认/移除)。
+  const groupOptions = Array.from(
+    new Set([...(groups ?? []).map((g) => g.name), ...(form?.warmup_policies ?? []).map((r) => r.group)]),
+  ).filter((n) => n !== '')
+
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
     if (!form || !data || mutation.isPending) return
+
+    // 两期顺序守卫(对抗审核 [中]):phase2 < phase1 时 phase2 永远命不中
+    // (号龄到 phase1 后直接毕业),存进去就是一份静默失效的配置。
+    const p1 = Number(form.warmup_phase1_hours)
+    const p2 = Number(form.warmup_phase2_hours)
+    if (Number.isInteger(p1) && Number.isInteger(p2) && p2 < p1) {
+      setFormError(t('settings.field.warmupPhaseOrderError'))
+      return
+    }
+    setFormError(null)
 
     const patch = buildPatch(form, data)
     if (Object.keys(patch).length === 0) {
@@ -475,6 +601,21 @@ export default function SettingsPage() {
                 {t('settings.field.maxSwitchAttemptsHint')}
               </p>
             </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {t('settings.field.rpmWaitMs')}
+              </label>
+              <input
+                type="number"
+                step={1}
+                min={0}
+                value={form?.rpm_wait_ms ?? ''}
+                onChange={(e) => set('rpm_wait_ms', e.target.value)}
+                disabled={isLoading || form === null}
+                className={inputClass}
+              />
+              <p className="text-xs text-muted-foreground">{t('settings.field.rpmWaitMsHint')}</p>
+            </div>
             <label className="flex cursor-pointer items-center gap-3 sm:col-span-2 lg:col-span-3">
               <input
                 type="checkbox"
@@ -485,6 +626,160 @@ export default function SettingsPage() {
               />
               <span className="text-sm font-medium">{t('settings.field.quotaPollEnabled')}</span>
             </label>
+          </CardContent>
+        </Card>
+
+        {/* ── 新号暖机 ── */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">{t('settings.section.warmup')}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <label className="flex cursor-pointer items-start gap-3">
+              <input
+                type="checkbox"
+                checked={form?.warmup_enabled ?? true}
+                onChange={(e) => set('warmup_enabled', e.target.checked)}
+                disabled={isLoading || form === null}
+                className="mt-0.5 h-4 w-4 rounded"
+              />
+              <span>
+                <span className="block text-sm font-medium">{t('settings.field.warmupEnabled')}</span>
+                <span className="block text-xs text-muted-foreground">
+                  {t('settings.field.warmupEnabledHint')}
+                </span>
+              </span>
+            </label>
+
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('settings.field.warmupPhase1Hours')}
+                </label>
+                <input
+                  type="number"
+                  step={1}
+                  min={0}
+                  value={form?.warmup_phase1_hours ?? ''}
+                  onChange={(e) => set('warmup_phase1_hours', e.target.value)}
+                  disabled={isLoading || form === null}
+                  className={inputClass}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('settings.field.warmupPhase1Rpm')}
+                </label>
+                <input
+                  type="number"
+                  step={1}
+                  min={1}
+                  value={form?.warmup_phase1_rpm ?? ''}
+                  onChange={(e) => set('warmup_phase1_rpm', e.target.value)}
+                  disabled={isLoading || form === null}
+                  className={inputClass}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('settings.field.warmupPhase2Hours')}
+                </label>
+                <input
+                  type="number"
+                  step={1}
+                  min={0}
+                  value={form?.warmup_phase2_hours ?? ''}
+                  onChange={(e) => set('warmup_phase2_hours', e.target.value)}
+                  disabled={isLoading || form === null}
+                  className={inputClass}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('settings.field.warmupPhase2Rpm')}
+                </label>
+                <input
+                  type="number"
+                  step={1}
+                  min={1}
+                  value={form?.warmup_phase2_rpm ?? ''}
+                  onChange={(e) => set('warmup_phase2_rpm', e.target.value)}
+                  disabled={isLoading || form === null}
+                  className={inputClass}
+                />
+              </div>
+            </div>
+
+            {/* 按分组策略:命中的组完全接管(单期);hours=0 = 该组关闭暖机 */}
+            <div className="space-y-2">
+              <span className="block text-sm font-medium">{t('settings.field.warmupPolicies')}</span>
+              <p className="text-xs text-muted-foreground">
+                {t('settings.field.warmupPoliciesHint')}
+              </p>
+              {(form?.warmup_policies ?? []).map((row, idx) => (
+                <div key={idx} className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={row.group}
+                    onChange={(e) => setPolicyRow(idx, { group: e.target.value })}
+                    disabled={isLoading || form === null}
+                    className={`${inputClass} w-44`}
+                  >
+                    <option value="" disabled>
+                      {t('settings.field.warmupPolicyGroupPlaceholder')}
+                    </option>
+                    {groupOptions
+                      .filter(
+                        (g) =>
+                          g === row.group ||
+                          !(form?.warmup_policies ?? []).some((r, i) => i !== idx && r.group === g),
+                      )
+                      .map((g) => (
+                        <option key={g} value={g}>
+                          {g}
+                        </option>
+                      ))}
+                  </select>
+                  <input
+                    type="number"
+                    step={1}
+                    min={1}
+                    value={row.rpm}
+                    onChange={(e) => setPolicyRow(idx, { rpm: e.target.value })}
+                    disabled={isLoading || form === null}
+                    placeholder={t('settings.field.warmupPolicyRpmPlaceholder')}
+                    className={`${inputClass} w-28`}
+                  />
+                  <input
+                    type="number"
+                    step={1}
+                    min={0}
+                    value={row.hours}
+                    onChange={(e) => setPolicyRow(idx, { hours: e.target.value })}
+                    disabled={isLoading || form === null}
+                    placeholder={t('settings.field.warmupPolicyHoursPlaceholder')}
+                    className={`${inputClass} w-32`}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removePolicyRow(idx)}
+                    disabled={isLoading || form === null}
+                  >
+                    {t('settings.field.warmupPolicyRemove')}
+                  </Button>
+                </div>
+              ))}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={addPolicyRow}
+                disabled={isLoading || form === null}
+              >
+                {t('settings.field.warmupPolicyAdd')}
+              </Button>
+            </div>
           </CardContent>
         </Card>
 
@@ -705,6 +1000,9 @@ export default function SettingsPage() {
         {/* 保存区 */}
         {mutation.isError && (
           <ErrorNote error={mutation.error} labelKey="common.actionFailed" />
+        )}
+        {formError !== null && (
+          <p className="text-sm text-rose-600 dark:text-rose-300">{formError}</p>
         )}
 
         <div className="flex items-center justify-end gap-3">

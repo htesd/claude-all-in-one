@@ -57,6 +57,20 @@ export interface SystemSettings {
   /** 客户端**未指定** effort 时的默认思考档位。只影响没说话的客户端——显式点了档位的请求原样透传。
    *  档位越高思考越深也越慢：实测 max 的思考量约为 xhigh 的 1.7 倍。默认 high。 */
   default_thinking_effort: ThinkingEffort
+  /** RPM 闸等待预算（毫秒，默认 10000）：合格号全部仅因 RPM 定频暂不可选时，等窗口腾名额的最长时长。 */
+  rpm_wait_ms?: number
+  /** 低优先新号暖机总开关（默认开；调度 rank ≥ 100 的号按号龄两期限速，高优号豁免）。 */
+  warmup_enabled?: boolean
+  /** 暖机适应期时长（小时，默认 2）。 */
+  warmup_phase1_hours?: number
+  /** 暖机适应期 RPM 上限（默认 2）。 */
+  warmup_phase1_rpm?: number
+  /** 暖机爬坡期截止（小时，默认 24；号龄 ≥ 此值即毕业）。 */
+  warmup_phase2_hours?: number
+  /** 暖机爬坡期 RPM 上限（默认 6）。 */
+  warmup_phase2_rpm?: number
+  /** 按分组的新号暖机策略：命中的组完全接管（单期；hours=0 = 该组关闭暖机），未列出的组走全局两期。 */
+  warmup_group_policies?: Record<string, GroupWarmupPolicy> | null
   /**
    * 逐 worker 的**实然值**：该 worker 此刻真正在用的热调参数 + 最近一次同步的结果。
    *
@@ -106,6 +120,14 @@ export interface WorkerSettingsView {
 export const THINKING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 
 export type ThinkingEffort = (typeof THINKING_EFFORTS)[number]
+
+/** 一个分组的新号暖机策略（与后端 `GroupWarmupPolicy` 对齐）。 */
+export interface GroupWarmupPolicy {
+  /** 新号 RPM 上限（生效期内）。 */
+  rpm: number
+  /** 暖机时长（小时）；0 = 该组显式关闭暖机。 */
+  hours: number
+}
 
 /**
  * PUT /admin/api/settings 请求体（局部覆写）。

@@ -322,6 +322,43 @@ pub struct SystemConfig {
     /// 策略参数在 DB 里可热改。见 [`RestockConfig`]。
     #[serde(default)]
     pub restock: RestockConfig,
+    /// **热追加/覆盖的 cursor 模型目录**(默认空 = 纯内置目录)。
+    ///
+    /// cursor 上游不提供菜单查询,模型表只能内置;但「新模型能不能用」又只能靠实测。
+    /// 本字段让试探新模型**不用重新部署**:DB overlay 热改后 30s 内 worker 生效。
+    /// `menu=false`(默认)= 探测位:可被点名、出现在 `/v1/models`,但不进每个
+    /// 请求都带的 `1.14` 清单 —— 热配置只允许**试**,菜单位要回代码对齐真机快照
+    /// 才能转正。同名条目整体覆盖内置项(参数一起换)。
+    #[serde(default)]
+    pub cursor_extra_models: Vec<ExtraModelSpec>,
+    /// **cursor 内建工具护栏的策略句**(默认空 = 用 gw-cursor 内置默认)。
+    ///
+    /// Cursor 的内建工具(终端、读写文件、代码库检索、网页搜索)是服务端自带的,
+    /// 哪怕我方一个工具都不声明模型照样会调,而反代执行不了 —— 只能收口,
+    /// 表现成「半截回答」。护栏是追加在系统提示末尾的一段话,生产实测 12 小时里
+    /// 仍有 302 次收口(296 次发生在已出字之后),所以文案要能反复调。
+    ///
+    /// 只有**策略句**在这里(「清单里没有的能力怎么办」这类自然语言);
+    /// 工具闭集与能力替代表由 gw-cursor 按每次请求的 `tools` **代码生成**,
+    /// 配置里没有占位符 —— 模板拼错会静默丢掉整个闭集,而闭集是这道护栏最硬的一半。
+    ///
+    /// **命名空间**:与 [`Self::cursor_extra_models`] 一致的 `cursor_` 前缀。
+    /// 这个旋钮只影响 cursor 家族,kiro / claude-dario / claude-subprocess 一律不读它。
+    #[serde(default)]
+    pub cursor_tool_guard: String,
+}
+
+/// 一个热追加的 cursor 模型条目(见 [`SystemConfig::cursor_extra_models`])。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtraModelSpec {
+    /// Cursor Run 侧模型名(线上名,如 `grok-4.7`)。
+    pub name: String,
+    /// 参数 `{key: val}`(照抄同族模型的 parameterDefinitions,如 effort/fast/thinking)。
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+    /// 进不进 `1.14` 可用清单。默认 **false** = 探测位(可被点名但不进清单)。
+    #[serde(default)]
+    pub menu: bool,
 }
 
 impl SystemConfig {
@@ -452,10 +489,20 @@ pub struct SchedulerConfig {
     /// 429 限流冷却秒数(到期自愈)。
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
-    /// 账号临时封禁(TEMPORARILY_SUSPENDED)冷却秒数(默认 3600=1h,比限流长——别每 5min
-    /// 重戳封禁号产生异常调用指纹)。到期自愈再试,仍封则再冷却。
+    /// 账号临时封禁(TEMPORARILY_SUSPENDED)的**基准**冷却秒数(默认 3600=1h)。
+    /// 实际冷却按连续 suspend 次数指数退避:第 k 次 = 本值 * 2^(k-1),
+    /// 封顶 [`Self::suspended_backoff_cap_secs`],并叠 ±20% 抖动打散整批复活的同步性。
     #[serde(default = "default_suspended_cooldown_secs")]
     pub suspended_cooldown_secs: u64,
+    /// 封禁冷却的退避上限秒数(默认 86400=24h)。
+    #[serde(default = "default_suspended_backoff_cap_secs")]
+    pub suspended_backoff_cap_secs: u64,
+    /// 同一账号**连续** suspend 复活失败达此次数 → 自动退役(disabled=1 落库,
+    /// 面板可见、可手动恢复;成功一次 chat 即清零)。**0 = 不自动退役**(恢复旧行为:
+    /// 死号永远每小时冷却循环)。默认 3:实测 suspend 号 0/35 恢复,整点复活风暴只会
+    /// 把客户原文反复泼向死号、持续喂给上游风控"这些身份同属一个池"的关联证据。
+    #[serde(default = "default_suspend_retire_strikes")]
+    pub suspend_retire_strikes: u32,
     /// 空响应冷却秒数(达阈值后)。
     #[serde(default = "default_empty_response_cooldown_secs")]
     pub empty_response_cooldown_secs: u64,
@@ -471,6 +518,28 @@ pub struct SchedulerConfig {
     /// 会话亲和条目 TTL 秒数(超时未访问 = 会话重开,自然再平衡)。
     #[serde(default = "default_affinity_ttl_secs")]
     pub affinity_ttl_secs: u64,
+    /// 会话亲和「粘性预算」:primary **仅因并发满**而暂不可选时,等它腾出 permit 的
+    /// 最长毫秒数。`0` = **只关掉等待**。
+    ///
+    /// ⚠️ `0` **不等于回到本开关引入前的行为**(对抗评审第五轮 [高],两人都指出这句
+    /// 原文档在撒谎)。同批上线的**固定溢出伙伴**没有开关、始终生效:primary 仅因并发满
+    /// 时会话**保留 primary、改走伙伴**,而引入前是「把伙伴当场转正、永不迁回」。
+    /// 于是 `hold=0` 下 A 满→落 B→A 空出后仍回 A,老实现则会一直留在 B。
+    /// 这个差异是**有意的**(它正是本次改造要解决的问题),这里只是把话说准。
+    ///
+    /// 为什么需要(2026-08-14 实测):轮转派号会让**同一会话的相邻两轮落到不同账号**,
+    /// 上游看到的是「一个用户在恢复它从未创建过的数百轮对话」——这是账号池最强的
+    /// 可检测特征。当天一批 10 个号 1 小时内被 `TEMPORARILY_SUSPENDED` 掉 9 个,
+    /// 被封号平均 **27.5 会话/小时、73% 换会话率**,存活号 **9.4 / 36%**,无交叉。
+    ///
+    /// **只钳「并发满」这一种原因**:真失效(禁用/限流/RPM/额度/不支持本模型)照旧改选。
+    /// 等待不消耗换号预算,预算耗尽即 fail-open 回落原路径,绝不把请求挂死。
+    #[serde(default = "default_affinity_hold_ms")]
+    pub affinity_hold_ms: u64,
+    /// 是否允许把**已钉扎的会话**向上迁移到更高优先级层(默认 `true` = 引入本开关前的行为)。
+    /// 关掉能进一步压低换会话率,代价是高优先层的便宜号被利用得慢一些。
+    #[serde(default = "default_affinity_migrate_up")]
+    pub affinity_migrate_up: bool,
     /// worker 后台配额轮询开关(默认开)。复刻真实 Kiro IDE 每 ~5min 一次 getUsageLimits 的
     /// ambient 流量(防封)+ 让配额面板无人看 dashboard 时也新鲜。与冷却阈值同放 SchedulerConfig
     /// 是为复用既有 30s 热应用路径——admin 设置面板可即时启停轮询,无需重启(对抗审查 Architect#5)。
@@ -549,6 +618,53 @@ pub struct SchedulerConfig {
     /// 依赖墙上时钟,不受失败类别干扰。
     #[serde(default = "default_tier_hold_window_ms")]
     pub tier_hold_window_ms: u64,
+    /// **低优先新号暖机**总开关(默认开):调度 rank >= 100 的号按号龄(accounts.created_at)
+    /// 获得更低的有效 RPM 上限;rank < 100 的高优号(成员边 @0 的 POWER/PRO MAX 等)
+    /// 完全不受影响。背景:restock 补货的新号一上线就被鲸客流量瞬时灌满
+    /// (2026-08-10 ha7477062:新号几分钟内打到封号),上游对新号的节奏容忍远低于老号。
+    ///
+    /// 有效 RPM = min(账号 `extra.rpm_limit`, 暖机上限) —— 暖机只收紧、**绝不放宽**
+    /// 账号已有更严的上限。挂在现有 rpm_limit 滑动窗口语义上:达限后的等待/迁移/503
+    /// 行为与既有定频完全一致,不改并发、不改排序、不改会话亲和。
+    #[serde(default = "default_warmup_enabled")]
+    pub warmup_enabled: bool,
+    /// 适应期时长(小时):号龄 < 本值,有效 RPM = [`Self::warmup_phase1_rpm`]。0 = 跳过该期。
+    #[serde(default = "default_warmup_phase1_hours")]
+    pub warmup_phase1_hours: u64,
+    /// 适应期 RPM 上限(默认 2)。
+    #[serde(default = "default_warmup_phase1_rpm")]
+    pub warmup_phase1_rpm: u32,
+    /// 爬坡期截止(小时):号龄在 [phase1_hours, phase2_hours) 内,有效 RPM =
+    /// [`Self::warmup_phase2_rpm`];号龄 ≥ 本值即毕业,恢复账号自身配置。
+    #[serde(default = "default_warmup_phase2_hours")]
+    pub warmup_phase2_hours: u64,
+    /// 爬坡期 RPM 上限(默认 6)。
+    #[serde(default = "default_warmup_phase2_rpm")]
+    pub warmup_phase2_rpm: u32,
+    /// **RPM 闸等待预算**(毫秒):合格号全部仅因 RPM 定频(账号 `extra.rpm_limit` 或暖机
+    /// 上限)暂不可选时,等滑动窗口腾出名额再选的最长时长;耗尽仍等不到才报错。
+    /// 默认 10000(10s)。
+    ///
+    /// 背景(2026-08-11 CUR 组生产事故):该等待原先搭 [`Self::queue_wait_ms`] 的车
+    /// (排队模式专属预算),而 queue_wait_ms 默认 0、CUR 组没开排队 —— 唯一合格的
+    /// cursor 号顶着自己的 rpm_limit 时,请求一秒都不等,直接 503,日志还误报
+    /// 「组内所有账号均已禁用」。拆成独立预算后:等待发生在**响应开始之前**,客户端
+    /// 只是变慢(yapi 空闲判定 300s,10s 预算远在其内)。
+    ///
+    /// 预算耗尽后的错误是 **AllRpmLimited**(独立变体,503 与中性客户端文案同
+    /// AllBusy):号没死、并发也没满,只是在自我限速 —— 日志与 /health 统计
+    /// 不该再撒谎。生效预算钳到 ≤ RPM 窗口(60s),再大是死重。
+    #[serde(default = "default_rpm_wait_ms")]
+    pub rpm_wait_ms: u64,
+    /// **按分组的新号暖机策略**(键 = 分组名):命中分组的低优先新号(rank >= 100、
+    /// 号龄 < `hours`)有效 RPM 收紧到 `rpm`;`hours = 0` = 该组**显式关闭暖机**。
+    /// 未列出的分组走上面的全局两期暖机(由 `warmup_enabled` 总管)。
+    ///
+    /// 背景:全局暖机是为 kiro 补货新号设计的(2026-08-10 ha7477062),但它按 rank
+    /// 一刀切,把 cursor 订阅号也限到了 2 RPM(2026-08-11 CUR 组 503 事故)。分组策略
+    /// 让「哪个组要保护、保护多狠、保护多久」可按业务线分别拍板,互不拖累。
+    #[serde(default)]
+    pub warmup_group_policies: std::collections::BTreeMap<String, GroupWarmupPolicy>,
 }
 
 fn default_rate_limit_cooldown_secs() -> u64 {
@@ -562,6 +678,19 @@ fn default_queue_wait_ms() -> u64 {
 fn default_rate_limit_pace_ms() -> u64 {
     0
 }
+/// RPM 闸等待预算默认 10s:够一次滑动窗口腾名额,又远在下游空闲判定(yapi 300s)之内。
+fn default_rpm_wait_ms() -> u64 {
+    10_000
+}
+
+/// 一个分组的新号暖机策略(见 [`SchedulerConfig::warmup_group_policies`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupWarmupPolicy {
+    /// 新号 RPM 上限(生效期内的有效上限;clamp ≥1,0 = "一次都不许"太反直觉)。
+    pub rpm: u32,
+    /// 暖机时长(小时):号龄 < 本值才限速。**0 = 该组显式关闭暖机**。
+    pub hours: u64,
+}
 fn default_rate_limit_pace_max_strikes() -> u32 {
     0
 }
@@ -572,8 +701,30 @@ fn default_tier_hold_ms() -> u64 {
 fn default_tier_hold_window_ms() -> u64 {
     0
 }
+/// 暖机默认**开启**:补货新号是封号重灾区,默认保护;高优号不受影响,老号(>24h)无感。
+fn default_warmup_enabled() -> bool {
+    true
+}
+fn default_warmup_phase1_hours() -> u64 {
+    2
+}
+fn default_warmup_phase1_rpm() -> u32 {
+    2
+}
+fn default_warmup_phase2_hours() -> u64 {
+    24
+}
+fn default_warmup_phase2_rpm() -> u32 {
+    6
+}
 fn default_suspended_cooldown_secs() -> u64 {
     3600
+}
+fn default_suspended_backoff_cap_secs() -> u64 {
+    86400
+}
+fn default_suspend_retire_strikes() -> u32 {
+    3
 }
 fn default_empty_response_cooldown_secs() -> u64 {
     60
@@ -596,17 +747,29 @@ fn default_max_switch_attempts() -> u32 {
 fn default_affinity_ttl_secs() -> u64 {
     1800
 }
+/// 默认 0 = 关闭。开关式引入:不配置时行为与引入前逐字节一致,线上按需热调。
+fn default_affinity_hold_ms() -> u64 {
+    0
+}
+/// 默认 true = 保持引入本开关前的跨层向上迁移行为。
+fn default_affinity_migrate_up() -> bool {
+    true
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
             suspended_cooldown_secs: default_suspended_cooldown_secs(),
+            suspended_backoff_cap_secs: default_suspended_backoff_cap_secs(),
+            suspend_retire_strikes: default_suspend_retire_strikes(),
             empty_response_cooldown_secs: default_empty_response_cooldown_secs(),
             empty_response_window_secs: default_empty_response_window_secs(),
             empty_response_threshold: default_empty_response_threshold(),
             max_failures: default_max_failures(),
             affinity_ttl_secs: default_affinity_ttl_secs(),
+            affinity_hold_ms: default_affinity_hold_ms(),
+            affinity_migrate_up: default_affinity_migrate_up(),
             quota_poll_enabled: default_quota_poll_enabled(),
             max_switch_attempts: default_max_switch_attempts(),
             queue_wait_ms: default_queue_wait_ms(),
@@ -614,6 +777,13 @@ impl Default for SchedulerConfig {
             rate_limit_pace_max_strikes: default_rate_limit_pace_max_strikes(),
             tier_hold_ms: default_tier_hold_ms(),
             tier_hold_window_ms: default_tier_hold_window_ms(),
+            warmup_enabled: default_warmup_enabled(),
+            warmup_phase1_hours: default_warmup_phase1_hours(),
+            warmup_phase1_rpm: default_warmup_phase1_rpm(),
+            warmup_phase2_hours: default_warmup_phase2_hours(),
+            warmup_phase2_rpm: default_warmup_phase2_rpm(),
+            rpm_wait_ms: default_rpm_wait_ms(),
+            warmup_group_policies: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -738,6 +908,13 @@ pub struct SystemSettings {
     pub rate_limit_cooldown_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspended_cooldown_secs: Option<u64>,
+    /// 封禁冷却退避上限(秒)。详见 [`SchedulerConfig::suspended_backoff_cap_secs`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_backoff_cap_secs: Option<u64>,
+    /// 连续 suspend 复活失败自动退役阈值(0 = 不退役)。
+    /// 详见 [`SchedulerConfig::suspend_retire_strikes`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_retire_strikes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub empty_response_cooldown_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -768,9 +945,40 @@ pub struct SystemSettings {
     pub tier_hold_window_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affinity_ttl_secs: Option<u64>,
+    /// 会话亲和粘性预算(毫秒;None = 用 yaml 基线;0 = 关闭)。
+    /// 详见 [`SchedulerConfig::affinity_hold_ms`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_hold_ms: Option<u64>,
+    /// 已钉扎会话是否允许跨层向上迁移(None = 用 yaml 基线默认 true)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_migrate_up: Option<bool>,
     /// worker 后台配额轮询热开关(None = 用 yaml 基线默认 true)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_poll_enabled: Option<bool>,
+    // —— 低优先新号暖机(详见 SchedulerConfig 同名字段;None = 用 yaml 基线)——
+    /// 暖机总开关(默认 true)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_enabled: Option<bool>,
+    /// 适应期时长(小时,默认 2)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_phase1_hours: Option<u64>,
+    /// 适应期 RPM 上限(默认 2)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_phase1_rpm: Option<u32>,
+    /// 爬坡期截止(小时,默认 24;号龄 ≥ 此值即毕业)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_phase2_hours: Option<u64>,
+    /// 爬坡期 RPM 上限(默认 6)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_phase2_rpm: Option<u32>,
+    /// RPM 闸等待预算(毫秒,默认 10000)。详见 [`SchedulerConfig::rpm_wait_ms`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm_wait_ms: Option<u64>,
+    /// 按分组的新号暖机策略(整图替换;None = 用 yaml 基线)。
+    /// 详见 [`SchedulerConfig::warmup_group_policies`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_group_policies:
+        Option<std::collections::BTreeMap<String, GroupWarmupPolicy>>,
     // —— image ——
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_enabled: Option<bool>,
@@ -805,6 +1013,14 @@ pub struct SystemSettings {
     /// 类型是枚举,所以 `PUT /settings` 那步 `from_value::<SystemSettings>` 就会拒掉非法档位。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_effort: Option<ThinkingEffort>,
+    /// 热追加/覆盖的 cursor 模型目录(整表替换;None = 用 yaml 基线)。
+    /// 详见 [`SystemConfig::cursor_extra_models`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_extra_models: Option<Vec<ExtraModelSpec>>,
+    /// cursor 内建工具护栏的策略句(None = 用 yaml 基线;空串 = 回 gw-cursor 内置默认)。
+    /// 详见 [`SystemConfig::cursor_tool_guard`]。**只影响 cursor 家族。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_tool_guard: Option<String>,
     /// 兜住本版本**不认识**的 overlay key(新镜像写、旧镜像读的滚动升级窗口)。
     ///
     /// 存在的唯一理由是让「一个陌生 key」不再作废整份 overlay。它有两个消费者:
@@ -835,6 +1051,8 @@ impl SystemSettings {
         if let Some(v) = self.cache_max_sessions { base.cache.max_sessions = v; }
         if let Some(v) = self.rate_limit_cooldown_secs { base.scheduler.rate_limit_cooldown_secs = v; }
         if let Some(v) = self.suspended_cooldown_secs { base.scheduler.suspended_cooldown_secs = v; }
+        if let Some(v) = self.suspended_backoff_cap_secs { base.scheduler.suspended_backoff_cap_secs = v; }
+        if let Some(v) = self.suspend_retire_strikes { base.scheduler.suspend_retire_strikes = v; }
         if let Some(v) = self.empty_response_cooldown_secs { base.scheduler.empty_response_cooldown_secs = v; }
         if let Some(v) = self.empty_response_window_secs { base.scheduler.empty_response_window_secs = v; }
         if let Some(v) = self.empty_response_threshold { base.scheduler.empty_response_threshold = v; }
@@ -846,7 +1064,18 @@ impl SystemSettings {
         if let Some(v) = self.tier_hold_ms { base.scheduler.tier_hold_ms = v; }
         if let Some(v) = self.tier_hold_window_ms { base.scheduler.tier_hold_window_ms = v; }
         if let Some(v) = self.affinity_ttl_secs { base.scheduler.affinity_ttl_secs = v; }
+        if let Some(v) = self.affinity_hold_ms { base.scheduler.affinity_hold_ms = v; }
+        if let Some(v) = self.affinity_migrate_up { base.scheduler.affinity_migrate_up = v; }
         if let Some(v) = self.quota_poll_enabled { base.scheduler.quota_poll_enabled = v; }
+        if let Some(v) = self.warmup_enabled { base.scheduler.warmup_enabled = v; }
+        if let Some(v) = self.warmup_phase1_hours { base.scheduler.warmup_phase1_hours = v; }
+        if let Some(v) = self.warmup_phase1_rpm { base.scheduler.warmup_phase1_rpm = v; }
+        if let Some(v) = self.warmup_phase2_hours { base.scheduler.warmup_phase2_hours = v; }
+        if let Some(v) = self.warmup_phase2_rpm { base.scheduler.warmup_phase2_rpm = v; }
+        if let Some(v) = self.rpm_wait_ms { base.scheduler.rpm_wait_ms = v; }
+        if let Some(v) = &self.warmup_group_policies {
+            base.scheduler.warmup_group_policies = v.clone();
+        }
         if let Some(v) = self.image_enabled { base.image.enabled = v; }
         if let Some(v) = self.image_max_long_edge { base.image.max_long_edge = v; }
         if let Some(v) = self.image_max_pixels_single { base.image.max_pixels_single = v; }
@@ -858,6 +1087,12 @@ impl SystemSettings {
         if let Some(v) = self.thinking_signature { base.experimental.thinking_signature = v; }
         if let Some(v) = self.q_endpoint { base.experimental.q_endpoint = v; }
         if let Some(v) = self.default_thinking_effort { base.thinking.default_effort = v; }
+        if let Some(v) = &self.cursor_extra_models {
+            base.cursor_extra_models = v.clone();
+        }
+        if let Some(v) = &self.cursor_tool_guard {
+            base.cursor_tool_guard = v.clone();
+        }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -875,6 +1110,8 @@ impl SystemSettings {
             cache_max_sessions: Some(cfg.cache.max_sessions),
             rate_limit_cooldown_secs: Some(cfg.scheduler.rate_limit_cooldown_secs),
             suspended_cooldown_secs: Some(cfg.scheduler.suspended_cooldown_secs),
+            suspended_backoff_cap_secs: Some(cfg.scheduler.suspended_backoff_cap_secs),
+            suspend_retire_strikes: Some(cfg.scheduler.suspend_retire_strikes),
             empty_response_cooldown_secs: Some(cfg.scheduler.empty_response_cooldown_secs),
             empty_response_window_secs: Some(cfg.scheduler.empty_response_window_secs),
             empty_response_threshold: Some(cfg.scheduler.empty_response_threshold),
@@ -886,7 +1123,16 @@ impl SystemSettings {
             tier_hold_ms: Some(cfg.scheduler.tier_hold_ms),
             tier_hold_window_ms: Some(cfg.scheduler.tier_hold_window_ms),
             affinity_ttl_secs: Some(cfg.scheduler.affinity_ttl_secs),
+            affinity_hold_ms: Some(cfg.scheduler.affinity_hold_ms),
+            affinity_migrate_up: Some(cfg.scheduler.affinity_migrate_up),
             quota_poll_enabled: Some(cfg.scheduler.quota_poll_enabled),
+            warmup_enabled: Some(cfg.scheduler.warmup_enabled),
+            warmup_phase1_hours: Some(cfg.scheduler.warmup_phase1_hours),
+            warmup_phase1_rpm: Some(cfg.scheduler.warmup_phase1_rpm),
+            warmup_phase2_hours: Some(cfg.scheduler.warmup_phase2_hours),
+            warmup_phase2_rpm: Some(cfg.scheduler.warmup_phase2_rpm),
+            rpm_wait_ms: Some(cfg.scheduler.rpm_wait_ms),
+            warmup_group_policies: Some(cfg.scheduler.warmup_group_policies.clone()),
             image_enabled: Some(cfg.image.enabled),
             image_max_long_edge: Some(cfg.image.max_long_edge),
             image_max_pixels_single: Some(cfg.image.max_pixels_single),
@@ -898,6 +1144,8 @@ impl SystemSettings {
             thinking_signature: Some(cfg.experimental.thinking_signature),
             q_endpoint: Some(cfg.experimental.q_endpoint),
             default_thinking_effort: Some(cfg.thinking.default_effort),
+            cursor_extra_models: Some(cfg.cursor_extra_models.clone()),
+            cursor_tool_guard: Some(cfg.cursor_tool_guard.clone()),
             // 全量视图由本进程的有效配置构造,按定义不含未知 key。
             unknown: Default::default(),
         }
@@ -1179,6 +1427,27 @@ workers:
         full.apply_to(&mut target);
         assert_eq!(target.scheduler.max_failures, base.scheduler.max_failures);
         assert_eq!(target.cache.read_multiplier, base.cache.read_multiplier);
+    }
+
+    #[test]
+    fn settings_warmup_apply_to_overrides_and_preserves() {
+        // None → 保留基线(默认开,2h/2,24h/6);Some → 覆盖。验证暖机字段的 overlay 语义。
+        let mut base = SystemConfig::default();
+        SystemSettings::default().apply_to(&mut base);
+        assert!(base.scheduler.warmup_enabled, "基线默认开");
+        assert_eq!(base.scheduler.warmup_phase1_rpm, 2);
+        let s = SystemSettings {
+            warmup_enabled: Some(false),
+            warmup_phase1_hours: Some(4),
+            warmup_phase2_rpm: Some(9),
+            ..Default::default()
+        };
+        s.apply_to(&mut base);
+        assert!(!base.scheduler.warmup_enabled, "Some(false) 应关掉暖机");
+        assert_eq!(base.scheduler.warmup_phase1_hours, 4);
+        assert_eq!(base.scheduler.warmup_phase2_rpm, 9);
+        assert_eq!(base.scheduler.warmup_phase1_rpm, 2, "未提供的字段不动");
+        assert_eq!(base.scheduler.warmup_phase2_hours, 24, "未提供的字段不动");
     }
 
     #[test]

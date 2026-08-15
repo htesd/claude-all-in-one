@@ -1,9 +1,11 @@
 import type {
   AccountDisplayStatus,
   AccountGroupMembership,
+  AccountModelEntry,
   AccountRow,
   AccountRuntimeEntry,
   AccountRuntimeInstance,
+  OnDemandQuota,
 } from './types'
 
 /** 把按 worker 实例组织的运行态摊平成 account_id 索引；同号出现在多实例时偏向在线实例。 */
@@ -33,17 +35,34 @@ export function deriveAccountStatus(
   row: AccountRow,
   runtime: AccountRuntimeEntry | undefined,
 ): AccountDisplayStatus {
-  if (row.disabled) return { kind: 'disabled' }
+  // 自动退役会落库 disabled=1:先判 row.disabled 会把 runtime 的 suspended_retired
+  // 永远遮成普通「已停用」(红标签变死代码,退役号混进人工停用堆)。runtime 在线且
+  // 报退役时优先展示退役。
+  if (row.disabled) {
+    if (runtime?.online && runtime.status.reason === 'suspended_retired') {
+      return { kind: 'retired' }
+    }
+    return { kind: 'disabled' }
+  }
   if (!runtime || !runtime.online) return { kind: 'offline' }
 
   const status = runtime.status
-  if (!status.disabled) return { kind: 'ok' }
+  if (!status.disabled) {
+    // 复活观察期:冷却刚过、单飞探测中 —— 与"正常"区分开,免得排查时
+    // 把单飞限流误判成并发闸坏了。
+    if (status.probation) return { kind: 'probation' }
+    return { kind: 'ok' }
+  }
 
   switch (status.reason) {
     case 'rate_limited':
       return { kind: 'rate_limited', secs: status.cooldown_remaining_secs }
     case 'empty_response':
       return { kind: 'empty_response', secs: status.cooldown_remaining_secs }
+    case 'temporarily_suspended':
+      return { kind: 'suspended', secs: status.cooldown_remaining_secs }
+    case 'suspended_retired':
+      return { kind: 'retired' }
     case 'quota_exhausted':
       return { kind: 'quota_exhausted' }
     case 'invalid_refresh_token':
@@ -138,9 +157,34 @@ export function diffMemberships(
   return { upserts, removals }
 }
 
-/** 积分展示格式化:整数千分位。允许负值(超额账号的 remaining=已超出多少)。 */
+/** 积分/美元展示:接近整数用整数千分位,否则保留两位小数(Cursor 官方额度是美元)。 */
 export function formatCredits(n: number): string {
-  return Math.round(n).toLocaleString()
+  if (Number.isFinite(n) && Math.abs(n - Math.round(n)) < 1e-9) {
+    return Math.round(n).toLocaleString()
+  }
+  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/** 模型不可用标记剩余时间的短格式:< 1h 显示分钟(下限 1m),否则显示小时(整点不带小数)。 */
+export function formatMarkTtl(secs: number): string {
+  if (secs < 3600) return `${Math.max(1, Math.round(secs / 60))}m`
+  const h = secs / 3600
+  return `${Number.isInteger(h) ? h : h.toFixed(1)}h`
+}
+
+/** 模型可用三态(「查看模型」弹窗的展示口径)。 */
+export type ModelAvailability = 'available' | 'marked' | 'unsupported'
+
+/**
+ * 模型可用三态推导:档位不支持 > 被标记 > 可用。
+ * 与后端 `available` 字段(supported && 无标记)同源,前端重算是为了把「不可用」
+ * 细分出两种成因 —— 被标记(临时,附剩余重探时间)与档位不支持(静态,换档才变)。
+ * `mark_remaining_secs` 为 0(即将到期)仍算标记中,与后端 `is_none()` 判定对齐。
+ */
+export function deriveModelAvailability(m: AccountModelEntry): ModelAvailability {
+  if (!m.supported) return 'unsupported'
+  if (m.mark_remaining_secs != null) return 'marked'
+  return 'available'
 }
 
 /** 剩余是否吃紧(超额/为 0/< 上限 10%）—— 用于标红提示该换号。 */
@@ -150,15 +194,64 @@ export function isQuotaLow(remaining: number, limit: number): boolean {
   return remaining <= 0 || remaining / limit < 0.1
 }
 
+/** 美元金额短格式($ + 千分位;整数不带小数)。超额额度列专用。 */
+export function formatUsd(n: number): string {
+  return `$${formatCredits(n)}`
+}
+
+/**
+ * 超额（on-demand）展示三态：
+ * - `off`：未开启（面板显示「关」）
+ * - `unlimited`：已开启但不限额
+ * - `on`：已开启且有上限
+ *
+ * null/缺省（该 provider 无超额概念，或还没查到）由调用方按「—」处理。
+ */
+export function onDemandState(od: OnDemandQuota): 'off' | 'unlimited' | 'on' {
+  if (!od.enabled) return 'off'
+  if (od.unlimited || od.limit == null || od.limit <= 0) return 'unlimited'
+  return 'on'
+}
+
+/**
+ * 超额是否吃紧（已用 ≥ 上限 80%）—— 标黄提醒即将触顶（触顶后上游会开始拒绝请求）。
+ * 不限额/未开启永不吃紧。
+ */
+export function isOnDemandHigh(od: OnDemandQuota): boolean {
+  if (onDemandState(od) !== 'on' || od.limit == null || od.limit <= 0) return false
+  return od.used / od.limit >= 0.8
+}
+
+/**
+ * 模型白名单判定,**镜像后端 `gw-core::account::model_allowlist_allows` 的语义**:
+ * - `null` / 缺失 = 不限(放行一切);
+ * - 空数组 = 全禁(fail-closed,写侧正常不会存出这个形态);
+ * - 条目小写精确匹配,`前缀*` 通配仅限末尾。
+ * 用途:把账号现有白名单换算成「查看模型」弹窗的勾选基线。改这里必须同步后端匹配器。
+ */
+export function modelAllowlistAllows(
+  allowlist: string[] | null | undefined,
+  modelId: string,
+): boolean {
+  if (allowlist == null) return true
+  const id = modelId.toLowerCase()
+  return allowlist.some((raw) => {
+    const entry = raw.toLowerCase()
+    if (entry.endsWith('*')) return id.startsWith(entry.slice(0, -1))
+    return id === entry
+  })
+}
+
 /** 配额展示口径:'windows' = 滚动窗口利用率(5h/7d,Claude OAuth/ccmax);
- *  'credits' = 积分剩余/上限(Kiro);'none' = 无配额概念(Cursor 订阅制,后端不采集)。 */
+ *  'credits' = 剩余/上限(Kiro=积分;Cursor=官方账期美元)。 */
 export type QuotaKind = 'credits' | 'windows' | 'none'
 
 /** provider → 配额口径。dario(claude-dario)无积分概念,只有 5h/7d 利用率窗口;
- *  cursor 是订阅制、后端不采集配额数字,配额列恒为 —,用 'none' 免得表头误称「积分」。 */
+ *  cursor 走官方 GetCurrentPeriodUsage,与 Kiro 一样用剩余/上限列(单位美元,见 label)。 */
 export function quotaKindForProvider(provider: string): QuotaKind {
   if (provider === 'claude-dario') return 'windows'
-  if (provider === 'cursor') return 'none'
+  // cursor 曾标 'none'(后端未采集);现已接 DashboardService,与积分列同形展示美元。
+  if (provider === 'cursor') return 'credits'
   return 'credits'
 }
 
@@ -316,4 +409,36 @@ export function buildCursorExtra(input: CursorExtraInput): Record<string, unknow
     if (value) extra[key] = value
   }
   return extra
+}
+
+/**
+ * Cursor 官方登录的一次轮询结果（喂给决策函数的输入）。
+ * - pending：后端回 200，还没授权
+ * - done：后端回 201，账号已落库
+ * - error：axios 异常；status 为 HTTP 状态码，undefined = 传输层错误（无响应）
+ */
+export type CursorLoginPollOutcome =
+  | { kind: 'pending' }
+  | { kind: 'done' }
+  | { kind: 'error'; status?: number }
+
+/** 轮询决策：继续 / 成功收尾 / 终态失败 / 超时。 */
+export type CursorLoginPollAction = 'continue' | 'success' | 'fail' | 'timeout'
+
+/**
+ * Cursor 登录轮询状态机（纯函数，便于单测）：
+ * - done 永远算成功——凭据已落库，即使刚好越过截止线也不能按超时误报；
+ * - 越过 expires_in_sec 窗口 → timeout（会话已被后端清扫，再问也是 400）；
+ * - 502（后端到 Cursor 的瞬时网络错误）与传输层错误（无 status）→ 继续，会话还在；
+ * - 其余 4xx/5xx → 终态失败（4xx 会话已清；未约定的其他状态码保守按终态处理）。
+ */
+export function decideCursorLoginPoll(
+  outcome: CursorLoginPollOutcome,
+  timedOut: boolean,
+): CursorLoginPollAction {
+  if (outcome.kind === 'done') return 'success'
+  if (timedOut) return 'timeout'
+  if (outcome.kind === 'pending') return 'continue'
+  if (outcome.status === undefined || outcome.status === 502) return 'continue'
+  return 'fail'
 }

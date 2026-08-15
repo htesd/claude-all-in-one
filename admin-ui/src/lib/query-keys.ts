@@ -25,6 +25,8 @@ export const queryKeys = {
     list: () => ['accounts', 'list'] as const,
     /** worker 运行态，15s 轮询。 */
     runtime: () => ['accounts', 'runtime'] as const,
+    /** 账号可用模型清单（models/local 弹窗）。 */
+    modelsLocal: (id: string) => ['accounts', 'models-local', id] as const,
   },
   settings: {
     /** 系统设置域根 key。 */

@@ -325,6 +325,31 @@ impl ToolDef {
 /// 陪等的代价是每个"需要动手"的请求都挂满 watchdog 的 90 秒。
 const RESP_TOOL_CHANNEL: u32 = 2;
 
+/// 内建 **exec 调用**(`ExecServerMessage`,2026-08-10 与 opencodex 项目的
+/// `agent.v1` 全量 protobuf schema 交叉核对过字段号):服务端让**客户端**执行
+/// 文件/命令操作,客户端在同一条 BiDi 流的请求侧回 `ExecClientMessage`。
+/// 对我们最重要的两个:
+///   field 3 = write_args {1:path, 2:file_text, 3:tool_call_id, 4:return_content, 5:file_bytes}
+///   field 7 = read_args  {1:path, 2:tool_call_id}
+///
+/// 带图请求的必经流程:服务端把附件字节用 write 推给客户端「落盘」
+/// (`/assets/attach-N-<uuid>.png`),模型随后用 read 读同一路径把图看进去。
+/// 真 IDE 有真磁盘所以无感;我们不回执的话,服务端 90 秒心跳死等(2026-08-10 实测),
+/// 表现就是带图请求全模型 502。
+///
+/// 实物帧(`tests/fixtures/asset_echo_real.bin`,200B):
+///   顶层 field 2(exec_server_message)→ field 3 write_args{1:路径, 5:字节}
+///   + field 19 span_context(标准 OTel){1:32hex trace, 2:16hex span, 3:flags} + field 55=0。
+/// 注意它**不裹** `1.RESP_MESSAGE`,与工具调用帧(1.2)的包装不对称 —— 两路都要认。
+/// 此前这一帧被误判成「内建工具调用」在出字前收口:凡是带图请求,全模型
+/// (fable/opus/grok 实测)一律 502 EmptyResponse,客户端重试风暴。
+const EXEC_WRITE_ARGS: u32 = 3; // exec_server_message.3 = write_args
+const EXEC_READ_ARGS: u32 = 7; // exec_server_message.7 = read_args
+/// exec 消息的关联 id(`uint32 id` / `string exec_id`),回执时原样带回。
+/// 实测的资产写调用两个都缺省(0 / "")。
+const EXEC_ID: u32 = 1;
+const EXEC_EXEC_ID: u32 = 15;
+
 // ── 工具调用帧(响应侧)的字段号 ────────────────────────────────────────────
 //
 // 2026-08-07 对真上游实测解出。整条路径:
@@ -523,7 +548,121 @@ pub fn parse_tool_call(payload: &[u8]) -> Option<ToolCall> {
     Some(ToolCall { id, name, args })
 }
 
+/// 内建工具调用的**身份字段号**(`1.2.2.<N>` 里的 N)。外部/MCP 工具(`.15`)返回
+/// `None` —— 那条路由 [`parse_tool_call`] 处理。
+///
+/// ## 为什么是字段号而不是名字
+///
+/// Cursor 的内建工具是**闭集枚举、不带名字**的:身份就编码在字段号里
+/// (§13.2 抓包实证:`.1` 终端命令、`.4` 读文件)。所以「模型刚才想干什么」这个
+/// 问题在这里只能得到一个数字,认识的数字才翻得成人话。
+///
+/// 这个数字有两个用处:
+/// 1. 下一轮纠偏时**指名**换哪个工具(见 chat.rs 的 `builtin_capability`);
+/// 2. 收口日志里把**不认识**的字段号记下来 —— 抓包定枚举那一步的现成线索,
+///    不用先猜哪些内建工具在被调。
+///
+/// 跳过的字段是已知的非身份位:`15` 外部工具、`57` 重复的 call_id、`59` 毫秒时间戳。
+pub fn builtin_tool_ident(payload: &[u8]) -> Option<u32> {
+    let ch = tool_channel(payload)?;
+    let detail = Reader::new(ch).find_map(|(f, v)| match (f, v) {
+        (TC_DETAIL, PbValue::Len(s)) => Some(s),
+        _ => None,
+    })?;
+    Reader::new(detail).find_map(|(f, v)| match (f, v) {
+        (TC_EXTERNAL, _) => None,
+        (57 | 59, _) => None,
+        (f, PbValue::Len(_)) => Some(f),
+        _ => None,
+    })
+}
+
+/// 一次**已实证**的内建工具调用(§13.2 抓包:`.1` 终端命令、`.4` 读文件)。
+///
+/// 只为这两个存在:它们是收口日志里的绝对大头,且参数字段号有实物依据
+/// (`.1` = `{1:{1:'ls -la', 3:超时, 5:'ls', 8:argv, 15:描述}}`,
+///  `.4` = `{1:{2:'README'}}`)。其余内建身份(代码检索、网页搜索…)参数形状
+/// 未实证,**不猜** —— 翻译错比收口更糟:客户端会执行一个参数张冠李戴的工具。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuiltinCall {
+    /// `1.2.2.1`:终端命令,命令串在 `.1.1`。
+    Terminal { id: String, command: String },
+    /// `1.2.2.4`:读文件,路径在 `.1.2`。
+    ReadFile { id: String, path: String },
+}
+
+/// 解一帧**内建**工具调用的参数(chat.rs 兼容转换层用)。
+///
+/// 与 [`builtin_tool_ident`] 同源(同一个 detail 块),但只认参数形状有抓包
+/// 实证的 `.1` / `.4`;参数缺失或为空一律 `None`,让调用方落回收口 ——
+/// 转换层的失败必须是单向的(认不出 → 维持原行为),绝不输出错参数的调用。
+pub fn parse_builtin_call(payload: &[u8]) -> Option<BuiltinCall> {
+    // ⚠️ 只认 `1.2`(RESP_MESSAGE → 工具通道)的包装形态,与 parse_tool_call 同款。
+    // 不用 tool_channel():那个函数还接受**顶层** field 2 —— 那是 exec 通道
+    // (asset-echo 帧,顶层 field 2 = exec_server_message),其 field 2 恰好是
+    // shell_args,拿工具通道的字段号去解它是张冠李戴。exec 通道由
+    // parse_exec_write/read 处理,这里绝不越界。
+    let msg = Reader::new(payload).find_map(|(f, v)| match (f, v) {
+        (RESP_MESSAGE, PbValue::Len(s)) => Some(s),
+        _ => None,
+    })?;
+    let ch = Reader::new(msg).find_map(|(f, v)| match (f, v) {
+        (RESP_TOOL_CHANNEL, PbValue::Len(s)) => Some(s),
+        _ => None,
+    })?;
+    let mut id = String::new();
+    let mut detail = None;
+    for (f, v) in Reader::new(ch) {
+        match (f, v) {
+            (TC_CALL_ID, PbValue::Len(s)) => id = String::from_utf8_lossy(s).to_string(),
+            (TC_DETAIL, PbValue::Len(s)) => detail = Some(s),
+            _ => {}
+        }
+    }
+    for (f, v) in Reader::new(detail?) {
+        let PbValue::Len(body) = v else { continue };
+        match f {
+            // 终端命令:`.1.1.1` = 命令串。
+            1 => {
+                let inner = Reader::new(body).find_map(|(f2, v2)| match (f2, v2) {
+                    (1, PbValue::Len(s)) => Some(s),
+                    _ => None,
+                })?;
+                let command = Reader::new(inner).find_map(|(f3, v3)| match (f3, v3) {
+                    (1, PbValue::Len(s)) => Some(String::from_utf8_lossy(s).into_owned()),
+                    _ => None,
+                })?;
+                if command.trim().is_empty() {
+                    return None;
+                }
+                return Some(BuiltinCall::Terminal { id, command });
+            }
+            // 读文件:`.4.1.2` = 路径。
+            4 => {
+                let inner = Reader::new(body).find_map(|(f2, v2)| match (f2, v2) {
+                    (1, PbValue::Len(s)) => Some(s),
+                    _ => None,
+                })?;
+                let path = Reader::new(inner).find_map(|(f3, v3)| match (f3, v3) {
+                    (2, PbValue::Len(s)) => Some(String::from_utf8_lossy(s).into_owned()),
+                    _ => None,
+                })?;
+                if path.trim().is_empty() {
+                    return None;
+                }
+                return Some(BuiltinCall::ReadFile { id, path });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 这一帧是不是「上游在等客户端执行工具」。
+///
+/// 判定**故意保持宽松**(字段在就算,不看 wire type):这里的首要职责是
+/// 「别漏」—— 漏掉一帧真工具调用的代价是陪上游死等心跳到 watchdog。
+/// 严的解析交给 [`parse_tool_call`] / [`parse_asset_echo`],认不出再分类。
 pub fn is_tool_call(payload: &[u8]) -> bool {
     for (f, v) in Reader::new(payload) {
         if f == RESP_TOOL_CHANNEL {
@@ -538,6 +677,159 @@ pub fn is_tool_call(payload: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// 取出工具通道(`field 2`)的字节。工具调用帧裹在 `1.2` 里,资源回显帧
+/// 直接挂在顶层 field 2(见 [`RESP_ASSET`] 的注释),两路都要认。
+///
+/// 与 [`is_tool_call`] 不同,这里是**解析**入口,只接受 length-delimited;
+/// wire type 漂移的帧会落回调用方的「认不出」分支,而不是被静默跳过。
+fn tool_channel(payload: &[u8]) -> Option<&[u8]> {
+    for (f, v) in Reader::new(payload) {
+        match (f, v) {
+            (RESP_TOOL_CHANNEL, PbValue::Len(s)) => return Some(s),
+            (RESP_MESSAGE, PbValue::Len(sub)) => {
+                if let Some(s) = Reader::new(sub).find_map(|(f2, v2)| match (f2, v2) {
+                    (RESP_TOOL_CHANNEL, PbValue::Len(s)) => Some(s),
+                    _ => None,
+                }) {
+                    return Some(s);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 一次服务端写盘调用(`write_args`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecWrite {
+    /// 关联 id,回执原样带回(实测的资产写调用里是缺省 0)。
+    pub id: u64,
+    pub exec_id: String,
+    pub path: String,
+    /// 要落盘的内容:`file_bytes`(field 5)优先,只有 `file_text`(field 2)时取其字节。
+    pub bytes: Vec<u8>,
+}
+
+/// 一次服务端读文件调用(`read_args`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecRead {
+    pub id: u64,
+    pub exec_id: String,
+    pub path: String,
+}
+
+/// 取 exec 消息的关联 id(`1`=uint32、`15`=string),缺省即 0 / ""。
+fn exec_ids(ch: &[u8]) -> (u64, String) {
+    let mut id = 0u64;
+    let mut exec_id = String::new();
+    for (f, v) in Reader::new(ch) {
+        match (f, v) {
+            (EXEC_ID, PbValue::Varint(n)) => id = n,
+            (EXEC_EXEC_ID, PbValue::Len(s)) => exec_id = String::from_utf8_lossy(s).to_string(),
+            _ => {}
+        }
+    }
+    (id, exec_id)
+}
+
+/// 解服务端写盘调用。不是 write_args(或结构对不上)→ `None`。
+///
+/// ⚠️ 认领条件:路径必须是**绝对路径**(以 `/` 开头)且内容在场
+/// (`file_bytes` 或 `file_text`)。真工具调用帧的 `1.2.3` 也是个字符串
+/// (另一个 id,形如 `<uuid>-0-<4字符>`,见 PROTOCOL §13.2)—— 单靠
+/// 「field 3 能解出字符串」会把工具帧吞掉,工具回路直接哑掉。
+pub fn parse_exec_write(payload: &[u8]) -> Option<ExecWrite> {
+    let ch = tool_channel(payload)?;
+    let args = Reader::new(ch).find_map(|(f, v)| match (f, v) {
+        (EXEC_WRITE_ARGS, PbValue::Len(s)) => Some(s),
+        _ => None,
+    })?;
+    let mut path = String::new();
+    let mut bytes = None;
+    for (f, v) in Reader::new(args) {
+        match (f, v) {
+            (1, PbValue::Len(s)) => path = String::from_utf8_lossy(s).to_string(),
+            (2, PbValue::Len(s)) => {
+                if bytes.is_none() {
+                    bytes = Some(s.to_vec());
+                }
+            }
+            (5, PbValue::Len(s)) => bytes = Some(s.to_vec()),
+            _ => {}
+        }
+    }
+    if !path.starts_with('/') {
+        return None;
+    }
+    let (id, exec_id) = exec_ids(ch);
+    Some(ExecWrite {
+        id,
+        exec_id,
+        path,
+        bytes: bytes?,
+    })
+}
+
+/// 解服务端读文件调用。不是 read_args → `None`。认领只需绝对路径:
+/// read_args 只有 {1:path, 2:tool_call_id} 两个字段,没有可混淆的同号字符串。
+pub fn parse_exec_read(payload: &[u8]) -> Option<ExecRead> {
+    let ch = tool_channel(payload)?;
+    let args = Reader::new(ch).find_map(|(f, v)| match (f, v) {
+        (EXEC_READ_ARGS, PbValue::Len(s)) => Some(s),
+        _ => None,
+    })?;
+    let mut path = String::new();
+    for (f, v) in Reader::new(args) {
+        if let (1, PbValue::Len(s)) = (f, v) {
+            path = String::from_utf8_lossy(s).to_string();
+        }
+    }
+    if !path.starts_with('/') {
+        return None;
+    }
+    let (id, exec_id) = exec_ids(ch);
+    Some(ExecRead { id, exec_id, path })
+}
+
+/// 客户端 exec 回执的公共骨架:`AgentClientMessage{2: exec_client_message{…}}`。
+/// `result_field` 与结果体外层由调用方定(write_result=3 / read_result=7,与服务侧同号)。
+fn exec_client_frame(id: u64, exec_id: &str, result_field: u32, result: &Writer) -> Vec<u8> {
+    let mut ecm = Writer::new();
+    if id != 0 {
+        ecm.uint(EXEC_ID, id);
+    }
+    if !exec_id.is_empty() {
+        ecm.string(EXEC_EXEC_ID, exec_id);
+    }
+    ecm.message(result_field, result);
+    let mut top = Writer::new();
+    top.message(RESP_TOOL_CHANNEL, &ecm);
+    top.into_bytes()
+}
+
+/// 编码写盘成功回执:`write_result{1: write_success{1:path, 3:file_size}}`。
+pub fn encode_write_success(id: u64, exec_id: &str, path: &str, file_size: usize) -> Vec<u8> {
+    let mut ws = Writer::new();
+    ws.string(1, path);
+    ws.uint(3, file_size as u64);
+    let mut wr = Writer::new();
+    wr.message(1, &ws); // WriteResult.success
+    exec_client_frame(id, exec_id, EXEC_WRITE_ARGS, &wr)
+}
+
+/// 编码读文件成功回执(二进制):`read_result{1: read_success{1:path, 4:file_size, 5:data}}`。
+/// 图片必须走 `data`(bytes)而不是 `content`(string)—— PNG 不是合法 UTF-8。
+pub fn encode_read_success_data(id: u64, exec_id: &str, path: &str, data: &[u8]) -> Vec<u8> {
+    let mut rs = Writer::new();
+    rs.string(1, path);
+    rs.uint(4, data.len() as u64);
+    rs.bytes(5, data);
+    let mut rr = Writer::new();
+    rr.message(1, &rs); // ReadResult.success
+    exec_client_frame(id, exec_id, EXEC_READ_ARGS, &rr)
 }
 
 /// `1.14 {1: 输入, 2: 输出, 3: 缓存命中}` —— 用量,**同时是本轮的收尾信号**。
@@ -568,6 +860,12 @@ pub struct Model {
     /// 值的类型文档没写(`fast=false` / `context=300k` / `effort=high` 混在一起),
     /// 这里一律按字符串编码 —— 与 `effort=high`、`context=300k` 这类字面量一致。
     pub params: Vec<(String, String)>,
+    /// 是否进 `1.14` 可用模型清单(每个 Run 请求都带整份)。
+    ///
+    /// 探测中的模型(还没在真机菜单里证实)必须 `false`:可选中(`1.9` 当前模型),
+    /// 但不进清单 —— 未证实条目混进 `1.14` 会污染**所有**模型的请求
+    /// (审查 gpt-5.6-sol 高危),也让我们的清单与任何真实客户端版本都对不上。
+    pub menu_visible: bool,
 }
 
 impl Model {
@@ -575,6 +873,7 @@ impl Model {
         Self {
             name: name.into(),
             params: Vec::new(),
+            menu_visible: true,
         }
     }
 
@@ -585,7 +884,14 @@ impl Model {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            menu_visible: true,
         }
+    }
+
+    /// 标记为探测项:可选中但不进 `1.14` 清单(见 `menu_visible` 注释)。
+    pub fn probe(mut self) -> Self {
+        self.menu_visible = false;
+        self
     }
 
     fn encode(&self) -> Writer {
@@ -822,9 +1128,12 @@ pub fn build_frame0(
     body.uint(BODY_FLAG10, 0);
     // 1.25 本轮 turn id。每轮必须换 —— 复用同一个值等于告诉服务端「还是那一轮」。
     body.string(BODY_TURN_ID, &uuid::Uuid::new_v4().to_string());
-    // 1.14 可用清单(repeated,每个模型一条)
+    // 1.14 可用清单(repeated,每个模型一条;探测项不进清单,见 Model::menu_visible)
     if shape.model_catalog {
         for m in catalog {
+            if !m.menu_visible {
+                continue;
+            }
             body.message(BODY_MODEL_CATALOG, &m.encode());
         }
     }
@@ -1470,6 +1779,40 @@ mod tests {
     }
 
     #[test]
+    fn probe_models_stay_out_of_the_menu() {
+        // 探测项(menu_visible=false)可被选中为当前模型,但不进 1.14 清单 ——
+        // 未证实的条目不污染所有模型的请求(审查 gpt-5.6-sol 高危)。
+        let catalog = vec![
+            Model::new("default"),
+            Model::with_params("grok-4.6", &[("effort", "high")]).probe(),
+        ];
+        let bytes = build_frame0(
+            &one_user("hi"),
+            "",
+            &[],
+            Media::default(),
+            &Model::with_params("grok-4.6", &[("effort", "high")]).probe(),
+            &catalog,
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
+        let body = dig(&bytes, &[FRAME_BODY]).unwrap();
+        let listed: Vec<String> = Reader::new(body)
+            .filter_map(|(f, v)| match (f, v) {
+                (BODY_MODEL_CATALOG, PbValue::Len(s)) => string_at(s, MODEL_NAME),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed, vec!["default"], "探测项不该进 1.14 清单");
+        // 但 1.9 当前模型确实是 grok-4.6 —— 探测流量真的打到它身上。
+        let cur = dig(body, &[BODY_MODEL]).unwrap();
+        assert_eq!(string_at(cur, MODEL_NAME).as_deref(), Some("grok-4.6"));
+    }
+
+    #[test]
     fn shape_toggles_actually_drop_sections() {
         let off = RunShape {
             env_block: false,
@@ -1982,6 +2325,260 @@ mod tests {
         );
     }
 
+    /// ⭐ **锚在 2026-08-10 的抓包实物上**:带图请求的资产落盘调用
+    /// (`exec_server_message.3` = write_args,字段号经 opencodex 的
+    /// `agent.v1` schema 交叉核对)。
+    ///
+    /// 这是「带图请求全模型 502」的直接病因:这一帧走 exec 通道,被误判成
+    /// 内建工具调用在出字前收口;而只跳过不回执,服务端又 90s 心跳死等。
+    /// 它必须被解成**写盘调用**(存内存 + 回执),既不是外部工具也不是跳过对象。
+    #[test]
+    fn 抓包实物里的资产写调用被认出且不被当成工具() {
+        let raw = include_bytes!("../tests/fixtures/asset_echo_real.bin");
+        assert!(is_tool_call(raw), "它确实走 exec 通道");
+        let w = parse_exec_write(raw).expect("资产写调用必须解得出来");
+        assert_eq!(w.path, "/assets/attach-0-6bd00159-1e01-4924-b8c2-12f28cc81e53.png");
+        assert_eq!(w.bytes.len(), 73, "1x1 探针 PNG 的原始字节数");
+        assert_eq!(w.id, 0, "实物帧里关联 id 缺省");
+        assert_eq!(w.exec_id, "");
+        assert!(
+            parse_tool_call(raw).is_none(),
+            "资产写调用没有工具名,绝不能交给调用方当工具执行"
+        );
+        assert!(parse_exec_read(raw).is_none(), "写不是读");
+    }
+
+    /// 反向钉住:真工具帧(外部/内建)**不是**写/读调用 —— 否则工具回路直接哑掉。
+    #[test]
+    fn 工具帧不被当成_exec_调用() {
+        let ext = include_bytes!("../tests/fixtures/tool_call_external_real.bin");
+        assert!(parse_exec_write(ext).is_none(), "外部工具帧不是写调用");
+        assert!(parse_exec_read(ext).is_none(), "外部工具帧不是读调用");
+        let builtin = include_bytes!("../tests/fixtures/tool_call_builtin_real.bin");
+        assert!(parse_exec_write(builtin).is_none(), "内建工具帧不是写调用");
+        assert!(parse_exec_read(builtin).is_none(), "内建工具帧不是读调用");
+    }
+
+    /// 写调用认领条件:绝对路径 + 内容在场(file_bytes 或 file_text),缺任何一个
+    /// 都不认领 —— 真工具调用帧的 `1.2.3` 也是个字符串(另一个 id,PROTOCOL §13.2),
+    /// 单靠「能解出字段」会把工具帧吞成写调用,工具回路直接哑掉。
+    #[test]
+    fn 写调用缺路径或缺内容都不认领() {
+        // 有字节没路径。
+        let mut args = Writer::new();
+        args.bytes(5, b"xxxx");
+        let mut ch = Writer::new();
+        ch.message(EXEC_WRITE_ARGS, &args);
+        let mut top = Writer::new();
+        top.message(RESP_TOOL_CHANNEL, &ch);
+        assert!(parse_exec_write(&top.into_bytes()).is_none());
+
+        // 有路径没内容。
+        let mut args = Writer::new();
+        args.string(1, "/assets/attach-0-x.png");
+        let mut ch = Writer::new();
+        ch.message(EXEC_WRITE_ARGS, &args);
+        let mut top = Writer::new();
+        top.message(RESP_TOOL_CHANNEL, &ch);
+        assert!(parse_exec_write(&top.into_bytes()).is_none());
+
+        // 相对路径不认领(工具帧 1.2.3 的 id 形状)。
+        let mut args = Writer::new();
+        args.string(1, "3f2a1b9c-0-x7ab");
+        args.bytes(5, b"xxxx");
+        let mut ch = Writer::new();
+        ch.message(EXEC_WRITE_ARGS, &args);
+        let mut top = Writer::new();
+        top.message(RESP_TOOL_CHANNEL, &ch);
+        assert!(parse_exec_write(&top.into_bytes()).is_none());
+
+        // file_text(field 2)也是合法内容载体。
+        let mut args = Writer::new();
+        args.string(1, "/assets/note.txt");
+        args.string(2, "hello");
+        let mut ch = Writer::new();
+        ch.uint(EXEC_ID, 42);
+        ch.string(EXEC_EXEC_ID, "exec-1");
+        ch.message(EXEC_WRITE_ARGS, &args);
+        let mut top = Writer::new();
+        top.message(RESP_TOOL_CHANNEL, &ch);
+        let w = parse_exec_write(&top.into_bytes()).expect("file_text 形态也要认得");
+        assert_eq!(w.bytes, b"hello");
+        assert_eq!(w.id, 42);
+        assert_eq!(w.exec_id, "exec-1");
+    }
+
+    /// `is_tool_call` 保持宽松(字段在就算,不看 wire type)—— 宁可错进
+    /// 工具分支再分类,也不能漏掉真工具帧陪上游死等心跳。
+    #[test]
+    fn 工具通道判定不挑_wire_type() {
+        let mut top = Writer::new();
+        top.uint(RESP_TOOL_CHANNEL, 0);
+        assert!(is_tool_call(&top.into_bytes()));
+        // 但解析入口是严的:wire type 不是 length-delimited 就不认领。
+        let mut top2 = Writer::new();
+        top2.uint(RESP_TOOL_CHANNEL, 0);
+        let top2 = top2.into_bytes();
+        assert!(parse_exec_write(&top2).is_none());
+        assert!(parse_tool_call(&top2).is_none());
+    }
+
+    /// ⭐ 合帧:资产写调用(顶层 field 2)与用量(`1.14`)并进同一帧时,
+    /// 两边都得解得出来。chat.rs 的流程依赖这个 —— 先处理 exec、再判工具、
+    /// 最后判用量,谁也不许把谁吞掉(吞了用量 = 陪上游死等心跳到 watchdog)。
+    #[test]
+    fn 资产写调用与用量合帧两者都可解() {
+        let mut args = Writer::new();
+        args.string(1, "/assets/attach-0-x.png");
+        args.bytes(5, b"png-bytes");
+        let mut ch = Writer::new();
+        ch.message(EXEC_WRITE_ARGS, &args);
+        let mut u = Writer::new();
+        u.uint(1, 100);
+        u.uint(2, 5);
+        u.uint(3, 90);
+        let mut msg = Writer::new();
+        msg.message(RESP_USAGE, &u);
+        let mut top = Writer::new();
+        top.message(RESP_MESSAGE, &msg);
+        top.message(RESP_TOOL_CHANNEL, &ch);
+        let frame = top.into_bytes();
+        let w = parse_exec_write(&frame).expect("合帧里的写调用必须解得出");
+        assert_eq!(w.path, "/assets/attach-0-x.png");
+        assert_eq!(w.bytes, b"png-bytes");
+        assert!(parse_tool_call(&frame).is_none(), "合帧里没有工具调用");
+        assert_eq!(
+            parse_frame(&frame).usage,
+            Some((100, 5, 90)),
+            "合帧里的用量绝不能被写调用吞掉"
+        );
+    }
+
+    /// 回执编码:字段号必须与 `agent.v1` schema 一致 —— 自己写自己解是白测,
+    /// 所以这里手解字节核对关键字段的位置。
+    #[test]
+    fn 写盘回执的字段号对齐_schema() {
+        let ack = encode_write_success(42, "exec-1", "/assets/a.png", 73);
+        // AgentClientMessage.2 = exec_client_message
+        let ecm = Reader::new(&ack)
+            .find_map(|(f, v)| match (f, v) {
+                (2, PbValue::Len(s)) => Some(s),
+                _ => None,
+            })
+            .expect("顶层必须有 field 2");
+        let mut seen_id = None;
+        let mut seen_exec_id = None;
+        let mut wr = None;
+        for (f, v) in Reader::new(ecm) {
+            match (f, v) {
+                (1, PbValue::Varint(n)) => seen_id = Some(n),
+                (15, PbValue::Len(s)) => seen_exec_id = Some(String::from_utf8_lossy(s).to_string()),
+                (3, PbValue::Len(s)) => wr = Some(s),
+                _ => {}
+            }
+        }
+        assert_eq!(seen_id, Some(42), "id 必须原样带回(field 1)");
+        assert_eq!(seen_exec_id.as_deref(), Some("exec-1"), "exec_id 在 field 15");
+        // write_result.1 = write_success{1:path, 3:file_size}
+        let ws = Reader::new(wr.expect("write_result 在 field 3"))
+            .find_map(|(f, v)| match (f, v) {
+                (1, PbValue::Len(s)) => Some(s),
+                _ => None,
+            })
+            .expect("success 在 field 1");
+        let mut path = None;
+        let mut size = None;
+        for (f, v) in Reader::new(ws) {
+            match (f, v) {
+                (1, PbValue::Len(s)) => path = Some(String::from_utf8_lossy(s).to_string()),
+                (3, PbValue::Varint(n)) => size = Some(n),
+                _ => {}
+            }
+        }
+        assert_eq!(path.as_deref(), Some("/assets/a.png"));
+        assert_eq!(size, Some(73));
+
+        // 缺省 id(0 / "")不占字段 —— 实测的资产写调用就是这个形态。
+        let ack0 = encode_write_success(0, "", "/assets/a.png", 1);
+        let ecm0 = Reader::new(&ack0)
+            .find_map(|(f, v)| match (f, v) {
+                (2, PbValue::Len(s)) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !Reader::new(ecm0).any(|(f, _)| f == 1 || f == 15),
+            "缺省 id 不该出现在线上"
+        );
+    }
+
+    /// 读盘回执:图片走 `data`(field 5,bytes),file_size 在 field 4。
+    #[test]
+    fn 读盘回执的字段号对齐_schema() {
+        let reply = encode_read_success_data(7, "e2", "/assets/a.png", b"\x89PNG");
+        let ecm = Reader::new(&reply)
+            .find_map(|(f, v)| match (f, v) {
+                (2, PbValue::Len(s)) => Some(s),
+                _ => None,
+            })
+            .expect("顶层必须有 field 2");
+        let mut seen_id = None;
+        let mut rr = None;
+        for (f, v) in Reader::new(ecm) {
+            match (f, v) {
+                (1, PbValue::Varint(n)) => seen_id = Some(n),
+                (7, PbValue::Len(s)) => rr = Some(s),
+                _ => {}
+            }
+        }
+        assert_eq!(seen_id, Some(7));
+        let rs = Reader::new(rr.expect("read_result 在 field 7"))
+            .find_map(|(f, v)| match (f, v) {
+                (1, PbValue::Len(s)) => Some(s),
+                _ => None,
+            })
+            .expect("success 在 field 1");
+        let mut path = None;
+        let mut size = None;
+        let mut data = None;
+        for (f, v) in Reader::new(rs) {
+            match (f, v) {
+                (1, PbValue::Len(s)) => path = Some(String::from_utf8_lossy(s).to_string()),
+                (4, PbValue::Varint(n)) => size = Some(n),
+                (5, PbValue::Len(s)) => data = Some(s.to_vec()),
+                _ => {}
+            }
+        }
+        assert_eq!(path.as_deref(), Some("/assets/a.png"));
+        assert_eq!(size, Some(4));
+        assert_eq!(data.as_deref(), Some(&b"\x89PNG"[..]), "图片字节走 field 5(data)");
+    }
+
+    /// 读调用解析:绝对路径才认领,关联 id 带回。
+    #[test]
+    fn 读调用解析() {
+        let mut args = Writer::new();
+        args.string(1, "/assets/attach-0-x.png");
+        let mut ch = Writer::new();
+        ch.uint(EXEC_ID, 9);
+        ch.message(EXEC_READ_ARGS, &args);
+        let mut top = Writer::new();
+        top.message(RESP_TOOL_CHANNEL, &ch);
+        let r = parse_exec_read(&top.into_bytes()).expect("读调用必须解得出");
+        assert_eq!(r.path, "/assets/attach-0-x.png");
+        assert_eq!(r.id, 9);
+        assert!(parse_exec_write(&{
+            let mut args = Writer::new();
+            args.string(1, "/assets/attach-0-x.png");
+            let mut ch = Writer::new();
+            ch.message(EXEC_READ_ARGS, &args);
+            let mut top = Writer::new();
+            top.message(RESP_TOOL_CHANNEL, &ch);
+            top.into_bytes()
+        })
+        .is_none(), "读不是写");
+    }
+
     /// ⭐ 数值参数。这是 2026-08-07 那次「grok 无限重试」的直接病因:
     /// 旧解析只读 `google.protobuf.Value` 的 string 档(field 3),
     /// 模型传 `limit: 200` 时值在 number 档(field 2, double),解出空串,
@@ -2074,6 +2671,92 @@ mod tests {
         let f = outer.into_bytes();
         assert!(is_tool_call(&f), "仍要认出「这是工具帧」好主动收口");
         assert!(parse_tool_call(&f).is_none(), "但不能当成可转发的外部工具");
+    }
+
+    /// 兼容转换层正例:内建终端帧(§13.2 实证 `1.2.2.1.1.1` = 命令串)要解得出来。
+    #[test]
+    fn 内建终端帧解出命令串() {
+        let mut term = Writer::new();
+        term.string(1, "ls -la");
+        let mut one = Writer::new();
+        one.message(1, &term);
+        let mut detail = Writer::new();
+        detail.message(1, &one); // 1.2.2.1 = 终端工具
+        let mut ch = Writer::new();
+        ch.string(TC_CALL_ID, "call-x-0");
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        assert_eq!(
+            parse_builtin_call(&outer.into_bytes()),
+            Some(BuiltinCall::Terminal { id: "call-x-0".into(), command: "ls -la".into() })
+        );
+    }
+
+    /// 内建读文件帧(§13.2 实证 `.4 = {1:{2:'README'}}`,路径在 `1.2.2.4.1.2`)。
+    #[test]
+    fn 内建读文件帧解出路径() {
+        let mut rd = Writer::new();
+        rd.string(2, "/tmp/a.png");
+        let mut one = Writer::new();
+        one.message(1, &rd);
+        let mut detail = Writer::new();
+        detail.message(4, &one); // 1.2.2.4 = 读文件
+        let mut ch = Writer::new();
+        ch.string(TC_CALL_ID, "call-y-0");
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        assert_eq!(
+            parse_builtin_call(&outer.into_bytes()),
+            Some(BuiltinCall::ReadFile { id: "call-y-0".into(), path: "/tmp/a.png".into() })
+        );
+    }
+
+    /// 边界钉死:外部工具帧、exec 资产帧(顶层 field 2)、空命令都不许被
+    /// 当成内建调用 —— 转换层的失败必须是单向的(认不出 → 落回收口)。
+    #[test]
+    fn 内建调用解析的边界() {
+        // 外部工具(.15)归 parse_tool_call,不归转换层。
+        let mut inner = Writer::new();
+        inner.string(1, "gwtools-read");
+        inner.string(TC_BARE_NAME, "read");
+        let mut ext = Writer::new();
+        ext.message(TC_INNER, &inner);
+        let mut detail = Writer::new();
+        detail.message(TC_EXTERNAL, &ext);
+        let mut ch = Writer::new();
+        ch.string(TC_CALL_ID, "call-z-0");
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        assert_eq!(parse_builtin_call(&outer.into_bytes()), None);
+
+        // exec 资产帧不裹 `1.2`(顶层 field 2 = exec_server_message),它的
+        // field 2 恰好是 shell_args —— 越界去解就是张冠李戴翻译出假终端调用。
+        let real: &[u8] = include_bytes!("../tests/fixtures/asset_echo_real.bin");
+        assert_eq!(parse_builtin_call(real), None);
+
+        // 空命令 → None(落回收口),绝不产出空参数的调用。
+        let mut term = Writer::new();
+        term.string(1, "   ");
+        let mut one = Writer::new();
+        one.message(1, &term);
+        let mut detail = Writer::new();
+        detail.message(1, &one);
+        let mut ch = Writer::new();
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        assert_eq!(parse_builtin_call(&outer.into_bytes()), None);
     }
 
     /// 工具声明落在 `1.2.1.2.7`,**5 个字段一个不能少**(真包 16/16 全都有)。

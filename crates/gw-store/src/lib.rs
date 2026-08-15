@@ -185,6 +185,21 @@ CREATE TABLE IF NOT EXISTS log_blob_refs (
 );
 CREATE INDEX IF NOT EXISTS idx_blobref_hash ON log_blob_refs(hash);
 
+-- suspend 生命周期(事实源;内存运行态只是它的镜像):连续 suspend 次数、
+-- 生命周期原因、冷却到期绝对时刻。独立建表而非塞进 accounts.extra ——
+-- extra 有整体替换/导入合并路径,生命周期状态放进去会被误洗。
+-- epoch:人工恢复(restore_account)单调递增;worker 的持久化写带它做
+-- 条件更新(WHERE epoch = 写入方已知值)——恢复与 worker 待落库队列竞态时,
+-- 旧状态写不回、退役号不会被反写重新禁用(对抗审查阻断#3)。
+CREATE TABLE IF NOT EXISTS account_lifecycle (
+    account_id     TEXT PRIMARY KEY,
+    suspend_streak INTEGER NOT NULL DEFAULT 0,
+    reason         TEXT,
+    retry_at       INTEGER,
+    epoch          INTEGER NOT NULL DEFAULT 0,
+    revision       INTEGER NOT NULL DEFAULT 0
+);
+
 -- ── 自动补货(drop.kiro.ss 买 ksk_ 号并自动上号) ────────────────────────────
 -- 订单。**幂等键必须在发出购买请求之前落到这里**:进程崩在请求途中时,重启后靠这张表
 -- 才知道那个 client_order_id 是什么,用原 id 重放才能问出真实结果而不是重复扣款。
@@ -828,11 +843,123 @@ impl SqliteStore {
         Ok(if changed == 1 { UpdateAccountOutcome::Ok } else { UpdateAccountOutcome::NotFound })
     }
 
-    /// 删除账号;`false` = 不存在。usage_records 历史归属不动。
+    /// 删除账号;`false` = 不存在。usage_records 历史归属不动;
+    /// suspend 生命周期行同事务删除(否则重导同 id 会继承旧号的退役/冷却状态)。
     pub fn delete_account(&self, account_id: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
-        let changed = conn.execute("DELETE FROM accounts WHERE account_id = ?1", [account_id])?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let changed = tx.execute("DELETE FROM accounts WHERE account_id = ?1", [account_id])?;
+        tx.execute(
+            "DELETE FROM account_lifecycle WHERE account_id = ?1",
+            [account_id],
+        )?;
+        tx.commit()?;
         Ok(changed == 1)
+    }
+
+    /// 读全部 suspend 生命周期行(worker 启动水合 + sync 周期对账用;
+    /// 行数 = 有过 suspend 的号,规模小)。
+    pub fn load_suspend_lifecycles(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, gw_core::store::SuspendLifecycle>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT account_id, suspend_streak, reason, retry_at, epoch, revision FROM account_lifecycle",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                gw_core::store::SuspendLifecycle {
+                    suspend_streak: r.get::<_, i64>(1)? as u32,
+                    reason: r.get(2)?,
+                    retry_at: r.get(3)?,
+                    epoch: r.get(4)?,
+                    revision: r.get(5)?,
+                },
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (id, lc) = r?;
+            out.insert(id, lc);
+        }
+        Ok(out)
+    }
+
+    /// 持久化一次 suspend 生命周期状态转换。**全序条件写**:仅当 `(epoch, revision)`
+    /// 比库内行**严格更新**才生效——epoch 由人工恢复递增(挡旧世代写),revision
+    /// 由 worker 每次转换递增(挡同 epoch 的乱序 detached 写,对抗审查二轮阻断#1)。
+    /// 返回 `false` = 竞态落败(调用方放弃本次写入,由 sync 对账收敛),不是错误。
+    ///
+    /// `set_disabled=true` 时同事务把 `accounts.disabled` 置 1(自动退役)——
+    /// 且仅在条件写生效时才置,否则退役会被反写到一个刚被人工恢复的号上。
+    ///
+    /// INSERT 带 `WHERE EXISTS(accounts)`:删除账号后迟到的 detached 写不得为
+    /// 不存在的账号重插孤儿行(对抗审查二轮中#4)。
+    pub fn persist_suspend_lifecycle(
+        &self,
+        account_id: &str,
+        lc: &gw_core::store::SuspendLifecycle,
+        set_disabled: bool,
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let applied = tx.execute(
+            "INSERT INTO account_lifecycle (account_id, suspend_streak, reason, retry_at, epoch, revision) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+             WHERE EXISTS (SELECT 1 FROM accounts WHERE account_id = ?1) \
+             ON CONFLICT(account_id) DO UPDATE SET \
+             suspend_streak=excluded.suspend_streak, reason=excluded.reason, \
+             retry_at=excluded.retry_at, epoch=excluded.epoch, revision=excluded.revision \
+             WHERE account_lifecycle.epoch < excluded.epoch \
+                OR (account_lifecycle.epoch = excluded.epoch \
+                    AND account_lifecycle.revision < excluded.revision)",
+            rusqlite::params![
+                account_id,
+                lc.suspend_streak as i64,
+                lc.reason,
+                lc.retry_at,
+                lc.epoch,
+                lc.revision
+            ],
+        )? == 1;
+        if applied && set_disabled {
+            tx.execute(
+                "UPDATE accounts SET disabled = 1 WHERE account_id = ?1",
+                [account_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    /// 人工恢复(原子):解除配置停用 + 清 suspend 生命周期内容 + **epoch 递增、
+    /// revision 归零**。行不删除(写清零行):worker 的 sync 对账靠「库 (epoch,revision)
+    /// 比内存新」发现这次恢复,进而清运行态——即使该号只是运行态冷却
+    /// (DB disabled 一直是 0,无配置翻转),恢复也能可靠送达 worker(对抗审查阻断#2)。
+    pub fn restore_account(&self, account_id: &str) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE accounts SET disabled = 0 WHERE account_id = ?1",
+            [account_id],
+        )?;
+        // 账号不存在:整单回滚——不得为不存在的号留下孤儿生命周期行
+        // (迟到的恢复/PATCH 打错 id 都不该重插行,对抗审查三轮中#2)。
+        if changed == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO account_lifecycle (account_id, suspend_streak, reason, retry_at, epoch, revision) \
+             VALUES (?1, 0, NULL, NULL, 1, 0) \
+             ON CONFLICT(account_id) DO UPDATE SET \
+             suspend_streak=0, reason=NULL, retry_at=NULL, \
+             epoch=account_lifecycle.epoch+1, revision=0",
+            [account_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// worker 刷新 token 后回写 extra(rolling refresh_token 持久化,
@@ -1891,6 +2018,8 @@ impl SqliteStore {
                 provider: row.provider,
                 max_concurrency: row.max_concurrency.clamp(1, u32::MAX as i64) as u32,
                 disabled: row.disabled,
+                // 暖机号龄的事实源(accounts.created_at,对补货号≈上游激活时间)。
+                created_at: row.created_at,
                 extra,
             });
         }
@@ -3261,6 +3390,19 @@ mod tests {
         assert!(a3.disabled);
     }
 
+    /// 暖机号龄事实源:accounts.created_at 必须原样带进运行时 Account,
+    /// 丢了它(=0)暖机会对所有号失效(fail-open 到不限速)。
+    #[test]
+    fn load_owned_accounts_carries_created_at_for_warmup() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_account("k1", "G0", "kiro", 1, "{}").unwrap();
+        let row = store.get_account("k1").unwrap().unwrap();
+        let accounts = store.load_owned_accounts("G0").unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(row.created_at > 0, "建库即应有建档时刻");
+        assert_eq!(accounts[0].created_at, row.created_at, "created_at 必须直通");
+    }
+
     #[test]
     fn import_accounts_yaml_idempotent() {
         let yaml = r#"
@@ -3640,6 +3782,7 @@ groups:
         let mut stmt = conn
             .prepare("SELECT account_id, priority FROM account_groups WHERE group_name='G0' ORDER BY 1")
             .unwrap();
+
         let rows: Vec<(String, i64)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
@@ -3651,6 +3794,78 @@ groups:
             "回填后组内排序必须与升级前的 extra.priority 一致"
         );
     }
+
+    /// suspend 生命周期往返:条件写(含退役置 disabled)→ 读回 → 人工恢复
+    /// (epoch 递增)→ 旧 epoch / 同 epoch 旧 revision 的写入被拒(竞态不落旧状态)。
+    #[test]
+    fn suspend_lifecycle_roundtrip_and_restore() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.create_account("a", "G0", "kiro", 2, "{}").unwrap();
+        let lc = gw_core::store::SuspendLifecycle {
+            suspend_streak: 2,
+            reason: Some("temporarily_suspended".into()),
+            retry_at: Some(1_800_000_000),
+            epoch: 0,
+            revision: 1,
+        };
+        assert!(s.persist_suspend_lifecycle("a", &lc, false).unwrap());
+        let m = s.load_suspend_lifecycles().unwrap();
+        assert_eq!(m.get("a"), Some(&lc));
+        // 同 epoch 的**乱序**写:rev 3 先落,rev 2 后到必须落败(二轮阻断#1)。
+        let newer = gw_core::store::SuspendLifecycle { revision: 3, ..lc.clone() };
+        assert!(s.persist_suspend_lifecycle("a", &newer, false).unwrap());
+        let stale = gw_core::store::SuspendLifecycle { revision: 2, ..lc.clone() };
+        assert!(!s.persist_suspend_lifecycle("a", &stale, false).unwrap());
+        assert_eq!(
+            s.load_suspend_lifecycles().unwrap().get("a").unwrap().revision,
+            3,
+            "同 epoch 旧 revision 不得覆盖新状态"
+        );
+        // 退役:覆盖为 retired 且同事务置 disabled=1。
+        let retired = gw_core::store::SuspendLifecycle {
+            suspend_streak: 3,
+            reason: Some("suspended_retired".into()),
+            retry_at: None,
+            epoch: 0,
+            revision: 4,
+        };
+        assert!(s.persist_suspend_lifecycle("a", &retired, true).unwrap());
+        assert!(s.get_account("a").unwrap().unwrap().disabled, "退役必须置 disabled=1");
+        // 人工恢复:disabled=0 + 行清零 + epoch 递增、revision 归零。
+        assert!(s.restore_account("a").unwrap());
+        assert!(!s.get_account("a").unwrap().unwrap().disabled);
+        let m = s.load_suspend_lifecycles().unwrap();
+        let row = m.get("a").expect("恢复写清零行而不是删行");
+        assert_eq!(row.suspend_streak, 0);
+        assert_eq!(row.reason, None);
+        assert_eq!(row.retry_at, None);
+        assert_eq!(row.epoch, 1, "恢复必须递增 epoch");
+        assert_eq!(row.revision, 0, "恢复必须归零 revision");
+        // 竞态:worker 队列里的旧状态写不回(且不会重新置 disabled)。
+        assert!(!s.persist_suspend_lifecycle("a", &retired, true).unwrap());
+        assert!(!s.get_account("a").unwrap().unwrap().disabled, "落败的退役写不得反写 disabled");
+        assert_eq!(s.load_suspend_lifecycles().unwrap().get("a").unwrap().epoch, 1);
+        // 恢复后的新转换(epoch=1, rev=1)正常生效,且读回 epoch 确实前进(三轮阻断:
+        // SET 漏 epoch=excluded.epoch 时,这里读回的仍是旧 epoch)。
+        let next = gw_core::store::SuspendLifecycle { epoch: 1, revision: 1, ..lc.clone() };
+        assert!(s.persist_suspend_lifecycle("a", &next, false).unwrap());
+        let row = s.load_suspend_lifecycles().unwrap().remove("a").unwrap();
+        assert_eq!((row.epoch, row.revision), (1, 1), "更大 epoch 写后读回必须前进");
+        // 旧 epoch 的高 revision 写在 epoch 前进后必败(含 set_disabled)。
+        let stale_hi_rev = gw_core::store::SuspendLifecycle { epoch: 0, revision: 99, ..retired.clone() };
+        assert!(!s.persist_suspend_lifecycle("a", &stale_hi_rev, true).unwrap());
+        assert!(!s.get_account("a").unwrap().unwrap().disabled);
+        // 删除后 restore 不得重插生命周期行(三轮中#2)。
+        // 删号:生命周期行同事务删除;之后迟到的写不得重插孤儿行。
+        assert!(s.delete_account("a").unwrap());
+        assert!(s.load_suspend_lifecycles().unwrap().get("a").is_none());
+        assert!(!s.persist_suspend_lifecycle("a", &next, false).unwrap(),
+            "账号已删,迟到写不得重插孤儿行");
+        assert!(!s.restore_account("a").unwrap(), "账号已删,恢复必须 false");
+        assert!(s.load_suspend_lifecycles().unwrap().get("a").is_none(),
+            "删除后 restore 不得重插生命周期行");
+    }
+
 
     /// key 未分组 / 分组行不存在时**鉴权不得失败**(写成 JOIN 会让这类 key 直接 401,
     /// 是最容易踩的回归)。

@@ -1,5 +1,565 @@
 # Changelog
 
+## [cursor-cch] cursor 会话键被滚动指纹污染:缓存命中恒 0 的根因 — 2026-08-15
+
+### Features
+
+- 新增 `gw-core/src/normalize.rs`:`strip_rolling_fingerprints` 的**唯一实现**。
+  gw-kiro 的同名函数改为薄委托(501 条测试原样全绿 = 逐字节等价),死代码删除。
+- `gw-cursor::chat::extract_system` 现在剥掉 Claude Code 的滚动 billing 指纹行。
+- 新增 `delta_history()`:`Continuation` 相位下**只发本轮**,历史交服务端。
+  开关 `CURSOR_DELTA_HISTORY`,**默认关 —— 且已被真号实测否决,不要开**(见下)。
+
+### Design Rationale
+
+- **根因**:Claude Code 在 system 顶部拼一行
+  `x-anthropic-billing-header: …; cch=<5位16进制>;`,`cch` 是**每请求都变**的 body 哈希。
+  `gw-cursor` 的 `extract_system` 是裸透传,而它的产物同时喂给三处:会话亲和键
+  (→ 上游 `conversation_id`)、发给上游的系统提示、`cache_sim` 的指纹。于是:
+  会话键每请求都变 → 账号钉扎失效 + `conversation_id` 每轮都变 →
+  `ConvRegistry::phase_for` **一次都没返回过 `Continuation`** → 缓存指纹每轮都变、
+  命中率恒 0。kiro 早有这道处理,cursor 一直没有。
+- 代码里记着 Continuation 实测把命中率从 **32.6% 拉到 49.8%**(单轮最高 98.7%)——
+  那份收益 ccmax 流量从来没吃到过。这次修完才第一次可达。
+- **`delta_history` 为什么默认关**:开了之后我方不再重传历史,正确性完全押在
+  「服务端真按 `conversation_id` 存住了前几轮」这个**我方无法直接验证**的假设上
+  (只能靠模型答得对不对间接判断)。押错 = 模型静默丢上下文,比"贵但对"糟得多。
+  代码默认因此保持关闭。
+
+### 2026-08-15 上线实测:cch 修复✅ / delta 模式❌(已关)
+
+镜像 `cch-20260815-030821`,只换 `caio-worker-cursor`(router / worker0 / 其余 22 个容器未动)。
+
+**探针 A —— cch 修复,通过。** 不带 `metadata.user_id`、每轮 `cch` 都不同的 Claude Code
+形状请求发两轮:两轮落在**同一个账号**(`ultra-test`),`cache_read` 从 2176 涨到 6656。
+会话键不再被滚动指纹搅动,前缀缓存第一次真的开始命中。
+
+**探针 B —— delta 模式,否决。** 稳定 `metadata.user_id` 连发三轮(①记住 4712
+②聊件无关的事 ③问那个数字),同一构建只翻开关:
+
+| `CURSOR_DELTA_HISTORY` | 第三轮回答 |
+|---|---|
+| `1`(只发本轮) | 「这次对话里我没收到过你要我记住的数字」❌ |
+| `0`(内联全量) | 「4712」✅ |
+
+**服务端在我方这种请求形态下并不替我们持有历史。** 已把容器改回 `-e CURSOR_DELTA_HISTORY=0`。
+
+**连带订正 `PROTOCOL-agent-run.md` §17.3**:那句「两个事实跨 4 轮全部答对 →
+历史确实在服务端」有混淆变量 —— 当时请求里**同时内联着全量历史**,分不开
+「服务端记得」和「我们自己贴了」。上面这次是第一次把内联那份拿掉的干净检验。
+于是 §17.3 的 98.7% 命中要重新归因:收益来自**内联文本被前缀缓存**,
+与服务端存不存历史无关。有状态声明真正买到的是**缓存命中**,不是**免传历史**。
+
+### Notes & Caveats
+
+- ⚠️ **上线瞬间所有命中该指纹行的 cursor 会话会一次性迁移**:会话键变了 → 账号钉扎重来、
+  服务端会话冷启动。命中率会先掉一下再回升。带显式 `metadata.user_id` 的客户端
+  (如 opencode)不受影响 —— 它们本来就绕开内容哈希。
+- **`fold_history` 与 `phase` 此前完全无关**(第一版我误判成有因果):`ctx.phase` 只传给
+  `build_frame0` 决定环境块/预算表,从不决定要不要折。所以 cch 修复**治不了模型绕圈** ——
+  那需要 `delta_history`(本次已备好,待实验后开启)。对抗评审 Skeptic 指出了这个误判。
+- 在 `Continuation` 相位下折叠曾被我判为**矛盾状态**(一边声明「历史在你那儿」,
+  一边又内联同一段历史 = 喂两遍),`delta_history` 就是为消掉它而写。
+  实测之后这个判断也要收回:服务端根本没在存,所以内联**不是**重复,而是唯一的来源。
+- ⚠️ **grok 绕圈因此仍未解决。** 「一坨长文本」这个形状目前**没有替代品** ——
+  免传历史走不通(本条),repeated `1.2.1` 走不通(上游只回心跳)。
+  剩下的着力点是**改渲染本身**:分隔符/角色标记,或把历史挪进 `1.2.1.2` 上下文块的
+  独立条目(这才是「结构化报文」在本协议下唯一可能的形态,尚未验证)。
+  已上线的 `TOOL_LOOP_NUDGE` 治的是另一个病(本轮只有工具返回、一个问题都没有)。
+- 剥离判据锚定 `x-anthropic-billing-header:` **行首**(不依赖 `cc_*` 字段名,CC 升级会改)。
+  代价:用户正文里若有以该前缀开头的行也会被删。这是 kiro 长期沿用的取舍
+  (它的测试就锁了"中间行也剥"),沿用不改。
+
+## [openai-wire] cursor 通道开 OpenAI 入口(chat/completions + responses)— 2026-08-14
+
+### Features
+
+- **`gw-core/src/openai/`**:新的边界适配层,八个文件、零新依赖(复用已有 `sha2`/`uuid`)。
+  - 入站:`chat_req.rs` / `resp_req.rs` 把两种 OpenAI 请求转成 Anthropic Messages body;
+    `inbound.rs` 放两者共用的零件(tools / tool_choice / 内容分片 / 采样参数 / 工具返回值)。
+  - 出站:`chat_out.rs` / `resp_out.rs` 各一个流式状态机 + 一个非流式折叠;
+    `usage.rs` 管两种用量形状,`error.rs` 管错误形状。
+- **worker 多两条入口**:`POST /v1/chat/completions`、`POST /v1/responses`,
+  **只在 `provider.family() == "cursor"` 时挂载**。转换完立刻接回 `handle_chat`
+  (原 `messages` 的主体),选号 / 会话亲和 / 租约 / 重试 / 计费 / 请求日志一行没改。
+- **router 多两条转发**:复用 `forward` 的全部逻辑,只把 worker 侧 URL 参数化;
+  `parse_session_id` 增加 `gw_core::openai::session_hint` 回退(OpenAI body 取不到会话)。
+- **`/v1/models` 同时给两套字段**:追加 `object`/`created`/`owned_by`,原 Anthropic 字段
+  一个没动。一个端点同时喂饱 Anthropic SDK 与 NewAPI 的「获取模型列表」。
+
+### Design Rationale
+
+- **内部 IR 仍是 Anthropic,只在边界适配** —— `docs/ARCHITECTURE.md:194` 早就定了这条。
+  cursor 上游本来就供 gpt / grok / gemini / kimi / glm(目录 33 项),客户却只能用
+  Anthropic 协议去要它们;而 kiro / ccmax 的主链路全程 Anthropic、零转换,那是刻意保住的
+  资产(thinking 签名透传、cache_read 计费),不该被 OpenAI 入口稀释。所以**只给 cursor 开**。
+- **顺带砍掉一道有损转换**:今天 caio 对 NewAPI 说 Anthropic,NewAPI 再用
+  `to_oai_chat_resp.go` 转成 OpenAI —— 那个转换器只认 5 种事件、没有 default 兜底
+  (我方 2026-07 为保活帧实测过)。我方原生说 OpenAI,这一跳连同它的损耗一起消失。
+- **闸门是结构性的,不是文档约定**:路由按 family 条件挂载,非 cursor 的 worker 上这两条
+  路径根本不存在(实测 404)。策略单拎成 `mount_openai_wire()` 以便被测试点名。
+- **出站只在最后一步分叉**:新增 `Wire` 枚举一路传到 `finish_response`,`Wire::Anthropic`
+  分支原样调用旧函数。所有选号/重试/收尾逻辑共用一份,不复制第二条链路。
+- **`reasoning_content` 而不是丢掉思考**:OpenAI 官方 ChatCompletions 没有思考字段,
+  用 DeepSeek 系带起来的事实标准(NewAPI 认它);Responses 侧走 `reasoning_summary_text`。
+- **请求日志与语料链路口径不变**:入库的仍是**转换后的 Anthropic body / Messages**,
+  与 kiro 同一种形状,yapi 那边不用适配。
+
+### 对抗评审(3 个 codex 视角)改掉的东西
+
+评审报了 2 个 high + 一批 medium,**两个 high 都是真的**:
+
+- **[高] 传输 EOF 被当成协议成功终态**(Architect#1 / Skeptic#1)。上游半截断流(没发
+  `message_stop`)时,原实现给 chat 补 `finish_reason:"stop"` + `[DONE]`、给 responses 补
+  `response.completed` —— 把一个**可检测的截断**变成了静默的假成功。已改成:没见过
+  `message_stop` 就 EOF → 报错终态(见 `error::truncated_stream_payload`)。变异测试验过。
+- **[高] cursor 的会话身份不含客户维度 = 跨客户串话**(Minimalist#1)。cursor 是唯一有
+  服务端会话续写的上游(`ConvRegistry::phase_for` → `Phase::Continuation`,且
+  `CURSOR_STATEFUL` 默认开),而 conversation_id 是 `hash(system + 第一条 user)` 纯内容派生。
+  同组两个客户只要 system 与开场白相同,就会续在对方的服务端会话上。**这条在本次改动前
+  就存在**(Anthropic 入口打 cursor worker 同样成立),但把入口开给 NewAPI 这种多租户中转
+  正好凑齐碰撞前提。已在 worker 侧给 cursor 的亲和键补上客户 key 维度
+  (`affinity_scoped_by_client`),kiro / dario 不动(它们没有服务端续写,共享键只影响缓存命中)。
+
+其余已改:`/v1/models` 的 OpenAI 字段收窄到只在 cursor worker 追加(共享端点不该为一种协议
+改另一种协议的响应);保活不再抢在 `response.created` 前面、也不再出现在终止事件之后;
+终态之后的事件一律不再产出帧;`max_tokens` 截断改发 `response.incomplete` 且**不给半截工具
+调用补 done**;`Response` 对象改为从 IR 反推真实请求参数(并写明三处有损);
+`tool_choice:"none"` 改成**真的撤掉 tools**(上游只读 tools,光写字段是摆设);
+空工具输出给占位、分片数组走同一套映射(两者原样透传都会被上游拒);
+无 tools 却要求必须用工具 → 400;重复的块起始被忽略;快照按 `output_index` 排序;
+旧版 `function_call` / `role:"function"` 往返打通;router 的 404 能力转移改为逐个排除、
+不再一次就宣告失败;router 与 worker 边界前的错误(401/503/502/畸形 JSON)也换成 OpenAI 形状。
+
+**驳回**:「删掉 Responses 省 39% 代码」(用户明确要的就是这个协议);
+「`max_tokens`/`temperature` 等参数 cursor 不读,应当拒绝」——
+Anthropic 入口今天对同一个 provider 同样是静默忽略,让 OpenAI 入口更严没有道理,
+只有 `tool_choice:none` 是能兑现的,已单独兑现。
+
+### Notes & Caveats
+
+- **`max_tokens` 缺席时我方补 64k**。Anthropic 侧它必填,OpenAI 侧可选。补一个小值等于
+  替客户截断回答,而截断在流式里表现为「话说一半就停」——最难被认出是网关干的那种故障。
+- **`previous_response_id` / `item_reference` 明确 400**,不静默忽略:忽略等于把「续上一轮」
+  变成「重新开一轮」,客户端拿到一个上下文凭空丢失的回答,查都没法查。
+- **Responses 回传的 `reasoning` 条目收下即丢**。cursor 通道拿不到可回放的加密 CoT
+  (见记忆 `caio-thinking-blob-extraction`),把 summary 当 thinking 塞回去会得到一个
+  **没有签名**的思考块,Anthropic 家族上游直接拒收。
+- **`stream_options.include_usage` 为假时不发用量帧**:严格按 `choices[0]` 解析的客户端
+  会被空 `choices` 噎住。为真时用量帧必须排在 `[DONE]` **之前**,否则 NewAPI 记 0 用量。
+- **保活帧按线缆分形态**:chat 发空 delta chunk,responses 发 `response.in_progress`。
+  都不用 SSE 注释 —— 注释在标准解析器里被跳过、不会变成下游事件,客户端照样判定空闲。
+- **`reasoning_tokens` 恒 0**:Anthropic 线缆把思考文本算进 `output_tokens`,不单独给数。
+  报一个猜出来的值会让客户按它对账,比留 0 更糟。
+- **托管工具(`web_search` / `code_interpreter`)静默跳过**:cursor 上游没有对应物。
+  为一个我方不认识的工具把整条请求打回去,比丢掉它更糟。
+- **尚未对真实上游跑过流式 happy path**:本机没有可用 cursor token 的号,且真发请求要消耗
+  用户订阅额度。协议形状由单测(罐装事件序列逐帧断言)+ worker 级 SSE 字节断言覆盖;
+  路由、鉴权、转发、错误形状已在本机实跑验证。
+
+## [affinity-r4] 会话亲和:修完对抗评审两轮的高危 + 一个观测计数器 — 2026-08-14
+
+### Features
+
+- **溢出伙伴不再被临时候选覆盖**(第三轮 [高])。`select_id` 的溢出分支现在**再分一次
+  原因**:伙伴仅仅并发满 → 本轮临时另选、**不写回** `ent.overflow`;伙伴真失效 → 才换人
+  并记住。之前是无条件写回,于是「固定伙伴」在高并发下沿全池漂移,契约等于没实现。
+- **上迁目标恰好是现任伙伴时对调,而不是留下重复 ID**(第四轮 [高],三个评审员各自
+  独立复现)。时序 `primary=lo, overflow=hi` → 上迁 → 两个字段双双指向 hi → 此后 hi 一忙
+  就被同时当成「主号忙」和「伙伴忙」,伙伴槽位被自己占死。处置是把旧 primary 换到伙伴位
+  (第五轮 [中] 的建议:清空会让下次溢出按分层 LRU 另挑陌生号,平白多触达一个身份)。
+- **`affinity_primary_if_only_busy` 改为委托 `entry_ok_ignoring_busy`**(第三轮 [中])。
+  手写版与共享版有真实语义差异(无条件拒 `probation`、跳过 RPM 懒清理顺序),
+  「判据不可能漂移」的目标名存实亡。判据只能有一个来源。
+- **`sync_accounts` 删号时同时清匹配的 `overflow`,且两张表在同一临界区改**
+  (第三轮 [低] + 第四轮 [中])。原先只在被删号是 `primary` 时删整条亲和项;
+  且 `drop(entries)` 在亲和清理之前 —— 两个重叠的 `sync_accounts` 之间有窗口能让
+  「新 B + 旧 overflow=B」复活本轮要消灭的陈旧伙伴关系。
+- **新增 `affinity_spill_total`**(`QueueStats` → worker `/health` 的 `queue`):
+  「两个当前槽位双双并发满、本轮临时用第三个号」的事件计数。只观测,不拦截。
+
+### Design Rationale
+
+- **砍掉了做了一半的 `session_account_cap` / `_enforce` 硬上限**(第四轮三人一致 [高])。
+  cap 检查只长在 `partner_only_busy` 这一个分支上,而真实失效路径(primary 死了改钉、
+  伙伴死了换人)全部绕过它,`AffinityEntry` 也不记历史触达集合 —— 那个「上限」拦不住
+  它声称要拦的东西,却引入了三条 high(误报 503、`AllBusy` 语义污染、`busy` 陈旧)。
+  加上实测触发面 **0/224 会话**(峰值在途并发 13 / 总槽位 36),决定只留最便宜的先行指标。
+- 计数器口径**故意保守**:每事件 +1 而非每请求、`try_lease` 可能还会失败、`busy` 表示
+  「本请求此前抢 permit 失败过」而非「此刻仍忙」—— 它是趋势信号(0 → 非 0 = 该补号),
+  不是台账。
+
+### Notes & Caveats
+
+- ⚠️ **`affinity_hold_ms=0` 不等于回到改造前的行为**(第五轮 [高],原文档撒了谎,已改)。
+  固定溢出伙伴**没有开关**、始终生效:`0` 只关掉「等 primary」这一段。
+  想整体回滚只能换镜像。
+- ⚠️ **`affinity_spill_total` 有已知盲区**:伙伴真失效被换人、primary 真失效被改钉,
+  这两条路上会话都确实多触达了一个身份,但计数器不涨。真实「一个会话触达几个号」
+  只能从 `request_logs` 按未加盐逻辑会话键重算(脚本 hopnow.py)。
+  测试 `dead_partner_is_replaced_and_remembered` 把这个盲区**显式钉住**了。
+- **知情不改的两条**(第五轮 [中],均为既有架构性质,不是本轮引入):
+  1. 亲和状态在**选号**阶段就提交(改 primary/overflow、记 rebind),而真实触达发生在
+     `try_lease` 成功之后;失败只退 RPM、标 busy,不回滚亲和。要修得引入「租约成功后
+     提交」的事务边界。
+  2. 每次带 session 的选号都在持 `entries` + `affinity` 双锁时对**全表**做 TTL `retain`,
+     高基数 session 下是 O(N²) 并把 acquire 串行化。TTL 只限时间不限条目数。
+- `sync_accounts` 的测试只覆盖**顺序**契约,没构造真正的并发窗口(把 `drop(entries)`
+  移回去测试仍会绿)。写确定性竞态测试代价过高,这里靠代码注释交接。
+- 四条不变量都做了**变异验证**(逐个破坏 → 对应测试 FAILED):忙伙伴不覆盖、
+  上迁对调、改钉作废旧伙伴、hold=0 不改钉。534 测试通过,亲和相关 20 条连跑 5 次无抖动。
+
+
+## [已完成] 账号级可用模型白名单(规格存档)
+
+> 状态:**已于 2026-08-13 按本规格完整落地并发版**(镜像 `allowlist-20260813-105344`,
+> 见下方 [model-allowlist] 条目)。本节保留为设计规格存档;
+> 文末「另外两条待办」(内建截断伪装成功 / 协议内回失败结果)**仍是待做**,交接给下一位。
+
+### 需求
+
+Cursor 账号的**模型权限不齐**:一部分号只有 Cursor 自家模型(`composer-2.5` / `default`)
+和 `grok-*`;claude / gpt 这些第三方前沿模型要另外的计费额度。现状是每个 claude 请求都
+可能落到没权限的号上,换来一次上游拒绝(`ERROR_RATE_LIMITED_CHANGEABLE`,带
+`autoSwitchToModel`)。调度层的动态学习会把 `(号, 模型)` 记 6h 不可用并换号,
+**但那是先赔一次首包前失败才学会**:每个新上线的号、每次 6h TTL 过期都要再赔一次。
+静态白名单把这次失败挪到调度之前,一次上游请求都不发。
+
+用户原话:「有的只支持 grok 和 composer,有的都支持,需要配置每个账号哪些模型可用,
+不然都支持的账号压力太大,只支持 grok 的又分摊不到压力。」
+
+### 已有的半成品(2026-08-13 随 cursor-tool-guard-hot 一起部署,休眠)
+
+- `crates/gw-cursor/src/models.rs`:`allow_list()` + `pub fn account_supports(account, requested)`
+  —— 读 `extra.models`,收逗号串与 JSON 数组,支持 `前缀*` 通配,**判定前先过
+  `to_cursor_model()` 归一**(白名单写上游侧名字,客户发来的是带日期后缀/族别名的名字)。
+  已有 5 个测试(未配=不限 / 只有自家模型的号挡 claude / 归一口径 / 全名精确不吃前缀 /
+  大小写与数组写法)。
+- `crates/gw-cursor/src/lib.rs`:`CursorProvider::account_supports_model` 已调它。
+- **刻意没进 `CURSOR_ACCOUNT_SCHEMA`**(那里留了一段注释说明原因)→ 后台不渲染输入框
+  → 没人能设 → 休眠。测试 `schema_declares_credentials_and_anti_correlation_fields`
+  里有一条 `assert!(!has("models"))` 钉着这个状态,做的时候记得一起改。
+
+### 要改什么
+
+1. **改名** `extra.models` → `extra.model_allowlist`。它是通用路由策略,不是 cursor 私有。
+2. **纯匹配器挪到 `gw-core`**(如 `account.rs`:`pub fn model_allowlist_allows(account, upstream_model) -> bool`)。
+   **不要**新增 `normalize_model_id` trait 方法 —— 各 provider 在自己的
+   `account_supports_model` 里与核心匹配器求**逻辑与**,并复用它**真正发包时用的那个映射函数**:
+   - cursor:`cursor_native_support(..) && core::model_allowlist_allows(a, &to_cursor_model(m))`
+   - kiro:**暂不接线**(保留 FREE-no-opus 原逻辑)—— 用户硬约束「不影响 kiro」
+   - ccmax(claude-subprocess)/ dario:**完全不接**
+   理由:`Provider::account_supports_model` 的语义已经是「该账号最终能否服务该模型」,
+   在 worker 外面再挂第二个判断,等于把最终答案拆给两个所有者。
+3. **规范存储 = JSON 字符串数组**;CSV 只当 UI 输入与旧配置兼容。
+4. **fail-open 只适用于「字段不存在」**,其余一律在**写侧** fail-closed:
+
+   | 情况 | 行为 |
+   |---|---|
+   | 字段缺失 | 不限(兼容存量,绝不能因元数据缺失把健康号摘出池) |
+   | 合法非空列表 | 按列表限制 |
+   | `null` | 规范化成**删除该键** |
+   | 空串 / 空数组 | 保存时拒绝,或明确规范化成删除键 —— **不能**解释成「不限」 |
+   | 类型错 / 通配符不在末尾 | 400 拒绝更新 |
+   | 真要「全禁」 | 用账号 `disabled`,不要靠白名单表达 |
+
+   这条是 gpt 评审里最要紧的一条:运维填了个空值,本意多半是「全禁」,当成「全放」是要出事的。
+5. 通配符**只许出现在末尾**;文档里写明 `grok*` 会自动放行未来的 Grok 型号
+   (所以它不是严格静态白名单)。
+6. **写侧接口**:加一个定点 PATCH 字段,照 `proxy_url` / `priority` 那个模式
+   (`crates/gw-app/src/admin/accounts.rs` 约 1482–1508 行)走 `st.store.merge_account_extra`,
+   **绝不碰凭据字段**。⚠️ 整体替换 `extra` 那条路**走不通**:`GET /accounts` 回来的凭据是
+   `***` 掩码,读不回来也不能原样发回(写侧会拒绝含掩码的回传值)。
+   记得把新字段加进 `has_patch` / `poke_workers_sync` 的触发条件(同文件约 1521 行),
+   否则改完要等 worker 最多 30s 的周期 sync 才生效。
+7. **前端**:`admin-ui/src/features/accounts/components/CursorAccountDialog.tsx` 是**手写字段**
+   不是 schema 驱动的,所以要手动加输入框;加完再把 `FieldSpec` 放回
+   `CURSOR_ACCOUNT_SCHEMA` 并改掉上面那条 `assert!(!has(...))`。
+   **必须适配手机端**(断点从窄往宽写、宽内容裹 `overflow-x-auto`、375px 自查)。
+8. **一个独立的危险点**(与白名单无关,但同一片代码):`models.rs::to_cursor_model` 把
+   **未知模型名归一成 `default`**。于是只要白名单含 `default`,任意拼错的模型名都会放行,
+   客户端**静默拿到另一个模型**。要把「客户端明确要 `default`」与「未知名字回退 `default`」
+   分开,后者直接 400。
+
+### 实现约束
+
+- `account_supports_model` 由调度器**在锁内**对每个候选账号调用(`worker/mod.rs` 约 2374 行),
+  所以必须**无副作用且快**:只读 `extra`,不查上游,别在里面分配 `String`
+  —— kiro 那边是 370 个号的规模。
+- 部署铁律:rsync **绝不** `--delete`(排除 `config/`、`data/`、`docker-compose*.yml`、
+  `*.bak*`、`.git/`、`target/`、`node_modules/`、`admin-ui/dist/`);`docker build --network=host`;
+  改前端要**重建整个镜像**(UI 内嵌二进制)。本次只需重启 `router` + `worker-cursor`
+  (compose 第 11 / 41 行),`worker0`(kiro,第 23 行)与 dario(78 / 92 行)一律不动。
+- 本地构建/测试必须限内存:
+  `systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=0 cargo …`
+
+### 另外两条待办(同一片代码,优先级低于上面)
+
+1. **内建截断仍伪装成成功**。`gw-cursor/src/chat.rs` 的 `builtin_truncated` 分支照样发
+   `stop_reason=end_turn` + `message_stop`,于是 worker 判 `saw_message_stop=true` →
+   **请求日志记 200 成功**,还 `h(true)` 确认了会话。12h 内 296 次半截回答在面板上全绿,
+   只能靠用户报障发现。要改成不发正常 `end_turn`(发 SSE error 或换 `stop_reason`),
+   并按未完成口径落库。注意首包已 committed、换不了号,目标只是「日志里是红的、
+   客户端知道被截断」。**会让面板成功率掉下来,那是真实数字**(已跟用户说明)。
+2. **协议内回失败结果**(根治内建工具收口)。要先用 `CURSOR_DUMP_TOOL_FRAMES=<目录>`
+   环境变量抓几十帧真实内建调用帧(**需要重启 worker-cursor**,用户已同意开这个口子),
+   定死 `1.2.2.<N>` 的身份枚举与**请求侧客户端回执消息形状**,然后在同一条 BiDi 流里
+   回一个「工具不可用,请改用 `gwtools-X`」的失败结果,让模型在**本轮内**自己纠偏
+   (纠偏次数封顶 1~2 次防循环)。
+   ⚠️ **绝不猜字段号**:回执被上游忽略 = 90s 心跳死等,比现在的瞬间收口更差。
+   已知线索:这些帧在**工具通道 `1.2.2.<N>`** 而不是 exec 通道(收口日志 preview 尾部有
+   `<uuid>-N-<4字符>` 的 `1.2.3` 签名);exec 通道的字段号已有 schema 实证可参照
+   (`2=shell, 3=write, 4=delete, 5=grep, 7=read, 8=ls, 9=diagnostics, 11=mcp, 14=shell_stream`,
+   客户端回执同号),但**两条通道的回执消息不一定是同一个**。
+   收口日志已经带上 `cap=`(认出的能力)与不认识的字段号,是这一步的现成线索。
+   做完之后还有第三步:能可靠映射时直接把内建调用**翻译**成调用方工具的 `tool_use`,
+   把失败变成无感成功。
+
+## [model-allowlist] - 2026-08-13
+
+账号级可用模型白名单(`extra.model_allowlist`)按上方规格完整落地并发版;
+顺带补齐 cursor 账号三条用量展示与「收到」刷屏文案修正。
+镜像 `claude-all-in-one:allowlist-20260813-105344`,重启 `caio-router` + `caio-worker-cursor`,
+kiro(worker0)与 dario 容器不动。
+
+### Features
+
+- **白名单核心**:纯匹配器挪到 `gw-core::account`(`MODEL_ALLOWLIST_KEY` +
+  `model_allowlist_allows`,`前缀*` 通配仅限末尾);cursor 侧 `account_supports`
+  改为 `cursor_native_support && core 匹配器` 求逻辑与,kiro / dario / ccmax 零接线。
+- **语义定稿**(规格第 4 条,写侧 fail-closed):字段缺失/null = 不限;
+  空表/类型错/中置通配 = 400 拒绝;规范存储小写 JSON 字符串数组,CSV 只当 UI 输入。
+- **未知模型名不再静默回退 `default`**(规格第 8 条危险点):
+  `resolve_cursor_model` 未知名返回 None → chat.rs 报 `bad_request_visible` 400,
+  拼错模型名的客户端拿到明确错误而不是悄悄换模型。
+- **写侧**:`PATCH /accounts/{id}` 定点字段 `model_allowlist`(照 `proxy_url` 模式走
+  `merge_account_extra`,绝不碰凭据;空串=清除写 null),`normalize_model_allowlist`
+  校验+规范化,进 `poke_workers_sync` 触发条件,`redacted_view` 顶层回显数组。
+- **前端**:`EditAccountDialog` 加输入框(不传=不动/空串=清除/变更才进 patch),
+  `types.ts` 补 `AccountRow.model_allowlist` 与 `UpdateAccountPayload.model_allowlist`,
+  i18n 中英文案;schema 放回 `model_allowlist` FieldSpec。
+- **cursor 三条用量**:`usage.rs` 解析 `autoPercentUsed` / `apiPercentUsed` 装进
+  `QuotaWindow`(label "auto"/"api",非法值不造窗口),`AccountTableRow` credits 分支
+  渲染百分比窗口 —— 此前只显示 on-demand 美元一条。
+- `fold_history` 注入文案加「不要重复致意」,修「收到」刷屏根因。
+
+### 验证
+
+- `cargo test --workspace` 全绿(452 通过;`cursor_login_transient_failure_keeps_session`
+  并行偶发失败、单跑通过,与本批改动无关的既有 flake)。
+- admin-ui:`tsc --noEmit` + vite build 通过,dist 重建后嵌入二进制(sha256 `b9d2650f…`)。
+- 生产写侧端到端:设置 `"default, composer*, GROK*"` 落库为
+  `["default","composer*","grok*"]`;`gr*k`(中置通配)400;空串清除回显 null,
+  测试账号已恢复不限,无脏数据。worker health 正常(8 账号)。
+
+### 注意事项
+
+- `grok*` 会自动放行未来的 Grok 型号,不是严格静态白名单(规格第 5 条,刻意为之)。
+- 真要「全禁」用账号 `disabled`,不要靠白名单表达。
+- 上方规格存档里的「另外两条待办」(内建截断伪装成功 / 协议内回失败结果)仍未做。
+
+## [cursor-tool-guard-hot] - 2026-08-13
+
+Cursor 内建工具护栏改版 + **文案热更新**;内建截断后下一轮向模型纠偏。
+
+### 背景
+
+Cursor 的内建工具(终端、读写文件、代码库检索、网页搜索)是**服务端自带**的:
+哪怕我方一个工具都不声明,模型照样会调,而反代执行不了 —— 只能收口。
+worker-cursor 12 小时日志:外部工具成功 **3119** 次,内建工具收口 **302** 次,
+其中 **296 次发生在已出字之后** —— 客户端收到「半截回答 + 正常 end_turn」,
+无错误、无工具调用。用户报障原话是「工具调用总失败」,看到的就是这个。
+
+落盘 preview 里模型要调的是 `echo …; grep -nE …`(shell)和「按符号名+目录搜代码」,
+**全都是调用方已经声明过的能力**(Claude Code 的 `Bash` / `Grep`)。第二版文案
+(「声明的工具都是真的,但不要调内建的终端/文件读写/网页搜索/代码库检索」)在这种
+局面下**自相矛盾**:被点名禁掉的能力与调用方的 `Bash`/`Read`/`Edit` 逐字重合。
+
+### 改动
+
+- **护栏文案 v3**(`gw-cursor::chat::builtin_tool_guard`):从「禁什么」改成三条正向信息
+  —— ① 逐个列出可调用工具的**全名闭集**;② 能力→工具**替代表**(按调用方实际声明的
+  名字生成);③ 策略句。工具个数的硬阈值换成 1200 字符预算。
+- **能力匹配去掉纯子串档**,只留「全等 > 去符号全等 > 前缀(≥4字符)」:子串会让
+  `Thread` 命中 `read`、`TodoWrite` 抢到「写文件」。宁可不出替代行也不指错工具。
+- **文案热更新**:`SystemConfig.cursor_tool_guard` + `SystemSettings` overlay
+  → worker 启动初载 & 30s 设置环 → `gw_cursor::set_tool_guard_policy()`
+  (`cursor_extra_models` 同款先例)。**只有策略句是配置**,闭集与替代表由代码生成。
+- **可观测**:`/health` 回显 `cursor_guard_rev`(4 字节指纹,**不回显全文**);
+  内建收口 WARN 带 `guard_rev` + `cap`(认出的能力)。
+- **下一轮纠偏**(`TruncationNotices`):内建收口按 conversation 记一笔,下次同会话
+  请求在用户消息末尾补「上一轮你调了本环境不提供的内建工具,请改用 `gwtools-X` 重做」。
+- 写侧校验:`PUT /admin/api/settings` 拦 `cursor_tool_guard` 超长(2000 字符)。
+
+### 设计取舍(gpt-5.6-sol 对抗评审)
+
+- **不做 `{tools}`/`{redirects}` 占位符模板**:动态部分的结构不会变,变的只是那几句
+  自然语言。模板一旦拼错会**静默丢掉整个闭集**,而闭集是这道护栏最硬的一半。
+- **默认文案不含后果威胁、不点名 Cursor 内建工具**:「否则回答会被截断」可能让模型
+  对合法工具也变保守、或转头在正文里解释网关环境;点名内建能力则重演 v2 的自相矛盾。
+  两者作为**热配置里的实验变体**存在(改设置即可试),不作第一版默认。已钉成测试
+  `默认护栏不含后果威胁也不点名内建工具` —— 防止后人「顺手把话说狠一点」种回旧病。
+- **校验失败保留上一份有效值**,不静默回默认:护栏效果正按 `guard_rev` 分桶比对
+  收口率,悄悄换一版会让那份数据作废。
+- **纠偏认不出能力时不指名工具**:字段号只认抓包实证过的 `.1` 终端 / `.4` 读文件,
+  其余记日志返回 None。「你上次调了内建终端」这种自信的错话比模糊的实话更容易带偏模型。
+- **纠偏不挂在 `ConvRegistry` 上**:那张表被 `CURSOR_STATEFUL` 门控,而半截回答在两种
+  模式下都在客户端历史里 —— 挂进去等于让一个退路开关顺手关掉一个不相干的修复。
+- **命名空间隔离**:设置项走 `cursor_` 前缀、代码全在 `gw-cursor`、apply 函数对非
+  cursor worker 是无害 no-op。kiro / claude-dario / claude-subprocess(ccmax)零改动。
+
+### 注意事项
+
+- 这是**缓解不是根治**。根治要在同一条 BiDi 流里回一个「工具不可用」的失败结果,
+  让模型在**本轮内**自己纠偏。但内建调用在**工具通道 `1.2.2.<N>`** 而不是 exec 通道
+  (preview 尾部有 `<uuid>-N-<4字符>` 的 `1.2.3` 签名),客户端回执消息形状未定;
+  **猜字段号的代价是回执被忽略 → 90s 心跳死等,比现在的瞬间收口更差**。
+  下一步靠 `CURSOR_DUMP_TOOL_FRAMES` 抓实物定死。
+- 已知未修:内建截断仍发 `stop_reason=end_turn` + `message_stop`,于是 worker 判
+  `saw_message_stop=true` → **请求日志记 200 成功**。那 296 次在面板上是全绿的,
+  只能靠用户报障发现。单独一条待办。
+- 账号级模型白名单(`extra.models`)逻辑已在 `models::account_supports` 并接上
+  `account_supports_model`,但**刻意未进 account schema**(后台不渲染):空值/非法值的
+  fail-open 语义与字段命名还没定稿,先上会让人照一版将来要改的语义配一遍。
+
+### 验证
+
+- `cargo test --workspace`:**1335 通过 0 失败**。
+- 顺带修一个真 flake:文案测试原本读进程全局策略句,与热配置测试互相顶
+  (「单跑全绿、全量跑随机红」)。拆出纯函数 `builtin_tool_guard_with(tools, policy)`
+  后文案断言完全不碰全局。
+
+## [cursor-hot-catalog] - 2026-08-13
+
+Cursor 模型目录支持**热追加/覆盖**:加模型、试新模型不再需要重新部署。
+
+### 背景
+
+cursor 上游不提供菜单查询,模型表(含每模型参数)只能内置在代码里
+(`gw-cursor::models::catalog`,2026-08-10 对齐真机菜单 33 项)。代价是每加一个
+模型都要改代码、构建镜像、切容器 —— 08-13 加 grok-4.6 时又走了一遍全流程,
+而它本来只是一次「上游认不认这个名字」的试探。
+
+### 改动
+
+- `gw-core`:`SystemConfig.cursor_extra_models: Vec<ExtraModelSpec{name, params, menu}>`
+  + `SystemSettings` 同名 overlay 字段(整表替换语义,与 warmup_group_policies 一致)。
+- `gw-cursor`:进程级 `EXTRA_MODELS`(RwLock)+ `set_extra_models()`(lib 单点导出);
+  `catalog()` = 内置目录 + 热追加项(**同名整体覆盖**,参数一起换)。
+  `menu=false`(默认)= 探测位:可被点名、出现在 `/v1/models`,但**不进** `1.14`
+  清单(每个 Run 请求都带的那份)——热配置只允许试,菜单位要回代码对齐真机快照
+  才转正(08-13 gpt-5.6-sol 一审高危:未证实条目混进 1.14 会污染所有模型的请求)。
+- `gw-app`:`apply_cursor_extra_models()` 接进 worker 启动初载与 30s 设置环
+  (cache_sim 同款先例);非 cursor worker 是无害 no-op。空名条目读侧丢弃。
+- admin-ui 无需改动:设置页按字段构造 patch,不会冲掉这个键。
+
+### 验证
+
+- `cargo test --workspace`:14 套件 1315 通过 0 失败(新增:
+  热追加覆盖/追加/probe 标志保留/清空恢复;frame0 编码层探测项不进 1.14;
+  测试间并发用 CATALOG_TEST_LOCK 串行)。
+- 线上热配验证:DB 写探测项 → 30s 内 `/v1/models` 可见 → 清空即消失。
+
+## [cursor-on-demand] - 2026-08-12
+
+Cursor 账号的**超额(on-demand / usage-based)额度**在面板里可读可改:账号表新增
+「超额(已用/上限)」列,点击即开设置弹窗(预设档 / 自定义金额 / 关闭)。
+
+### 背景
+
+`ultra-test` 在 08-11 事故里被 2 RPM 卡住,同期 `test` 号是另一种死法:**$20 账期
+烧穿**后上游直接拒。套餐额度面板早就看得见,但「超额开没开、上限多少、已经烧了
+多少」只能去 cursor.com 网页翻 —— 号一多就等于没有监控。这一版把它搬进面板。
+
+### 上游协议(解包客户端 + 真号实测得到,非文档)
+
+`aiserver.v1.DashboardService`(与已有 `GetCurrentPeriodUsage` 同一个 service):
+
+- `GetHardLimit` → `{hard_limit, no_usage_based_allowed}`。**proto3 零值不序列化**,
+  所以 `no_usage_based_allowed` 缺省 = false = **已开启**(不是"未知")。
+- `SetHardLimit`:开启 `{hardLimit:N, noUsageBasedAllowed:false,
+  preserveHardLimitPerUser:true}`;关闭 `{noUsageBasedAllowed:true, ...}`。
+- **两个接口单位不一致**,是这一版最容易踩的坑:`hard_limit` 是**美元整数**,
+  `GetCurrentPeriodUsage.spendLimitUsage` 是**美分**。内部统一归一成美元。
+- `hardLimit = 2147483647`(i32::MAX)是**不限额哨兵值**,不是真上限 —— 照原样显示
+  会变成 "$2147483647",故单独归一成 `unlimited`。
+
+### 改动
+
+- `gw-core`:`OnDemandQuota{enabled, limit, used, unlimited}`,挂到 `AccountQuota.on_demand`;
+  Provider trait 加 `on_demand_supported()`(默认 false)/ `set_on_demand_limit()`
+  (默认 Unsupported)—— 别的 provider 零改动。
+- `gw-cursor`:三端点调用抽出共用 `dashboard_call()`;`account_quota` 合并
+  `GetHardLimit`。**这一跳失败只 debug 日志、不让整个配额查询失败**:套餐额度是账号页
+  主信息,不该被一个附加字段拖垮(超额栏退化成"—")。已用金额只有用量接口有,
+  合并时从上一步结果接回,否则会被覆盖成 0。
+- `gw-app`:`POST /accounts/{id}/on-demand`(worker + admin 顺序扇出)。
+  `limit_usd` 校验 `0..=i32::MAX`,**超范围直接拒不静默截断**(会把"设 $50"变成别的数);
+  `0`/`null` = 关闭。走 `quota_sem`(控制面对上游并发只此一处),成功后回读并刷配额缓存
+  (否则运维要等一个 TTL 才看到新值,会以为没生效)。
+- **写失败不计失败池**:一次计费设置被拒与 chat 可用性无关,不该让号进冷却。
+  上游拒绝原文(如 `Payment method required`)从 Connect `details[].debug` 抽出透传到面板。
+- admin-ui:超额列**仅 cursor 视图出现**('all' 混着多种 provider,给非 cursor 行挂一列
+  「—」像是查不到而非不支持);已用达上限 80% 标黄;未开启显示「关」、离线/未采集显示
+  「—」(不显示假的 $0)。中英文案齐全。
+
+### 已知限制
+
+- 超额上限**只支持整数美元**,因为上游字段就是 i32。
+- 未绑支付方式的号开不了:上游回 400 `failed_precondition` /
+  `onDemandPaymentMethodRequired`,**客户端同样开不了**,不是本功能的 bug ——
+  需先去 cursor.com/dashboard 绑卡。线上 `ultra2` 正处于此状态。
+
+### 验证
+
+- workspace 1312 测试全绿;gw-cursor 新增 9 条(含实测响应做金标准样例:
+  `{"hardLimit":75}` + `individualLimit:7500` 美分,正好覆盖单位不一致这个坑)。
+- admin-ui tsc + build 通过,60 测试全绿(新增 7 条覆盖 off/unlimited/缺省上限/
+  80% 阈值/美元格式)。
+- 真号实测:`ultra-test` 设 `hardLimit=75` 成功并回读一致。
+
+## [group-warmup-and-rpm-wait] - 2026-08-11
+
+两件事同源于 2026-08-11 CUR 组 503 事故:唯一合格的 cursor 号 `ultra-test`
+被 **2 RPM** 卡住时,客户请求一秒不等直接 503,日志还报「组内所有账号均已禁用」。
+
+### 根因(与最初怀疑的「亲和钉死」不符,代码走读后订正)
+
+1. 那 2 RPM 不是账号配置,是**全局新号暖机**(默认开,rank ≥ 100、适应期 2h@2rpm)
+   按 rank 一刀切,cursor 订阅号也被限 —— 暖机本是为 kiro 补货新号设计的
+   (2026-08-10 ha7477062)。
+2. 「等 RPM 窗口腾名额」的分支绑死在排队模式预算(`queue_wait_ms`,默认 0)上,
+   没开排队的组直接跌落 `AllDisabled`(文案谎称"全禁用",客户 503)。
+
+### 改动
+
+- **RPM 闸等待与排队解耦**:新预算 `scheduler.rpm_wait_ms`(默认 10000,热调,
+  钳到 ≤ RPM 窗口 60s),与 queue_wait 取大;等待不消耗换号预算、分片 ≤200ms
+  重选、等待者上限 64(RAII 名额,超出快速失败,防突发堆积+惊群抢锁)。
+  预算耗尽仍等不到 → 报新变体 **AllRpmLimited**(503 与客户端文案不变,
+  但日志不再谎称「全禁用」或「并发满」)。
+- 混合「A 并发满 + B 被 RPM 闸住」时,busy 等待分支不再烧 attempts 抢跑,
+  让给 RPM 分支(不耗预算、分片重选,期间 permit 释放照样命中)。
+- **按分组暖机策略** `scheduler.warmup_group_policies`(热调,设置页可视化编辑):
+  `{组名: {rpm, hours}}`。命中的组完全接管(单期,到期毕业;`hours=0` = 该组
+  显式关闭暖机,全局开关也压不住);未列出的组走全局两期,kiro 补货保护不变。
+  GroupView 带上分组名,暖机口径跟随请求的成员视图。
+- 设置写侧宽松化:overlay 里残留「更新镜像写入、本版本不认识」的键不再锁死
+  普通写入(只拒**本次 patch** 里的未知键;显式 `null` 可清残留)——回滚
+  旧 router 后设置面板仍可用。
+- 设置页新增「新号暖机」卡片(全局开关 + 两期参数 + 分组策略编辑器)与
+  调度卡的 rpm_wait_ms 输入;此前暖机只有 yaml/API、面板不可见。
+
+### 即时处置(运维,非代码)
+
+- `ultra-test` 优先级 100→0(高优豁免暖机),CUR 组容量当场恢复;
+  `test`($20 账期烧穿,fable 被限)手动禁用。
+
+### 验证
+
+- gw-app 447 全绿(+4:策略接管/豁免/更严、RPM 等待、AllBusy 分类),
+  workspace 全套件零失败;admin-ui tsc + 53 测试全绿。
+
 ## [kiro-legacy-wire-switch] - 2026-08-11
 
 `KIRO_LEGACY_WIRE=1`:Kiro 上游报文**整体**退回 2026-07-28(`58b6f27` 对齐 1.0.212)
@@ -50,6 +610,301 @@
   `KIRO_LEGACY_THINKING_TAGS=1`(即现在不发标签),开总开关会让标签重新注入
   history[0] = 缓存前缀第一块字节变化,在途会话下一轮全量 miss 一次。低峰切换。
   若当前已设 `KIRO_LEGACY_THINKING_TAGS=1`,则前缀无变化,随时可切。
+
+## [cursor-quota-and-adaptive-thinking] - 2026-08-10
+
+两件事:① Claude Code `thinking.type=adaptive` 导致无首字挂满 5 分钟;
+② Cursor 账号表接官方账期用量(`GetCurrentPeriodUsage`)。
+
+### adaptive 无首字 / upstream stalled 300s
+
+生产请求 `thinking: {type:"adaptive"}` 时,收侧只认 `enabled` → 不透传 `1.4`,
+但思考帧仍刷新 `last_progress`,90s 心跳 watchdog 失效;客户端等到 gw-app
+`STREAM_IDLE_ABORT`(300s)才报 `upstream stalled: no event for 300s`。
+
+- `client_wants_thinking` 认 `enabled` **与** `adaptive`
+- 未透传的思考不再刷新 `last_progress`
+- `apply_thinking_pref` 对 `adaptive` 显式开上游 `thinking=true`
+
+### 官方额度表(方案 A)
+
+- `gw-cursor::usage`:只读 `DashboardService/GetCurrentPeriodUsage`(美分→美元)
+- `CursorProvider::account_quota` 走账号专属出口(与 refresh/chat 同 IP)
+- admin-ui:`quotaKindForProvider('cursor')` → `credits` 列展示剩余/上限美元
+
+## [cursor-tool-use-usage-fallback] - 2026-08-10
+
+cursor 通道 `tool_use` 收口时输入/缓存为 0 的计费空洞。gw-cursor 相关测试覆盖。
+
+### 背景
+
+生产 `claude-fable-5` 近两小时成功请求里约 39/40 条 `input_tokens=0`、
+`cache_read=0`,只有 output —— new-api 面板显示「0 / N」。根因:外部工具轮
+反代一问一答会在 tool_use 处 `break`,上游通常不给 `1.14` 用量帧;旧回退只估
+`output = chars/4`,输入与缓存恒为 0。有 `1.14` 的 end_turn 轮不受影响。
+
+### 修复
+
+- 无上游用量时按请求体(system + turns + tools)chars/4 粗估 input;多轮把非本轮
+  前缀估成 `cache_read` / `real_cache_read`。
+- 工具/内建收口前若同帧已带 `1.14`,先收下再 break(合帧不丢)。
+- 上游自报用量同步写入 `real_cache_read_tokens`(cursor 无模拟/真实双轨)。
+
+## [cursor-model-catalog-33] - 2026-08-10
+
+gw-cursor 模型目录 8 → 33 项。gw-cursor **120 项测试通过**。
+
+### 背景
+
+旧目录是 2026-08-07 抓包逆向时的客户端菜单快照(Run 1.14 字段,仅 8 项),
+`claude-opus-4-8` / `claude-haiku-4-5` 这类名字会被按族归并到 5 系/composer,
+面板 `/v1/models` 显得"模型很少"。
+
+### 来源与口径
+
+新目录取自真机 Cursor 客户端 `state.vscdb` 内服务器下发的
+`availableDefaultModels2`(33 项,含每模型 parameterDefinitions)——比抓包
+快照新且权威。参数默认值按菜单声明范围选取(claude 系 thinking=true/effort=high、
+gpt 系 reasoning=medium、gemini-3.6-flash effort=medium 等)。目录已有的精确名
+原样透传(不再归并),目录外名字仍按族归一。菜单=上游提供,能否实调取决于
+账号计费状态(pro 号第三方前沿模型超量会降级 grok-4.5),这是既有上游行为。
+
+## [low-priority-warmup] - 2026-08-10
+
+低优先新号暖机(动态有效 RPM)。全量 **1230 项测试通过**(+10)。
+
+### 背景:补货新号上线即被鲸客流量灌死
+
+2026-08-10 `ha7477062` 封号排查:restock 补货的新号一上线就全速进轮转,
+被鲸客的瞬时流量几分钟打到 `TEMPORARILY_SUSPENDED`。上游对新号的节奏容忍
+远低于老号,而既有 `rpm_limit` 只能逐号手配 —— 补货号落地即高优流量的
+泄洪口,等不到人去配。
+
+### 方案(gpt-5.6-sol 评审修订定稿)
+
+低优先号(调度 rank >= 100)按号龄(`accounts.created_at`,对补货号≈上游
+激活时间)获得更低的**有效 RPM 上限**;高优号(rank < 100,成员边 @0 的
+POWER/PRO MAX 等)**完全不受影响**:
+
+- 适应期:号龄 0 ~ 2h,有效 RPM = 2
+- 爬坡期:号龄 2 ~ 24h,有效 RPM = 6(期边界左闭右开:恰好 2h 进爬坡,恰好 24h 毕业)
+- 毕业:> 24h,恢复账号自身配置
+- 有效 RPM = **min(账号 `extra.rpm_limit`, 暖机上限)** —— 暖机只收紧,
+  绝不放宽账号已有的更严上限。
+
+### 实现要点与取舍
+
+- **单点抽象防口径分叉**:`CredentialState::effective_rpm_limit(rank, warmup, now)`
+  是所有 RPM 判定/记账的唯一入口,`eligible_ids` / `tier_hold_wait` /
+  `queue_tier_hold_wait` / `select_id` 原子预留+退还 / `queue_probe` /
+  `queue_stats` / 状态快照全部走它;`rpm_*` 方法族改为显式接收算好的上限,
+  编译器保证没有调用点能绕过。
+- **rank 口径**:有分组视图的调用点用成员边 rank(与选号分层同源,同号在不同
+  组视图下跟随该次请求的层);无视图的点(`queue_stats` / `status_snapshot` /
+  `note_upstream_call`)用 `default_rank` 兜底 —— 只影响观测/记账,60s 滑窗自愈,
+  真正的准入判定(生产每请求都带视图)不受影响。取舍写在
+  `effective_rpm_limit` 注释里。
+- **`Account.created_at`**(serde default 0):0 = 未知号龄(accounts.yaml 降级
+  加载/手工构造)→ 按已毕业处理,**fail-open 到旧行为**,绝不因元数据缺失把
+  老号当新号限流;时钟回拨按号龄 0(吃最严档)。`load_owned_accounts` 直通
+  DB 列;token 刷新走 clone 回写,created_at 天然存活。各 crate 测试桩补
+  `created_at: 0`,既有调度测试零改动。
+- **不改并发、不改 tiered_lru 排序、不改会话亲和**:RPM 达限后的等待/迁移/503
+  行为完全沿用既有定频语义(软状态,不进禁用统计,不触发 AllDisabled)。
+- **配置热更**:`scheduler.warmup_*`(enabled 默认 true,phase1 2h/2,phase2 24h/6)
+  走 settings overlay(`SystemSettings` 同名字段),30s 内生效;RPM 上限 clamp ≥1
+  (0 = "一次都不许"的笔误会静默停掉所有新号,想停有总开关)。
+- **可观测**:`AccountStatusSnapshot` 加 `warmup_phase`(null=不暖机/高优,
+  0=适应期,1=爬坡期),`rpm_limit` 字段改报**有效**上限(含暖机 min)——
+  经 /health → router 聚合 serde 直通,前端本期不改。
+
+### 测试(+10)
+
+- `warmup_phase_cap_period_boundaries`:三期边界(恰好 2h/24h 左闭右开)。
+- `warmup_phase_cap_exemptions_and_edge_cases`:高优豁免、未知号龄 fail-open、
+  时钟回拨吃最严档、开关关闭。
+- `warmup_never_relaxes_stricter_configured_rpm`:min 语义(配置 10→2、配置 1→1、
+  老号 10→10)。
+- `warmup_caps_new_low_priority_account_old_account_takes_over`:打满退出合格集、
+  老号承接、快照三字段。
+- `warmup_phase2_allows_six_per_minute`:爬坡期 6 格,第 7 次溢出。
+- `warmup_exempts_high_priority_new_account`:高优新号连打 8 次不限。
+- `warmup_disabled_means_no_cap_for_new_accounts`:开关关闭 = 旧行为。
+- `warmup_tuning_hot_update_takes_effect`:update_tuning 热关立即不限。
+- `settings_warmup_apply_to_overrides_and_preserves`(gw-core):overlay 覆盖/保留语义。
+- `load_owned_accounts_carries_created_at_for_warmup`(gw-store):号龄列直通。
+
+### 审查修复(gpt-5.6-sol 暖机复审,1 高 2 中;+3 测试)
+
+- **[高] 同一 lease 的追加调用能突破暖机硬上限**:`note_upstream_call` 从「只记不拦」
+  改为**原子准入**——同一把 entries 锁内检查有效上限(含暖机),达限返回 `false`
+  且不多记,调用方不得硬发。各调用点语义:token 刷新重试被拦 → 不上报失败
+  (rt 刚证有效,按 TokenInvalid 报会永久误禁)、直接换号;profileArn 修复重试被拦 →
+  按「无法修复」落入统一失败处理;Overloaded 退避被拦 → 按退避用尽返回最近一次
+  过载错误(对外 529,客户端自动重试);web search 续轮被拦 → 优雅降级收尾
+  (已得内容照常返回,保 usage,`OnUpstreamCall` 改 `Fn() -> bool`);人工探针被拦 →
+  如实回 `stage: "rpm_limited"`。
+- **[中] 追加调用的 rank 口径与准入同视图**:`note_upstream_call` 加 `view` 参数,
+  生产链路(刷新重试/修复重试/过载退避/web search 续轮)全部传请求的成员视图 ——
+  「成员边低优但 extra.priority 高优」的号,追加调用不再被 default_rank 错误豁免、
+  不再漏记真实调用。仅人工探针(无分组上下文)传 None 按 default_rank。
+- **[中] RPM 退还竞态**:预留改发**句柄**(entry 内递增序号,deque 存
+  `(Instant, u64)`),`select_id` 随选中 id 返回句柄,`rpm_refund` 按句柄精确删除 —
+  不再无脑 `pop_back`(并发下尾部可能是别人的真实调用,退错 = 替别人的超频开窗)。
+  退还也随之不再需要回传视图重算口径。
+
+### 复审修复(gpt-5.6-sol 第三轮,1 高 1 中 1 低;+1 测试)
+
+- **[高] profileArn 修复验证被拦会误杀刚修好的号**:验证调用被 RPM 闸门拦住时,
+  上一版把修复前的 e2 透给统一失败处理 → 按 TokenInvalid 上报 → 永久误禁
+  `invalid_refresh_token`。暖机一期 RPM=2 下这是**确定性路径**(首发 1 格 →
+  刷新重试第 2 格遇旧 ARN 403 → 新 ARN 发现成功 → 验证调用达限)。修为照
+  token 刷新分支语义:被拦 ≠ 修复失败,不上报、释放 lease 换号,预算/时限
+  用尽才透原始错误。
+- **[中] 过载退避的记账时机**:准入(检查+记账)从退避睡眠**之前**挪到睡眠
+  完成后、调用发出前 —— 任务在睡眠期被取消不再留下从未发送的假 hit,
+  滑动窗口也不会按过早的预留时刻提前放出名额。
+- **[低] 补 worker 调用点分支测试**(`heal_retry_blocked_by_rpm_does_not_report_or_disable_account`):
+  mock provider(chat 恒 403、refresh 成功、强制发现 ARN 成功)直调 messages
+  handler,断言验证调用未发出(chat 计数 = 2)、账号未禁用、无 TokenInvalid
+  上报、被拦调用未记账。这是本仓库第一个 handler 级 mock provider 测试。
+
+## [account-models-local] - 2026-08-10
+
+「账号可用模型列表」收尾 + 修一个线上确诊的扇出超时 bug。全量 **1220 项测试通过**(+5),
+admin-ui **53 项**(+4),`bun run build`(tsc strict)绿。
+
+### 背景:面板看不到「这个号还能用哪些模型」
+
+model-marks 落地后,状态徽章能告诉你「这号被逐模型拒过 N 个」,但回答不了
+「那它到底还能用哪些」——要看档位静态支持表 × 已学标记的乘积,只能翻代码心算。
+本次把它做成一个端点 + 一个弹窗。
+
+### 账号可用模型清单(纯本地,零上游)
+
+- **worker**:`GET /accounts/{id}/models/local` 已先行落地(见 worker/mod.rs
+  `models_local`)——静态目录 × `account_supports_model` 档位支持 − 已学
+  INVALID_MODEL_ID 标记,纯内存读,毫秒级;目录外的标记(上游新模型/变体名)
+  单独透出不丢掉。「可用」口径是**本地认知**:未观察到拒绝 ≠ 上游保证,
+  上游真相仍靠「拉目录 / 探针」。
+- **admin 扇出**:`GET /admin/api/accounts/{id}/models/local`,与 quota/models
+  同款顺序扇出(2xx 透出,404 问下一个,其余记首个错误;全不持有 → 404
+  「没有 worker 持有该账号」)。
+- **面板**:kiro 行操作区新增「查看模型」图标按钮(其它 provider 无此概念不显示),
+  弹窗三态展示:可用 / 被标记(附剩余重探时间 `formatMarkTtl`)/ 档位不支持,
+  外加目录外标记区;三态推导 `deriveModelAvailability` 是纯函数(标记剩余 0s
+  仍算标记中,与后端 `is_none()` 对齐),配 Vitest。
+
+### 修复:quota/models 扇出 2s 超时误报「没有 worker 持有该账号」
+
+线上确诊:`models_account`/`quota_account` 扇出用 `st.http`(2s 管理面聚合 client),
+而 worker 侧要真打上游控制面(拉目录/查配额),>2s 是常态 —— 传输超时在扇出循环里
+等价于「该 worker 离线」,全部轮完误报 404,直连同一 worker 却是 200。probe 端点
+注释里早有同款踩坑记录(用 120s)。修法:三个扇出共用 `control_plane_http()`
+(30s;控制面 GET 正常秒级,30s 兜住抖动又不挂死管理页),`st.http` 的其它用途
+(聚合 /health 等需要快速跳过离线 worker 的场景)不动。回归测试用 3s 慢应答
+worker 锁死:旧 client 必现的误判,现在拿到 200。
+
+### 审查修复(gpt-5.6-sol 二审,2 中 3 低)
+
+- **[中] models/local 扇出误用 30s client**:纯本地端点毫秒级返回,串行扇出时一个
+  挂住的 worker 会把面板请求拖 30s。改回 2s 的 `st.http`(与其它纯本地管理面调用
+  一致),30s 只留给真打上游的 quota/models;两处注释同步改正。
+- **[中] 弹窗数据新鲜度**:全局默认 staleTime 是 30s(此前注释误写 0),重开弹窗
+  可能展示旧缓存。`useAccountModelsLocal` 加 `staleTime: 0` + `refetchOnMount:
+  'always'`(每次打开必重新取快照);i18n 剩余时间表述从「倒计时」口径改为
+  「查询时快照」口径(zh/en)。
+- **[低] 慢应答回归测试挪位**:models/local 改回 2s 后,3s 慢应答测试打在它上面
+  必挂;移到真正出过事的 quota 扇出(3s 慢应答假 worker 打 `POST /accounts/{id}/quota`,
+  断言 200 而非 404)。
+- **[低] 弹窗标题名不副实**(列表含不支持/被标记条目):zh 改「模型支持情况」、
+  en 改 "Model availability",集合公式文案改为「静态目录 + 档位支持判断 + 已学标记」。
+- **[低] 前端类型过宽**:`AccountModelEntry` 的 `display_name`/`mark_remaining_secs`
+  由可选改为必填可空(`string | null` / `number | null`),与 worker 实际输出对齐;
+  测试桩同步补齐。
+
+## [model-marks-observability] - 2026-08-10
+
+封号潮排障实录(2026-08-10):唯一活号 `kiro-apikey-d8ac5a33253d` 面板显示「正常」
+(未禁用/无冷却/额度 9988/10000),实际服务全 503——它对上游的每个模型都被
+`INVALID_MODEL_ID` 拒绝(上游"半死":配额接口还读得出、模型调用全拒),caio 按设计
+打了 `(账号,模型)` 不可用标记并绕开,但标记是纯内存、面板和 runtime API 完全看不到,
+排查只能翻日志。本次把这个观测盲区补上。全量 **1214 项测试通过**(+2),
+admin-ui **38 项**(+2)。
+
+- **runtime API 暴露标记**:`AccountStatusSnapshot` 新增 `model_unavailable`
+  数组(模型名 + 标记剩余重探秒数),经 worker `/health` → router 聚合 → 面板,
+  全链路 serde 直通,旧 worker 缺字段时前端按"无标记"降级。
+- **面板**:状态徽章旁新增橙色「模型不可用×N」徽章,title 逐模型列出剩余重探时间
+  (`formatMarkTtl`:<1h 显分钟,否则显小时)。
+- **救号按钮覆盖该状态**:挂着模型标记的号也会出现救号按钮,且 worker 侧
+  `reset_account` 现在**一并清除该号的模型不可用标记**——否则 reset 返回成功、
+  号仍被标记挡在选号池外直到 6h TTL 自然过期(与此前清 RPM 窗口同款理由,
+  锁顺序 entries → model_unavailable,与选号谓词一致)。
+
+### 审查修复(gpt-5.6-sol 一审)
+
+- **[高] 剩余重探秒数方向写反**:`t.saturating_duration_since(now)`(标记时刻 − 现在)
+  恒饱和为 0,导致过期标记滤不掉、剩余时间恒为 TTL。修为 `now - t`,并补
+  「剩余递减 + 过期消失」的针对性测试(旧断言只查"在范围内",抓不住方向错误)。
+- **[中] 自动退役被配置停用遮蔽**:退役落库 `disabled=1`,而 `deriveAccountStatus`
+  先判 `row.disabled`,红「已退役」标签成死代码。修为 runtime 在线且报
+  `suspended_retired` 时优先展示退役,并补优先级/分桶测试。
+
+## [suspend-lifecycle] - 2026-08-10
+
+封号调查(证据见 HANDOFF-2026-08-10-ban-investigation.md)的落地修复,
+按 gpt-5.6-sol 方案审查的三轮意见做全。全量 **1212 项测试通过**(+15)。
+
+### 背景:死号每小时整批复活,把客户原文泼向尸体
+
+生产实锤:一个真实客户请求 32 秒内被泼到 12 个账号(11 个复活中的死企业号 +
+1 个活 PRO+)。机制链:suspend 固定 3600s 冷却 → 到期整批复活 → 客户端重试的
+新请求挨个踩中刚复活的尸体。同一段客户原文反复跨身份重放,是喂给上游风控的
+池关联证据。同时 ~100 个假冷却号让 restock 的 healthy 计数频繁触底
+(`min_healthy=1`),3 小时白买 6 个号(¥30/个)。
+
+### suspend 生命周期状态机(仅 kiro 启用)
+
+- **指数退避 + 抖动**:第 k 次连续 suspend 冷却 = `suspended_cooldown_secs * 2^(k-1)`,
+  封顶 `suspended_backoff_cap_secs`(默认 24h),±20% 确定性抖动(FNV(账号,档位),
+  不引 rand 依赖)——「整批死号同一秒复活」的同步性被打散。
+- **复活观察期(probation 单飞)**:冷却到期不再满血回轮转,并发限 1,直到一次
+  **完整成功**(非流式折叠成功 / 流式走到 `message_stop`)才满血;再失败吃下一档
+  退避。观察期占用的号在取号分类里按"忙"认领,不掉进 AllDisabled 误报 503。
+- **世代闸门(suspend_gen)**:lease 快照选号时的世代;旧世代在途请求的迟到
+  成功/失败一律不改写新状态——同批并发里第一个 suspend 计击后,其余回声与
+  迟到成功都不再干扰退避(审查阻断 #1/#2)。
+- **自动退役**:连续 `suspend_retire_strikes`(默认 3,0=关闭,可热调)次复活失败
+  → 持久禁用 + `disabled=1` 落库,面板「已退役」,restock 直接判死(可回收),
+  不再每小时复活闪烁。
+- **状态落库**(新表 `account_lifecycle`):退避档位/retry_at/退役标记全部持久化,
+  每次状态转换即入队、worker sync 循环落库;重启按库水合——不重抽抖动、
+  不让"已退到 24h 档"的号因发版提前复活(审查阻断 #5)。
+- **人工恢复原子化**:面板「启用」= `disabled=0` + 删生命周期行,单事务
+  (`restore_account`);worker sync 的配置翻转路径同步清运行态 + 前进世代 +
+  入队清零行兜底(审查阻断 #4)。
+- **provider 作用域**:只对 kiro 启用(「0/35 不可恢复」的实测只覆盖 Kiro 号);
+  dario 等 provider 经 `suspend_policy_scoped` 闸保持旧的平冷却、不退役,
+  构造与 30s 热更两条路径同一口径(审查阻断 #6)。
+
+### 排队号不再因空响应下线
+
+空响应达阈值冷却保留给非排队号;排队号(企业共享池)的空响应多是跨租户拥挤的
+上游抖动,下线只会缩小健康池、让 restock 把假冷却当缺口一直买号(与 429 同哲学:
+唯一 hold 下线信号是 403 suspend)。真毒报文由 poison_memo 多账号确认机制兜底
+(EmptyResponse 本来就不换号,不扩大喷洒)。
+
+### 面板
+
+新状态标签:封禁冷却(带剩余秒)、已退役(红)、复活观察期(橙)。
+顺带修了「运行态封禁冷却被显示成已停用」的歧义(原 deriveAccountStatus 把
+`temporarily_suspended` 归并进"已停用")。
+
+### 配置
+
+`system.yaml` / 设置面板新增:`suspended_backoff_cap_secs`(默认 86400)、
+`suspend_retire_strikes`(默认 3,0=不退役恢复旧行为)。均支持热更。
 
 ## [cursor-review-fixes-2] - 2026-08-07
 
