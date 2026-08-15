@@ -20,6 +20,7 @@ use futures::StreamExt;
 use gw_core::account::Account;
 use gw_core::config::{AccountsConfig, InstancesConfig, SystemConfig};
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
+use gw_core::openai::{Wire, WireFrame};
 use gw_core::provider::{
     AccountQuota, CallCtx, ChatRequest, ChatUsage, Provider, SseEvent, StreamItem,
 };
@@ -606,6 +607,31 @@ impl WorkerState {
     async fn sync_accounts_from_db(self: &Arc<Self>) -> Option<(usize, usize)> {
         let store = self.store.clone()?;
         let _serialized = self.sync_lock.lock().await;
+        // 先冲刷 suspend 生命周期落库队列(最新状态覆盖旧的;退役条目同事务置
+        // disabled=1)。**条件写**:Ok(false) = epoch 竞态落败(人工恢复更新),
+        // 不回队——紧随其后的对账会采用库内真相;Err 才回队下轮重试。
+        for (id, (lc, set_disabled)) in self.scheduler.take_pending_lifecycles() {
+            match store.persist_suspend_lifecycle(&id, &lc, set_disabled) {
+                Ok(true) => {
+                    if set_disabled {
+                        tracing::warn!(account = %id, "suspend 自动退役已落库(disabled=1)");
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(account = %id, "suspend 生命周期落库 epoch 落败,由对账收敛");
+                }
+                Err(e) => {
+                    tracing::error!(account = %id, "suspend 生命周期落库失败,下轮 sync 重试: {e}");
+                    self.scheduler.requeue_lifecycle(&id, (lc, set_disabled));
+                }
+            }
+        }
+        // 对账:库内 epoch 更新(=人工恢复)的号,采用库内真相重水合运行态——
+        // 运行态冷却的号 DB disabled 恒 0,配置翻转路径感知不到人工恢复,靠这里送达。
+        match store.load_suspend_lifecycles() {
+            Ok(rows) => self.scheduler.adopt_db_lifecycles(&rows),
+            Err(e) => tracing::warn!("suspend 生命周期对账读库失败,本轮跳过: {e}"),
+        }
         // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
         flush_dirty_extras(&self.scheduler, &store, &self.refresh_locks, "sync 重试").await;
         // 成员边与账号集**先都读出来,两个都成功才发布**(对抗审查 Skeptic#3)。
@@ -627,7 +653,7 @@ impl WorkerState {
         // 至多短暂不可选(仅是暂时不可用,不是提权)。反过来发布会让撤销晚一步生效。
         *self.group_views.write() = memberships
             .into_iter()
-            .map(|(g, rank)| (g, scheduler::GroupView::new(rank)))
+            .map(|(g, rank)| (g.clone(), scheduler::GroupView::new(g, rank)))
             .collect();
         let accounts =
             filter_by_provider(accounts.into_iter().map(Arc::new).collect(), self.provider.family());
@@ -656,6 +682,13 @@ fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
                 "percent_used": w.percent_used,
                 "reset_at": w.reset_at,
             })).collect::<Vec<_>>(),
+            // 超额(on-demand)额度:null = 该 provider 无此概念 / 未查到,前端显示 —。
+            "on_demand": q.on_demand.as_ref().map(|od| serde_json::json!({
+                "enabled": od.enabled,
+                "limit": od.limit,
+                "used": od.used,
+                "unlimited": od.unlimited,
+            })),
         }),
         None => serde_json::Value::Null,
     }
@@ -915,6 +948,13 @@ pub async fn run(
         if let Ok(sv) = serde_json::to_value(&full) {
             provider.apply_hot_settings(&sv);
         }
+        // cursor 追加模型目录启动初载(与 30s 轮询同一口径,别留 30s 窗口)。
+        apply_cursor_extra_models(&effective_system);
+        // 护栏策略句同理:不初载的话头 30s 用的是内置默认,而线上跑的是配置版 ——
+        // 那段窗口的收口率会被记到错误的 guard_rev 上。
+        if let Err(e) = apply_cursor_tool_guard(&effective_system) {
+            tracing::error!("cursor 护栏策略句启动初载失败,本进程沿用内置默认: {e}");
+        }
     }
 
     // Fix6: For dario workers, filter out accounts that fail validate_account
@@ -995,9 +1035,40 @@ pub async fn run(
         })
         .unwrap_or_default()
         .into_iter()
-        .map(|(g, rank)| (g, scheduler::GroupView::new(rank)))
+        .map(|(g, rank)| (g.clone(), scheduler::GroupView::new(g, rank)))
         .collect();
     tracing::info!(groups = initial_views.len(), "成员边启动装载完成");
+
+    // suspend 生命周期(退避/观察期/退役/落库)只对 kiro 启用:0/35 不可恢复的
+    // 实测数据只覆盖 Kiro 号,dario 等 provider 的 TemporarilyBlocked 语义不同,
+    // 保持逐字节旧行为(平冷却、到期满血复活)。
+    let lifecycle_enabled = provider.family() == "kiro";
+    // 落库的 suspend 生命周期在构造时水合:重启不丢退避进度、不重抽抖动,
+    // 部署重启不会让"已退到 24h 档"的号提前复活。读库失败按空表起(=旧行为),
+    // 由周期 sync 把内存里的新转换陆续落库补齐。
+    let lifecycles = if lifecycle_enabled {
+        store
+            .as_ref()
+            .map(|s| s.load_suspend_lifecycles())
+            .transpose()
+            .unwrap_or_else(|e| {
+                tracing::error!("启动装载 suspend 生命周期失败,本轮以空表起(退避进度本轮不水合): {e}");
+                None
+            })
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    if !lifecycles.is_empty() {
+        tracing::info!(accounts = lifecycles.len(), "suspend 生命周期启动水合完成");
+    }
+    let scheduler =
+        AccountScheduler::new_with_lifecycles(accounts, &effective_system.scheduler, &lifecycles, lifecycle_enabled);
+    if lifecycle_enabled {
+        if let Some(s) = &store {
+            scheduler.set_lifecycle_store(s.clone());
+        }
+    }
 
     let state = Arc::new(WorkerState {
         group_views: parking_lot::RwLock::new(initial_views),
@@ -1005,7 +1076,7 @@ pub async fn run(
         egress_desc,
         group: wcfg.account_group.clone(),
         provider,
-        scheduler: AccountScheduler::new(accounts, &effective_system.scheduler),
+        scheduler,
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         usage_sink,
         pending_writes: PendingWrites::new(),
@@ -1122,6 +1193,17 @@ pub async fn run(
                         st.scheduler.update_tuning(&eff.scheduler);
                         gw_kiro::cache_sim::global().set_ttl_secs(eff.cache.sim_ttl_secs);
                         gw_kiro::cache_sim::global().set_max_sessions(eff.cache.max_sessions);
+                        apply_cursor_extra_models(&eff);
+                        // 护栏策略句:校验失败保留上一份有效值,并把原因并进本轮同步错误 ——
+                        // 与上面 provider 级设置同一条原则(应用失败必须说出来,不能让面板报「一致」)。
+                        let apply_err = match apply_cursor_tool_guard(&eff) {
+                            Ok(()) => apply_err,
+                            Err(e) => {
+                                tracing::error!("cursor 护栏策略句未应用(沿用上一份有效值): {e}");
+                                let msg = format!("cursor 护栏策略句未应用: {e}");
+                                if apply_err.is_empty() { msg } else { format!("{apply_err}; {msg}") }
+                            }
+                        };
                         // 应用成功才刷新时间戳与快照:面板上「多久前同步的」才是可信的
                         // 新鲜度指标 —— 失败时它会停住不动,一眼看出配置僵了多久。
                         *st.settings_sync.write() = SettingsSync {
@@ -1193,6 +1275,23 @@ pub async fn run(
         // 不该和生产流量耦合(对抗审查三视角一致指出)。这里只读一把 RwLock。
         .route("/settings-sync", get(settings_sync));
 
+    // OpenAI 线缆:cursor 上游本来就供 gpt / grok / gemini 这些非 Anthropic 家族的模型,
+    // 却只能用 Anthropic 协议去要 —— 给它开 OpenAI 入口,顺带省掉下游 NewAPI 那道
+    // 有损的 Claude→OpenAI 转换(它只认 5 种事件,见 `keepalive_frame` 的注释)。
+    //
+    // **按 family 条件挂载**是结构性闸门:kiro / dario / claude-subprocess 上这两条路径
+    // 根本不存在(404),不靠文档里的君子协定约束。它们的主链路全程 Anthropic、
+    // 零转换,那是刻意保住的资产(见 gw_core::provider 模块文档),不该被 OpenAI 入口稀释。
+    if mount_openai_wire(state.provider.family()) {
+        app = app
+            .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/responses", post(responses));
+        tracing::info!(
+            family = state.provider.family(),
+            "已挂载 OpenAI 线缆入口: /v1/chat/completions + /v1/responses"
+        );
+    }
+
     // worker 不做对外鉴权、且信任 router 注入的 X-Gw-Client-Key;必须只绑 loopback,
     // 否则客户端可直连 worker 绕过 router 鉴权并伪造用量归属(审查 #2)。
     let loopback = is_loopback_listen(&wcfg.listen);
@@ -1204,7 +1303,9 @@ pub async fn run(
             .route("/accounts/{id}/reset", post(reset_account))
             .route("/accounts/{id}/refresh", post(refresh_account))
             .route("/accounts/{id}/quota", post(quota_account))
+            .route("/accounts/{id}/on-demand", post(on_demand_account))
             .route("/accounts/{id}/models", post(models_account))
+            .route("/accounts/{id}/models/local", get(models_local))
             .route("/accounts/{id}/probe", post(probe_account))
             .route("/oauth/exchange", post(oauth_exchange))
             .route("/sync", post(sync_now));
@@ -1388,8 +1489,40 @@ fn is_loopback_listen(listen: &str) -> bool {
     }
 }
 
+/// 把 cursor 热追加模型目录写进 gw-cursor 的进程全局表(启动初载与 30s 轮询共用)。
+/// 对非 cursor worker 是无害 no-op(模型目录只有 cursor provider 会读)。
+/// 空名条目直接丢弃(写侧不拦,读侧兜底)。
+fn apply_cursor_extra_models(cfg: &gw_core::config::SystemConfig) {
+    let models = cfg
+        .cursor_extra_models
+        .iter()
+        .filter(|s| !s.name.trim().is_empty())
+        .map(|s| {
+            let params: Vec<(&str, &str)> = s
+                .params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let m = gw_cursor::run::Model::with_params(s.name.trim(), &params);
+            // menu=false(默认)= 探测位:可被点名但不进 1.14 清单。
+            if s.menu { m } else { m.probe() }
+        })
+        .collect();
+    gw_cursor::set_extra_models(models);
+}
+
+/// 把 cursor 内建工具护栏的策略句写进 gw-cursor 的进程全局(启动初载与 30s 轮询共用)。
+/// 对非 cursor worker 是无害 no-op(只有 cursor provider 会读)。
+///
+/// 校验失败**保留上一份有效值**并把原因交回调用方计入 settings 同步错误 ——
+/// 不静默回默认:护栏的效果正在被按版本分桶比对收口率,悄悄换一版会让那份数据作废。
+fn apply_cursor_tool_guard(cfg: &gw_core::config::SystemConfig) -> Result<(), String> {
+    gw_cursor::set_tool_guard_policy(&cfg.cursor_tool_guard)
+}
+
 /// `GET /settings-sync` —— 设置热调实况(轻量,不碰 scheduler 与配额)。
 async fn settings_sync(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
+
     Json(serde_json::json!({
         "role": "worker",
         "instance": st.instance,
@@ -1411,6 +1544,11 @@ fn settings_view(st: &WorkerState) -> serde_json::Value {
         "effective": s.effective,
         // false = provider 级设置(缓存计费等)对本 worker 要重启才生效。
         "provider_hot": s.provider_hot,
+        // cursor 内建工具护栏策略句的短指纹。**只回显指纹不回显全文** ——
+        // 全文是每个请求都发给上游的系统提示的一部分,不该跟着健康快照到处走。
+        // 它回答的是「线上跑的是哪一版、从什么时候起」,正是按版本分桶比对
+        // 内建工具收口率需要的那个字段。非 cursor worker 上它恒为内置默认的指纹。
+        "cursor_guard_rev": gw_cursor::tool_guard_rev(),
     })
 }
 
@@ -1450,7 +1588,8 @@ async fn health(State(st): State<Arc<WorkerState>>) -> impl IntoResponse {
 }
 
 /// `POST /accounts/{id}/reset` —— 内网管理:人工救号。清运行时禁用/冷却/失败计数
-/// (配置层 disabled 不动,那走 PATCH)。由 admin(router 进程)扇出调用;
+/// (含 429 节流窗口、RPM 滑动窗口、(账号,模型) 不可用标记;配置层 disabled 不动,
+/// 那走 PATCH)。由 admin(router 进程)扇出调用;
 /// worker 只绑 loopback,信任内网调用方。404 = 账号不在本 worker 组。
 async fn reset_account(
     State(st): State<Arc<WorkerState>>,
@@ -1517,6 +1656,10 @@ async fn refresh_account(
         )
             .into_response();
     };
+    // 开工时快照 suspend 世代:本次刷新可能跑几秒,期间账号若发生状态转换
+    // (suspend/复活/恢复),迟到的上报就是旧世代回声,不得改写新状态
+    // (对抗审查阻断#7;本路径不走 lease,必须自己快照)。
+    let gen = st.scheduler.current_suspend_gen(&id);
     match st.force_refresh(account).await {
         Ok(refreshed) => {
             // 绝不回传 token 明文;只给 expires_at 让操作者确认新 token 的有效期窗口。
@@ -1533,7 +1676,7 @@ async fn refresh_account(
             // rt 永久失效(TokenInvalid)→ 立即标 invalid_refresh_token 禁用,仪表盘即时
             // 见死号、不再被路由到;transient(网络/5xx)→ 仅计失败数(救号一键清)。
             // 不在此换号/重试(人工动作就是要看这一次结果)。
-            st.scheduler.report_failure(&id, e.kind);
+            st.scheduler.report_failure_with_gen(&id, e.kind, gen);
             // 运维端点:人工点"刷新"就是要看这一次的真实失败原因。
             admin_error_response(&e)
         }
@@ -1617,9 +1760,18 @@ async fn probe_account(
     };
 
     let started = std::time::Instant::now();
-    // 定频记账:人工探针也是一次真实的上游调用。虽然低频,但不记的话运维探一个
-    // 已接近上限的号就可能把它推过阈值 —— 而定频闸门存在的意义正是防这个。
-    st.scheduler.note_upstream_call(&ctx.account.account_id);
+    // 定频准入:人工探针也是一次真实的上游调用,同样受有效 RPM 上限约束(含暖机)。
+    // 达限就如实报"被定频拦住"、绝不硬发 —— 探一个已接近上限的号把它推过阈值,
+    // 正是定频闸门要防的事。探针无分组上下文,按 default_rank 口径(低频人工操作,
+    // 取舍见 effective_rpm_limit 注释)。
+    if !st.scheduler.note_upstream_call(&ctx.account.account_id, None) {
+        return Json(serde_json::json!({
+            "replied": false, "account_id": id, "model": model,
+            "stage": "rpm_limited",
+            "error": "该号已达有效 RPM 上限(含暖机),探针未发出",
+        }))
+        .into_response();
+    }
     let stream = match st.provider.chat(req, &ctx).await {
         Ok(s) => s,
         Err(e) => {
@@ -1753,6 +1905,107 @@ async fn quota_account(
     }
 }
 
+/// `POST /accounts/{id}/on-demand` —— 设置该号的超额(on-demand)额度上限。
+///
+/// body: `{"limit_usd": 50}`(美元整数);`0` 或 `null` = **关闭**超额。
+///
+/// ⚠️ 与 `/quota` 不同,这是**写**操作:它改上游账号的计费设置,开启后套餐用尽会产生
+/// 真实费用。只由 admin 面板的显式运维动作触发,绝不在任何轮询路径上。
+///
+/// 成功后**顺带刷新配额缓存**:否则面板要等一个 TTL 才看到新上限,运维会以为没生效。
+async fn on_demand_account(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    if st.scheduler.account(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "account_id": id})),
+        )
+            .into_response();
+    }
+    if !st.provider.on_demand_supported() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {"message": format!("provider {} 不支持超额额度设置", st.provider.family())}
+            })),
+        )
+            .into_response();
+    }
+    // limit_usd 缺省/null/0 → 关闭超额。负数或超 i32 的值直接拒:上游字段是 i32,
+    // 静默截断会把「设 $50」变成别的数字。
+    let raw = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("limit_usd").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let limit_usd: Option<u32> = if raw.is_null() {
+        None
+    } else {
+        match raw.as_i64() {
+            Some(n) if (0..=i32::MAX as i64).contains(&n) => Some(n as u32),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {"message": "limit_usd 必须是 0..=2147483647 的整数(美元),0 或 null = 关闭超额"}
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // 与配额查询同走 quota_sem:控制面对上游的并发压力边界只有这一处。
+    let _permit = match st.quota_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"ok": false, "account_id": id})),
+            )
+                .into_response();
+        }
+    };
+    let Some(account) = st.scheduler.account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "account_id": id})),
+        )
+            .into_response();
+    };
+    let account = match st.ensure_credentialed(account).await {
+        Ok(a) => a,
+        Err(e) => return admin_error_response(&e),
+    };
+    if let Err(e) = st.provider.set_on_demand_limit(&account, limit_usd).await {
+        // 上游拒绝(如未绑支付方式的 failed_precondition)按原文透出:运维要能区分
+        // 「我们发错了」和「这号上游不允许」。写操作失败**不计失败池**:它与 chat
+        // 可用性无关,一次计费设置被拒不该让号进冷却。
+        return admin_error_response(&e);
+    }
+    // 回读一次(顺带刷新面板缓存)。回读失败不算设置失败:上游已经接受了。
+    let quota = match st.try_fetch_quota(&id).await {
+        Ok(q) => {
+            st.quota_cache
+                .lock()
+                .insert(id.clone(), (q.clone(), std::time::Instant::now()));
+            q
+        }
+        Err(e) => {
+            tracing::debug!(account = %id, "超额设置成功但回读失败: {e}");
+            None
+        }
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "account_id": id,
+        "quota": quota_to_json(quota),
+    }))
+    .into_response()
+}
+
 /// `POST /accounts/{id}/models` —— 用该账号拉一次上游**模型目录**并落库。
 ///
 /// 目的是把 `rateMultiplier`(定价)与逐模型的 thinking 档位表从"代码里写死的印象"
@@ -1863,7 +2116,64 @@ async fn models_account(
     }
 }
 
-/// `POST /sync` —— 立即从 DB 同步组内账号集(与 30s 周期循环共用实现)。
+/// `GET /accounts/{id}/models/local` —— 该号的模型可用清单(**纯本地,绝不打上游**):
+/// provider 静态目录 × (档位静态支持 `account_supports_model` − 已学 INVALID_MODEL_ID
+/// 标记)。面板「查看模型」按钮的数据源。
+///
+/// 「可用」口径是**本地认知**:未观察到拒绝 ≠ 上游保证(半死号要真发一次才知道,
+/// 上游真相用 `POST /accounts/{id}/models` 拉目录 + `/probe` 验)。本端点零风险,
+/// 随便点。仅本 worker 持有该账号时命中;不持有 → 404(admin 据此向其余 worker 续问)。
+async fn models_local(
+    State(st): State<Arc<WorkerState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(account) = st.scheduler.account(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"account_id": id})),
+        )
+            .into_response();
+    };
+    let catalog = match st.provider.list_models().await {
+        Ok(c) => c,
+        Err(e) => return admin_error_response(&e),
+    };
+    let marks = st.scheduler.model_marks_for(&id);
+    let mark_secs: std::collections::HashMap<&str, u64> = marks
+        .iter()
+        .map(|m| (m.model.as_str(), m.remaining_secs))
+        .collect();
+    let mut in_catalog: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let models: Vec<serde_json::Value> = catalog
+        .iter()
+        .map(|m| {
+            in_catalog.insert(m.id.as_str());
+            let supported = st.provider.account_supports_model(&account, &m.id);
+            let mark = mark_secs.get(m.id.as_str()).copied();
+            serde_json::json!({
+                "id": m.id,
+                "display_name": m.display_name,
+                "supported": supported,
+                "mark_remaining_secs": mark,
+                "available": supported && mark.is_none(),
+            })
+        })
+        .collect();
+    // 目录外的标记(上游新模型/请求变体名打不中目录行)单独透出,不悄悄丢掉。
+    let off_catalog_marks: Vec<serde_json::Value> = marks
+        .iter()
+        .filter(|m| !in_catalog.contains(m.model.as_str()))
+        .map(|m| {
+            serde_json::json!({"model": m.model, "remaining_secs": m.remaining_secs})
+        })
+        .collect();
+    Json(serde_json::json!({
+        "account_id": id,
+        "models": models,
+        "off_catalog_marks": off_catalog_marks,
+    }))
+    .into_response()
+}
 /// admin 导入账号后主动捅一下,消除"导入后 30s 内按号操作报无人持有"的窗口。
 /// 无库(降级模式)/读库失败 → 503,调用方按 best-effort 忽略。
 async fn sync_now(State(st): State<Arc<WorkerState>>) -> axum::response::Response {
@@ -1889,28 +2199,50 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
     // 但 Anthropic /v1/models 条目带 created_at,严格类型客户端会校验——给个固定占位值
     // 以保证兼容(非真实日期,仅占位)。
     const MODEL_CREATED_AT: &str = "2025-01-01T00:00:00Z";
+    // OpenAI 形状用的 unix 秒占位(与上面那个 ISO 串同一个时刻,只是另一种编码)。
+    const MODEL_CREATED_UNIX: i64 = 1_735_689_600;
+    // OpenAI 字段**只在开了 OpenAI 入口的 worker 上**追加。
+    //
+    // 这是个共享端点:kiro / dario / claude-subprocess 也走它。给所有家族无条件加字段
+    // 就是为了迁就一种协议去改另一种协议的共享响应 —— 按 JSON Schema 严校验的客户端、
+    // 或对响应体做快照/哈希的代理都会看到不兼容变化(对抗评审 Architect#2)。
+    // 只有 cursor 的客户端会说 OpenAI,也只有它需要这几个键。
+    let openai_shape = mount_openai_wire(st.provider.family());
     match st.provider.list_models().await {
         Ok(list) => {
             let data: Vec<serde_json::Value> = list
                 .iter()
                 .map(|m| {
-                    serde_json::json!({
+                    let mut item = serde_json::json!({
                         "type": "model",
                         "id": m.id,
                         "display_name": m.display_name.clone().unwrap_or_else(|| m.id.clone()),
                         "created_at": MODEL_CREATED_AT,
-                    })
+                    });
+                    if openai_shape {
+                        if let Some(o) = item.as_object_mut() {
+                            o.insert("object".into(), serde_json::json!("model"));
+                            o.insert("created".into(), serde_json::json!(MODEL_CREATED_UNIX));
+                            o.insert("owned_by".into(), serde_json::json!(st.provider.family()));
+                        }
+                    }
+                    item
                 })
                 .collect();
             let first = list.first().map(|m| m.id.clone());
             let last = list.last().map(|m| m.id.clone());
-            Json(serde_json::json!({
+            let mut body = serde_json::json!({
                 "data": data,
                 "has_more": false,
                 "first_id": first,
                 "last_id": last,
-            }))
-            .into_response()
+            });
+            if openai_shape {
+                if let Some(o) = body.as_object_mut() {
+                    o.insert("object".into(), serde_json::json!("list"));
+                }
+            }
+            Json(body).into_response()
         }
         Err(e) => {
             // 目录当前是本地生成、恒 Ok;一旦改成真实上游查询,原文只剩这一条日志路。
@@ -1972,11 +2304,51 @@ fn parse_group_header(headers: &HeaderMap) -> Result<Option<String>, String> {
 /// 而把它判为不合格 → 落进 `select_id` 的"primary 不可用 → 改选并当场转正、永不迁回"
 /// 分支 → **永久改写正常客户的钉扎**,上游前缀缓存冷启动。分了命名空间,低价流量就只能
 /// 动自己那一份条目。组名与会话键都不含 NUL,用 NUL 分隔。
-fn group_scoped_affinity_key(group: Option<&str>, key: Option<String>) -> Option<String> {
-    match (group, key) {
-        (Some(g), Some(k)) => Some(format!("{g}\u{0}{k}")),
-        (_, k) => k,
-    }
+///
+/// `client` 非空时**再按客户 key 分一层**,见 [`affinity_scoped_by_client`]。
+fn group_scoped_affinity_key(
+    group: Option<&str>,
+    client: Option<&str>,
+    key: Option<String>,
+) -> Option<String> {
+    let key = key?;
+    let scoped = match client.filter(|c| !c.is_empty()) {
+        Some(c) => format!("{c}\u{0}{key}"),
+        None => key,
+    };
+    Some(match group {
+        Some(g) => format!("{g}\u{0}{scoped}"),
+        None => scoped,
+    })
+}
+
+/// 会话亲和键要不要**再按客户 key** 分一层命名空间。
+///
+/// ## 为什么 cursor 必须分(不分就是跨客户串话)
+///
+/// cursor 是**唯一有服务端会话续写**的上游:`ConvRegistry::phase_for` 在
+/// (conversation_id, account_id) 都命中时返回 `Phase::Continuation`,于是本轮只发增量、
+/// 由 Cursor 服务端接着上一轮往下说。而 `conversation_id` 来自
+/// `gw_cursor::chat::affinity_key_from_body` = `hash(system + 第一条 user)` —— **纯内容派生,
+/// 不含任何客户身份**。
+///
+/// 于是:同组两个不同 API key,只要 system 相同、开场那句话相同(通用 agent 提示词 +
+/// "hello" 就够了),就会拿到同一个 conversation_id;亲和又把它们钉到同一个账号;
+/// 两个条件一齐命中 → 后来那位客户的请求被当作前一位客户会话的**续写**发上去。
+/// gw-cursor 自己的文档注释早就点了这个名:「第三条在 `CURSOR_STATEFUL=1` 下是跨用户串话」,
+/// 而 `stateful` 的默认值是**开**(`CURSOR_STATEFUL` 只有显式 `=0` 才关)。
+///
+/// 这条路径在本次改动之前就存在(Anthropic 入口打 cursor worker 同样成立),但把入口开给
+/// **NewAPI 这种多租户中转**正好凑齐了碰撞前提:同一个组下面挂着许多互不相识的客户。
+/// 所以在这里补上客户维度 —— 不同客户永不共享 conversation_id,`Continuation` 也就永不跨客户。
+///
+/// ## 为什么只给 cursor
+///
+/// kiro / dario 没有服务端续写:每轮重传全量历史,共享的键只影响**前缀缓存命中**,
+/// 泄不出上下文(kiro 发给上游的 conversationId 还额外按账号加盐)。给它们也分层会
+/// 无谓打散主链路的缓存亲和,而主链路是生产主力 —— 不动。
+fn affinity_scoped_by_client(family: &str) -> bool {
+    family == "cursor"
 }
 
 /// 一条消息的 `content` 是否为空。
@@ -2028,10 +2400,105 @@ fn validate_message_contents(body: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// 哪些 provider 家族挂 OpenAI 线缆入口。
+///
+/// 目前只有 `cursor`。单拎成函数是为了让这条策略**可被测试点名** —— 一句
+/// `family == "cursor"` 埋在路由构造里,没人能证明它有没有被悄悄放宽。
+fn mount_openai_wire(family: &str) -> bool {
+    family == "cursor"
+}
+
+/// `POST /v1/messages` —— 原生 Anthropic 入口(全部非 cursor 流量走这条)。
 async fn messages(
     State(st): State<Arc<WorkerState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    handle_chat(st, headers, body, Wire::Anthropic).await
+}
+
+/// `POST /v1/chat/completions` —— OpenAI ChatCompletions 入口(**仅 cursor 家族挂载**)。
+///
+/// 入站转成 Anthropic body 后走的就是 [`messages`] 那条链路,一个分支都不分:
+/// 选号、会话亲和、租约、重试、计费、请求日志全部共用。
+async fn chat_completions(
+    State(st): State<Arc<WorkerState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    openai_entry(st, headers, body, gw_core::openai::chat_req::convert_request).await
+}
+
+/// `POST /v1/responses` —— OpenAI Responses 入口(**仅 cursor 家族挂载**)。
+async fn responses(
+    State(st): State<Arc<WorkerState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    openai_entry(st, headers, body, gw_core::openai::resp_req::convert_request).await
+}
+
+/// 两条 OpenAI 入口的共同前半段:解析 → 转换 → 交给 `handle_chat`。
+///
+/// **收 `Bytes` 而不是 `Json<Value>`**:后者的 extractor 在畸形 JSON 上直接返回 axum 的
+/// 默认拒绝体(纯文本 / 非 OpenAI 形状),而那是在我方 handler 之前发生的,wire-aware
+/// 的错误壳根本来不及套上 —— OpenAI SDK / NewAPI 按 `error` schema 解不出来
+/// (对抗评审 Minimalist#4)。自己解就能保证**这条路径上每一个错误**都是 OpenAI 形状。
+async fn openai_entry(
+    st: Arc<WorkerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    convert: fn(
+        &serde_json::Value,
+    ) -> Result<gw_core::openai::Converted, gw_core::openai::ConvertError>,
+) -> axum::response::Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return openai_convert_error(&gw_core::openai::ConvertError::new(format!(
+                "无效 JSON: {e}"
+            )))
+        }
+    };
+    match convert(&parsed) {
+        Ok(c) => {
+            // 静默降级留痕:客户端声明了我方没有的托管工具(web_search 等),
+            // 我方丢掉后照常回答 —— 响应里几乎看不出来,不打日志就永远查不到。
+            if !c.dropped_tools.is_empty() {
+                tracing::warn!(
+                    dropped = ?c.dropped_tools,
+                    "OpenAI 入站请求声明了本通道不支持的托管工具,已丢弃(其余照常处理)"
+                );
+            }
+            handle_chat(st, headers, c.body, c.wire).await
+        }
+        Err(e) => openai_convert_error(&e),
+    }
+}
+
+/// 入站转换失败 → OpenAI 形状的 400。
+///
+/// **不占账号、不消耗配额**:与 `validate_message_contents` 同样的「在门口挡掉」思路,
+/// 而且 `param` 会点名出问题的字段,客户端能直接定位。
+fn openai_convert_error(e: &gw_core::openai::ConvertError) -> axum::response::Response {
+    tracing::debug!("OpenAI 入站请求非法,本地拒绝: {e}");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(gw_core::openai::openai_error_body(
+            400,
+            &e.message,
+            e.param.as_deref(),
+            None,
+        )),
+    )
+        .into_response()
+}
+
+async fn handle_chat(
+    st: Arc<WorkerState>,
+    headers: HeaderMap,
+    body: serde_json::Value,
+    wire: Wire,
 ) -> axum::response::Response {
     let req = ChatRequest::from_anthropic_body(body);
     // 入站结构校验:空 content 的消息上游必拒(2026-08-02 实测 失败样本命中 8/173、
@@ -2039,14 +2506,7 @@ async fn messages(
     // 客户根本查不出是哪条消息的问题。在这里挡掉:不占账号、不消耗配额、报错点名下标。
     if let Err(msg) = validate_message_contents(&req.body) {
         tracing::debug!("入站请求结构非法,本地拒绝: {msg}");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": msg}
-            })),
-        )
-            .into_response();
+        return error_response(wire, StatusCode::BAD_REQUEST, &msg);
     }
     // 请求日志(#③)采集:进入即计时。报文序列化(client/kiro)推迟到收尾的 blocking 任务里做,
     // 不在热路径(handler 入口)同步跑(审查 Skeptic#1)。
@@ -2059,13 +2519,8 @@ async fn messages(
         Ok(g) => g,
         Err(msg) => {
             tracing::error!("分组头非法,拒绝请求: {msg}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                // `error.type` 必填,少了它严格校验的客户端解析不了(见 anthropic_error_type)。
-                Json(serde_json::json!({"type":"error","error":{
-                    "type":"api_error","message": msg}})),
-            )
-                .into_response();
+            // `error.type` 必填,少了它严格校验的客户端解析不了(见 anthropic_error_type)。
+            return error_response(wire, StatusCode::INTERNAL_SERVER_ERROR, &msg);
         }
     };
     // 组名 → 成员视图。**查不到的组给空视图**(→ GroupEmpty/503),绝不回落全量池:
@@ -2079,7 +2534,13 @@ async fn messages(
         .unwrap_or_default()
         .to_string();
     // 会话亲和键 = provider 派生的 conversationId(Kiro)。None → 无亲和按负载选号。
-    let affinity_key = group_scoped_affinity_key(group.as_deref(), st.provider.affinity_key(&req));
+    // cursor 还要再按客户 key 分一层 —— 不分就是跨客户串话,见 `affinity_scoped_by_client`。
+    let client_scope = affinity_scoped_by_client(st.provider.family()).then_some(client_key.as_str());
+    let affinity_key = group_scoped_affinity_key(
+        group.as_deref(),
+        client_scope,
+        st.provider.affinity_key(&req),
+    );
 
     // 选号 + 发起 chat 的重试循环:token 失效(403/401)时刷新该号并对账号生命周期上报,
     // 换号重试;首包前的可重试错误最多走 total 个账号。committed(首包已出)后不重试。
@@ -2105,7 +2566,7 @@ async fn messages(
         //    模型的号——否则亲和会反复选中同一不支持的号(ModelNotAvailable 不禁号)死循环。
         let lease = match st
             .scheduler
-            .acquire_in_group(
+            .acquire_in_group_until(
                 affinity_key.as_deref(),
                 |a| {
                     st.provider.account_supports_model(a, &req.model)
@@ -2126,6 +2587,11 @@ async fn messages(
                     let w = st.scheduler.tier_hold_window();
                     !w.is_zero() && retry_started.elapsed() < w
                 },
+                // 请求级绝对截止:把 `RETRY_DEADLINE` 一路传进选号里的四条等待分支。
+                // 不传的话每次 acquire 都重开一份本地预算,「两次换号各等一轮」就能
+                // 越过 180s(对抗评审 [高])——而下游 yapi 是 300s 无 event 即中止,
+                // 越线的代价是客户拿到一个比明确报错更难查的中断。
+                Some(retry_started + RETRY_DEADLINE),
             )
             .await
         {
@@ -2141,6 +2607,7 @@ async fn messages(
                     scheduler::AcquireError::GroupEmpty
                     | scheduler::AcquireError::AllDisabled
                     | scheduler::AcquireError::AllBusy
+                    | scheduler::AcquireError::AllRpmLimited
                     | scheduler::AcquireError::Empty => StatusCode::SERVICE_UNAVAILABLE,
                 };
                 // 内部原因(哪一档耗尽 / 组里压根没成员)只进日志:它描述的是账号池形态,
@@ -2150,16 +2617,13 @@ async fn messages(
                     model = %req.model,
                     "选号失败: {e}"
                 );
-                return (
-                    code,
-                    Json(serde_json::json!({"type":"error","error":{
-                        "type": error_type_for_status(code),
-                        "message": e.client_message()}})),
-                )
-                    .into_response();
+                return error_response(wire, code, e.client_message());
             }
         };
         let account_id = lease.account_id().to_string();
+        // 选号时的 suspend 世代快照:本 lease 后续所有成功/失败上报都带它,
+        // 调度器据此丢弃「状态转换前就在途」的迟到回声(见 suspend_gen)。
+        let suspend_gen = lease.suspend_gen;
 
         // 2. 确保该号有未过期 access_token(按需刷新,带 expires_at 检查 + 单飞)。
         //    刷新失败按 kind 处理:invalid_grant(TokenInvalid)永久禁用;transient
@@ -2168,13 +2632,13 @@ async fn messages(
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(account = %account_id, kind = ?e.kind, "凭证刷新失败: {e}");
-                st.scheduler.report_failure(&account_id, e.kind);
+                st.scheduler.report_failure_with_gen(&account_id, e.kind, suspend_gen);
                 drop(lease);
                 if !e.kind.worth_switching_account()
                     || retry_started.elapsed() >= RETRY_DEADLINE
                     || attempts >= switch_cap(e.kind, total, general_cap)
                 {
-                    return upstream_error_response(&e);
+                    return upstream_error_response_wire(wire, &e);
                 }
                 continue;
             }
@@ -2197,7 +2661,7 @@ async fn messages(
         //    - Overloaded(模型级容量不足):**同号退避重试**(见 chat_with_overload_backoff),
         //      不换号、不记账号失败;退避用尽才透出 → 对外 529。
         //    - 其他可重试错误:上报失败、换号重试。
-        match chat_with_overload_backoff(&st, &req, &ctx, &account_id).await {
+        match chat_with_overload_backoff(&st, &req, &ctx, &account_id, view.as_ref()).await {
             Ok(stream) => {
                 // 服务端 web search:客户端声明了 `web_search_20250305` → 进执行回环
                 // (反代自搜 + 注回),把首轮流当 round 1 续跑。其余流量字节一致走原路径。
@@ -2211,6 +2675,8 @@ async fn messages(
                         ctx,
                         spec,
                         started_at,
+                        view.clone(),
+                        wire,
                     )
                     .await;
                 }
@@ -2222,6 +2688,7 @@ async fn messages(
                     &client_key,
                     ctx.account.clone(),
                     started_at,
+                    wire,
                 )
                 .await;
             }
@@ -2246,8 +2713,24 @@ async fn messages(
                             session_id: affinity_key.clone().unwrap_or_default(),
                             cache_key: affinity_key.clone().unwrap_or_default(),
                         };
-                        // 定频记账:这是同一个 lease 上的**第二次**上游调用,不记就会超频。
-                        st.scheduler.note_upstream_call(&retry_ctx.account.account_id);
+                        // 定频准入:这是同一个 lease 上的**第二次**上游调用,不拦就会超频
+                        // (暖机 RPM=2 的号一次刷新重试就能发出第 3 次)。达限则**不硬发**:
+                        // 该号没犯错(rt 刚证有效),绝不上报失败(那会按 TokenInvalid 永久禁用),
+                        // 直接换号;预算/时限用尽则把原始错误透给客户。
+                        if !st
+                            .scheduler
+                            .note_upstream_call(&retry_ctx.account.account_id, view.as_ref())
+                        {
+                            tracing::info!(account = %account_id,
+                                "刷新后重试被 RPM 准入拦住(含暖机),换号");
+                            drop(lease);
+                            if retry_started.elapsed() >= RETRY_DEADLINE
+                                || attempts >= switch_cap(e.kind, total, general_cap)
+                            {
+                                return upstream_error_response_wire(wire, &e);
+                            }
+                            continue;
+                        }
                         match st.provider.chat(req.clone(), &retry_ctx).await {
                             Ok(stream) => {
                                 if let Some(spec) =
@@ -2262,6 +2745,8 @@ async fn messages(
                                         retry_ctx,
                                         spec,
                                         started_at,
+                                        view.clone(),
+                                        wire,
                                     )
                                     .await;
                                 }
@@ -2273,6 +2758,7 @@ async fn messages(
                                     &client_key,
                                     retry_ctx.account.clone(),
                                     started_at,
+                                    wire,
                                 )
                                 .await;
                             }
@@ -2300,9 +2786,29 @@ async fn messages(
                                                     .clone()
                                                     .unwrap_or_default(),
                                             };
-                                            // 定频记账:profileArn 修复后的重试同样是一次真实上游调用。
-                                            st.scheduler
-                                                .note_upstream_call(&heal_ctx.account.account_id);
+                                            // 定频准入:profileArn 修复后的验证调用同样是真实
+                                            // 上游调用;达限(含暖机)则不硬发。
+                                            // ⚠️ 被闸门拦住 ≠ 修复失败(对抗审查复审 [高]):
+                                            // ARN 已修好并持久化,号是好的 —— 绝不能把 e2 透给
+                                            // 下方的 TokenInvalid 上报(那会把刚救回的号永久
+                                            // 误禁 invalid_refresh_token;暖机一期 RPM=2 下这是
+                                            // 确定性路径)。照 token 刷新分支语义:释放 lease
+                                            // 换号,预算/时限用尽才透原始错误。
+                                            if !st.scheduler.note_upstream_call(
+                                                &heal_ctx.account.account_id,
+                                                view.as_ref(),
+                                            ) {
+                                                tracing::info!(account = %account_id,
+                                                    "profileArn 修复验证被 RPM 准入拦住(含暖机),换号(不上报失败)");
+                                                drop(lease);
+                                                if retry_started.elapsed() >= RETRY_DEADLINE
+                                                    || attempts
+                                                        >= switch_cap(e2.kind, total, general_cap)
+                                                {
+                                                    return upstream_error_response_wire(wire, &e2);
+                                                }
+                                                continue;
+                                            }
                                             match st.provider.chat(req.clone(), &heal_ctx).await {
                                                 Ok(stream) => {
                                                     if let Some(spec) =
@@ -2319,6 +2825,8 @@ async fn messages(
                                                             heal_ctx,
                                                             spec,
                                                             started_at,
+                                                            view.clone(),
+                                                            wire,
                                                         )
                                                         .await;
                                                     }
@@ -2330,6 +2838,7 @@ async fn messages(
                                                         &client_key,
                                                         heal_ctx.account.clone(),
                                                         started_at,
+                                                        wire,
                                                     )
                                                     .await;
                                                 }
@@ -2349,13 +2858,13 @@ async fn messages(
                                 // 不弱化死号识别。注:「刷新成功⇒rt 有效」只证认证有效,不代表 entitlement
                                 // 未被服务端撤销,故不能据此把 TokenInvalid 一律降级(对抗审查 HIGH)。
                                 tracing::warn!(account = %account_id, kind = ?e2.kind, "刷新后重试仍失败: {e2}");
-                                st.scheduler.report_failure(&account_id, e2.kind);
+                                st.scheduler.report_failure_with_gen(&account_id, e2.kind, suspend_gen);
                                 drop(lease);
                                 if !e2.kind.worth_switching_account()
                                     || retry_started.elapsed() >= RETRY_DEADLINE
                                     || attempts >= switch_cap(e2.kind, total, general_cap)
                                 {
-                                    return upstream_error_response(&e2);
+                                    return upstream_error_response_wire(wire, &e2);
                                 }
                                 continue;
                             }
@@ -2364,13 +2873,13 @@ async fn messages(
                     Err(re) => {
                         // 刷新失败:invalid_grant→永久禁用;transient→换号重试。
                         tracing::warn!(account = %account_id, kind = ?re.kind, "同号刷新失败: {re}");
-                        st.scheduler.report_failure(&account_id, re.kind);
+                        st.scheduler.report_failure_with_gen(&account_id, re.kind, suspend_gen);
                         drop(lease);
                         if !re.kind.worth_switching_account()
                             || retry_started.elapsed() >= RETRY_DEADLINE
                             || attempts >= switch_cap(re.kind, total, general_cap)
                         {
-                            return upstream_error_response(&re);
+                            return upstream_error_response_wire(wire, &re);
                         }
                         continue;
                     }
@@ -2379,7 +2888,7 @@ async fn messages(
             Err(e) => {
                 let kind = e.kind;
                 tracing::warn!(account = %account_id, kind = ?kind, "chat 失败: {e}");
-                st.scheduler.report_failure(&account_id, kind);
+                st.scheduler.report_failure_with_gen(&account_id, kind, suspend_gen);
                 // 该号对本模型不可用(INVALID_MODEL_ID):记 (号,模型) 不可用,后续选号跳过它、
                 // 路由到有该模型的号(该号**不禁用**,仍服务其它模型)。
                 if kind == UpstreamErrorKind::ModelNotAvailable {
@@ -2410,7 +2919,7 @@ async fn messages(
                         ResponseLog::None, // 首包前失败:无模型回复。
                         st.provider.family(),
                     );
-                    return upstream_error_response(&e);
+                    return upstream_error_response_wire(wire, &e);
                 }
                 continue;
             }
@@ -2498,6 +3007,8 @@ async fn chat_with_overload_backoff(
     req: &ChatRequest,
     ctx: &CallCtx,
     account_id: &str,
+    // 成员视图:追加调用的 RPM 准入与选号同口径(见 note_upstream_call)。
+    view: Option<&scheduler::GroupView>,
 ) -> Result<gw_core::provider::ChatStream, gw_core::error::UpstreamError> {
     let mut last = match chat_once_corrected(st, req, ctx).await {
         Ok(s) => return Ok(s),
@@ -2505,9 +3016,6 @@ async fn chat_with_overload_backoff(
         Err(e) => return Err(e),
     };
     for (i, base_ms) in OVERLOAD_BACKOFF_MS.iter().enumerate() {
-        // 定频记账:首发那一次的名额已在 select_id 预留,这里记的是**追加**的重试。
-        // 记在发出之前 —— 上游已收到但返回错误的调用一样计入它的频率画像。
-        st.scheduler.note_upstream_call(account_id);
         let wait = jittered(*base_ms);
         tracing::info!(
             account = %account_id, model = %req.model, attempt = i + 1,
@@ -2515,6 +3023,16 @@ async fn chat_with_overload_backoff(
             "上游模型过载,同号退避重试(不换号/不记账号失败)"
         );
         tokio::time::sleep(wait).await;
+        // 定频准入在退避**完成之后、发出之前**(对抗审查复审 [中]):先记账再睡的话,
+        // 任务在睡眠期被取消会留下从未发送的假 hit,且滑动窗口按预留时刻过期,
+        // 窗口边界会提前放出名额。首发名额已在 select_id 预留,这里拦的是追加调用;
+        // 检查+记账原子(见 note_upstream_call)。达限(含暖机)不再硬发:按退避用尽
+        // 处理,返回最近一次过载错误 → 对外 529(客户端自动重试),与预算耗尽显同一路径。
+        if !st.scheduler.note_upstream_call(account_id, view) {
+            tracing::info!(account = %account_id, model = %req.model,
+                "过载退避重试被 RPM 准入拦住(含暖机),按退避用尽处理");
+            return Err(last);
+        }
         match chat_once_corrected(st, req, ctx).await {
             Ok(s) => {
                 tracing::info!(account = %account_id, model = %req.model, attempt = i + 1,
@@ -2679,6 +3197,56 @@ fn upstream_error_payload(e: &gw_core::error::UpstreamError) -> serde_json::Valu
             "message": e.client_message(),
         },
     })
+}
+
+/// [`upstream_error_response`] 的 wire-aware 版本。
+///
+/// `Wire::Anthropic` **原样调用旧函数**,逐字节不变 —— 这是生产主链路,不容形状漂移。
+/// OpenAI 系只换外壳:状态码、中性文案、脱敏纪律全部沿用同一套。
+fn upstream_error_response_wire(
+    wire: Wire,
+    e: &gw_core::error::UpstreamError,
+) -> axum::response::Response {
+    if !wire.is_openai() {
+        return upstream_error_response(e);
+    }
+    let code = upstream_status(e.kind);
+    (
+        code,
+        Json(gw_core::openai::openai_error_body(
+            code.as_u16(),
+            &e.client_message(),
+            None,
+            None,
+        )),
+    )
+        .into_response()
+}
+
+/// 自算状态码的错误(入站校验失败、选号失败)→ wire-aware 响应体。
+///
+/// Anthropic 分支与手写 `json!({"type":"error", ...})` **完全等价**:
+/// `error_type_for_status` 就是那些字面量的来源(400→invalid_request_error、
+/// 500→api_error),换成它是为了让两种线缆共用同一张状态码→类型表,而不是各写一份。
+fn error_response(wire: Wire, code: StatusCode, message: &str) -> axum::response::Response {
+    if wire.is_openai() {
+        return (
+            code,
+            Json(gw_core::openai::openai_error_body(
+                code.as_u16(),
+                message,
+                None,
+                None,
+            )),
+        )
+            .into_response();
+    }
+    (
+        code,
+        Json(serde_json::json!({"type":"error","error":{
+            "type": error_type_for_status(code), "message": message}})),
+    )
+        .into_response()
 }
 
 /// 流中硬错误 → 对外 SSE `error` 事件。
@@ -3015,13 +3583,17 @@ async fn finish_web_search_response(
     ctx: CallCtx,
     spec: crate::websearch::WebSearchSpec,
     started_at: std::time::Instant,
+    // 成员视图:续轮的 RPM 准入与选号同口径(见 note_upstream_call)。
+    view: Option<scheduler::GroupView>,
+    wire: Wire,
 ) -> axum::response::Response {
     let account = ctx.account.clone();
     let account_id = account.account_id.clone();
-    // 定频记账回调:web search 的每一次续轮上游调用都要计入该号的 RPM。
+    // 定频准入回调:web search 的每一次续轮上游调用都要过该号的有效 RPM 闸
+    // (含暖机),达限即停发、优雅降级收尾。
     let st_for_rpm = st.clone();
     let acct_for_rpm = account_id.clone();
-    let on_call = move || st_for_rpm.scheduler.note_upstream_call(&acct_for_rpm);
+    let on_call = move || st_for_rpm.scheduler.note_upstream_call(&acct_for_rpm, view.as_ref());
     match crate::websearch::run_loop(
         st.provider.clone(),
         &ctx,
@@ -3034,13 +3606,14 @@ async fn finish_web_search_response(
     {
         Ok((events, usage)) => {
             let synth = crate::websearch::synth_stream(events, usage);
-            finish_response(st, lease, synth, req, client_key, account, started_at).await
+            finish_response(st, lease, synth, req, client_key, account, started_at, wire).await
         }
         Err(e) => {
             tracing::warn!(account = %account_id, kind = ?e.kind, "web search 回环失败: {e}");
-            st.scheduler.report_failure(&account_id, e.kind);
+            st.scheduler
+                .report_failure_with_gen(&account_id, e.kind, lease.suspend_gen);
             drop(lease);
-            upstream_error_response(&e)
+            upstream_error_response_wire(wire, &e)
         }
     }
 }
@@ -3054,6 +3627,7 @@ async fn finish_response(
     client_key: &str,
     account: Arc<Account>,
     started_at: std::time::Instant,
+    wire: Wire,
 ) -> axum::response::Response {
     if req.stream {
         // 流式:返回惰性 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库 usage+请求日志)。
@@ -3065,6 +3639,7 @@ async fn finish_response(
             client_key.to_string(),
             account,
             started_at,
+            wire,
         )
     } else {
         // 非流式:此处即时抽干流、折叠成单个 Messages JSON。
@@ -3080,6 +3655,7 @@ async fn finish_response(
             account,
             started_at,
             st.provider.family(),
+            wire,
         )
         .await
     }
@@ -3105,12 +3681,17 @@ async fn collect_response(
     account: Arc<Account>,
     started_at: std::time::Instant,
     family: &'static str,
+    wire: Wire,
 ) -> axum::response::Response {
     /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
     /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
     const MAX_NONSTREAM_EVENTS: usize = 500_000;
 
     let account_id = lease.account_id().to_string();
+    // 出站换形状要的两样东西(`req` 稍后被 move 进落库任务,先取):兜底模型名,
+    // 以及 Responses 对象要回显的请求参数。
+    let req_model = req.model.clone();
+    let req_echo = gw_core::openai::resp_out::RequestEcho::from_anthropic(&req.body);
     let mut events: Vec<SseEvent> = Vec::new();
     let mut last_usage: Option<ChatUsage> = None;
     let mut hard_err: Option<UpstreamError> = None;
@@ -3173,13 +3754,14 @@ async fn collect_response(
         Outcome::Bad(_) => (Some(502), Some("bad_gateway".to_string())),
     };
     if success {
-        scheduler.report_success(&account_id);
+        // 非流式折叠成功 = 完整成功(消息体已收齐),可清 suspend 退避进度。
+        scheduler.report_success_observed(&account_id, lease.suspend_gen, true);
     } else {
         let kind = match &outcome {
             Outcome::Upstream(e) => e.kind,
             _ => UpstreamErrorKind::ServerError,
         };
-        scheduler.report_failure(&account_id, kind);
+        scheduler.report_failure_with_gen(&account_id, kind, lease.suspend_gen);
         // 防御:理论上 INVALID_MODEL_ID 是首包前 400 走主循环,但若上游 mid-stream 冒出
         // 也在此记 (号,模型) 不可用,与主循环口径一致(不禁号 + 后续选号跳过该号)。
         if kind == UpstreamErrorKind::ModelNotAvailable {
@@ -3232,18 +3814,35 @@ async fn collect_response(
     }
 
     match outcome {
-        Outcome::Ok(msg) => (StatusCode::OK, Json(msg)).into_response(),
-        Outcome::Upstream(e) => upstream_error_response(&e),
+        // 成功体按线缆换形状。**入库的仍是 Anthropic 那份**(上面的 ResponseLog::Folded),
+        // 与流式路径同口径 —— 日志/语料链路只认一种形状。
+        Outcome::Ok(msg) => {
+            let body = match wire {
+                Wire::Anthropic => msg,
+                Wire::OpenAiChat { .. } => {
+                    gw_core::openai::chat_out::fold_completion(&msg, &req_model)
+                }
+                Wire::OpenAiResponses => gw_core::openai::resp_out::fold_response(
+                    &msg,
+                    &req_model,
+                    &req_echo,
+                ),
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Outcome::Upstream(e) => upstream_error_response_wire(wire, &e),
         // 折叠失败体有两个来源:我方的折叠诊断,以及 `fold_sse_to_message` 对上游 error
         // 事件的**原样回传**(fold.rs:49)。后者是上游报文,不能直发客户 —— 与流式路径
         // 同一个闸门,原文落日志。
         Outcome::Bad(data) => {
             tracing::warn!(account = %account_id, "非流式折叠失败,回中性错误: {data}");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(sanitize_upstream_error_payload(&data)),
-            )
-                .into_response()
+            let neutral = sanitize_upstream_error_payload(&data);
+            let body = if wire.is_openai() {
+                gw_core::openai::error::from_anthropic_error(&neutral, 502)
+            } else {
+                neutral
+            };
+            (StatusCode::BAD_GATEWAY, Json(body)).into_response()
         }
     }
 }
@@ -3328,6 +3927,84 @@ fn keepalive_frame(open: Option<OpenBlock>) -> SseEvent {
     )
 }
 
+/// 出站线缆转换器。`None`(= [`Wire::Anthropic`])时整条转发路径**一行都不改**。
+///
+/// 一条 Anthropic 事件在 OpenAI 侧可能产出 0..N 帧(如 `content_block_start(tool_use)`
+/// 会同时开条目和发首个参数帧),所以接口是「进一条、出一个 Vec」,由调用方排队下发。
+enum OutConv {
+    Chat(gw_core::openai::chat_out::ChatStreamOut),
+    Responses(gw_core::openai::resp_out::ResponsesStreamOut),
+}
+
+impl OutConv {
+    /// 按线缆建转换器;Anthropic 返回 `None`。
+    ///
+    /// `body` 是**转换后的 Anthropic 请求体**:Responses 的 `Response` 对象要回显
+    /// `instructions` / `tools` / `tool_choice` / `parallel_tool_calls`,这些信息在 IR
+    /// 里全都还在,反向映射即可 —— 不必把原始 OpenAI 请求一路带下来。
+    fn for_wire(wire: Wire, model: &str, body: &serde_json::Value) -> Option<Self> {
+        match wire {
+            Wire::Anthropic => None,
+            Wire::OpenAiChat { include_usage } => Some(Self::Chat(
+                gw_core::openai::chat_out::ChatStreamOut::new(model, include_usage),
+            )),
+            Wire::OpenAiResponses => Some(Self::Responses(
+                gw_core::openai::resp_out::ResponsesStreamOut::new(model).with_echo(
+                    gw_core::openai::resp_out::RequestEcho::from_anthropic(body),
+                ),
+            )),
+        }
+    }
+
+    fn push(&mut self, ev: &SseEvent) -> Vec<WireFrame> {
+        match self {
+            Self::Chat(c) => c.push(ev),
+            Self::Responses(r) => r.push(ev),
+        }
+    }
+
+    /// 流走到尽头(正常结束 / 上游断流 / 我方中止)时补齐终止序列。幂等。
+    fn finish(&mut self) -> Vec<WireFrame> {
+        match self {
+            Self::Chat(c) => c.finish(),
+            Self::Responses(r) => r.finish(),
+        }
+    }
+
+    /// 硬错误 → 该线缆的失败形状。`data` 须**已中性化**。
+    fn fail(&mut self, data: &serde_json::Value) -> Vec<WireFrame> {
+        match self {
+            Self::Chat(c) => c.fail(data),
+            Self::Responses(r) => r.fail(data),
+        }
+    }
+
+    /// 保活帧。可能多于一帧:Responses 在首个上游事件迟到时要先补 `response.created`。
+    fn keepalive(&mut self) -> Vec<WireFrame> {
+        match self {
+            Self::Chat(c) => vec![c.keepalive()],
+            Self::Responses(r) => r.keepalive(),
+        }
+    }
+
+    /// 终止序列已发过。之后**不得再发保活** —— `[DONE]` / `response.completed`
+    /// 之后冒出新帧,严格客户端会当成协议违例。
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Chat(c) => c.is_finished(),
+            Self::Responses(r) => r.is_finished(),
+        }
+    }
+}
+
+/// [`WireFrame`] → axum SSE 事件(gw-core 不认识 axum,转换只此一处)。
+fn wire_event(f: WireFrame) -> Event {
+    match f.event {
+        Some(name) => Event::default().event(name).data(f.data),
+        None => Event::default().data(f.data),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     st: Arc<WorkerState>,
@@ -3337,6 +4014,7 @@ fn stream_response(
     client_key: String,
     account: Arc<Account>,
     started_at: std::time::Instant,
+    wire: Wire,
 ) -> axum::response::Response {
     /// unfold 累积态:lease 持有到流结束;reported 防重复上报;last_usage 缓存终结用量。
     struct StreamCtx {
@@ -3344,6 +4022,8 @@ fn stream_response(
         account_id: String,
         model: String,
         client_key: String,
+        /// 选号时的 suspend 世代快照(见 `_lease`);Drop 上报时原样带回。
+        suspend_gen: u64,
         _lease: scheduler::AccountLease,
         inner: gw_core::provider::ChatStream,
         saw_error: bool,
@@ -3376,7 +4056,7 @@ fn stream_response(
         /// 见过真实上游 payload 但未收终止事件就 EOF)。实测是封号前兆。
         ///
         /// ⚠️ 与 `idle_aborted` 同款隔离纪律,且**更严**:Drop 里它走独立分支——
-        /// 跳过 `report_success`(它会清 failure_count/429 strikes/paced_until,
+        /// 跳过 `report_success_observed`(它会清 failure_count/429 strikes/paced_until,
         /// 等于改写健康状态,codex 对抗评审#2),也绝不走 report_failure;
         /// 只喂 scheduler 的软冷却(report_upstream_cut)与请求日志 error_kind。
         upstream_cut: bool,
@@ -3386,6 +4066,13 @@ fn stream_response(
         open_block: Option<OpenBlock>,
         /// 最近一次收到上游事件的时刻(空闲时长的基准)。
         last_event_at: std::time::Instant,
+        /// 出站线缆转换器。`None` = 原生 Anthropic,转发路径与引入本字段之前逐字节相同。
+        conv: Option<OutConv>,
+        /// 待下发帧队列:一条上游事件在 OpenAI 侧可能产出多帧,而 `unfold` 每次只能
+        /// 交出一个 —— 多出来的排这里,下一轮先排空再去拉上游。
+        pending: std::collections::VecDeque<Event>,
+        /// 上游流已耗尽且终止序列已排入 `pending`,排空后即结束。
+        drained: bool,
     }
 
     // 收尾(账号生命周期上报 + usage 落库)统一放 Drop:无论流跑到 None 正常结束,
@@ -3403,7 +4090,7 @@ fn stream_response(
                 self.reported = true;
                 if self.upstream_cut && account_ok {
                     // upstream_cut 独立分支:与健康/禁用体系完全隔离——
-                    // **跳过** report_success(它会清 failure_count/429
+                    // **跳过** report_success_observed(它会清 failure_count/429
                     // strikes/paced_until,等于把掐流当成成功去改写健康状态,
                     // codex 对抗评审#2),也绝不走 report_failure。
                     // 只喂软冷却信号;代际不符(账号已 reset/重启用)由调度器丢弃。
@@ -3411,11 +4098,19 @@ fn stream_response(
                         .scheduler
                         .report_upstream_cut(&self.account_id, self.cut_epoch);
                 } else if account_ok {
-                    self.st.scheduler.report_success(&self.account_id);
+                    // suspend 退避清零只认「同世代 + 流走到 message_stop」的完整成功;
+                    // 客户端断开/上游静默中止的半流仍清 429 连击等既有口径(方法内分层)。
+                    self.st.scheduler.report_success_observed(
+                        &self.account_id,
+                        self.suspend_gen,
+                        self.saw_message_stop,
+                    );
                 } else {
-                    self.st
-                        .scheduler
-                        .report_failure(&self.account_id, UpstreamErrorKind::ServerError);
+                    self.st.scheduler.report_failure_with_gen(
+                        &self.account_id,
+                        UpstreamErrorKind::ServerError,
+                        self.suspend_gen,
+                    );
                 }
             }
             // detach 到当前运行时,做 usage 落库(#130)+ 请求日志落库(#③)。
@@ -3506,11 +4201,14 @@ fn stream_response(
 
     let account_id = lease.account_id().to_string();
     let model = req.model.clone();
+    // 转换器建好再交给结构体:`req` 会在字段列表中途被 move,而字段按书写顺序求值。
+    let conv = OutConv::for_wire(wire, &req.model, &req.body);
     let init = StreamCtx {
         st,
         account_id,
         model,
         client_key,
+        suspend_gen: lease.suspend_gen,
         cut_epoch: lease.cut_epoch,
         _lease: lease,
         inner: stream,
@@ -3529,11 +4227,22 @@ fn stream_response(
         upstream_cut: false,
         open_block: None,
         last_event_at: std::time::Instant::now(),
+        conv,
+        pending: std::collections::VecDeque::new(),
+        drained: false,
     };
 
     let sse = futures::stream::unfold(init, |mut ctx| async move {
         // 单步内循环跳过 usage 事件,直到拿到一个可转发事件或流结束(避免递归类型膨胀)。
         loop {
+            // 队列优先:一条上游事件产出的多帧要挨个交出去,期间不去拉上游。
+            if let Some(ev) = ctx.pending.pop_front() {
+                return Some((Ok::<Event, std::convert::Infallible>(ev), ctx));
+            }
+            // 终止序列已排空 → 真结束(返回 None 会 drop ctx,收尾走 StreamCtx::drop)。
+            if ctx.drained {
+                return None;
+            }
             // 上一轮已因静默撞上硬上限并发过错误事件 → 结束流。返回 None 会 drop ctx,
             // 连带 drop `inner` 从而真正切断上游连接(不留悬挂请求)。
             if ctx.idle_aborted {
@@ -3548,6 +4257,14 @@ fn stream_response(
                     item
                 }
                 Err(_) => {
+                    // 转换器已发过终止序列 → 客户端**已经拿到完整响应**,此刻还挂着只是
+                    // 在等上游 EOF(为了收 message_stop 之后才到的 usage 事件)。
+                    // 这时候既不能发保活(终态之后再冒帧是协议违例),也**不能**判 idle abort ——
+                    // 那会把一个已经成功交付的请求在日志里记成 `upstream_idle_abort`
+                    // (对抗评审 Architect#5)。静默等 EOF 即可。
+                    if ctx.conv.as_ref().is_some_and(OutConv::is_finished) {
+                        continue;
+                    }
                     let idle = ctx.last_event_at.elapsed();
                     if idle >= STREAM_IDLE_ABORT {
                         // 静默到硬上限:主动中止并给客户端一个**明确错误**,而不是让它继续
@@ -3559,15 +4276,22 @@ fn stream_response(
                             idle_secs = idle.as_secs(),
                             "上游静默超过硬上限,主动中止本次流"
                         );
-                        let out = Event::default().event("error").data(
-                            serde_json::json!({"type":"error","error":{
-                                "type":"api_error",
-                                "message": format!(
-                                    "upstream stalled: no event for {}s",
-                                    idle.as_secs()
-                                )}})
-                            .to_string(),
-                        );
+                        let payload = serde_json::json!({"type":"error","error":{
+                            "type":"api_error",
+                            "message": format!(
+                                "upstream stalled: no event for {}s",
+                                idle.as_secs()
+                            )}});
+                        // OpenAI 线缆:转成该协议的失败形状(chat 是 error 帧 + [DONE],
+                        // responses 是 response.failed),否则客户端收到一个它读不懂的
+                        // Anthropic error 事件,表现和「干等到超时」没区别。
+                        if let Some(conv) = ctx.conv.as_mut() {
+                            for f in conv.fail(&payload) {
+                                ctx.pending.push_back(wire_event(f));
+                            }
+                            continue;
+                        }
+                        let out = Event::default().event("error").data(payload.to_string());
                         return Some((Ok::<Event, std::convert::Infallible>(out), ctx));
                     }
                     tracing::debug!(
@@ -3578,6 +4302,23 @@ fn stream_response(
                     );
                     // 保活帧**不**进 resp_events:它不是模型回复内容,且对折叠是 no-op,
                     // 混进去只会平白占掉 RESPONSE_LOG_MAX_BYTES 预算。
+                    //
+                    // OpenAI 线缆有自己的保活形态(空 delta / response.in_progress),
+                    // **不能**把 Anthropic 的零增量喂给转换器 —— 那会在 chat 侧变成一条
+                    // 真的空内容增量、在 responses 侧被算进 output_text 的全量文本。
+                    if let Some(conv) = ctx.conv.as_mut() {
+                        // 已发过终止序列(收到 message_stop 但底层流还没 EOF)→ 静默等 EOF。
+                        // 再发保活等于在 [DONE] / response.completed 之后又冒出一帧。
+                        // 这里**不能**顺手 drop 上游流:usage 事件常在 message_stop **之后**
+                        // 才到(见 gw-cursor),提前切断就是丢计费。
+                        if conv.is_finished() {
+                            continue;
+                        }
+                        for f in conv.keepalive() {
+                            ctx.pending.push_back(wire_event(f));
+                        }
+                        continue;
+                    }
                     let ka = keepalive_frame(ctx.open_block);
                     let out = Event::default().event(ka.event.clone()).data(ka.data.to_string());
                     return Some((Ok::<Event, std::convert::Infallible>(out), ctx));
@@ -3616,6 +4357,20 @@ fn stream_response(
                     }
                     // 跟踪当前开着的块,供保活帧选形态(必须在转发前更新:下一轮静默时要用)。
                     ctx.open_block = track_open_block(ctx.open_block, &ev);
+                    // OpenAI 线缆:转换后排队下发。请求日志的采集口径**不变** ——
+                    // 存的仍是 Anthropic 事件(与 kiro 同口径,yapi 语料链路不用适配)。
+                    if let Some(conv) = ctx.conv.as_mut() {
+                        let frames = conv.push(&ev);
+                        if ev.event != "error" && ctx.resp_bytes < RESPONSE_LOG_MAX_BYTES {
+                            let n = ev.data.to_string().len();
+                            ctx.resp_bytes = ctx.resp_bytes.saturating_add(n);
+                            ctx.resp_events.push(ev);
+                        }
+                        for f in frames {
+                            ctx.pending.push_back(wire_event(f));
+                        }
+                        continue;
+                    }
                     let out = match ev.to_wire() {
                         Ok(_) => {
                             // 转发本就要把 data 序列化成字符串,这里复用它:既当字节预算度量,又喂给下游,
@@ -3668,13 +4423,38 @@ fn stream_response(
                     }
                     if !ctx.reported {
                         ctx.reported = true;
-                        ctx.st.scheduler.report_failure(&ctx.account_id, e.kind);
+                        ctx.st.scheduler.report_failure_with_gen(
+                            &ctx.account_id,
+                            e.kind,
+                            ctx.suspend_gen,
+                        );
+                    }
+                    if let Some(conv) = ctx.conv.as_mut() {
+                        for f in conv.fail(&sse_error_payload(&e)) {
+                            ctx.pending.push_back(wire_event(f));
+                        }
+                        ctx.drained = true;
+                        continue;
                     }
                     return Some((Ok(sse_error_event(&e)), ctx));
                 }
                 None => {
                     // 流正常结束。收尾(生命周期上报 + usage 落库)由 StreamCtx::drop 统一处理,
                     // 与"客户端中断致响应体被 drop"走同一条路径,避免两处逻辑分叉。
+                    //
+                    // OpenAI 线缆多一步:补齐终止序列(末帧 / 未收口的条目 / [DONE])。
+                    // 上游没发 message_stop 就断掉时,这一步是客户端唯一能拿到收尾的地方;
+                    // 已经收过尾则 `finish()` 幂等返回空。
+                    if let Some(conv) = ctx.conv.as_mut() {
+                        let frames = conv.finish();
+                        ctx.drained = true;
+                        if !frames.is_empty() {
+                            for f in frames {
+                                ctx.pending.push_back(wire_event(f));
+                            }
+                            continue;
+                        }
+                    }
                     return None;
                 }
             }
@@ -3916,6 +4696,7 @@ mod tests {
             provider: "kiro".into(),
             max_concurrency: 1,
             disabled: false,
+            created_at: 0,
             extra: BTreeMap::new(),
         };
         acc.extra
@@ -4070,7 +4851,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
@@ -4096,7 +4877,7 @@ mod tests {
                 serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
             ))),
         ];
-        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
+        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "overloaded_error");
@@ -4121,7 +4902,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro").await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -4138,6 +4919,7 @@ mod tests {
             provider: "kiro".into(),
             max_concurrency: 1,
             disabled: false,
+            created_at: 0,
             extra: map,
         }
     }
@@ -4285,6 +5067,7 @@ mod tests {
             provider: String::new(), // 故意留空
             max_concurrency: 1,
             disabled: false,
+            created_at: 0,
             extra: BTreeMap::new(),
         });
         let req = req_model_m();
@@ -4345,6 +5128,7 @@ mod tests {
             provider: "kiro".into(),
             max_concurrency: 4,
             disabled: false,
+            created_at: 0,
             extra: Default::default(),
         });
         AccountScheduler::new(vec![acc], &gw_core::config::SchedulerConfig::default())
@@ -4470,6 +5254,7 @@ mod tests {
         let acquire = [
             scheduler::AcquireError::AllDisabled,
             scheduler::AcquireError::AllBusy,
+            scheduler::AcquireError::AllRpmLimited,
             scheduler::AcquireError::Empty,
             scheduler::AcquireError::GroupEmpty,
             scheduler::AcquireError::NoModelSupport,
@@ -4618,19 +5403,48 @@ mod tests {
     /// (`select_id` 的"primary 不合格 → 改选并当场转正、永不迁回")。
     #[test]
     fn affinity_key_is_namespaced_per_group() {
-        let plain = group_scoped_affinity_key(None, Some("sess-1".into()));
-        let scoped = group_scoped_affinity_key(Some("GECO"), Some("sess-1".into()));
+        let plain = group_scoped_affinity_key(None, None, Some("sess-1".into()));
+        let scoped = group_scoped_affinity_key(Some("GECO"), None, Some("sess-1".into()));
         assert_eq!(plain.as_deref(), Some("sess-1"), "未分组请求的亲和键必须原样不变");
         assert_ne!(plain, scoped, "同一会话键在两个组下必须落到不同的亲和条目");
         assert_eq!(scoped.as_deref(), Some("GECO\u{0}sess-1"));
         // 两个不同的组也必须互不干扰。
         assert_ne!(
-            group_scoped_affinity_key(Some("G0"), Some("sess-1".into())),
+            group_scoped_affinity_key(Some("G0"), None, Some("sess-1".into())),
             scoped,
             "不同分组的同名会话不得共用一个钉扎"
         );
         // 无会话键(无亲和记忆)时都是 None,不得凭空造出一个键。
-        assert_eq!(group_scoped_affinity_key(Some("GECO"), None), None);
+        assert_eq!(group_scoped_affinity_key(Some("GECO"), None, None), None);
+    }
+
+    /// **跨客户串话的闸门。**
+    ///
+    /// cursor 的 conversation_id 是纯内容派生的,而 `ConvRegistry` 在
+    /// (conversation_id, account) 双命中时会走服务端续写 —— 两个不同客户拿到同一个键,
+    /// 后来那位就会续在前一位的会话上。所以客户维度必须进命名空间。
+    #[test]
+    fn cursor_的亲和键按客户_key_再分一层() {
+        assert!(affinity_scoped_by_client("cursor"));
+        // 没有服务端续写的家族不分层:分了只会无谓打散主链路的缓存亲和。
+        for f in ["kiro", "claude-dario", "claude-subprocess", ""] {
+            assert!(!affinity_scoped_by_client(f), "{f} 不该按客户分层");
+        }
+
+        // 同组、同内容键、**不同客户** → 必须是两个不同的亲和条目。
+        let a = group_scoped_affinity_key(Some("CUR"), Some("key-a"), Some("sess-1".into()));
+        let b = group_scoped_affinity_key(Some("CUR"), Some("key-b"), Some("sess-1".into()));
+        assert_ne!(a, b, "同一开场白的两个客户不得共用 conversation_id");
+        // 同一个客户的同一会话必须稳定(否则每轮换 conversation_id,续写全废)。
+        assert_eq!(
+            a,
+            group_scoped_affinity_key(Some("CUR"), Some("key-a"), Some("sess-1".into()))
+        );
+        // 客户 key 缺席(未分组 / 无 router 头)→ 退回旧行为,不凭空多加分隔符。
+        assert_eq!(
+            group_scoped_affinity_key(Some("CUR"), Some(""), Some("sess-1".into())).as_deref(),
+            Some("CUR\u{0}sess-1")
+        );
     }
 
     /// 保活帧必须**始终**用 `content_block_delta` 这个事件名。
@@ -4749,11 +5563,16 @@ mod tests {
         );
     }
 
-    /// mock provider:chat 恒返回空流(本测试不走 chat,StreamCtx 的流由测试直接构造)。
-    struct CutStreamMockProvider;
+    // ───── 审查复审 [高] 回归:profileArn 修复验证被 RPM 拦不得误杀账号 ─────
+
+    /// mock provider:chat 恒 403 TokenInvalid(记录真实发出的调用次数),
+    /// refresh 成功(换新 at),强制发现 profileArn 成功。
+    struct HealGateMockProvider {
+        chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     #[async_trait::async_trait]
-    impl Provider for CutStreamMockProvider {
+    impl Provider for HealGateMockProvider {
         fn family(&self) -> &'static str {
             "kiro"
         }
@@ -4770,18 +5589,100 @@ mod tests {
             _req: ChatRequest,
             _ctx: &CallCtx,
         ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
-            Ok(chat_stream(vec![]))
+            self.chat_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(UpstreamError::new(UpstreamErrorKind::TokenInvalid, "mock 403"))
         }
         async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
-            Ok(account.clone())
+            let mut a = account.clone();
+            a.extra.insert("access_token".into(), serde_json::json!("at-new"));
+            a.extra
+                .insert("expires_at".into(), serde_json::json!("2099-01-01T00:00:00Z"));
+            Ok(a)
         }
+        async fn force_discover_profile_arn(
+            &self,
+            _account: &Account,
+        ) -> Result<Option<String>, UpstreamError> {
+            Ok(Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/TESTPROFILE".into(),
+            ))
+        }
+    }
+
+    /// profileArn 发现成功、但修复后的验证调用被 RPM 闸门拦住(暖机一期 RPM=2 的
+    /// 确定性路径:首发占 1 格 → 刷新重试占第 2 格 → 验证调用达限):
+    /// **不得**把修复前的 e2 按 TokenInvalid 上报 —— 那会把刚修好的号永久误禁
+    /// (invalid_refresh_token)。被拦 ≠ 修复失败:换号/透错,不上报、不禁用。
+    #[tokio::test]
+    async fn heal_retry_blocked_by_rpm_does_not_report_or_disable_account() {
+        let mut extra = BTreeMap::new();
+        extra.insert("access_token".into(), serde_json::json!("at-old"));
+        extra.insert("refresh_token".into(), serde_json::json!("rt-1"));
+        extra.insert("expires_at".into(), serde_json::json!("2099-01-01T00:00:00Z"));
+        // 付费非 FREE + 无 profile_arn → needs_profile_discovery 成立,走强制发现。
+        extra.insert("subscription_title".into(), serde_json::json!("KIRO PRO"));
+        // 有效 RPM = 2:首发预留 + 刷新重试各占一格,验证调用必被拦。
+        extra.insert("rpm_limit".into(), serde_json::json!(2));
+        let acc = Arc::new(Account {
+            account_id: "a".into(),
+            provider: "kiro".into(),
+            max_concurrency: 2,
+            disabled: false,
+            created_at: 0,
+            extra,
+        });
+        let chat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> =
+            Arc::new(HealGateMockProvider { chat_calls: chat_calls.clone() });
+        let st = Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider,
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(
+                vec![acc],
+                &gw_core::config::SchedulerConfig::default(),
+            ),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        });
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = messages(State(st.clone()), HeaderMap::new(), Json(body)).await;
+        // 单号池:attempts(1) 已触 switch_cap → 透原始 403 的对外映射(502)。
+        // 关键不是状态码,而是下面两条:没发第三次调用、号没被上报禁用。
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "首发 + 刷新重试 = 2 次真实调用;被拦的验证调用绝不能发出"
+        );
+        let snap = st.scheduler.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(!a.disabled, "被 RPM 拦 ≠ 修复失败,账号不得被禁用");
+        assert_eq!(a.reason, "", "不得按 TokenInvalid 上报(invalid_refresh_token)");
+        assert_eq!(a.rpm_used, 2, "被拦的验证调用不得记账");
     }
 
     /// upstream_cut(静默掐流前兆)收尾纪律:只喂软冷却 + 请求日志 error_kind,
     /// 客户端 finale 原样送达,健康/禁用体系零变化(2026-07-25 事故 + 评审#2)。
     #[tokio::test]
     async fn upstream_cut_stream_feeds_soft_drain_only() {
-        let provider: Arc<dyn Provider> = Arc::new(CutStreamMockProvider);
+        let chat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(HealGateMockProvider { chat_calls });
         let st = Arc::new(WorkerState {
             instance: 0,
             egress_desc: String::new(),
@@ -4837,6 +5738,7 @@ mod tests {
             String::new(),
             Arc::new(acct(&[])),
             std::time::Instant::now(),
+            Wire::Anthropic,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
@@ -4857,6 +5759,7 @@ mod tests {
             String::new(),
             Arc::new(acct(&[])),
             std::time::Instant::now(),
+            Wire::Anthropic,
         );
         let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         assert!(st.scheduler.is_draining("a"), "窗口内两次 cut 应进软冷却");
@@ -4865,5 +5768,376 @@ mod tests {
         assert!(!a.disabled, "draining 不等于禁用,健康面板不受影响");
         let lease = st.scheduler.acquire(None).await.unwrap();
         assert_eq!(lease.account_id(), "a", "normal 全空时 fail-open:draining 号仍服务");
+    }
+
+    // ───────────────────────── OpenAI 线缆(cursor 专属)─────────────────────────
+
+    #[test]
+    fn openai_线缆只挂给_cursor_家族() {
+        assert!(mount_openai_wire("cursor"));
+        // kiro / ccmax 明确不做:它们的主链路全程 Anthropic、零转换,那是刻意保住的资产。
+        for f in ["kiro", "claude-dario", "claude-subprocess", "", "Cursor"] {
+            assert!(!mount_openai_wire(f), "{f} 不该挂 OpenAI 入口");
+        }
+    }
+
+    /// 只为 `/v1/models` 形状测试存在的 provider:家族名可控 + 目录里真有一项。
+    struct CatalogMockProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for CatalogMockProvider {
+        fn family(&self) -> &'static str {
+            self.0
+        }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] {
+            &[]
+        }
+        async fn list_models(&self) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> {
+            Ok(vec![gw_core::model::ModelInfo {
+                display_name: Some("Grok".into()),
+                ..gw_core::model::ModelInfo::new("grok-4.5")
+            }])
+        }
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _ctx: &CallCtx,
+        ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+            Err(UpstreamError::new(UpstreamErrorKind::Other, "未用到"))
+        }
+        async fn refresh_auth(&self, a: &Account) -> Result<Account, UpstreamError> {
+            Ok(a.clone())
+        }
+    }
+
+    fn catalog_state(family: &'static str) -> Arc<WorkerState> {
+        let provider: Arc<dyn Provider> = Arc::new(CatalogMockProvider(family));
+        Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider,
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(
+                vec![Arc::new(acct(&[]))],
+                &gw_core::config::SchedulerConfig::default(),
+            ),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        })
+    }
+
+    /// `/v1/models` 是**共享**端点:kiro / dario 也走它。OpenAI 字段只能加在开了
+    /// OpenAI 入口的 worker 上,否则就是为迁就一种协议去改另一种协议的共享响应
+    /// (按 schema 严校验的客户端、对响应体做快照的代理都会看到不兼容变化)。
+    #[tokio::test]
+    async fn models_端点的_openai_字段只出现在_cursor_worker() {
+        let kiro = body_json(models(State(catalog_state("kiro"))).await).await;
+        assert!(kiro.get("object").is_none(), "非 cursor 家族不该出现 object:list");
+        let item = &kiro["data"][0];
+        assert_eq!(item["type"], "model", "Anthropic 字段必须还在");
+        assert_eq!(item["id"], "grok-4.5");
+        assert!(item.get("created_at").is_some());
+        for k in ["object", "created", "owned_by"] {
+            assert!(item.get(k).is_none(), "非 cursor 家族不该出现 {k}");
+        }
+
+        let cursor = body_json(models(State(catalog_state("cursor"))).await).await;
+        assert_eq!(cursor["object"], "list", "NewAPI 的获取模型列表认这个键");
+        let item = &cursor["data"][0];
+        assert_eq!(item["object"], "model");
+        assert_eq!(item["owned_by"], "cursor");
+        assert!(item["created"].is_i64());
+        // 两套字段并存:Anthropic 侧一个都不能少。
+        assert_eq!(item["type"], "model");
+        assert_eq!(item["display_name"], "Grok");
+    }
+
+    /// 一段典型的 Anthropic 回复流:文本 + 用量 + 正常收尾。
+    fn text_reply_stream() -> gw_core::provider::ChatStream {
+        chat_stream(vec![
+            Ok(StreamItem::Sse(SseEvent::new(
+                "message_start",
+                serde_json::json!({"message":{"model":"grok-4.5","usage":{"input_tokens":7}}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "content_block_start",
+                serde_json::json!({"index":0,"content_block":{"type":"text","text":""}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "content_block_delta",
+                serde_json::json!({"index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "content_block_stop",
+                serde_json::json!({"index":0}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new(
+                "message_delta",
+                serde_json::json!({"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            ))),
+            Ok(StreamItem::Sse(SseEvent::new("message_stop", serde_json::json!({})))),
+        ])
+    }
+
+    fn wire_state() -> Arc<WorkerState> {
+        let provider: Arc<dyn Provider> = Arc::new(HealGateMockProvider {
+            chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider,
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(
+                vec![Arc::new(acct(&[]))],
+                &gw_core::config::SchedulerConfig::default(),
+            ),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        })
+    }
+
+    async fn sse_body(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn chat_线缆的流式响应以_done_收尾_用量帧在它之前() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            text_reply_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::OpenAiChat { include_usage: true },
+        );
+        let body = sse_body(resp).await;
+        // ChatCompletions 不写 event 行 —— 写了会让只认 data: 的解析器丢帧。
+        assert!(!body.contains("event: "), "chat 线缆不该有 event 行:\n{body}");
+        assert!(body.contains("chat.completion.chunk"));
+        assert!(body.contains("\"content\":\"hi\""));
+        let done = body.rfind("data: [DONE]").expect("必须以 [DONE] 收尾");
+        let usage = body.rfind("\"usage\"").expect("include_usage=true 必须发用量帧");
+        // 顺序反了 NewAPI 读到终止哨兵就收工,这次请求在它那边记 0 用量。
+        assert!(usage < done, "用量帧必须在 [DONE] 之前:\n{body}");
+        assert!(body.contains("\"prompt_tokens\":7"));
+        assert!(body.contains("\"completion_tokens\":2"));
+        // Anthropic 的事件名一个都不该漏出去。
+        assert!(!body.contains("message_stop"));
+        assert!(!body.contains("content_block_delta"));
+    }
+
+    #[tokio::test]
+    async fn responses_线缆的流式响应以_response_completed_收尾() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            text_reply_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::OpenAiResponses,
+        );
+        let body = sse_body(resp).await;
+        // Responses 每帧都必须带 event 名,客户端按它分发。
+        assert!(body.contains("event: response.created"));
+        assert!(body.contains("event: response.output_text.delta"));
+        assert!(body.contains("event: response.completed"));
+        assert!(!body.contains("[DONE]"), "Responses 没有 [DONE] 这个概念");
+        assert!(!body.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn 两种_openai_线缆的非流式响应各是各的形状() {
+        let st = wire_state();
+
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let chat = collect_response(
+            &st.scheduler,
+            None,
+            None,
+            None,
+            lease,
+            text_reply_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            "cursor",
+            Wire::OpenAiChat { include_usage: false },
+        )
+        .await;
+        assert_eq!(chat.status(), StatusCode::OK);
+        let v = body_json(chat).await;
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], serde_json::json!(7));
+
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let responses = collect_response(
+            &st.scheduler,
+            None,
+            None,
+            None,
+            lease,
+            text_reply_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            "cursor",
+            Wire::OpenAiResponses,
+        )
+        .await;
+        let v = body_json(responses).await;
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["content"][0]["text"], "hi");
+        assert_eq!(v["usage"]["input_tokens"], serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn anthropic_线缆的非流式响应一个字节都没变() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = collect_response(
+            &st.scheduler,
+            None,
+            None,
+            None,
+            lease,
+            text_reply_stream(),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            "kiro",
+            Wire::Anthropic,
+        )
+        .await;
+        let v = body_json(resp).await;
+        // 还是 Anthropic Messages:没有 object/choices,有 content 数组与 stop_reason。
+        assert!(v.get("object").is_none());
+        assert!(v.get("choices").is_none());
+        assert_eq!(v["content"][0]["text"], "hi");
+        assert_eq!(v["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn 入站转换失败回_openai_形状的_400_并点名字段() {
+        let st = wire_state();
+        // 缺 messages:不占账号、不打上游,直接在门口挡掉。
+        let resp = chat_completions(
+            State(st.clone()),
+            HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::json!({"model": "grok-4.5"}).to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["param"], "messages");
+        // Anthropic 的错误外壳不该出现。
+        assert!(v.get("type").is_none());
+
+        let resp = responses(
+            State(st),
+            HeaderMap::new(),
+            axum::body::Bytes::from(
+                serde_json::json!({"model":"m","input":"hi","previous_response_id":"resp_x"})
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["param"], "previous_response_id");
+    }
+
+    #[tokio::test]
+    async fn 选号失败在_openai_线缆上也换成_openai_错误体() {
+        // 空池 → AcquireError,走的是 `error_response` 那条自算状态码的路。
+        let provider: Arc<dyn Provider> = Arc::new(HealGateMockProvider {
+            chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let st = Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider,
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(
+                Vec::new(),
+                &gw_core::config::SchedulerConfig::default(),
+            ),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        });
+        let resp = chat_completions(
+            State(st.clone()),
+            HeaderMap::new(),
+            axum::body::Bytes::from(
+                serde_json::json!({
+                    "model": "grok-4.5",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(v.get("type").is_none(), "不能漏出 Anthropic 的错误外壳");
+
+        // 同一条路径在 Anthropic 线缆上必须保持旧形状。
+        let resp = messages(
+            State(st),
+            HeaderMap::new(),
+            Json(serde_json::json!({
+                "model": "grok-4.5",
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let v = body_json(resp).await;
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "overloaded_error");
     }
 }

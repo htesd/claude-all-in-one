@@ -492,11 +492,13 @@ fn strip_web_search_tool(body: &mut Value) {
 ///
 /// 失败语义:**仅首轮**失败上抛 `Err`(交 worker 上报+落库);后续轮失败/折叠失败 → **优雅降级**
 /// (用已得内容收尾,保住已计费 usage,不放大成 502,符合 v60 不放大错误契约)。
-/// 每发起一次**后续轮**上游调用时的回调(定频记账用)。
+/// 每发起一次**后续轮**上游调用前的准入回调(定频用):返回 `false` = 已达有效 RPM
+/// 上限(含暖机),**不得再发** —— 回环按「后续轮失败」同款优雅降级收尾(已得内容
+/// 照常返回、保 usage,不放大成 502,符合 v60 不放大错误契约)。
 ///
-/// 为什么用回调而不是把 scheduler 传进来:websearch 不该依赖调度层。而漏记会让
+/// 为什么用回调而不是把 scheduler 传进来:websearch 不该依赖调度层。而漏记/漏拦会让
 /// 一轮 web search 的 N 次续轮调用全部不计入 RPM —— 单个请求就能把号推过阈值。
-pub type OnUpstreamCall<'a> = &'a (dyn Fn() + Send + Sync);
+pub type OnUpstreamCall<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
 pub async fn run_loop(
     provider: Arc<dyn Provider>,
@@ -635,8 +637,12 @@ pub async fn run_loop(
             strip_web_search_tool(&mut next_body);
         }
         let next_req = ChatRequest::from_anthropic_body(next_body);
-        // 定频记账:续轮同样是真实的上游调用(一轮 web search 可能有多次)。
-        on_upstream_call();
+        // 定频准入:续轮同样是真实的上游调用(一轮 web search 可能有多次)。
+        // 达有效 RPM 上限(含暖机)不再硬发 —— 按「后续轮失败」同款优雅降级收尾。
+        if !on_upstream_call() {
+            degraded = true;
+            break;
+        }
         match provider.chat(next_req, ctx).await {
             Ok(s) => cur_stream = s,
             Err(_) => {

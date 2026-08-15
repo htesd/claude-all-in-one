@@ -6,6 +6,8 @@ import { ErrorNote } from '@/components/ui/error-note'
 import { cn } from '@/lib/utils'
 import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import type { RuntimeQueryState } from '@/features/accounts/components/AccountTableRow'
+import { AccountModelsDialog } from '@/features/accounts/components/AccountModelsDialog'
+import { OnDemandDialog } from '@/features/accounts/components/OnDemandDialog'
 import {
   AccountsFilterBar,
   type StatusFilter,
@@ -59,6 +61,10 @@ export default function AccountsPage() {
   const [oauthOpen, setOauthOpen] = useState(false)
   const [cursorOpen, setCursorOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  // 「查看模型」弹窗目标（仅 kiro 行有入口；纯本地查询,无需 mutation/反馈条）。
+  const [modelsAccountId, setModelsAccountId] = useState<string | null>(null)
+  // 超额设置弹窗的目标账号 id（跟随列表数据取行，行被删则自动关闭）。
+  const [onDemandId, setOnDemandId] = useState<string | null>(null)
   // 刷新 token 成功的轻量反馈（无 toast 库）：账号 + 新有效期。本地态而非派生自
   // refreshMutation.isSuccess——后者会在其它 mutation 成功后残留旧账号（审查 3 名 reviewer）。
   // 任一操作（含再次刷新）开始即清空，做到注释承诺的"下次操作自动消失"。
@@ -171,6 +177,13 @@ export default function AccountsPage() {
       ? providerFilter
       : (providers.find((p) => p.count > 0)?.provider ?? '')
   const quotaKind = quotaKindForProvider(effectiveProviderForQuota)
+  // 超额列:**当前页里有 cursor 号就显示**,而不是看 effectiveProviderForQuota。
+  // 后者在默认的 'all' 视图下会回落成「第一个有号的 provider」(混部机器上通常是
+  // kiro),于是超额列默认整列不渲染 —— 运维必须先把筛选切到 Cursor 才看得见,
+  // 而「每个 cursor 号超额多少」恰恰是要一眼可见的信息。
+  // 非 cursor 行在该列显示「—」(见 AccountTableRow:provider 不支持则无 on_demand),
+  // 这点噪音远小于默认看不见的代价。
+  const showOnDemand = pagedRows.some((r) => r.provider === 'cursor')
 
   // 轮询失败但还有旧数据时继续按旧数据展示（配合下方警示条）；完全没数据才降级
   const runtimeState: RuntimeQueryState = runtimeQuery.isPending
@@ -184,6 +197,24 @@ export default function AccountsPage() {
     editingId !== null
       ? (accountsQuery.data?.find((row) => row.account_id === editingId) ?? null)
       : null
+
+  // 「查看模型」弹窗同理跟随列表数据：需要整行（provider 决定可否编辑白名单、
+  // model_allowlist 决定勾选基线），行被删则自动关闭。
+  const modelsRow =
+    modelsAccountId !== null
+      ? (accountsQuery.data?.find((row) => row.account_id === modelsAccountId) ?? null)
+      : null
+
+  // 超额弹窗同理跟随列表数据；当前快照取 runtime 里的配额缓存（与表格同一数据源，
+  // 设置成功后 invalidate 会一并刷新，弹窗里的「当前」不会停在旧值）。
+  const onDemandRow =
+    onDemandId !== null
+      ? (accountsQuery.data?.find((row) => row.account_id === onDemandId) ?? null)
+      : null
+  const onDemandRuntime = onDemandId !== null ? runtimeByAccount.get(onDemandId) : undefined
+  const onDemandCurrent = onDemandRuntime?.online
+    ? onDemandRuntime.status.quota?.on_demand
+    : undefined
 
   // 当前有 mutation 进行中的 account_id —— 只置灰对应行的按钮
   const busyId = updateMutation.isPending
@@ -340,12 +371,15 @@ export default function AccountsPage() {
         runtimeState={runtimeState}
         groupColors={groupColors}
         quotaKind={quotaKind}
+        showOnDemand={showOnDemand}
         busyId={busyId}
         onToggleDisabled={handleToggleDisabled}
         onEdit={(row) => setEditingId(row.account_id)}
         onDelete={handleDelete}
         onReset={handleReset}
         onRefresh={handleRefresh}
+        onViewModels={(row) => setModelsAccountId(row.account_id)}
+        onEditOnDemand={(row) => setOnDemandId(row.account_id)}
       />
 
       {/* 分页控件 */}
@@ -367,6 +401,17 @@ export default function AccountsPage() {
         open={editingRow !== null}
         row={editingRow}
         onClose={() => setEditingId(null)}
+      />
+      <AccountModelsDialog
+        open={modelsRow !== null}
+        row={modelsRow}
+        onClose={() => setModelsAccountId(null)}
+      />
+      <OnDemandDialog
+        open={onDemandRow !== null}
+        row={onDemandRow}
+        current={onDemandCurrent}
+        onClose={() => setOnDemandId(null)}
       />
     </div>
   )

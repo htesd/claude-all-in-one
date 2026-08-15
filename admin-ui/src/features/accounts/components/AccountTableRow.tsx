@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { HeartPulse, Pencil, RefreshCw, Trash2 } from 'lucide-react'
+import { HeartPulse, ListChecks, Pencil, RefreshCw, Trash2 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -12,7 +12,11 @@ import { cn } from '@/lib/utils'
 import {
   deriveAccountStatus,
   formatCredits,
+  formatMarkTtl,
+  formatUsd,
+  isOnDemandHigh,
   isQuotaLow,
+  onDemandState,
   priorityToTier,
   providerTabLabel,
   type QuotaKind,
@@ -34,8 +38,10 @@ interface AccountTableRowProps {
   runtimeState: RuntimeQueryState
   /** 分组名 -> 颜色（来自 /groups）。一个号可属多个组，所以传整张表而不是单个颜色。 */
   groupColors: Map<string, string>
-  /** 配额列口径(随所属 tab):'credits'=积分(Kiro);'windows'=5h/7d 利用率(ccmax/dario);'none'=无配额概念(Cursor)。 */
+  /** 配额列口径(随所属 tab):'credits'=积分/美元(Kiro·Cursor);'windows'=5h/7d(ccmax/dario);'none'=无配额概念。 */
   quotaKind: QuotaKind
+  /** 是否渲染超额（on-demand）列 —— 与表头一致，仅支持的 provider 为 true。 */
+  showOnDemand: boolean
   /** 本行是否有进行中的 mutation（按钮置灰防连点）。 */
   busy: boolean
   onToggleDisabled: (row: AccountRow) => void
@@ -43,6 +49,10 @@ interface AccountTableRowProps {
   onDelete: (id: string) => void
   onReset: (id: string) => void
   onRefresh: (id: string) => void
+  /** 打开「查看模型」弹窗（仅 kiro 行会渲染入口，纯本地零上游）。 */
+  onViewModels: (row: AccountRow) => void
+  /** 打开超额额度设置弹窗。 */
+  onEditOnDemand: (row: AccountRow) => void
 }
 
 export function AccountTableRow({
@@ -51,24 +61,31 @@ export function AccountTableRow({
   runtimeState,
   groupColors,
   quotaKind,
+  showOnDemand,
   busy,
   onToggleDisabled,
   onEdit,
   onDelete,
   onReset,
   onRefresh,
+  onViewModels,
+  onEditOnDemand,
 }: AccountTableRowProps) {
   const { t } = useI18n()
   const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   const failureCount = runtime?.status.failure_count ?? 0
+  // (账号,模型) 不可用标记:号整体"正常"但被上游逐模型拒绝(INVALID_MODEL_ID)时,
+  // 状态徽章旁必须能看出"半死",否则面板上显示正常却不吃流量(2026-08-10 排障实录)。
+  const modelMarks = runtime?.online === true ? (runtime.status.model_unavailable ?? []) : []
   // 救号按钮：worker 在线且账号处于「运行时」禁用（冷却/封禁,非 admin 配置开关）,
-  // 或攒了失败计数 —— reset 可立即清掉,不必等冷却自然到期。
+  // 或攒了失败计数,或挂着模型不可用标记 —— reset 可立即清掉,不必等冷却/TTL 自然到期。
   const runtimeReason = runtime?.online === true ? runtime.status.reason : ''
   const canReset =
     runtime?.online === true &&
     ((runtime.status.disabled && runtimeReason !== '' && runtimeReason !== 'config') ||
-      failureCount > 0)
+      failureCount > 0 ||
+      modelMarks.length > 0)
   /** 并发列只在 worker 在线上报时显示「空闲/上限」，否则回落到配置值。 */
   const hasLivePermits = runtimeState === 'ready' && runtime !== undefined && runtime.online
   /**
@@ -82,6 +99,11 @@ export function AccountTableRow({
     (m) => priorityToTier(m.priority) === 'high',
   ).length
   const lowTierCount = (memberships ?? []).length - highTierCount
+  // 超额快照只有在线 worker 才有（离线时 status 无配额缓存）→ 显示「—」而非假的 0。
+  const onDemand = runtime?.online ? runtime.status.quota?.on_demand : undefined
+  // 只有 cursor 支持超额（与后端 on_demand_supported() 一致）。混部机器上这一列会
+  // 同时出现 kiro 行，它们不该是可点的。
+  const onDemandSupported = row.provider === 'cursor'
 
   return (
     <TR>
@@ -125,14 +147,28 @@ export function AccountTableRow({
             <span className="text-muted-foreground">—</span>
           )
         ) : (
-          <AccountStatusBadge status={deriveAccountStatus(row, runtime)} />
+          <span className="inline-flex flex-wrap items-center gap-1">
+            <AccountStatusBadge status={deriveAccountStatus(row, runtime)} />
+            {modelMarks.length > 0 && (
+              <Badge
+                variant="warning"
+                title={`${t('accounts.status.modelMarkedHint')}\n${modelMarks
+                  .map((m) => `${m.model} · ${formatMarkTtl(m.remaining_secs)}`)
+                  .join('\n')}`}
+              >
+                {t('accounts.status.modelMarked')}×{modelMarks.length}
+              </Badge>
+            )}
+          </span>
         )}
       </TD>
 
       {/* 配额列:口径随所属 tab。
           - windows(ccmax/dario):5h/7d 滚动窗口利用率%;无数据(未跑过流量/查询中)显示 —
-          - credits(Kiro):积分剩余/上限(来自 getUsageLimits)
-          - none(cursor 等):订阅制无配额概念、后端不采集,恒为 — */}
+          - credits(Kiro·Cursor):积分/美元剩余/上限。Cursor 额外带 auto(自家模型)/
+            api(第三方模型)两条百分比窗口 —— 上游只给 %、不给金额拆分,
+            与美元账期并排展示(用户点名要三条用量齐:auto、api、超额)
+          - none:订阅制无配额概念、后端不采集,恒为 — */}
       <TD className="text-right">
         {(() => {
           if (runtimeState === 'loading') return <Skeleton className="ml-auto h-4 w-16" />
@@ -161,7 +197,7 @@ export function AccountTableRow({
             )
           }
 
-          // credits(Kiro):剩余/上限。
+          // credits(Kiro·Cursor):剩余/上限;Cursor 附带 auto/api 两条百分比窗口。
           if (quota === undefined || quota === null) {
             return <span className="text-muted-foreground">—</span>
           }
@@ -172,10 +208,71 @@ export function AccountTableRow({
                 {formatCredits(quota.remaining)}
               </span>
               <span className="text-muted-foreground"> / {formatCredits(quota.limit)}</span>
+              {/* Cursor 的 auto(自家模型)/api(第三方模型)用量 —— 上游只给 %。
+                  缺省(kiro / 旧快照)不渲染,不出空条。 */}
+              {quota.windows && quota.windows.length > 0 && (
+                <span className="block text-xs">
+                  {quota.windows.map((w, i) => (
+                    <span key={w.label}>
+                      {i > 0 && <span className="text-muted-foreground"> · </span>}
+                      <span className="text-muted-foreground">{w.label} </span>
+                      <span
+                        className={cn('font-medium', w.percent_used >= 90 && 'text-destructive')}
+                      >
+                        {Math.round(w.percent_used)}%
+                      </span>
+                    </span>
+                  ))}
+                </span>
+              )}
             </span>
           )
         })()}
       </TD>
+
+      {/* 超额(on-demand)列:「已用超额 / 超额上限」(美元)。
+          - 该 provider 不支持(非 cursor)→ 不可点的「—」(点开弹窗只会被后端回 400)
+          - 未查到(worker 离线/该号未采集)→ —
+          - 未开启 → 灰「关」+ 点击可开
+          - 已开启不限额 → 已用 / 不限
+          - 已开启有上限 → 已用 / 上限,到 80% 标黄 */}
+      {showOnDemand && (
+        <TD className="text-right">
+          {runtimeState === 'loading' ? (
+            <Skeleton className="ml-auto h-4 w-16" />
+          ) : !onDemandSupported ? (
+            <span className="text-muted-foreground" title={t('accounts.onDemand.unsupported')}>
+              —
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onEditOnDemand(row)}
+              disabled={busy}
+              title={t('accounts.onDemand.editHint')}
+              className="tabular-nums underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50"
+            >
+              {onDemand == null ? (
+                <span className="text-muted-foreground">—</span>
+              ) : onDemandState(onDemand) === 'off' ? (
+                <span className="text-xs text-muted-foreground">{t('accounts.onDemand.off')}</span>
+              ) : (
+                <>
+                  <span className={cn('font-medium', isOnDemandHigh(onDemand) && 'text-warning')}>
+                    {formatUsd(onDemand.used)}
+                  </span>
+                  <span className="text-muted-foreground">
+                    {' / '}
+                    {onDemandState(onDemand) === 'unlimited'
+                      ? t('accounts.onDemand.unlimited')
+                      : formatUsd(onDemand.limit ?? 0)}
+                  </span>
+                </>
+              )}
+            </button>
+          )}
+        </TD>
+      )}
 
       {/* 并发：在用/上限（runtime）。available_permits 是空闲槽，在用 = 上限 - 空闲，
           故空闲账号显示 0/N(而非反直觉的 N/N)。无 runtime 数据时只显示配置上限。 */}
@@ -278,6 +375,19 @@ export function AccountTableRow({
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5">
+            {/* 查看模型：仅 kiro(模型清单来自 kiro 静态目录 × 档位 − 标记;
+                其它 provider 无此概念,不显示入口)。纯本地零上游,不依赖 runtime.online。 */}
+            {row.provider === 'kiro' && (
+              <button
+                type="button"
+                onClick={() => onViewModels(row)}
+                title={t('accounts.action.viewModels')}
+                disabled={busy}
+                className={iconButtonClass}
+              >
+                <ListChecks className="h-3.5 w-3.5" />
+              </button>
+            )}
             {/* 刷新 token 始终可用(与编辑/删除一致)：不依赖 runtime.online——runtime 降级时
                 仍要能手动刷新,后端会顺序扇出并回成功/失败/无人持有(审查 Skeptic#5/Minimalist#2)。 */}
             <button

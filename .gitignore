@@ -19,3 +19,11 @@
 *.bak.*
 *.bak-*
 *.exp-bak
+
+# 交叉编译产物(bookworm 目标)与部署用的裸二进制
+/target-bookworm
+/caio-bin-new
+# 内部运维/评审过程文档:含服务器 IP、admin 路径、SSH 别名等运维细节。
+# 本仓库是**公开**仓库,这类文档不入库。
+/HANDOFF-*.md
+/.review-request-*.md

@@ -64,6 +64,10 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   const [queueEnabled, setQueueEnabled] = useState(false)
   const [proxyUrl, setProxyUrl] = useState('')
   const [initialProxyUrl, setInitialProxyUrl] = useState('')
+  // 模型白名单(extra.model_allowlist):UI 层是逗号分隔串;后端写侧校验并
+  // 规范化成 JSON 数组落库。空串 = 清除(不限)。
+  const [modelAllowlist, setModelAllowlist] = useState('')
+  const [initialModelAllowlist, setInitialModelAllowlist] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
@@ -79,6 +83,12 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
       const currentProxy = typeof row.extra.proxy === 'string' ? row.extra.proxy : ''
       setProxyUrl(currentProxy)
       setInitialProxyUrl(currentProxy)
+      // 顶层回显是规范化后的 JSON 数组(或 null=不限);UI 层展示成逗号串。
+      const currentAllowlist = Array.isArray(row.model_allowlist)
+        ? row.model_allowlist.join(', ')
+        : ''
+      setModelAllowlist(currentAllowlist)
+      setInitialModelAllowlist(currentAllowlist)
       setError(null)
       setSaving(false)
     }
@@ -127,6 +137,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     // 排队开关：与原值比较，没动就不带 —— 否则对着不认这个字段的旧后端，
     // 只改并发也会让**整个保存**被判 400。
     if (queueEnabled !== (row.queue_enabled ?? false)) patch.queue_enabled = queueEnabled
+    // model_allowlist: 不传=不动，'' = 清除（不限），非空 = 逗号分隔条目
+    //（后端写侧校验：通配符只许末尾、非法字符 400，规范化成 JSON 数组落库）。
+    if (modelAllowlist !== initialModelAllowlist) patch.model_allowlist = modelAllowlist
 
     const draft: AccountGroupMembership[] = Object.entries(memberships).map(
       ([name, priority]) => ({ name, priority }),
@@ -318,6 +331,31 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
               autoComplete="off"
               className={inputClass}
             />
+          </div>
+
+          {/* 模型白名单（可选）：该号允许服务的模型，逗号分隔；留空 = 不限。
+              条目是 Run 侧模型名或「前缀*」（星号仅限末尾），后端写侧校验、
+              规范化成 JSON 数组落库。典型：只有自家模型的号写 default,composer*,grok* */}
+          <div className="space-y-1.5">
+            <label
+              htmlFor="edit-account-model-allowlist"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              {t('accounts.field.modelAllowlist')}
+            </label>
+            <input
+              id="edit-account-model-allowlist"
+              type="text"
+              value={modelAllowlist}
+              onChange={(event) => setModelAllowlist(event.target.value)}
+              placeholder={t('accounts.field.modelAllowlistPlaceholder')}
+              spellCheck={false}
+              autoComplete="off"
+              className={inputClass}
+            />
+            <p className="text-xs text-muted-foreground">
+              {t('accounts.field.modelAllowlistHint')}
+            </p>
           </div>
 
           {/* 更换凭据：默认折叠；展示脱敏尾号便于核对 */}

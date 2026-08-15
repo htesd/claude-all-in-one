@@ -14,6 +14,16 @@ export function AccountStatusBadge({ status }: { status: AccountDisplayStatus })
       return <Badge variant="muted">{t('accounts.status.offline')}</Badge>
     case 'ok':
       return <Badge variant="success">{t('accounts.status.normal')}</Badge>
+    case 'probation':
+      return <Badge variant="warning">{t('accounts.status.probation')}</Badge>
+    case 'suspended':
+      return (
+        <Badge variant="warning">
+          {t('accounts.status.suspended')} {status.secs}s
+        </Badge>
+      )
+    case 'retired':
+      return <Badge variant="destructive">{t('accounts.status.retired')}</Badge>
     case 'rate_limited':
       return (
         <Badge variant="warning">

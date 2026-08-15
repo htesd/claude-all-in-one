@@ -795,7 +795,32 @@ Cursor 的内建工具(终端、读写文件、网页搜索、代码库检索)�
 | 考记忆1 | 13014 | 12928 | **86** | 99.3% |
 | 考记忆2 | 13030 | 12928 | **102** | 99.2% |
 
-两个事实（名字 + 宠物名）跨 4 轮全部答对，**历史确实在服务端**。
+两个事实（名字 + 宠物名）跨 4 轮全部答对，~~**历史确实在服务端**~~。
+
+> ### ❗ 2026-08-15 订正：上面这句推论**有混淆变量，已被实测推翻**
+>
+> 当时的请求里**同时还内联着全量历史**（`chat.rs::fold_history` 无条件生效）。
+> 模型答对完全可以只是因为历史被贴给了它 —— 这个实验分不开「服务端记得」
+> 和「我们自己贴了」。
+>
+> 干净的检验（同一构建，只翻 `CURSOR_DELTA_HISTORY`，稳定 `metadata.user_id`
+> 连发三轮：①记住 4712 ②聊件无关的事 ③问那个数字）：
+>
+> | 开关 | 第三轮回答 |
+> |---|---|
+> | `1`（只发本轮，历史交服务端） | 「这次对话里我没收到过你要我记住的数字」❌ |
+> | `0`（内联全量） | 「4712」✅ |
+>
+> **结论：服务端在我方这种请求形态下并不替我们持有历史。**
+>
+> 于是 §17.3 的收益要重新归因：98.7% 命中与「新算 token 降到两位数」来自
+> **内联文本被上游前缀缓存**，与服务端存不存历史无关。两个机制此前被混成了一个。
+> 有状态声明（`1.2.1.2` 挂轮内）真正买到的是**缓存命中**，不是**免传历史**。
+>
+> §17.1 变体 B「完全不发上下文声明 → 丢历史」与此不矛盾：那条路连缓存前缀都对不上。
+>
+> 真客户端只发 2121B 靠 `1.2.17` + FileSyncService 的 4 个 blob 哈希，
+> §17.2 已实测我方走不通。**「免传历史」这条路目前仍然是关的。**
 
 对比**无状态**（每轮把历史全量重铺）：
 
@@ -828,3 +853,98 @@ Cursor 的内建工具(终端、读写文件、网页搜索、代码库检索)�
 `CONV_TTL` 2 小时后降级重铺；换号也降级（服务端会话属于旧号）。
 这两条是保守兜底：**我方无法验证服务端到底还记不记得**，只能靠模型答得对不对间接判断，
 所以宁可多铺一次。
+
+---
+
+## 18. 2026-08-10：带图请求全模型 502 的解 —— 「资源回显帧」的真身是**写盘调用**
+
+### 现象与误诊
+
+任何带图片附件的请求（fable / opus / grok 实测全中）→ 502 EmptyResponse。
+第一阶段的误诊：exec 通道（顶层 field 2）上一帧 `{3: {1:"/assets/attach-0-<uuid>.png",
+5:<原始字节>}, 19:…, 55:0}` 被当成「内建工具调用」在出字前收口。
+第二阶段的误诊：把它当「资源回显」只跳过不回执 —— 结果服务端 90s 心跳死等
+（watchdog 收口），因为它**在等客户端的回执**。
+
+### 真身（与 opencodex 项目的 `agent.v1` 全量 schema 交叉核对）
+
+这一帧是 `AgentServerMessage{2: exec_server_message{3: write_args}}` —— 服务端
+让**客户端执行写盘**：`write_args{1:path, 2:file_text, 3:tool_call_id,
+4:return_file_content_after_write, 5:file_bytes}`。带图流程全貌：
+
+1. 客户端随消息内联上传图片附件（`1.2.1.1.3`，§14.1）；
+2. 服务端落盘后用 `write_args` 把字节推回客户端「写入」`/assets/attach-N-<uuid>.png`；
+3. 客户端回 `AgentClientMessage{2: exec_client_message{1:id, 15:exec_id, 3:write_result{1:write_success{1:path, 3:file_size}}}}`；
+4. 模型要「看」图时发 `read_args`（exec 通道 field 7）读同一路径，
+   客户端回 `read_result{1: read_success{1:path, 4:file_size, 5:data(bytes)}}` ——
+   图片必须走 `data` 不是 `content`（PNG 不是合法 UTF-8）。
+
+exec 通道字段号（schema 实证，取代 §13.2 的猜测枚举）：
+`2=shell, 3=write, 4=delete, 5=grep, 7=read, 8=ls, 9=diagnostics,
+10=request_context, 11=mcp, 14=shell_stream, …`；客户端回执同号（write_result=3 …）。
+关联字段：`1: uint32 id`、`15: string exec_id`（实测资产写调用两个都缺省）。
+`19 = span_context`（标准 OTel：32hex trace + 16hex span）。
+
+### 落地（gw-cursor）
+
+- `run.rs`：`parse_exec_write` / `parse_exec_read`（认领条件：绝对路径 + 内容在场，
+  防把工具帧 `1.2.3` 的字符串 id 吞成写调用）、`encode_write_success` /
+  `encode_read_success_data`（回执经请求侧 BiDi 流送回，所以 `keep_stream_open`
+  必须开着）。
+- `lib.rs::AssetStore`：write 的字节按 conversation_id 存内存（单文件 12MB /
+  单会话 24MB 闸，2h TTL 与会话同寿命），read 从这里回图。
+- **红线没破**：只接「写 `/assets/` 前缀」和「读我们存过的路径」两种；
+  其余内建调用（终端、任意路径读写…）维持收口，不代执行。
+
+### 残余假设（三审记录，未观察到的合帧组合）
+
+1. **exec 帧 + 内建工具合帧**：若上游把 exec 调用与内建工具调用并进同一帧，
+   exec 臂先命中，内建工具的收口分支不再执行。实测 exec 写调用总是出字前的
+   第一帧、工具调用总在轮末，该组合未观察到；真出现的最坏表现是陪等心跳到
+   watchdog（90s）按空回复收口。
+2. **外部工具收口无 `1.14`**：外部工具臂命中即 `break`（反代一问一答，不能挂流
+   等工具结果）。上游 tool_use 轮通常不带用量帧；同帧若有 usage 现已在 break 前收下。
+   无上游用量（或上游 input/cache 全零的不可信帧）时按请求体粗估 input/output
+   （ASCII≈4 字符/token、非 ASCII≈1.5，工具参数计入 output，见 `estimate_usage_fallback`），
+   避免 new-api 显示「输入 0 / 缓存 0」；cache_read 不由估算给，统一走 §19 的模拟器。
+
+---
+
+## 19. 2026-08-11：模拟缓存计费（cache_sim 移植，与 kiro 同口径）
+
+**问题**：上游 `1.14` 的 cached 字段生产实测几乎恒 0（85 条成功请求仅 4 条
+cached>0），哪怕连续两条请求有 71.7% 字节级公共前缀、客户端带
+`cache_control: ephemeral` 断点。Run 协议请求侧没有 cache 断点概念可传，
+建不报缓存完全是 Cursor 服务端行为。客户侧账单在 kiro 通道缓存命中 90%+，
+到 cursor 通道全价 input，口径不一致、扣费偏多。
+
+**方案**：`cache_sim.rs`（移植 `gw-kiro::cache_sim`）按 Anthropic prefix cache
+语义模拟命中，只用于客户计费列：
+
+- 指纹 = system + tools + `to_turns` 逐条消息（**fold_history 之前**；折叠形态里
+  `</conversation_history>` 闭合标签横在中间，按折叠后内容取指纹会让第二轮
+  整段 miss）。tools 每轮原样重发、位置固定，是真实可缓存前缀（kiro 排除 tools
+  是因为它的 tools 只挂 currentMessage，这边没那个缝）。超长消息按 2KB 切 chunk，
+  哈希含位置编码，token 按字节占比分摊。
+- 键 = `account_id \x1f conversation_id`（服务端会话 per-account，换号=冷启动；
+  分隔符不会撞：account_id 过 `validate_account_id` 只含字母数字与 `-_.~`，
+  conversation_id 是 UUID）；同模型才命中；5 分钟 TTL 对齐 Anthropic ephemeral；
+  LRU 4096。
+- **peek/commit 两步 + 代际 CAS**：请求构造时 peek 拿计费值，**成功收尾才
+  commit**（与 `ConvRegistry` confirm/forget 同语义；内建工具截断路径也算成功 ——
+  截的是响应，请求轮服务端已处理）。commit 带代际号 compare-and-set：同会话
+  并发请求后完成的提交直接丢弃，不乱序覆盖（审查高危 #1）。
+- 收尾处按字段决策：上游 cached>0 用上游（真实命中优先），cached=0 用模拟值
+  顶替并封顶 `input_tokens`。`real_cache_read_tokens` 永远只认上游自报（对账列），
+  模拟值绝不进。
+
+**口径备忘**（防再次搞混）：
+
+- 入库 `StreamItem::Usage.input_tokens`：**总上下文**（含将被缓存覆盖的部分）；
+- SSE `message_delta.usage.input_tokens`：**未命中缓存的新增**（= 总 − cache_read）；
+- SSE 总上下文 = `input_tokens + cache_read_input_tokens`（cursor 无 cache_creation）。
+- 命中率 = `cache_read / 总上下文`，成本看「总 − cache_read」。
+
+早先 `estimate_usage_fallback` 里的「input − 本轮新增」一次性启发式已删除：
+生产上 `fold_history` 把多轮折成单条 Turn，`turns.len() > 1` 恒不成立（死代码），
+且它把 output 错耦进 input 新增量。

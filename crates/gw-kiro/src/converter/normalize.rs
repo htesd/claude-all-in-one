@@ -13,7 +13,6 @@
 
 use crate::anthropic_types::Message;
 
-const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 const CLAUDE_CODE_CLI_IDENTITY_LINE: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 const CLAUDE_AGENT_SDK_IDENTITY_LINE: &str =
@@ -21,41 +20,13 @@ const CLAUDE_AGENT_SDK_IDENTITY_LINE: &str =
 const MODEL_IDENTITY_PREFIX: &str = "You are powered by the model named ";
 const MODEL_IDENTITY_DELIMITER: &str = ". The exact model ID is ";
 
-/// 判定一行是否为 Claude Code 的滚动 billing 指纹行。
-///
-/// 现象:CC 在 system prompt 顶部拼 `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli; cch=<5位16进制>;`,
-/// 其中 `cch` 是每请求都变的 body 哈希 → 即使上游做 prefix cache,这行也让命中率永远 0。
-///
-/// 判据:行首(忽略前导空白与大小写)是 `x-anthropic-billing-header:` 即剥,**不再依赖具体
-/// `cc_*` 字段名**。
-///
-/// 为什么放宽:原收窄判据(要求行内含 `cc_version=`/`cc_entrypoint=`/`cch=` 之一)对 CC 版本升级
-/// 脆弱——CC 一旦改字段名/结构(实测 header 里带版本号 `cc_version=2.1.63.<build>`,字段集会随版本动),
-/// 旧判据就静默失配,每请求变化的随机 `cch` 重新泄进前缀、命中再次归零。改回只锚定 header 前缀
-/// (对齐 static_flow `converter.rs::strip_volatile_claude_code_billing_header` 的口径):
-/// `x-anthropic-billing-header:` 是 Anthropic 内部专有前缀,真实流量里 system 仅此一处,放宽不误伤用户正文。
-fn is_billing_fingerprint_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let prefix = BILLING_HEADER_PREFIX.as_bytes();
-    // 按字节比较前缀,避免在多字节字符边界上做 str 切片 panic。
-    trimmed.len() >= prefix.len()
-        && trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
-
 /// 删除 system 文本里的 CC 滚动 billing 指纹行(保留其余内容与换行结构)。
 ///
-/// 用 `split_inclusive('\n')` 保留每行的尾随换行,使非指纹行**逐字节原样**保留——
-/// 这保证 conversationId 锚点(同样调用本函数)在真实 CC 流量上与旧版字节一致(真实流量里
-/// 唯一的 `x-anthropic-` 行就是 billing header)。
+/// **实现已上收到 [`gw_core::normalize`]**,本函数是薄委托:cursor 通道也需要同一道处理
+/// (它此前没有,后果是会话键每请求都变 —— 见 `gw-cursor` 的 `extract_system`),
+/// 两边各留一份必然漂移。行为逐字节不变,本模块的既有测试原样守住。
 pub(super) fn strip_rolling_fingerprints(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for line in s.split_inclusive('\n') {
-        if is_billing_fingerprint_line(line) {
-            continue;
-        }
-        out.push_str(line);
-    }
-    out
+    gw_core::normalize::strip_rolling_fingerprints(s)
 }
 
 // === model identity 规范化 ===
@@ -346,10 +317,13 @@ mod tests {
     }
 
     /// 判据对大小写与前导空白不敏感;普通正文行不命中。
+    ///
+    /// 实现已上收到 `gw_core::normalize`,这里改为断言**经委托后的公开行为** ——
+    /// 委托若被换成别的实现(或漂移),这条仍然会响。
     #[test]
     fn billing_match_is_case_and_indent_insensitive() {
-        assert!(is_billing_fingerprint_line("  X-Anthropic-Billing-Header: cch=1;\n"));
-        assert!(is_billing_fingerprint_line("x-anthropic-billing-header:\n"));
-        assert!(!is_billing_fingerprint_line("hello world\n"));
+        assert_eq!(strip_rolling_fingerprints("  X-Anthropic-Billing-Header: cch=1;\n"), "");
+        assert_eq!(strip_rolling_fingerprints("x-anthropic-billing-header:\n"), "");
+        assert_eq!(strip_rolling_fingerprints("hello world\n"), "hello world\n");
     }
 }

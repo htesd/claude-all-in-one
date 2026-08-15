@@ -328,6 +328,7 @@ mod tests {
             provider: "kiro".into(),
             max_concurrency: 1,
             disabled: false,
+            created_at: 0,
             extra: Default::default(),
         };
         if let serde_json::Value::Object(map) = extra {

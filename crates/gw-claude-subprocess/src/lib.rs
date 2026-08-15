@@ -173,6 +173,7 @@ mod tests {
             provider: "claude-subprocess".into(),
             max_concurrency: 1,
             disabled: false,
+            created_at: 0,
             extra,
         }
     }

@@ -12,12 +12,16 @@
 //! - [`config`]  配置 DTO(instances/accounts/system)
 //! - [`provider`] Provider trait —— 新增上游只需实现它
 //! - [`store`]   持久化抽象(实现在 gw-store)
+//! - [`openai`]  OpenAI 线缆适配(**只在边界**,内部 IR 仍是 Anthropic)
+//! - [`normalize`] 线缆卫生:剥掉每请求都变的内容(会话键/缓存前缀的稳定性前提)
 
 pub mod account;
 pub mod config;
 pub mod error;
 pub mod fold;
 pub mod model;
+pub mod normalize;
+pub mod openai;
 pub mod pricing;
 pub mod provider;
 

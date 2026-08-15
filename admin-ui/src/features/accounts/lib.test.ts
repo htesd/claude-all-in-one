@@ -1,14 +1,24 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  accountStatusBucket,
   buildCursorExtra,
   buildProviderTabs,
+  decideCursorLoginPoll,
+  deriveAccountStatus,
+  deriveModelAvailability,
   diffMemberships,
+  formatMarkTtl,
+  formatUsd,
+  isOnDemandHigh,
+  modelAllowlistAllows,
+  onDemandState,
   providerTabLabel,
   quotaKindForProvider,
   sortAccounts,
 } from './lib'
-import type { AccountGroupMembership, AccountRow } from './types'
+import type { AccountGroupMembership, AccountModelEntry, AccountRow, AccountRuntimeEntry } from './types'
+import type { AccountUnavailableReason, OnDemandQuota } from './types'
 
 /** 只填排序用得到的字段，其余给最小合法值。 */
 function row(account_id: string, created_at: number, group_name = 'G0'): AccountRow {
@@ -74,16 +84,39 @@ describe('provider 展示标签(筛选器选项与表格 provider 列共用)', (
 })
 
 describe('provider 配额口径(决定账号页配额列语义)', () => {
-  it('kiro = 积分,claude-dario = 5h/7d 窗口,cursor = 无配额概念', () => {
+  it('kiro = 积分,claude-dario = 5h/7d 窗口,cursor = 官方美元额度(同 credits 列)', () => {
     expect(quotaKindForProvider('kiro')).toBe('credits')
     expect(quotaKindForProvider('claude-dario')).toBe('windows')
-    // Cursor 是订阅制,后端不采集配额数字 —— 用 'none' 让表头不谎称「积分」、单元格恒为 —
-    expect(quotaKindForProvider('cursor')).toBe('none')
+    expect(quotaKindForProvider('cursor')).toBe('credits')
   })
 
   it('未知 provider 回落积分口径(历史行为)', () => {
     expect(quotaKindForProvider('')).toBe('credits')
     expect(quotaKindForProvider('claude-subprocess')).toBe('credits')
+  })
+})
+
+describe('模型白名单判定(镜像后端 gw-core::account::model_allowlist_allows,改语义必须两边同步)', () => {
+  it('null / 缺失 = 不限,放行一切', () => {
+    expect(modelAllowlistAllows(null, 'claude-sonnet-5')).toBe(true)
+    expect(modelAllowlistAllows(undefined, 'anything')).toBe(true)
+  })
+
+  it('空数组 = 全禁(fail-closed;写侧正常不会存出这个形态)', () => {
+    expect(modelAllowlistAllows([], 'default')).toBe(false)
+  })
+
+  it('精确条目小写匹配,大小写不敏感', () => {
+    expect(modelAllowlistAllows(['default', 'composer-2.5'], 'default')).toBe(true)
+    expect(modelAllowlistAllows(['default'], 'Default')).toBe(true)
+    expect(modelAllowlistAllows(['default'], 'claude-sonnet-5')).toBe(false)
+  })
+
+  it('「前缀*」通配仅匹配前缀;全名精确条目不吃前缀', () => {
+    expect(modelAllowlistAllows(['grok*'], 'grok-4.6')).toBe(true)
+    expect(modelAllowlistAllows(['grok*'], 'kimi-k3')).toBe(false)
+    // 无星号的全名条目是精确匹配,不能当前缀用
+    expect(modelAllowlistAllows(['grok'], 'grok-4.6')).toBe(false)
   })
 })
 
@@ -284,5 +317,171 @@ describe('provider 筛选项', () => {
       'zeta',
     ])
     expect(tabs.find((t) => t.provider === 'zeta')?.count).toBe(1)
+  })
+})
+
+describe('模型不可用标记剩余时间格式化', () => {
+  it('< 1h 显示分钟，下限 1m（0s/负值不显示 0m）', () => {
+    expect(formatMarkTtl(1800)).toBe('30m')
+    expect(formatMarkTtl(59 * 60)).toBe('59m')
+    expect(formatMarkTtl(0)).toBe('1m')
+  })
+
+  it('>= 1h 显示小时：整点不带小数，非整点 1 位小数', () => {
+    expect(formatMarkTtl(3600)).toBe('1h')
+    expect(formatMarkTtl(6 * 3600)).toBe('6h')
+    expect(formatMarkTtl(5400)).toBe('1.5h')
+  })
+})
+
+/** 最小模型条目:只填三态推导用得到的字段。 */
+function modelEntry(supported: boolean, mark: number | null): AccountModelEntry {
+  return {
+    id: 'claude-opus-5',
+    display_name: null,
+    supported,
+    mark_remaining_secs: mark,
+    available: supported && mark === null,
+  }
+}
+
+describe('模型可用三态推导（查看模型弹窗）', () => {
+  it('支持且无标记 → 可用', () => {
+    expect(deriveModelAvailability(modelEntry(true, null))).toBe('available')
+  })
+
+  it('支持但有标记 → 被标记（与 available=false 一致）', () => {
+    expect(deriveModelAvailability(modelEntry(true, 1200))).toBe('marked')
+  })
+
+  it('标记剩余 0s（即将到期）仍算标记中，与后端 is_none() 判定对齐', () => {
+    expect(deriveModelAvailability(modelEntry(true, 0))).toBe('marked')
+  })
+
+  it('档位不支持优先于标记：两种不可用必须分开展示', () => {
+    expect(deriveModelAvailability(modelEntry(false, null))).toBe('unsupported')
+    expect(deriveModelAvailability(modelEntry(false, 300))).toBe('unsupported')
+  })
+})
+
+/** 最小运行态条目:只填状态推导用得到的字段。 */
+function rt(reason: AccountUnavailableReason, online = true): AccountRuntimeEntry {
+  return {
+    online,
+    status: {
+      account_id: 'a',
+      priority: 0,
+      disabled: reason !== '',
+      reason,
+      cooldown_remaining_secs: 0,
+      failure_count: 0,
+      available_permits: 1,
+      max_concurrency: 1,
+    },
+  }
+}
+
+describe('状态推导（配置 × 运行态 merge）', () => {
+  it('配置停用 + runtime 报退役 → 显示「已退役」而不是普通「已停用」', () => {
+    // 自动退役会落库 disabled=1;先判 row.disabled 会把退役永远遮成「已停用」(审查 [中])。
+    const r = { ...row('a', 1), disabled: true }
+    expect(deriveAccountStatus(r, rt('suspended_retired'))).toEqual({ kind: 'retired' })
+  })
+
+  it('配置停用但 runtime 无退役原因 → 仍是普通「已停用」(人工停用不冒名退役)', () => {
+    const r = { ...row('a', 1), disabled: true }
+    expect(deriveAccountStatus(r, rt(''))).toEqual({ kind: 'disabled' })
+    expect(deriveAccountStatus(r, rt('quota_exhausted'))).toEqual({ kind: 'disabled' })
+    // runtime 离线/缺失时不妄断,按配置展示。
+    expect(deriveAccountStatus(r, rt('suspended_retired', false))).toEqual({ kind: 'disabled' })
+    expect(deriveAccountStatus(r, undefined)).toEqual({ kind: 'disabled' })
+  })
+
+  it('runtime 退役/观察期归入异常分桶,不进「已停用」桶', () => {
+    expect(accountStatusBucket({ kind: 'retired' })).toBe('abnormal')
+    expect(accountStatusBucket({ kind: 'probation' })).toBe('abnormal')
+    expect(accountStatusBucket({ kind: 'disabled' })).toBe('disabled')
+  })
+
+  it('runtime 直接报退役(配置未停用) → 退役', () => {
+    expect(deriveAccountStatus(row('a', 1), rt('suspended_retired'))).toEqual({ kind: 'retired' })
+  })
+})
+
+describe('Cursor 官方登录轮询状态机', () => {
+  it('pending 且未超时 → 继续轮询', () => {
+    expect(decideCursorLoginPoll({ kind: 'pending' }, false)).toBe('continue')
+  })
+
+  it('done → 成功（即使刚好越过截止线也算成功，凭据已落库）', () => {
+    expect(decideCursorLoginPoll({ kind: 'done' }, false)).toBe('success')
+    expect(decideCursorLoginPoll({ kind: 'done' }, true)).toBe('success')
+  })
+
+  it('超过 expires_in_sec 窗口 → 超时停止（会话已被后端清扫）', () => {
+    expect(decideCursorLoginPoll({ kind: 'pending' }, true)).toBe('timeout')
+    expect(decideCursorLoginPoll({ kind: 'error', status: 502 }, true)).toBe('timeout')
+  })
+
+  it('502（后端到上游的瞬时网络错误）→ 继续轮询，会话还在', () => {
+    expect(decideCursorLoginPoll({ kind: 'error', status: 502 }, false)).toBe('continue')
+  })
+
+  it('传输层错误（无 HTTP 响应）→ 同样按瞬时处理，继续轮询', () => {
+    expect(decideCursorLoginPoll({ kind: 'error', status: undefined }, false)).toBe('continue')
+  })
+
+  it('4xx（会话已清的终态失败）→ 停止轮询并报错', () => {
+    expect(decideCursorLoginPoll({ kind: 'error', status: 400 }, false)).toBe('fail')
+    expect(decideCursorLoginPoll({ kind: 'error', status: 401 }, false)).toBe('fail')
+    expect(decideCursorLoginPoll({ kind: 'error', status: 409 }, false)).toBe('fail')
+  })
+
+  it('未约定的其他 5xx → 保守按终态失败停止', () => {
+    expect(decideCursorLoginPoll({ kind: 'error', status: 500 }, false)).toBe('fail')
+    expect(decideCursorLoginPoll({ kind: 'error', status: 503 }, false)).toBe('fail')
+  })
+})
+
+describe('超额（on-demand）额度展示', () => {
+  const od = (p: Partial<OnDemandQuota>): OnDemandQuota => ({
+    enabled: true,
+    used: 0,
+    unlimited: false,
+    ...p,
+  })
+
+  it('未开启 → off（面板显示「关」，不是 —）', () => {
+    expect(onDemandState(od({ enabled: false }))).toBe('off')
+  })
+
+  it('已开启 + 有上限 → on', () => {
+    expect(onDemandState(od({ limit: 75 }))).toBe('on')
+  })
+
+  it('已开启但不限额 → unlimited（上游 i32::MAX 已在后端归一）', () => {
+    expect(onDemandState(od({ unlimited: true }))).toBe('unlimited')
+  })
+
+  it('已开启但上限缺省/为 0 → 按不限额展示，不显示 $0 上限', () => {
+    expect(onDemandState(od({ limit: null }))).toBe('unlimited')
+    expect(onDemandState(od({ limit: 0 }))).toBe('unlimited')
+  })
+
+  it('已用达上限 80% 起标黄（触顶后上游会拒请求）', () => {
+    expect(isOnDemandHigh(od({ limit: 100, used: 79 }))).toBe(false)
+    expect(isOnDemandHigh(od({ limit: 100, used: 80 }))).toBe(true)
+    expect(isOnDemandHigh(od({ limit: 100, used: 120 }))).toBe(true)
+  })
+
+  it('未开启/不限额永不标黄（否则一堆号常驻黄字）', () => {
+    expect(isOnDemandHigh(od({ enabled: false, used: 999 }))).toBe(false)
+    expect(isOnDemandHigh(od({ unlimited: true, used: 999 }))).toBe(false)
+  })
+
+  it('美元格式：整数不带小数，小数保留两位', () => {
+    expect(formatUsd(75)).toBe('$75')
+    expect(formatUsd(22.5)).toBe('$22.50')
+    expect(formatUsd(0)).toBe('$0')
   })
 })

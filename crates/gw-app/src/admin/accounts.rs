@@ -213,6 +213,14 @@ pub struct UpdateAccountBody {
     /// 见 `worker/scheduler.rs::queue_enabled`。
     #[serde(default)]
     queue_enabled: Option<bool>,
+    /// 定点更新模型白名单(写 `extra.model_allowlist`,走 merge_account_extra
+    /// 绝不碰凭据,仿 proxy_url)。缺省=不动;`""`(空串/纯分隔符)=清除(写 null,
+    /// 读侧把 null 与缺失同义为「不限」);非空=逗号/分号/空白分隔的条目列表,
+    /// 写侧校验后规范化成 **JSON 字符串数组**落库(交接规格第 3 条:CSV 只当
+    /// UI 输入形态)。非法条目(裸 `*`、通配符不在末尾、非法字符)直接 400 ——
+    /// fail-closed,绝不静默收下一个语义存疑的白名单(规格第 4/5 条)。
+    #[serde(default)]
+    model_allowlist: Option<String>,
 }
 
 pub fn router() -> Router<AdminState> {
@@ -231,7 +239,9 @@ pub fn router() -> Router<AdminState> {
         .route("/accounts/{id}/reset", post(reset_account))
         .route("/accounts/{id}/refresh", post(refresh_account))
         .route("/accounts/{id}/quota", post(quota_account))
+        .route("/accounts/{id}/on-demand", post(on_demand_account))
         .route("/accounts/{id}/models", post(models_account))
+        .route("/accounts/{id}/models/local", get(models_local_account))
         .route("/accounts/{id}/probe", post(probe_account))
         .route("/models/catalog", get(model_catalog))
 }
@@ -242,6 +252,68 @@ fn api_error(status: StatusCode, msg: &str) -> axum::response::Response {
         Json(serde_json::json!({"type":"error","error":{"message": msg}})),
     )
         .into_response()
+}
+
+/// `model_allowlist` 的写侧校验与归一(交接规格第 3/4/5 条)。
+///
+/// 输入是逗号/分号/空白分隔的条目串(UI 的自然输入形态);
+/// - 空 / 纯分隔符 → `Ok(null)` = 清除(读侧把 null 与缺失同义为「不限」);
+/// - 非空 → 逐条校验后规范化为**小写 JSON 字符串数组**(规范存储形态);
+/// - 非法条目 → `Err(400 文案)`,整单拒绝不做部分应用 —— fail-closed,
+///   绝不静默收下一个语义存疑的白名单。
+///
+/// 逐条规则:
+/// - 裸 `*` 拒绝:「不限」用清空表达,「全禁」用账号 disabled 表达(规格第 4 条表尾);
+/// - `*` 只许出现在末尾(`grok*` 合法、`gr*k`/`*grok` 拒绝,规格第 5 条);
+/// - 字符集只允许字母/数字/`-`/`.`/`_`(Run 侧目录名的实际字符集)。
+fn normalize_model_allowlist(raw: &str) -> Result<serde_json::Value, String> {
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for tok in raw.split([',', ';']).flat_map(str::split_whitespace) {
+        let t = tok.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if t == "*" {
+            return Err(
+                "model_allowlist 不接受裸 `*`:不限就把该字段清空,全禁请直接停用账号".into(),
+            );
+        }
+        let body = t.strip_suffix('*').unwrap_or(&t);
+        if body.contains('*') {
+            return Err(format!(
+                "model_allowlist 条目 {t:?} 非法:通配符 `*` 只允许出现在末尾(如 grok*)"
+            ));
+        }
+        if body.is_empty()
+            || !body
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        {
+            return Err(format!(
+                "model_allowlist 条目 {t:?} 非法:只允许字母/数字/`-`/`.`/`_`(可选末尾 `*`)"
+            ));
+        }
+        items.push(serde_json::Value::String(t));
+    }
+    if items.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    Ok(serde_json::Value::Array(items))
+}
+
+/// 控制面扇出专用 http client(30s 超时)。
+///
+/// ⚠️ **不能用 `st.http`**:那是 2s 超时的管理面聚合客户端,为的是 worker 离线时快速
+/// 跳过。而配额/模型目录这类扇出,worker 侧要真打一次上游控制面,>2s 是常态 —— 2s
+/// 超时在扇出循环里等价于「该 worker 离线」,所有 worker 轮一遍后误报 404「没有
+/// worker 持有该账号」,直连同一 worker 却是 200(2026-08-10 线上确诊)。
+/// probe 端点早就踩过同款(见其注释,用 120s)。quota/models 两个扇出共用 30s:
+/// 控制面 GET 正常秒级,30s 足以兜住上游抖动,又不至于把管理页面挂死。
+/// 纯本地的 models/local 扇出不在此列 —— 它用 st.http(见 models_local_account 注释)。
+fn control_plane_http() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
 }
 
 /// 把 AccountRow 转为对外视图:extra 解析成对象并把含 token/secret/password
@@ -306,6 +378,9 @@ fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serd
         "priority": priority,
         // 排队开关:extra 里没有即视作关闭(与 scheduler::queue_enabled 同口径)。
         "queue_enabled": extra.get("queue_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+        // 模型白名单顶层回显(前端编辑框要能读到现值)。缺失/null = 不限,统一吐 null;
+        // 键名不含 token/secret/password/key,不会被上面的脱敏改写。
+        "model_allowlist": extra.get("model_allowlist").cloned().unwrap_or(serde_json::Value::Null),
         "disabled": row.disabled,
         "extra": extra,
         "created_at": row.created_at,
@@ -1414,15 +1489,20 @@ async fn update_account(
         None => None,
     };
     // 主体更新:仅当存在可改字段时才打 update_account(避免 all-None 空 patch 语义歧义)。
+    // ⚠️ `disabled=false`(启用)必须**剔除出通用 patch**:启用与「清 suspend 生命周期 +
+    // epoch 递增」是 restore_account 的单事务,拆两次写会留下"已启用但旧退避还在"
+    // 的可持久化半套状态(对抗审查二轮阻断#2)。disabled=true(停用)无此耦合,照走 patch。
+    let restore_requested = body.disabled == Some(false);
+    let patch_disabled = body.disabled.filter(|d| *d);
     let has_patch = body.group_name.is_some()
         || body.max_concurrency.is_some()
-        || body.disabled.is_some()
+        || patch_disabled.is_some()
         || extra.is_some();
     if has_patch {
         let patch = AccountPatch {
             group_name: body.group_name.clone(),
             max_concurrency: body.max_concurrency,
-            disabled: body.disabled,
+            disabled: patch_disabled,
             extra,
         };
         match st.store.update_account(&id, &patch) {
@@ -1441,6 +1521,16 @@ async fn update_account(
                     ),
                 )
             }
+            Err(e) => return internal_error(e),
+        }
+    }
+    // 人工启用 = 原子恢复:disabled=0 + 清 suspend 生命周期 + epoch 递增,单事务
+    // (restore_account 是唯一执行启用写入的地方,见上)。对没有生命周期行的普通账号
+    // 这是无害 no-op(仅多写一行清零行,worker 对账后自然收敛)。
+    if restore_requested {
+        match st.store.restore_account(&id) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
             Err(e) => return internal_error(e),
         }
     }
@@ -1483,13 +1573,32 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
+    // 定点模型白名单合并(同 proxy_url:增量 merge,绝不碰凭据)。
+    // 空串/纯分隔符 = 清除(写 null;merge_account_extra 是读-合-写,写 null 不删键,
+    // 读侧 gw_core::account::model_allowlist_allows 把 null 与缺失同义为「不限」)。
+    // 非空 = 写侧校验后规范化成 JSON 字符串数组;非法条目直接 400(fail-closed,
+    // 绝不静默收下语义存疑的白名单 —— 交接规格第 4/5 条)。
+    if let Some(raw) = &body.model_allowlist {
+        let allow_val = match normalize_model_allowlist(raw) {
+            Ok(v) => v,
+            Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
+        };
+        let delta = serde_json::json!({ "model_allowlist": allow_val }).to_string();
+        match st.store.merge_account_extra(&id, &delta) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     // 落库后 best-effort 捅所有 worker 立即同步(同 delete_account/import 的理由):
     // 否则启用/禁用/换组等改动要等 worker 自己最多 30s 的周期 sync 才生效,期间按号操作
     // (如导入对话框"编辑后立即验活")会误报"没有 worker 持有该账号"。
     if has_patch
+        || restore_requested
         || body.proxy_url.is_some()
         || body.priority.is_some()
         || body.queue_enabled.is_some()
+        || body.model_allowlist.is_some()
     {
         poke_workers_sync(&st).await;
     }
@@ -1687,10 +1796,16 @@ async fn quota_account(
     if let Err(msg) = validate_account_id(&id) {
         return api_error(StatusCode::BAD_REQUEST, msg);
     }
+    // 长超时 client:worker 侧要真打上游 getUsageLimits,2s 的 st.http 会把慢响应
+    // 误判成 worker 离线(见 control_plane_http 注释)。
+    let http = match control_plane_http() {
+        Ok(c) => c,
+        Err(e) => return internal_error(anyhow::anyhow!("扇出 http 客户端构造失败: {e}")),
+    };
     let mut first_error: Option<(u16, String)> = None;
     for w in st.workers.iter() {
         let url = format!("http://{}/accounts/{}/quota", w.listen, id);
-        let resp = match st.http.post(&url).send().await {
+        let resp = match http.post(&url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::debug!(instance = w.instance, "quota 扇出失败(worker 离线?): {e}");
@@ -1714,6 +1829,68 @@ async fn quota_account(
                 .and_then(|b| b.pointer("/error/message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("配额查询失败")
+                .to_string();
+            first_error = Some((status, msg));
+        }
+    }
+    if let Some((status, msg)) = first_error {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return api_error(code, &msg);
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+    )
+}
+
+/// `POST /accounts/{id}/on-demand` —— 设置该号的超额(on-demand)额度上限。
+///
+/// body: `{"limit_usd": 50}`(美元整数);`0`/`null` = 关闭超额。目前只有 Cursor 支持。
+///
+/// ⚠️ **写**操作:改的是上游账号的计费设置,开启后套餐用尽会产生真实费用。
+/// 与 quota 同款顺序扇出:2xx 立即返回,404 问下一个,其余记首个错误后继续
+/// (错误原文要能透出,比如未绑支付方式时上游的「Payment method required」)。
+async fn on_demand_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    // 长超时 client:worker 侧要真打上游 SetHardLimit + 回读,2s 会误判成 worker 离线。
+    let http = match control_plane_http() {
+        Ok(c) => c,
+        Err(e) => return internal_error(anyhow::anyhow!("扇出 http 客户端构造失败: {e}")),
+    };
+    let payload = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
+    let mut first_error: Option<(u16, String)> = None;
+    for w in st.workers.iter() {
+        let url = format!("http://{}/accounts/{}/on-demand", w.listen, id);
+        let resp = match http.post(&url).json(&payload).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(instance = w.instance, "on-demand 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status == 404 {
+            continue; // 该 worker 不持有此账号。
+        }
+        let rbody = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            return Json(
+                rbody.unwrap_or_else(|| serde_json::json!({"ok": true, "account_id": id})),
+            )
+            .into_response();
+        }
+        if first_error.is_none() {
+            let msg = rbody
+                .as_ref()
+                .and_then(|b| b.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("超额额度设置失败")
                 .to_string();
             first_error = Some((status, msg));
         }
@@ -1804,10 +1981,16 @@ async fn models_account(
     if let Err(msg) = validate_account_id(&id) {
         return api_error(StatusCode::BAD_REQUEST, msg);
     }
+    // 长超时 client:worker 侧要真打上游拉目录,2s 的 st.http 会把慢响应误判成
+    // worker 离线(见 control_plane_http 注释)。
+    let http = match control_plane_http() {
+        Ok(c) => c,
+        Err(e) => return internal_error(anyhow::anyhow!("扇出 http 客户端构造失败: {e}")),
+    };
     let mut first_error: Option<(u16, String)> = None;
     for w in st.workers.iter() {
         let url = format!("http://{}/accounts/{}/models", w.listen, id);
-        let resp = match st.http.post(&url).send().await {
+        let resp = match http.post(&url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::debug!(instance = w.instance, "models 扇出失败(worker 离线?): {e}");
@@ -1831,6 +2014,61 @@ async fn models_account(
                 .and_then(|b| b.pointer("/error/message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("模型目录查询失败")
+                .to_string();
+            first_error = Some((status, msg));
+        }
+    }
+    if let Some((status, msg)) = first_error {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return api_error(code, &msg);
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "没有 worker 持有该账号(账号不存在、worker 离线或组未被任何 worker 绑定)",
+    )
+}
+
+/// `GET /accounts/{id}/models/local` —— 账号可用模型清单(**纯本地**,worker 侧零上游)。
+///
+/// 与 `models_account` 同款顺序扇出(2xx 立即返回,404 问下一个,其余记首个错误后继续),
+/// 区别在 worker 侧只读内存(静态目录 + 档位支持判断 + 已学模型标记),毫秒级返回,
+/// 所以面板「查看模型」按钮可以随便点。
+///
+/// ⚠️ 这里**故意用 2s 的 `st.http`**,不用 control_plane_http:worker 侧纯本地、毫秒级,
+/// 2s 不响应就说明它真的挂了/事件循环卡死 —— 串行扇出若给 30s,一个挂住的 worker 会把
+/// 整个面板请求拖 30s。30s 长超时只留给真打上游的 quota/models 扇出(审查 gpt-5.6-sol)。
+async fn models_local_account(
+    State(st): State<AdminState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Err(msg) = validate_account_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let mut first_error: Option<(u16, String)> = None;
+    for w in st.workers.iter() {
+        let url = format!("http://{}/accounts/{}/models/local", w.listen, id);
+        let resp = match st.http.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(instance = w.instance, "models/local 扇出失败(worker 离线?): {e}");
+                continue;
+            }
+        };
+        let status = resp.status().as_u16();
+        if status == 404 {
+            continue; // 该 worker 不持有此账号。
+        }
+        let body = resp.json::<serde_json::Value>().await.ok();
+        if (200..300).contains(&status) {
+            return Json(body.unwrap_or_else(|| serde_json::json!({"account_id": id})))
+                .into_response();
+        }
+        if first_error.is_none() {
+            let msg = body
+                .as_ref()
+                .and_then(|b| b.pointer("/error/message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("模型清单查询失败")
                 .to_string();
             first_error = Some((status, msg));
         }
@@ -1906,6 +2144,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    use super::normalize_model_allowlist;
     use crate::admin::tests_support::{app, app_with_workers, req};
 
     async fn json_body(resp: axum::response::Response) -> serde_json::Value {
@@ -2216,6 +2455,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_model_allowlist_normalizes_clears_and_rejects() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account(
+                "acc1",
+                "G0",
+                "cursor",
+                2,
+                r#"{"access_token":"tok-secret"}"#,
+            )
+            .unwrap();
+        // 设置:CSV 输入 → 规范化成小写 JSON 字符串数组落库;凭据原样保留;顶层回显。
+        let body =
+            serde_json::json!({"model_allowlist": "Default, composer* ;GROK*"}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view: serde_json::Value = json_body(resp).await;
+        assert_eq!(
+            view["model_allowlist"],
+            serde_json::json!(["default", "composer*", "grok*"]),
+            "顶层应回显规范化后的数组: {view}"
+        );
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(
+            row.extra
+                .contains(r#""model_allowlist":["default","composer*","grok*"]"#),
+            "规范存储必须是小写 JSON 数组: {}",
+            row.extra
+        );
+        assert!(row.extra.contains("tok-secret"), "凭据不得被定点合并冲掉");
+
+        // 非法条目整单 400,库内值不动(fail-closed,不做部分应用)。
+        for bad in ["*", "gr*k", "*grok", "grok 4.5!"] {
+            let body = serde_json::json!({ "model_allowlist": bad }).to_string();
+            let resp = app
+                .clone()
+                .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?} 应被拒绝");
+        }
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(
+            row.extra.contains(r#""model_allowlist":["default","composer*","grok*"]"#),
+            "非法输入被拒后库内值必须不动: {}",
+            row.extra
+        );
+
+        // 清除:空串 → 写 null(读侧与缺失同义 = 不限),凭据仍在。
+        let body = serde_json::json!({"model_allowlist": ""}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(
+            row.extra.contains(r#""model_allowlist":null"#),
+            "清除应写 model_allowlist:null: {}",
+            row.extra
+        );
+        assert!(row.extra.contains("tok-secret"), "清除白名单不得动凭据");
+    }
+
+    /// 写侧校验函数的单元口径(与 PATCH 集成测试互补:这里穷举纯函数分支)。
+    #[test]
+    fn normalize_model_allowlist_rules() {
+        // 空 / 纯分隔符 → null(清除)。
+        assert_eq!(normalize_model_allowlist("").unwrap(), serde_json::Value::Null);
+        assert_eq!(normalize_model_allowlist("  , ; ").unwrap(), serde_json::Value::Null);
+        // 规范化:小写、去空白、逗号/分号/空白混合分隔都收。
+        assert_eq!(
+            normalize_model_allowlist("Default composer*,GROK-4.5;claude-*").unwrap(),
+            serde_json::json!(["default", "composer*", "grok-4.5", "claude-*"])
+        );
+        // 裸 `*`、通配符不在末尾、非法字符 → Err。
+        assert!(normalize_model_allowlist("*").is_err());
+        assert!(normalize_model_allowlist("default,*").is_err());
+        assert!(normalize_model_allowlist("gr*k").is_err());
+        assert!(normalize_model_allowlist("*grok").is_err());
+        assert!(normalize_model_allowlist("grok!").is_err());
+        // 非法条目不许部分应用:一个坏条目拖垮整单。
+        assert!(normalize_model_allowlist("default,gr*k,grok*").is_err());
+    }
+
+    #[tokio::test]
     async fn update_priority_merges_without_touching_credentials() {
         let (app, store) = app();
         store.create_group("G0", "", "").unwrap();
@@ -2338,6 +2669,167 @@ mod tests {
             sync_calls.load(Ordering::SeqCst),
             1,
             "PATCH 应立即 poke worker /sync,不等 30s 周期同步"
+        );
+    }
+
+    // === GET /accounts/{id}/models/local 扇出(账号可用模型清单,纯本地)===
+
+    /// 假 worker(真 TCP 端口):GET /accounts/{id}/models/local 按指定状态码 + body 应答,
+    /// `delay` 可模拟慢响应。
+    async fn spawn_models_local_worker(
+        status: u16,
+        body: serde_json::Value,
+        delay: std::time::Duration,
+    ) -> gw_core::config::WorkerConfig {
+        use axum::routing::get;
+        use axum::Json;
+        let router = axum::Router::new().route(
+            "/accounts/{id}/models/local",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    (axum::http::StatusCode::from_u16(status).unwrap(), Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        gw_core::config::WorkerConfig {
+            instance: 0,
+            listen: addr.to_string(),
+            egress: gw_core::config::EgressConfig::Direct,
+            account_group: "".to_string(),
+        }
+    }
+
+    async fn get_models_local(app: &axum::Router, id: &str) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .clone()
+            .oneshot(req("GET", &format!("/accounts/{id}/models/local"), None))
+            .await
+            .unwrap();
+        let status = resp.status();
+        (status, json_body(resp).await)
+    }
+
+    /// 持有方 200 → 原样透出(账号的模型清单 + 目录外标记)。
+    #[tokio::test]
+    async fn models_local_fanout_returns_holder_response() {
+        let payload = serde_json::json!({
+            "account_id": "acc-1",
+            "models": [
+                {"id": "claude-opus-5", "display_name": "Opus 5", "supported": true,
+                 "mark_remaining_secs": null, "available": true},
+                {"id": "claude-haiku-4.5", "display_name": "Haiku 4.5", "supported": true,
+                 "mark_remaining_secs": 1200, "available": false},
+            ],
+            "off_catalog_marks": [{"model": "claude-weird-9", "remaining_secs": 300}],
+        });
+        let w = spawn_models_local_worker(200, payload, std::time::Duration::ZERO).await;
+        let (app, _store) = app_with_workers(vec![w]);
+        let (status, v) = get_models_local(&app, "acc-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["models"].as_array().unwrap().len(), 2, "清单应原样透出");
+        assert_eq!(v["off_catalog_marks"][0]["model"], "claude-weird-9");
+    }
+
+    /// 404 = 不持有 → 问下一个 worker,命中后透出其应答。
+    #[tokio::test]
+    async fn models_local_fanout_404_falls_through_to_next_worker() {
+        let w1 = spawn_models_local_worker(
+            404,
+            serde_json::json!({"account_id": "acc-2"}),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let w2 = spawn_models_local_worker(
+            200,
+            serde_json::json!({"account_id": "acc-2", "models": [], "off_catalog_marks": []}),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (app, _store) = app_with_workers(vec![w1, w2]);
+        let (status, v) = get_models_local(&app, "acc-2").await;
+        assert_eq!(status, StatusCode::OK, "第一个 404 应续问第二个");
+        assert_eq!(v["account_id"], "acc-2");
+    }
+
+    /// 所有 worker 都不持有(或没有 worker)→ 404「没有 worker 持有该账号」。
+    #[tokio::test]
+    async fn models_local_fanout_no_holder_is_404() {
+        let w = spawn_models_local_worker(
+            404,
+            serde_json::json!({"account_id": "acc-3"}),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (app, _store) = app_with_workers(vec![w]);
+        let (status, v) = get_models_local(&app, "acc-3").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            v.to_string().contains("没有 worker 持有该账号"),
+            "应报无人持有: {v}"
+        );
+    }
+
+    /// 持有方报错(如 500)→ 透出首个错误,而不是误报「无人持有」。
+    #[tokio::test]
+    async fn models_local_fanout_surfaces_first_error() {
+        let w = spawn_models_local_worker(
+            500,
+            serde_json::json!({"error": {"message": "目录读取炸了"}}),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (app, _store) = app_with_workers(vec![w]);
+        let (status, v) = get_models_local(&app, "acc-4").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(v.to_string().contains("目录读取炸了"), "错误应透出: {v}");
+    }
+
+    /// ⚠️ 回归:真打上游的扇出(quota/models)必须用长超时 client(30s,见
+    /// control_plane_http)。worker 应答 > 2s 时,旧的 st.http(2s 管理面 client)会把
+    /// 传输超时当成「worker 离线」,扫完误报 404「没有 worker 持有该账号」——直连同一
+    /// worker 却是 200。这条用 3s 慢应答的 quota 假 worker 锁死:> 旧超时、< 新超时,
+    /// 必须拿到 200。(纯本地的 models/local 扇出相反:它就该用 2s 的 st.http,
+    /// 见 models_local_account 注释,故慢应答回归不打在它上面。)
+    #[tokio::test]
+    async fn quota_fanout_tolerates_slow_worker_beyond_2s() {
+        use axum::routing::post;
+        use axum::Json;
+        let router = axum::Router::new().route(
+            "/accounts/{id}/quota",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Json(serde_json::json!({"verified": true, "account_id": "acc-5"}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let w = gw_core::config::WorkerConfig {
+            instance: 0,
+            listen: addr.to_string(),
+            egress: gw_core::config::EgressConfig::Direct,
+            account_group: "".to_string(),
+        };
+        let (app, _store) = app_with_workers(vec![w]);
+        let resp = app
+            .oneshot(req("POST", "/accounts/acc-5/quota", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "3s 慢应答不得被误判成 worker 离线(旧 2s client 会)"
         );
     }
 

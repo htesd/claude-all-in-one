@@ -154,7 +154,8 @@ pub fn classify(
             // quota_exhausted / invalid_refresh_token 是持久禁用;其余(限流/临时封禁/
             // 空响应/连败)caio 归为会自愈的冷却 —— 但 temporarily_suspended 实测从不
             // 自愈(0/35),所以它其实也是死号,回收逻辑另行处理,这里只做展示区分。
-            "quota_exhausted" | "invalid_refresh_token" => h.dead += 1,
+            // suspended_retired 是连续复活失败后的**确认死号**(自动退役),计入真死。
+            "quota_exhausted" | "invalid_refresh_token" | "suspended_retired" => h.dead += 1,
             _ => h.cooling += 1,
         }
     }
@@ -1604,6 +1605,9 @@ impl Engine {
         for r in rows {
             let dead = match r.reason.as_str() {
                 "quota_exhausted" | "invalid_refresh_token" => true,
+                // 自动退役 = 已连续 N 次复活失败的确认死号(比"观察窗内零成功"更强的实证),
+                // 直接可收,无需再叠活动窗口。
+                "suspended_retired" => true,
                 "temporarily_suspended" => {
                     matches!(activity.get(&r.account_id), Some(&(n, 0)) if n > 0)
                 }

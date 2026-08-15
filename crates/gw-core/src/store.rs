@@ -171,6 +171,29 @@ pub struct AccountPatch {
     pub extra: Option<String>,
 }
 
+/// suspend 生命周期持久化行(独立表 `account_lifecycle`,与 `accounts.extra` 隔离——
+/// extra 承担凭据/配置且有整体替换与导入合并路径,生命周期状态放进去会被误洗)。
+///
+/// 落库是事实源、内存是运行镜像:重启后按本行水合,**不会重抽退避抖动**,
+/// 也不会让"已退到 24h 档"的号因部署重启提前复活。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SuspendLifecycle {
+    /// 连续 suspend 次数(一次**完整**成功才清零)。
+    pub suspend_streak: u32,
+    /// 当前生命周期原因:`temporarily_suspended`(冷却中/观察期) /
+    /// `suspended_retired`(自动退役)。None = 健康在役。
+    pub reason: Option<String>,
+    /// 冷却到期的绝对时刻(Unix 秒)。None = 不在冷却。
+    pub retry_at: Option<i64>,
+    /// 持久化世代:人工恢复单调递增;worker 写入必须匹配才算生效(条件写),
+    /// 杜绝「恢复后又被 worker 队列里的旧状态反写」。
+    pub epoch: i64,
+    /// 同一 epoch 内的转换序号(每次生命周期转换单调递增)。条件写要求
+    /// `revision` 严格更大才生效——detached 即时写之间没有顺序保证,
+    /// 没有它,同 epoch 的旧状态可能最后落库、永久覆盖新状态(对抗审查二轮阻断#1)。
+    pub revision: i64,
+}
+
 /// 控制面存储:鉴权、账号/key/组元数据。
 #[async_trait]
 pub trait ControlStore: Send + Sync {
