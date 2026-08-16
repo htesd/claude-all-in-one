@@ -75,7 +75,20 @@ async fn main() {
     let home = std::env::var("HOME").expect("HOME");
     let db = format!("{home}/.config/Cursor/User/globalStorage/state.vscdb");
 
-    let token = read_kv(&db, "cursorAuth/accessToken").expect("读不到 accessToken(Cursor 未登录?)");
+    // token 来源:CURSOR_E2E_TOKEN 环境变量 > IDE state.vscdb > CLI auth.json。
+    let token = std::env::var("CURSOR_E2E_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| read_kv(&db, "cursorAuth/accessToken"))
+        .or_else(|| {
+            let raw = std::fs::read_to_string(format!("{home}/.config/cursor/auth.json")).ok()?;
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()?
+                .get("accessToken")?
+                .as_str()
+                .map(String::from)
+        })
+        .expect("读不到 accessToken(Cursor 未登录?)");
 
     // 默认“成为真 IDE”:读真 telemetry.machineId(64-hex)+ telemetry.macMachineId,
     // 并**不**从磁盘取 config_version —— provider 会在 chat 前现调 GetServerConfig 取会话级
@@ -157,6 +170,8 @@ async fn main() {
         },
         context_frames: on("CURSOR_NO_FRAMES"),
         keep_stream_open: on("CURSOR_HALF_CLOSE"),
+        // CURSOR_PROFILE=cli 走 2026-08-16 抓包的 CLI 形态(服务端持史,见 cli.rs)。
+        profile: gw_cursor::cli::Profile::from_env(),
     };
     eprintln!("tuning={tuning:?}");
     let provider = CursorProvider::new(CursorConfig::default()).with_tuning(tuning);
@@ -176,51 +191,130 @@ async fn main() {
         prompts.iter().map(|p| vec![serde_json::json!({"role":"user","content":p})]).collect()
     };
 
+    // 与真实 Anthropic 客户端一致:每轮**重放全量历史**(上一轮 user+assistant 进 messages)。
+    // 不重放的话,CLI 形态的分叉检测会把每轮都当成新会话(这就是它的设计目的)。
+    let mut history: Vec<serde_json::Value> = Vec::new();
+
     for (i, msgs) in rounds.iter().enumerate() {
-        eprintln!("\n════════ 第 {} 轮({} 条消息)════════", i + 1, msgs.len());
-        let body = serde_json::json!({
-            "model": model,
-            "stream": true,
-            "max_tokens": 256,
-            "messages": msgs
-        });
-        let req = ChatRequest::from_anthropic_body(body);
-        let ctx = CallCtx {
-            account: std::sync::Arc::new(account.clone()),
-            session_id: conversation_id.clone(),
-            cache_key: "e2e".to_string(),
-        };
-        let mut stream = match provider.chat(req, &ctx).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("chat 失败: {e:?}");
-                std::process::exit(1);
-            }
-        };
-        let mut full = String::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(StreamItem::Sse(ev)) => {
-                    if ev.event == "content_block_delta" {
-                        if let Some(t) = ev.data["delta"]["text"].as_str() {
-                            full.push_str(t);
-                            print!("{t}");
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
-                        }
-                    } else if ev.event == "message_delta" {
-                        eprintln!("\n[stop_reason={}]", ev.data["delta"]["stop_reason"]);
-                    }
-                }
-                Ok(StreamItem::Usage(u)) => eprintln!("[usage output_tokens={}]", u.output_tokens),
-                // cursor provider 永不发送该变体(opt-in,仅 Kiro);列出仅为穷举完备。
-                Ok(StreamItem::UpstreamCut) => {}
-                Err(e) => {
-                    eprintln!("\n流错误: {e:?}");
-                    std::process::exit(1);
+        for m in msgs {
+            history.push(m.clone());
+        }
+        // CURSOR_E2E_IMAGE=<路径>:首轮消息带一张图片(base64 块),验证附件落盘+读图。
+        if i == 0 {
+            if let Ok(img_path) = std::env::var("CURSOR_E2E_IMAGE") {
+                let bytes = std::fs::read(&img_path).expect("读图片失败");
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                if let Some(last) = history.last_mut() {
+                    let text = last["content"].as_str().unwrap_or("").to_string();
+                    last["content"] = serde_json::json!([
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":b64}},
+                        {"type":"text","text":text}
+                    ]);
                 }
             }
         }
-        eprintln!("---- 第 {} 轮回复 {} 字符 ----", i + 1, full.chars().count());
+        // CURSOR_E2E_TOOLS=1:带一个 get_weather 工具,并自动应答 tool_result
+        // (哨兵串),验证 CLI 驱动的 MCP 桥全回路。
+        let with_tools = std::env::var("CURSOR_E2E_TOOLS").as_deref() == Ok("1");
+        let mut auto_follow = with_tools;
+        loop {
+            eprintln!("\n════════ 第 {} 轮(累计 {} 条消息)════════", i + 1, history.len());
+            let mut body = serde_json::json!({
+                "model": model,
+                "stream": true,
+                "max_tokens": 256,
+                "messages": history
+            });
+            if with_tools {
+                body["tools"] = serde_json::json!([{
+                    "name": "get_weather",
+                    "description": "查询指定城市的天气",
+                    "input_schema": {"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
+                }]);
+            }
+            let req = ChatRequest::from_anthropic_body(body);
+            let ctx = CallCtx {
+                account: std::sync::Arc::new(account.clone()),
+                session_id: conversation_id.clone(),
+                cache_key: "e2e".to_string(),
+            };
+            let mut stream = match provider.chat(req, &ctx).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("chat 失败: {e:?}");
+                    std::process::exit(1);
+                }
+            };
+            let mut full = String::new();
+            let mut tool_uses: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
+            let mut stop_reason = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(StreamItem::Sse(ev)) => {
+                        if ev.event == "content_block_delta" {
+                            if let Some(t) = ev.data["delta"]["text"].as_str() {
+                                full.push_str(t);
+                                print!("{t}");
+                                use std::io::Write;
+                                let _ = std::io::stdout().flush();
+                            }
+                            if ev.data["delta"]["type"] == "input_json_delta" {
+                                if let Some(p) = ev.data["delta"]["partial_json"].as_str() {
+                                    if let Some(last) = tool_uses.last_mut() {
+                                        last.2.push_str(p);
+                                    }
+                                }
+                            }
+                        } else if ev.event == "content_block_start"
+                            && ev.data["content_block"]["type"] == "tool_use"
+                        {
+                            tool_uses.push((
+                                ev.data["content_block"]["id"].as_str().unwrap_or("").to_string(),
+                                ev.data["content_block"]["name"].as_str().unwrap_or("").to_string(),
+                                String::new(),
+                            ));
+                        } else if ev.event == "message_delta" {
+                            stop_reason = ev.data["delta"]["stop_reason"].as_str().unwrap_or("").to_string();
+                            eprintln!("\n[stop_reason={stop_reason}]");
+                        }
+                    }
+                    Ok(StreamItem::Usage(u)) => eprintln!("[usage output_tokens={}]", u.output_tokens),
+                    Ok(StreamItem::UpstreamCut) => {}
+                    Err(e) => {
+                        eprintln!("\n流错误: {e:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            eprintln!("---- 第 {} 轮回复 {} 字符 ----", i + 1, full.chars().count());
+
+            if auto_follow && stop_reason == "tool_use" && !tool_uses.is_empty() {
+                // 组装 assistant tool_use 块 + user tool_result 块,自动再续一轮。
+                let content: Vec<serde_json::Value> = if full.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![serde_json::json!({"type":"text","text":full})]
+                };
+                let mut assistant_content = content;
+                let mut results = Vec::new();
+                for (id, name, args) in &tool_uses {
+                    assistant_content.push(serde_json::json!({
+                        "type":"tool_use","id":id,"name":name,
+                        "input": serde_json::from_str::<serde_json::Value>(args).unwrap_or(serde_json::json!({}))
+                    }));
+                    results.push(serde_json::json!({
+                        "type":"tool_result","tool_use_id":id,
+                        "content":"MCPSENTINEL-7749: 晴 26°C(网关桥接应答)"
+                    }));
+                }
+                history.push(serde_json::json!({"role":"assistant","content":assistant_content}));
+                history.push(serde_json::json!({"role":"user","content":results}));
+                auto_follow = false; // 只自动续一轮
+                continue;
+            }
+            history.push(serde_json::json!({"role":"assistant","content":full}));
+            break;
+        }
     }
 }

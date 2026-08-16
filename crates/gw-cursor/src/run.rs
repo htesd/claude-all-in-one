@@ -679,6 +679,80 @@ pub fn is_tool_call(payload: &[u8]) -> bool {
     false
 }
 
+/// CLI 形态的「本轮已提交」回显(CLI 响应**没有 `1.14` 用量帧**,2026-08-16 抓包实证):
+/// 正文/思考增量之后,服务端按序回显 thinking 摘要、正文消息,最后一帧 field-4 回显是
+/// 提交记录 —— `4.3.2.1` = `{1: bin[32], 2: bin[32]×N(消息哈希), 3: 本轮 turn id,
+/// 4: 172 字符签名, 5: 0}`。认出它就该收口,否则要等 90s 心跳看门狗。
+pub fn is_turn_commit(payload: &[u8]) -> bool {
+    for (f, v) in Reader::new(payload) {
+        if f != 4 {
+            continue;
+        }
+        let PbValue::Len(echo) = v else { continue };
+        let mut cur = Some(echo);
+        for want in [3u32, 2, 1] {
+            let Some(bytes) = cur else { break };
+            cur = None;
+            for (f2, v2) in Reader::new(bytes) {
+                if f2 == want {
+                    if let PbValue::Len(s) = v2 {
+                        cur = Some(s);
+                    }
+                    break;
+                }
+            }
+        }
+        let Some(rec) = cur else { continue };
+        // 提交记录的指纹:field 3 = 36 字符 turn id,field 4 = 长签名串。
+        let mut has_turn = false;
+        let mut has_sig = false;
+        for (f3, v3) in Reader::new(rec) {
+            match (f3, v3) {
+                (3, PbValue::Len(s)) => has_turn = s.len() == 36,
+                (4, PbValue::Len(s)) => has_sig = s.len() > 100,
+                _ => {}
+            }
+        }
+        if has_turn && has_sig {
+            return true;
+        }
+    }
+    false
+}
+
+/// 会话登记通知(CLI 形态抓包新帧,2026-08-16):顶层 field 2 的
+/// `request_context`(`{10: {2: conversation_id}, 19: span_context, 55: 0}`)。
+///
+/// 真 CLI 收到它**不回任何帧**(上下文已经在请求侧的 2.10 帧里推过了),
+/// 生成照常开始。我方早期实现把它误收成「内建工具调用」,首轮还没出字就掐断。
+/// 它与真正的 exec 请求的区分:只有 tracing 类字段(10/19/55),没有任何
+/// 可执行负载(2 shell / 3 write / 7 read / 11 mcp / 14 shell_stream …)。
+pub fn is_session_notice(payload: &[u8]) -> bool {
+    /// exec 通道里「需要客户端动作」的负载字段号(PROTOCOL §18 的 schema 实证枚举)。
+    const ACTIONABLE: &[u32] = &[2, 3, 4, 5, 7, 8, 9, 11, 14];
+    for (f, v) in Reader::new(payload) {
+        if f != RESP_TOOL_CHANNEL {
+            continue;
+        }
+        let PbValue::Len(sub) = v else { continue };
+        let mut has_request_context = false;
+        for (f2, v2) in Reader::new(sub) {
+            match f2 {
+                10 => {
+                    // request_context:{2: conversation_id}
+                    if let PbValue::Len(inner) = v2 {
+                        has_request_context = Reader::new(inner).any(|(f3, _)| f3 == 2);
+                    }
+                }
+                f if ACTIONABLE.contains(&f) => return false,
+                _ => {}
+            }
+        }
+        return has_request_context;
+    }
+    false
+}
+
 /// 取出工具通道(`field 2`)的字节。工具调用帧裹在 `1.2` 里,资源回显帧
 /// 直接挂在顶层 field 2(见 [`RESP_ASSET`] 的注释),两路都要认。
 ///
@@ -894,7 +968,8 @@ impl Model {
         self
     }
 
-    fn encode(&self) -> Writer {
+    /// `pub(crate)`:CLI 形态的首轮 `1.14` 目录复用同一编码(见 `cli.rs`)。
+    pub(crate) fn encode(&self) -> Writer {
         let mut w = Writer::new();
         w.string(MODEL_NAME, &self.name);
         for (k, v) in &self.params {
@@ -1173,7 +1248,9 @@ fn budget_section(key: &str, display: &str, chars: usize) -> Writer {
 /// 真客户端报 8 节;反代只有 system_prompt 与 conversation 是真的,其余恒 0 ——
 /// **这是有意的**:声明 tools/mcp/subagents 会让模型回工具调用,而我们无法应答
 /// (抓包里那条 `cursor-app-control-move_agent_to_root` 就是这么来的)。
-fn budget_table(system_chars: usize, conv_chars: usize) -> Writer {
+///
+/// `pub(crate)`:CLI 形态的后续轮预算表复用同一张表(见 `cli.rs`)。
+pub(crate) fn budget_table(system_chars: usize, conv_chars: usize) -> Writer {
     let sections: [(&str, &str, usize); 8] = [
         ("system_prompt", "System prompt", system_chars),
         ("tools", "Tool definitions", 0),
@@ -1522,6 +1599,35 @@ impl TrailerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 会话登记通知(CLI 形态)必须被认出,且不能误吞真正的 exec 请求。
+    #[test]
+    fn session_notice_recognized_and_exec_untouched() {
+        // 抓包实物同构:{2: {10: {2: conv}, 19: {1: trace, 2: span, 3: 0}, 55: 0}}
+        let mut rc = Writer::new();
+        rc.string(2, "9ea80b89-54e0-4273-a369-da13d190177c");
+        let mut span = Writer::new();
+        span.string(1, "3c0527122e953ea293870b02f1176698");
+        span.string(2, "19ed9930a989daae");
+        span.uint(3, 0);
+        let mut ch = Writer::new();
+        ch.message(10, &rc);
+        ch.message(19, &span);
+        ch.uint(55, 0);
+        let mut notice = Writer::new();
+        notice.message(2, &ch);
+        assert!(is_session_notice(&notice.into_bytes()));
+
+        // 带可执行负载(shell=field 2)的 exec 帧绝不能被判成通知。
+        let mut shell = Writer::new();
+        shell.string(1, "ls -la");
+        let mut ch2 = Writer::new();
+        ch2.message(2, &shell);
+        ch2.uint(55, 0);
+        let mut exec = Writer::new();
+        exec.message(2, &ch2);
+        assert!(!is_session_notice(&exec.into_bytes()));
+    }
 
 
     /// 测试包装:绝大多数用例不关心 `1.14` 清单,统一传空。
