@@ -948,3 +948,74 @@ cached>0），哪怕连续两条请求有 71.7% 字节级公共前缀、客户�
 早先 `estimate_usage_fallback` 里的「input − 本轮新增」一次性启发式已删除：
 生产上 `fold_history` 把多轮折成单条 Turn，`turns.len() > 1` 恒不成立（死代码），
 且它把 output 错耦进 input 新增量。
+
+---
+
+## 20. 2026-08-16/17:CLI 形态(cursor-agent)全量逆向 + 子进程驱动的落地
+
+> 方法:`cursor-agent`(2026.08.11-e8db854,bundled node + 普通 JS)用
+> `NODE_OPTIONS=--require preload.js` 预加载钩(钩 `http2.connect`/`session.request`)
+> 全量抓包;再用同一 bundled node 做**逐字节变异重放**(改 conv/turn/消息 uuid 后重发)
+> 与**变体二分**(真帧0×我方上下文 等 4 组合)定位必需字段。
+
+### 20.1 CLI 形态请求(与 IDE 形态的根本差异)
+
+- **头极简**:无 checksum/machineId/session-id/client-key/config-version,
+  不需要 GetServerConfig 握手。`x-cursor-client-type: cli`,
+  `x-cursor-client-version: cli-<版本>`,两条 traceparent **同值**且都 `-01`,
+  `x-ghost-mode: false`。`x-original-request-id` = `x-request-id` = 帧0 的 `1.25`
+  (重试时 x-request-id 换新、另两个不变)。
+- **消息** `{1:text, 2:uuid, 3:'', 4:kind}` —— uuid 与空附件容器**都在**;
+  漏了上游 200 接受后只发会话登记通知 + 心跳,永不生成。
+- **帧0**:首轮 `1.1` 空 + `1.14` 带参目录 + `1.9` 带参数;续轮 `1.1` 带预算表
+  (8 节,合计=各节之和)+ `1.15` 纯名目录(204 项,`{1:name, 7:0}`)+ `1.9` 裸名。
+  两种轮次都有 `1.16` = conversation_id 第二次出现。
+- **帧序握手(变体实验钉死)**:帧0 之后、2.10 上下文帧**之前**必须有 `{7:}` 与
+  `{5:{3:''}}`;缺了 → 心跳死等(与 IDE 缺 `1.2.1.2` 同族)。帧0 压不压缩无所谓。
+- **2.10 上下文帧**(每轮都发):`{2:{10:{1:{1:{…}}}}}`,内含 `.4` 环境、`.6` 身份
+  (`.5` = JWT sub)、`.8/.9` notes 占位、`.25` **系统提示**(可注入)、`.26/.27`、
+  `.28` hooks、`.32/.33`、`.14/.34` MCP、`.22` subagents、`.29` skills。
+- **会话登记通知**:响应第二帧 `{2:{10:{2:conv_id}, 19:span_context, 55:0}}`
+  (request_context),真客户端**不回执**,忽略即可。
+- **响应无 `1.14` 用量帧**。收尾信号 = field-4 回显序列最后的**提交记录**:
+  `4.3.2.1 = {1:bin[32], 2:bin[32]×N(思考/正文消息哈希), 3:本轮 turn id, 4:172字符签名, 5:0}`。
+  正文增量 `1.1.1`、思考 `1.4.1`、计时 field 8 与 IDE 相同。
+
+### 20.2 服务端持史:成立,但机制是内容寻址存储
+
+- 真 CLI 续轮只发新消息,跨进程 `--resume` 记得历史(含工具调用结果),且
+  `usage.cacheReadTokens` 是**真实命中**(实测 19456/19690)。
+- **但**:我方合成的续轮(帧级照抄真包)被服务端用一串 field-4 `4.2={1:bin[32]}`
+  **哈希回显**卡住——那是它要求客户端按需补传的内容分节(内容寻址 CAS,
+  跨会话共享:实测模型能从别的会话上下文里答出本会话没出现过的数字)。
+  分节哈希↔内容的映射未钉死,这是纯合成路线的剩余工程量。
+- 会话分叉(/compact、编辑重发)的防线:逐轮指纹前缀校验(见 `ConvRegistry::cli_lookup`),
+  分叉必须**换 conversation_id** 重铺,否则两段历史粘在一起。
+
+### 20.3 stream-json(CLI `-p --output-format stream-json`)事件分类
+
+- 增量:有 `timestamp_ms`、无 `model_call_id`,直接发。
+- 每条 model call 完结快照:**有 `model_call_id`**,内容与增量重复,**跳过**(不跳则整句复读)。
+- 最终全量回显:两者皆无,按前缀补差量;对不上就丢(防复读)。
+- `result` 事件的 usage 是上游真实值(inputTokens/cacheReadTokens)。
+
+### 20.4 工具桥(子进程方案的核心)
+
+- CLI 支持 MCP server(`~/.cursor/mcp.json`);权限白名单
+  `~/.cursor/permissions.json` 的键是 **`mcpAllowlist`**,条目格式
+  **`Mcp(server:tool)`(冒号必填,glob 支持)** —— 挖自 bundle 的
+  `shouldBlockMcp → matchesMcpPattern`。`{"mcpAllowlist":["gwtools:*"]}` 实测放行。
+- 桥 = 本网关二进制 `--mode cursor-mcp-bridge` 子进程(MCP stdio ↔ unix socket
+  JSON 行)。CLI 调桥工具 → 网关发 Anthropic `tool_use` 并结束本次响应 → 客户下次
+  请求带 `tool_result` → 写回 socket → CLI 继续,输出桥接到新响应。
+  CLI 进程全程存活(泵任务挂起等结果,TTL 280s)。
+- **安全**:ask 模式(read-only)仍允许**只读 shell**(ls/cat 真跑)——
+  子进程必须降权 nobody + `data/` 700、`control.db` 600,让模型读不到号库。
+  绝不加 `--force`/`--yolo`。
+
+### 20.5 结论
+
+纯协议合成(线协议 CLI 形态)单轮已打通(出字+正确收尾),续轮持史还需
+「哈希回显→按需上传」握手。**生产选择子进程驱动**(`clidrv.rs`):协议保真 100%、
+多轮/工具/图片/真实缓存命中全部实测通过。线协议 CLI 形态代码保留在
+`CURSOR_PROFILE=cli` 后,供后续攻坚对照。

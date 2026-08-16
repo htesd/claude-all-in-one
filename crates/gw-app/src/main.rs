@@ -62,6 +62,8 @@ enum Mode {
     Router,
     /// 实际反代:绑定固定出口 + 管理一组账号。
     Worker,
+    /// MCP 桥子进程(cursor-cli 驱动的工具回路,见 gw-cursor mcpbridge 模块)。
+    CursorMcpBridge,
 }
 
 #[derive(Debug, Parser)]
@@ -74,6 +76,14 @@ struct Args {
     /// worker 实例号(--mode worker 必填,对应 instances.yaml 的 instance)。
     #[arg(long)]
     instance: Option<u32>,
+
+    /// 桥控制通道(unix socket,--mode cursor-mcp-bridge 必填)。
+    #[arg(long)]
+    sock: Option<PathBuf>,
+
+    /// 桥工具定义(JSON 文件,--mode cursor-mcp-bridge 必填)。
+    #[arg(long)]
+    tools: Option<PathBuf>,
 
     /// instances.yaml 路径。
     #[arg(long, default_value = "config/instances.yaml")]
@@ -121,6 +131,15 @@ async fn main() -> anyhow::Result<()> {
                 &args.db,
             )
             .await
+        }
+        Mode::CursorMcpBridge => {
+            let sock = args
+                .sock
+                .ok_or_else(|| anyhow::anyhow!("--mode cursor-mcp-bridge 需要 --sock"))?;
+            let tools = args
+                .tools
+                .ok_or_else(|| anyhow::anyhow!("--mode cursor-mcp-bridge 需要 --tools"))?;
+            gw_cursor::mcpbridge::run(sock, tools).await
         }
     }
 }

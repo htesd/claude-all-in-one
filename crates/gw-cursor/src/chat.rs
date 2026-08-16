@@ -54,6 +54,8 @@ pub struct RunCtx {
     /// 服务端已有这个会话(且还是同一个号)→ [`Phase::Continuation`],否则降级回
     /// [`Phase::Opening`] 把历史整个重铺。
     pub phase: run::Phase,
+    /// 请求形态(IDE / CLI)。见 [`crate::cli::Profile`]。
+    pub profile: crate::cli::Profile,
     /// 帧0 发哪些分节。默认全发(完整模拟客户端);出问题时二分用。
     pub shape: RunShape,
     /// 是否补发 `field 3` 上下文帧(真客户端初始发 3 帧:帧0 + 两个 field 3)。
@@ -76,6 +78,11 @@ pub struct RunCtx {
 /// `message_start` 事件。抽出来是因为三条路径都要发它(思考先到 / 正文先到 /
 /// 纯工具调用),而漏发会让后面的块没有依附。
 fn message_start(msg_id: &str, model: &str) -> SseEvent {
+    message_start_pub(msg_id, model)
+}
+
+/// `pub(crate)`:CLI 驱动(clidrv)也发同一形态。
+pub(crate) fn message_start_pub(msg_id: &str, model: &str) -> SseEvent {
     SseEvent::new(
         "message_start",
         json!({
@@ -102,6 +109,15 @@ fn message_start(msg_id: &str, model: &str) -> SseEvent {
 /// ⚠️ 这只是**给客户端的线上口径**;`StreamItem::Usage` 的入库口径不变
 /// (仍是总上下文,计价方自己相减,见 `gw_core::pricing` 模块文档)。
 fn delta_usage_json(usage: &ChatUsage, output_tokens: u64) -> Value {
+    delta_usage_json_impl(usage, output_tokens)
+}
+
+/// `pub(crate)`:CLI 驱动(clidrv)收尾复用同一口径。output 取 usage 里的值。
+pub(crate) fn delta_usage_json_pub(usage: &ChatUsage) -> Value {
+    delta_usage_json_impl(usage, usage.output_tokens)
+}
+
+fn delta_usage_json_impl(usage: &ChatUsage, output_tokens: u64) -> Value {
     let uncached_input = usage.input_tokens.saturating_sub(usage.cache_read_tokens);
     let mut m = serde_json::Map::new();
     m.insert("input_tokens".into(), json!(uncached_input));
@@ -207,7 +223,7 @@ fn usage_from_upstream(input: u64, output: u64, cached: u64) -> ChatUsage {
 ///
 /// - `enabled` / `adaptive`(Claude Code):要透传。
 /// - `disabled` / 缺省 / 未知:不透传;未下发的思考也不得刷新 stall 计时。
-fn client_wants_thinking(thinking: Option<&Value>) -> bool {
+pub(crate) fn client_wants_thinking(thinking: Option<&Value>) -> bool {
     matches!(
         thinking
             .and_then(|t| t.get("type"))
@@ -333,7 +349,7 @@ fn extract_text_in_msg(content: &Value, media: Option<(usize, &MediaPlaceholders
 ///
 /// gw-kiro 早有这道处理(`converter::normalize`),cursor 这边一直没有 —— 同一份实现
 /// 现已上收到 gw-core,两边共用,不会再各自漂移。
-fn extract_system(body: &Value) -> String {
+pub(crate) fn extract_system(body: &Value) -> String {
     let raw = body.get("system").map(extract_text).unwrap_or_default();
     gw_core::normalize::strip_rolling_fingerprints(&raw)
 }
@@ -697,6 +713,81 @@ fn truncation_notice(cap: Option<&str>, tools: &[run::ToolDef]) -> String {
     s
 }
 
+/// 调用方历史的逐轮指纹(CLI 形态的分叉检测,见 `ConvRegistry::cli_lookup`)。
+///
+/// 指纹取 `to_turns` 的逐条消息(折叠之前),与 cache_sim 同一稳定语义层:
+/// 折叠形态里闭合标签横在中间,跨轮不再是字节前缀。
+pub fn history_fps(body: &Value) -> Vec<u64> {
+    to_turns(body)
+        .iter()
+        .map(|t| {
+            let mut h = Sha256::new();
+            h.update([if t.is_user { b'u' } else { b'a' }]);
+            h.update(t.text.as_bytes());
+            let d = h.finalize();
+            u64::from_be_bytes(d[..8].try_into().unwrap())
+        })
+        .collect()
+}
+
+/// CLI 驱动(子进程模式)能接的请求形态:末轮是 user 即可(含 tool_result
+/// 接续轮;工具声明/图片/PDF 都由 CLI 侧原生处理)。assistant 结尾(prefill)
+/// 不支持,回线协议形态。
+pub(crate) fn cli_eligible(body: &Value) -> bool {
+    to_turns(body).last().is_some_and(|t| t.is_user)
+}
+
+/// 取「整条都是 tool_result」的最后一条 user 消息的文本(CLI 驱动的桥接续用)。
+///
+/// 只认这个严格形态(Anthropic 客户端工具回路的真实形状):最后一条消息是 user、
+/// 内容块**全部**是 tool_result。多个结果按序拼接。不满足就返回 None(走重铺)。
+pub(crate) fn last_tool_result_text(body: &Value) -> Option<String> {
+    let msgs = body.get("messages")?.as_array()?;
+    let last = msgs.last()?;
+    if last.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return None;
+    }
+    let blocks = last.get("content")?.as_array()?;
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for b in blocks {
+        if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            return None;
+        }
+        let text = extract_text(b.get("content")?);
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&text);
+    }
+    Some(out)
+}
+
+/// 消息里是否含 tool_use / tool_result 块。
+///
+/// CLI 形态 Phase 1 不接工具回路(工具调用历史文本化与服务端持史冲突,
+/// 正解是 live-stream 桥接,见 PROTOCOL §20 的规划):带这些块的请求回 IDE 形态。
+fn body_has_tool_blocks(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|bs| {
+                        bs.iter().any(|b| {
+                            matches!(
+                                b.get("type").and_then(|t| t.as_str()),
+                                Some("tool_use") | Some("tool_result")
+                            )
+                        })
+                    })
+            })
+        })
+}
+
 /// Anthropic 请求体 → Run 的会话轮次列表。
 ///
 /// ⚠️ **system 不在这里。** 它的家是 `1.2.17.9.25`(抓包实物证实),由
@@ -854,7 +945,7 @@ fn collect_media_block(
 /// 曾经这里只扫顶层块,tool_result 内嵌的 image 直接 continue 掉;而
 /// extract_text 的注释声称「媒体走 to_media 内联」—— 两边互相推诿,agent 用
 /// Read 工具读的图片就静默消失、日志一条不留(2026-08-13 生产事故)。
-fn to_media(body: &Value) -> (Vec<run::ImageAttachment>, Vec<run::DocAttachment>, MediaPlaceholders) {
+pub(crate) fn to_media(body: &Value) -> (Vec<run::ImageAttachment>, Vec<run::DocAttachment>, MediaPlaceholders) {
     let mut images = Vec::new();
     let mut docs = Vec::new();
     let mut placeholders = MediaPlaceholders::new();
@@ -918,7 +1009,7 @@ fn to_media(body: &Value) -> (Vec<run::ImageAttachment>, Vec<run::DocAttachment>
 ///
 /// `input_schema` 缺失时给一个空 object schema:那一位在真包里 16/16 全都有值,
 /// 留空很可能被拒,而"无参数工具"用空 schema 表达是标准做法。
-fn to_tools(body: &Value) -> Vec<run::ToolDef> {
+pub(crate) fn to_tools(body: &Value) -> Vec<run::ToolDef> {
     let Some(arr) = body.get("tools").and_then(|t| t.as_array()) else {
         return Vec::new();
     };
@@ -1049,7 +1140,7 @@ const TOOL_LOOP_NUDGE: &str = "\n\n[继续]上面是你上一步请求的工具�
 /// 所以本轮消息只有工具返回时,`task` 传入**用户最近一次真实提问**,在工具返回后面
 /// 补一句「据此继续,别重复调用」。系统提示能改行为是实证过的(见
 /// [`builtin_tool_guard`]),这里用同一个杠杆。
-fn fold_history(turns: &[Turn], task: Option<&str>) -> Vec<Turn> {
+pub(crate) fn fold_history(turns: &[Turn], task: Option<&str>) -> Vec<Turn> {
     if turns.len() <= 1 && task.is_none() {
         return turns.to_vec();
     }
@@ -1291,6 +1382,42 @@ fn apply_headers(mut rb: reqwest::RequestBuilder, ctx: &RunCtx) -> reqwest::Requ
         .header("cookie", "")
 }
 
+/// CLI 形态的请求头(2026-08-16 抓包实物,cursor-agent 2026.08.11)。
+///
+/// 与 IDE 形态的全部差异:
+/// - **没有** checksum / machineId / session-id / client-key / config-version /
+///   fs-client-key / timezone / amzn-trace-id / cookie —— 也不需要 GetServerConfig 握手;
+/// - `x-cursor-client-type: cli`,`x-cursor-client-version: cli-<版本>`;
+/// - `x-ghost-mode: false`(IDE 是 true);
+/// - 两条 traceparent **同值**且 flags 都是 `-01`(IDE 是一 `-00` 一 `-01`);
+/// - `accept-encoding: gzip,br`(IDE 只有 gzip);
+/// - `x-original-request-id` == `x-request-id` == 帧0 的 `1.25`(首个逻辑尝试;
+///   真 CLI 重试时 x-request-id 换新、另两个不变,我方每个网关请求都是新尝试)。
+fn apply_cli_headers(
+    rb: reqwest::RequestBuilder,
+    ctx: &RunCtx,
+    request_id: &str,
+) -> reqwest::RequestBuilder {
+    let tp = wire::traceparent();
+    rb.header("connect-protocol-version", "1")
+        .header("connect-accept-encoding", "gzip,br")
+        .header("connect-content-encoding", "gzip")
+        .header("content-type", "application/connect+proto")
+        .header("user-agent", wire::USER_AGENT)
+        .header("authorization", format!("Bearer {}", ctx.token))
+        .header(
+            "x-blob-encryption-key",
+            session_key(&ctx.token, &ctx.conversation_id, "blob"),
+        )
+        .header("x-cursor-client-type", "cli")
+        .header("x-cursor-client-version", crate::cli::CLI_CLIENT_VERSION)
+        .header("x-ghost-mode", "false")
+        .header("x-request-id", request_id)
+        .header("x-original-request-id", request_id)
+        .header("traceparent", &tp)
+        .header("backend-traceparent", &tp)
+}
+
 /// 发起一次 Cursor Run,返回 Anthropic SSE 事件流。
 ///
 /// `client` 必须能协商 HTTP/2(Cursor 的流式端点强制 h2,降级到 h1 会被 ALB 回 464)。
@@ -1364,14 +1491,37 @@ pub async fn chat_stream(
     // 编号与附件收集顺序同源,不存在两边各数各的漂移。
     let (images, docs, media_placeholders) = to_media(&req.body);
     let raw_turns = to_turns_with_media(&req.body, Some(&media_placeholders));
+    let tools = to_tools(&req.body);
+
+    // ── CLI 形态(2026-08-16 抓包,见 `cli.rs` 模块文档)─────────────────────
+    // 纯文本、无工具、无附件的请求走 CLI 极简形态:只发最后一条新消息,
+    // 历史由服务端持有(实测跨进程记得,且上游真缓存命中回来)。
+    // Phase 1 不接工具回路/附件:带这些的请求维持 IDE 形态(生产在跑的那条)。
+    let cli_mode = ctx.profile.is_cli()
+        && tools.is_empty()
+        && images.is_empty()
+        && docs.is_empty()
+        && !body_has_tool_blocks(&req.body)
+        && raw_turns.last().is_some_and(|t| t.is_user);
+
     // 服务端已持有本会话历史(Continuation)且增量模式打开 → 只发本轮新消息。
     // 否则照旧折叠成一条(见 `fold_history` / `delta_history`)。
-    let turns = if delta_history_enabled() && ctx.phase.is_continuation() {
+    let turns = if cli_mode {
+        if ctx.phase.is_continuation() {
+            // 只发最后一条新消息(gate 已保证它是 user 轮)。
+            vec![raw_turns.last().cloned().expect("cli gate 保证非空")]
+        } else if raw_turns.len() == 1 {
+            raw_turns.clone()
+        } else {
+            // 重铺(新会话/历史分叉):Phase 1 先折叠进首条消息,与线上同口径。
+            // TODO(§20):CLI 形态的原生多条 1.2.1 重铺还没做消融实验,证实可行后换掉。
+            fold_history(&raw_turns, task.as_deref())
+        }
+    } else if delta_history_enabled() && ctx.phase.is_continuation() {
         delta_history(&raw_turns, task.as_deref())
     } else {
         fold_history(&raw_turns, task.as_deref())
     };
-    let tools = to_tools(&req.body);
     let system = {
         let mut sys = extract_system(&req.body);
         sys.push_str(&builtin_tool_guard(&tools));
@@ -1479,50 +1629,111 @@ pub async fn chat_stream(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let frame0 = run::build_frame0(
-        &turns,
-        &system,
-        &tools,
-        media,
-        &model,
-        &catalog,
-        &ctx.conversation_id,
-        &ctx.timezone,
-        now_ms,
-        ctx.shape,
-        ctx.phase,
-    );
-    // 逆向期用:把帧0 的 payload(未 gzip)原样落盘,好与真客户端逐字节对比。
-    if let Ok(dir) = std::env::var("CURSOR_DUMP_REQ") {
-        let f = format!("{dir}/frame0_{}.bin", uuid::Uuid::new_v4().simple());
-        let _ = std::fs::write(&f, &frame0);
-        tracing::warn!(file = %f, bytes = frame0.len(), "已落盘帧0 payload");
-    }
-    tracing::debug!(
-        phase = ?ctx.phase,
-        turns = turns.len(),
-        frame0_bytes = frame0.len(),
-        "cursor Run 请求已构造"
-    );
-
-    // 帧0 走 gzip(6KB 级,压缩有意义);开场四帧是 2-4 字节的裸帧,
-    // 抓包实物就是 flag=0x00 不压缩 —— 压几字节只会更大。
-    let mut frames = vec![wire::frame_compressed(&frame0).map_err(|e| {
-        UpstreamError::new(UpstreamErrorKind::Other, format!("gzip 请求帧失败: {e}"))
-    })?];
-    if ctx.context_frames {
-        frames.extend(run::build_prelude_frames().iter().map(|p| wire::frame(p)));
-    }
-
     let url = format!("https://{}/agent.v1.AgentService/Run", ctx.host);
-    let rb = apply_headers(client.post(&url), &ctx);
+
+    // CLI 形态与 IDE 形态分岔:帧序列与头表完全不同(见 `cli.rs` 模块文档)。
+    let (frames, rb) = if cli_mode {
+        // turn_id 同时是 `1.25` 与 x-request-id/x-original-request-id ——
+        // 真 CLI 里这三个值同源(重试时 x-request-id 换新、1.25 与 original 不变;
+        // 我方每个网关请求都是新的逻辑尝试,全部同值即可)。
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let opening = ctx.phase.is_opening();
+        // 预算表的 conversation 节 = 历史总字符(本轮新消息不计)。
+        let history_chars: usize = if opening {
+            0
+        } else {
+            raw_turns[..raw_turns.len().saturating_sub(1)]
+                .iter()
+                .map(|t| t.text.chars().count())
+                .sum()
+        };
+        let frame0 = crate::cli::build_frame0_cli(
+            &turns[0].text,
+            &model,
+            &catalog,
+            &ctx.conversation_id,
+            &turn_id,
+            &ctx.timezone,
+            now_ms,
+            opening,
+            (system.chars().count(), history_chars),
+            "file:///",
+        );
+        let context = crate::cli::build_context_frame_cli(
+            &system,
+            &ctx.token,
+            &ctx.conversation_id,
+            &ctx.timezone,
+            "/",
+        );
+        if let Ok(dir) = std::env::var("CURSOR_DUMP_REQ") {
+            let f = format!("{dir}/cli_frames_{}.bin", uuid::Uuid::new_v4().simple());
+            let _ = std::fs::write(&f, [frame0.as_slice(), b"\n----\n", &context].concat());
+            tracing::warn!(file = %f, "已落盘 CLI 帧0+上下文帧 payload");
+        }
+        tracing::debug!(
+            phase = ?ctx.phase,
+            frame0_bytes = frame0.len(),
+            context_bytes = context.len(),
+            "cursor Run 请求已构造(CLI 形态)"
+        );
+        let payloads = crate::cli::cli_request_frames(&frame0, &context);
+        let mut frames = Vec::with_capacity(payloads.len());
+        for (p, compress) in &payloads {
+            // 逐帧按真包决定是否 gzip(首轮帧0 不压,两个大帧压,小帧裸发)。
+            if *compress {
+                frames.push(wire::frame_compressed(p).map_err(|e| {
+                    UpstreamError::new(UpstreamErrorKind::Other, format!("gzip 请求帧失败: {e}"))
+                })?);
+            } else {
+                frames.push(wire::frame(p));
+            }
+        }
+        (frames, apply_cli_headers(client.post(&url), &ctx, &turn_id))
+    } else {
+        let frame0 = run::build_frame0(
+            &turns,
+            &system,
+            &tools,
+            media,
+            &model,
+            &catalog,
+            &ctx.conversation_id,
+            &ctx.timezone,
+            now_ms,
+            ctx.shape,
+            ctx.phase,
+        );
+        // 逆向期用:把帧0 的 payload(未 gzip)原样落盘,好与真客户端逐字节对比。
+        if let Ok(dir) = std::env::var("CURSOR_DUMP_REQ") {
+            let f = format!("{dir}/frame0_{}.bin", uuid::Uuid::new_v4().simple());
+            let _ = std::fs::write(&f, &frame0);
+            tracing::warn!(file = %f, bytes = frame0.len(), "已落盘帧0 payload");
+        }
+        tracing::debug!(
+            phase = ?ctx.phase,
+            turns = turns.len(),
+            frame0_bytes = frame0.len(),
+            "cursor Run 请求已构造"
+        );
+
+        // 帧0 走 gzip(6KB 级,压缩有意义);开场四帧是 2-4 字节的裸帧,
+        // 抓包实物就是 flag=0x00 不压缩 —— 压几字节只会更大。
+        let mut frames = vec![wire::frame_compressed(&frame0).map_err(|e| {
+            UpstreamError::new(UpstreamErrorKind::Other, format!("gzip 请求帧失败: {e}"))
+        })?];
+        if ctx.context_frames {
+            frames.extend(run::build_prelude_frames().iter().map(|p| wire::frame(p)));
+        }
+        (frames, apply_headers(client.post(&url), &ctx))
+    };
 
     // 保持请求流打开时,body 走一个 channel:初始帧先灌进去,发送端在响应读完前
     // 一直不 drop,于是 HTTP/2 的请求流不会 half-close —— 与真 BiDi 客户端一致。
     let (rb, body_keepalive) = if ctx.keep_stream_open {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+        // 容量要装下初始帧全集(CLI 形态 10 帧),否则 try_send 会静默丢帧。
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
         for f in frames {
-            // 容量 8 > 帧数,这里不会阻塞。
             let _ = tx.try_send(Ok(bytes::Bytes::from(f)));
         }
         let body = reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -1582,6 +1793,7 @@ pub async fn chat_stream(
         BuiltinXlate::from_tools(&tools),
         usage_fallback,
         sim_cache_read,
+        cli_mode,
     )))
 }
 
@@ -1728,6 +1940,8 @@ fn stream_to_anthropic(
     // 模拟的 cache_read(见 [`crate::cache_sim`]):上游 `1.14` 的 cached 为 0 时
     // 在收尾处顶替,封顶 input_tokens;上游报了真实命中时不用它。
     sim_cache_read: u64,
+    // CLI 形态(见 `cli.rs`):响应没有 `1.14` 用量帧,收尾认 `is_turn_commit` 回显。
+    cli_mode: bool,
 ) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamItem, UpstreamError>>(32);
 
@@ -1955,6 +2169,25 @@ fn stream_to_anthropic(
                             ))))
                             .await;
                     }
+                }
+
+                // CLI 形态的会话登记通知(2026-08-16 抓包新帧,见 run::is_session_notice):
+                // 顶层 field 2 的 request_context,真客户端不回任何帧 —— 忽略即可。
+                // 早期实现把它误收成「内建工具调用」,首轮还没出字就被掐断。
+                if run::is_session_notice(&payload) {
+                    last_progress = std::time::Instant::now();
+                    continue;
+                }
+
+                // CLI 形态**没有 `1.14` 用量帧**:收尾信号是「本轮已提交」回显
+                // (见 run::is_turn_commit)。不认它,每轮都要等满看门狗才收口。
+                if cli_mode && run::is_turn_commit(&payload) {
+                    // 合帧防御:同帧若有用量先收下(目前 CLI 实测没有,留这条不亏)。
+                    if let Some((input, output, cached)) = usage {
+                        upstream_usage = Some(usage_from_upstream(input, output, cached));
+                    }
+                    saw_end = true;
+                    break 'outer;
                 }
 
                 // 工具调用:上游在等客户端执行工具并回帧。
@@ -2497,6 +2730,7 @@ mod tests {
             shape: RunShape::default(),
             context_frames: true,
             phase: run::Phase::Opening,
+            profile: crate::cli::Profile::Ide,
             keep_stream_open: true,
             assets: std::sync::Arc::new(crate::AssetStore::default()),
             notices: std::sync::Arc::new(crate::TruncationNotices::default()),
@@ -2897,7 +3131,8 @@ mod tests {
             std::sync::Arc::new(crate::TruncationNotices::default()),
             BuiltinXlate::default(),
             ChatUsage::default(),
-            0, // 本用例不关心模拟缓存
+            0, // 本用例不关心模拟缓存,
+            false, // cli_mode:测试默认 IDE 形态
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3105,7 +3340,8 @@ mod tests {
                 output_tokens: 1,
                 ..Default::default()
             },
-            400, // 模拟缓存命中
+            400, // 模拟缓存命中,
+            false, // cli_mode:测试默认 IDE 形态
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3150,7 +3386,8 @@ mod tests {
             std::sync::Arc::new(crate::TruncationNotices::default()),
             BuiltinXlate::default(),
             ChatUsage::default(),
-            99999, // 模拟命中远超上游 input
+            99999, // 模拟命中远超上游 input,
+            false, // cli_mode:测试默认 IDE 形态
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3193,7 +3430,8 @@ mod tests {
                 input_tokens: 1,
                 ..Default::default()
             }, // fallback 不应被用到
-            5000, // 模拟值再大也不许盖过上游真实命中
+            5000, // 模拟值再大也不许盖过上游真实命中,
+            false, // cli_mode:测试默认 IDE 形态
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3260,6 +3498,7 @@ mod tests {
             BuiltinXlate::default(),
             ChatUsage::default(),
             0,
+            false, // cli_mode:测试默认 IDE 形态
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3397,6 +3636,7 @@ mod tests {
             xlate,
             ChatUsage { input_tokens: 10, ..Default::default() },
             0,
+            false, // cli_mode:测试默认 IDE 形态
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3449,6 +3689,7 @@ mod tests {
             BuiltinXlate::default(),
             ChatUsage::default(),
             0,
+            false, // cli_mode:测试默认 IDE 形态
         );
         let items: Vec<_> = out.collect().await;
         assert!(

@@ -1,5 +1,39 @@
 # Changelog
 
+## [cursor-cli-driver] cursor 通道子进程驱动(包裹官方 cursor-agent CLI) — 2026-08-17
+
+### Features
+
+- 新增 `gw-cursor/src/clidrv.rs`:以子进程驱动官方 `cursor-agent` CLI 作为上游。
+  每号独立 HOME(token 写 `auth.json` 即登录,CLI 自刷新),`-p stream-json`
+  逐事件转 Anthropic SSE,`--resume` 跨进程续会话(服务端持史实测成立),
+  usage 为上游**真实值**(含 cacheReadTokens)。
+- 新增 `--mode cursor-mcp-bridge`(`gw-cursor/src/mcpbridge.rs`):MCP stdio 桥,
+  把调用方声明的 tools 经 `gwtools` MCP server 暴露给 CLI;调用挂起→网关发
+  tool_use→调用方带回 tool_result→CLI 续跑,输出桥接到新响应(live bridge)。
+- 图片:附件落每号工作区 + 提示词带路径(ask 模式只读工具读图,实测识别正确);
+  PDF 沿用文本层抽取内联。
+- 会话分叉防线:逐轮指纹前缀校验,分叉换新会话重铺(见 PROTOCOL §20.2)。
+- 线协议侧新增 CLI 形态(`cli.rs`,`CURSOR_PROFILE=cli`,默认关):单轮已实测
+  出字+正常收尾;续轮持史缺「哈希回显」握手,留作后续攻坚(§20.2/§20.5)。
+- 开关:账号 `extra.driver="cli"` 或 `CURSOR_DRIVER=cli`(灰度用),默认关,
+  线协议 IDE 形态不变。
+
+### Security
+
+- CLI 固定 `--mode ask`(read-only),绝不加 `--force`;MCP 白名单
+  `{"mcpAllowlist":["gwtools:*"]}` 只放行桥工具。
+- ask 模式仍允许只读 shell:CLI/桥子进程降权 **nobody(65534)** 运行;
+  **部署要求 `data/` 700、`control.db` 600**,否则模型可 `cat` 走号库。
+- 镜像烘入 cursor-agent 2026.08.11-e8db854(钉版本,官方 tarball,约 +200MB)。
+
+### Test
+
+- 单测:全 workspace 1487 条全绿(新增 NDJSON 事件分类/去重、CLI 帧结构、
+  会话通知识别、提交回显收尾等 9 条)。
+- e2e 真号(宿主机直跑):纯文本三轮记忆(8866→9000 推理正确)、MCP 桥工具
+  回路(桥挂起→tool_result→续答,哨兵串往返)、多轮+工具混合、图片理解,全过。
+
 ## [cursor-cch] cursor 会话键被滚动指纹污染:缓存命中恒 0 的根因 — 2026-08-15
 
 ### Features

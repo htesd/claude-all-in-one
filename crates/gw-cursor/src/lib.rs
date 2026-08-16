@@ -33,7 +33,10 @@ pub mod auth;
 pub mod cache_sim;
 pub mod login;
 mod chat;
+pub mod cli;
+mod clidrv;
 mod config;
+pub mod mcpbridge;
 mod models;
 mod pdf;
 mod protobuf;
@@ -219,22 +222,35 @@ impl CursorConfig {
 /// 唯一理由是协议试错:`PROTOCOL-agent-run.md` §0 承认从没做过删字段/删帧实验,
 /// 「哪些字段必需」是空白,只能对着真上游二分。放在 API 上而不是读环境变量 ——
 /// 上一版的 `CURSOR_METHOD` 环境变量开关就是这么让生产悄悄打错端点的。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct RunTuning {
     pub shape: run::RunShape,
     /// 补发两个 `field 3` 上下文帧(真客户端初始 3 帧)。
     pub context_frames: bool,
     /// 发完初始帧后不 half-close 请求流(真客户端是 BiDi)。
     pub keep_stream_open: bool,
+    /// 请求形态:IDE(3.14.27)还是 CLI(cursor-agent 2026.08.11)。见 [`cli::Profile`]。
+    pub profile: cli::Profile,
+}
+
+impl Default for RunTuning {
+    fn default() -> Self {
+        Self::faithful()
+    }
 }
 
 impl RunTuning {
     /// 与真客户端一致:全分节 + 3 帧 + 不关流。
+    ///
+    /// 形态默认 IDE(生产在跑的形态);`CURSOR_PROFILE=cli` 切 CLI 形态 ——
+    /// 2026-08-16 抓包证实 CLI 形态服务端持史成立(见 `cli.rs` 模块文档),
+    /// 但默认切换要等 e2e 实测全部通过之后。
     pub fn faithful() -> Self {
         Self {
             shape: run::RunShape::default(),
             context_frames: true,
             keep_stream_open: true,
+            profile: cli::Profile::from_env(),
         }
     }
 }
@@ -272,6 +288,9 @@ pub struct CursorProvider {
     assets: Arc<AssetStore>,
     /// 「上一轮被内建工具截断」的待发纠偏标记(见 [`TruncationNotices`])。
     notices: Arc<TruncationNotices>,
+    /// CLI 驱动(子进程包裹 cursor-agent,见 [`clidrv`])的配置与会话表。
+    cli_cfg: clidrv::CliDriverConfig,
+    cli_convs: Arc<clidrv::CliConversations>,
 }
 
 /// 会话在**服务端**是否已经建立,以及建在哪个号上。
@@ -300,6 +319,23 @@ pub(crate) struct ConvRegistry {
 struct ConvEntry {
     account_id: String,
     at: Instant,
+    /// CLI 形态专用:已发往服务端的逐轮指纹(见 `chat::history_fps`)。
+    ///
+    /// 服务端持史之后,调用方若在**下一轮改写了历史**(/compact、编辑重发),
+    /// 服务端那份就与调用方看到的不一致 —— 继续只发增量等于让模型看两份
+    /// 不同的历史。逐轮指纹做前缀校验,分叉即换新 conversation_id 重铺。
+    /// IDE 形态不用它(历史每轮折叠重发,无所谓分叉)。
+    fps: Vec<u64>,
+}
+
+/// CLI 形态的会话判定结果(见 [`ConvRegistry::cli_lookup`])。
+pub(crate) enum CliLookup {
+    /// 服务端没有这个会话(或换了号):Opening。
+    Fresh,
+    /// 本地记录是调用方历史的严格前缀:Continuation,只发最后一条新消息。
+    Continue,
+    /// 调用方改写了历史:必须换 conversation_id + Opening 重铺。
+    Diverged,
 }
 
 impl ConvRegistry {
@@ -518,7 +554,8 @@ impl ConvRegistry {
     }
 
     /// 本轮**成功**收尾后登记:服务端现在持有这个会话了。
-    fn confirm(&self, conversation_id: &str, account_id: &str) {
+    /// `fps` 是 CLI 形态的逐轮指纹(见 [`ConvEntry::fps`]);IDE 形态传空表。
+    fn confirm_with_fps(&self, conversation_id: &str, account_id: &str, fps: Vec<u64>) {
         // 关闭时没人读这张表,写它纯属浪费(且把所有流的收尾串在同一把锁上)。
         if !self.stateful {
             return;
@@ -529,10 +566,50 @@ impl ConvRegistry {
             ConvEntry {
                 account_id: account_id.to_string(),
                 at: Instant::now(),
+                fps,
             },
         );
         // 顺手清过期项:这张表按会话增长,没人清就是内存泄漏。
         map.retain(|_, e| e.at.elapsed() < CONV_TTL);
+    }
+
+    /// CLI 形态的会话判定。`history_fps` 是本次请求**除最后一条新消息外**的
+    /// 全部历史轮指纹。
+    ///
+    /// 判定不变式与 `phase_for` 相同:任何不确定都当 Opening(Fresh/Diverged),
+    /// 宁可重铺不错续。
+    fn cli_lookup(&self, conversation_id: &str, account_id: &str, history_fps: &[u64]) -> CliLookup {
+        if !self.stateful {
+            return CliLookup::Fresh;
+        }
+        let map = self.map();
+        match map.get(conversation_id) {
+            Some(e) if e.account_id == account_id && e.at.elapsed() < CONV_TTL => {
+                if e.fps.len() <= history_fps.len()
+                    && e.fps.iter().zip(history_fps).all(|(a, b)| a == b)
+                {
+                    CliLookup::Continue
+                } else {
+                    tracing::info!(
+                        conversation_id,
+                        stored = e.fps.len(),
+                        incoming = history_fps.len(),
+                        "cursor CLI:调用方历史与已发记录分叉(/compact 或编辑重发?),换新会话重铺"
+                    );
+                    CliLookup::Diverged
+                }
+            }
+            Some(e) if e.account_id != account_id => {
+                tracing::info!(
+                    conversation_id,
+                    old = %e.account_id,
+                    new = %account_id,
+                    "cursor 会话换号,降级重铺历史(服务端会话属于旧号)"
+                );
+                CliLookup::Fresh
+            }
+            _ => CliLookup::Fresh,
+        }
     }
 
     /// 本轮失败:服务端可能没落下这一轮,下次从首轮重来。
@@ -561,6 +638,8 @@ impl CursorProvider {
             conversations: Arc::new(ConvRegistry::from_env()),
             assets: Arc::new(AssetStore::default()),
             notices: Arc::new(TruncationNotices::default()),
+            cli_cfg: clidrv::CliDriverConfig::from_env(),
+            cli_convs: Arc::new(clidrv::CliConversations::default()),
         }
     }
 
@@ -884,13 +963,25 @@ impl Provider for CursorProvider {
 
     async fn chat(&self, req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
         let token = Self::token_of(&ctx.account)?;
+
+        // CLI 驱动(子进程,见 `clidrv`)提前算:它不需要 machine_id / config_version
+        // —— 尤其不能卡在 GetServerConfig 上(那次握手 5–6s,且失败会误伤整条链路)。
+        let cli_driver = (std::env::var("CURSOR_DRIVER").as_deref() == Ok("cli")
+            || Self::opt_str(&ctx.account, "driver").as_deref() == Some("cli"))
+            && chat::cli_eligible(&req.body);
+
         let machine_id = Self::machine_id_of(&ctx.account, &token);
         let mac_machine_id = Self::mac_machine_id_of(&ctx.account, &token);
         let client = self.client_for(&ctx.account)?;
 
-        let config_version = self
-            .resolve_config_version(&ctx.account, &client, &token, &machine_id, &mac_machine_id)
-            .await?;
+        // CLI 形态/CLI 驱动都不需要 config_version(头表里没有这条)—— 省掉
+        // GetServerConfig 握手(单次 5–6s),也顺带绕开「取不到就失败」的冷启动面。
+        let config_version = if self.tuning.profile.is_cli() || cli_driver {
+            String::new()
+        } else {
+            self.resolve_config_version(&ctx.account, &client, &token, &machine_id, &mac_machine_id)
+                .await?
+        };
 
         // conversation_id:优先 router 下发的 session_id(会话稳定),否则 cache_key,
         // 两者都空时**从请求体自行派生** —— 绝不让空串上线。
@@ -914,7 +1005,175 @@ impl Provider for CursorProvider {
                 uuid::Uuid::new_v4().to_string()
             })
         };
-        let conversation_id = chat::conversation_uuid(&material);
+        let mut conversation_id = chat::conversation_uuid(&material);
+
+        // ── CLI 驱动(子进程包裹 cursor-agent,见 `clidrv` 模块文档)──────────
+        // 账号 extra `driver: "cli"` 或 CURSOR_DRIVER=cli(e2e 用)时启用。
+        // cli_driver 已在前面算好(含 cli_eligible),且已跳过 GetServerConfig。
+        if cli_driver {
+            let Some(cursor_model) = models::resolve_cursor_model(&req.model) else {
+                return Err(UpstreamError::bad_request_visible(format!(
+                    "cursor-cli: 未知模型名 {:?}",
+                    req.model
+                )));
+            };
+            let cli_model = clidrv::cli_model_name(&cursor_model);
+            let want_thinking = chat::client_wants_thinking(req.body.get("thinking"));
+            let tools = chat::to_tools(&req.body);
+            // 能力指引(实测:不说清楚的话模型会去试网页搜索/内建工具,撞墙后放弃)。
+            let system = {
+                let mut sys = chat::extract_system(&req.body);
+                if tools.is_empty() {
+                    sys.push_str("\n\n[运行环境约束]你没有任何工具可用:没有网页搜索、终端、文件读写。直接基于已有信息回答;信息不足就说明缺什么、让用户提供。");
+                } else {
+                    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+                    sys.push_str(&format!(
+                        "\n\n[运行环境约束]你只能调用这些工具(已通过 gwtools 提供并获批):{}。\
+                         没有网页搜索、终端、文件读写等其它能力,不要尝试,也不要让用户去批准什么——\
+                         这些工具直接调就能通。",
+                        names.join("、")
+                    ));
+                }
+                sys
+            };
+            let refresh = Self::opt_str(&ctx.account, "refresh_token");
+            let (home, ws) = clidrv::prepare_home(
+                &self.cli_cfg,
+                &ctx.account.account_id,
+                &token,
+                refresh.as_deref(),
+                &system,
+            )?;
+
+            let fps = chat::history_fps(&req.body);
+
+            // ① 调用方带 tool_result 回来:优先接续挂起的桥调用。
+            if let Some(result_text) = chat::last_tool_result_text(&req.body) {
+                if let Some(conv) = self.cli_convs.get(&conversation_id) {
+                    if conv.has_pending() {
+                        *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
+                        return clidrv::resume_conv(conv, result_text);
+                    }
+                }
+                // 没有挂起的桥调用(重启/超时):落回重铺,文本里带着工具结果。
+            }
+
+            // ② 常规:新开一个 CLI 进程(Fresh 或 --resume)。
+            let history = &fps[..fps.len().saturating_sub(1)];
+            let lookup = self
+                .cli_convs
+                .lookup(&conversation_id, &ctx.account.account_id, history);
+            let raw_turns = chat::to_turns(&req.body);
+            let mut prompt = match &lookup {
+                clidrv::CliLookup::Resume(_) => {
+                    raw_turns.last().map(|t| t.text.clone()).unwrap_or_default()
+                }
+                clidrv::CliLookup::Fresh if raw_turns.len() > 1 => {
+                    // 分叉/重铺:历史折进首条消息(与线协议形态同口径)。
+                    chat::fold_history(&raw_turns, None)
+                        .first()
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default()
+                }
+                clidrv::CliLookup::Fresh => {
+                    raw_turns.last().map(|t| t.text.clone()).unwrap_or_default()
+                }
+            };
+
+            // 附件:图片落盘 + 提示词带路径(ask 模式只读工具能读图);
+            // 文档(PDF)抽文本层内联(与线协议形态同一话术)。
+            let (images, docs, _) = chat::to_media(&req.body);
+            if !images.is_empty() {
+                let mut mention = String::new();
+                for (n, img) in images.iter().enumerate() {
+                    let ext = match img.mime.as_str() {
+                        "image/jpeg" => "jpg",
+                        "image/gif" => "gif",
+                        "image/webp" => "webp",
+                        _ => "png",
+                    };
+                    let p = ws.join("assets").join(format!("attach-{n}.{ext}"));
+                    if std::fs::write(&p, &img.bytes).is_ok() {
+                        mention.push_str(&format!("[图片见附件 {}]\n", p.display()));
+                    }
+                }
+                prompt = format!("{mention}{prompt}");
+            }
+            if !docs.is_empty() {
+                let mut pre = String::new();
+                for d in &docs {
+                    match &d.extracted {
+                        Some(txt) => pre.push_str(&format!(
+                            "<document path=\"{}\">\n{}\n</document>\n\n",
+                            d.path, txt
+                        )),
+                        None => pre.push_str(&format!(
+                            "<document path=\"{}\" note=\"无法抽取文本层;请直接告知用户无法读取\"/>\n\n",
+                            d.path
+                        )),
+                    }
+                }
+                prompt = format!("{pre}{prompt}");
+            }
+
+            let resume_sid = match &lookup {
+                clidrv::CliLookup::Resume(sid) => Some(sid.clone()),
+                _ => None,
+            };
+            let stream = clidrv::start_conv(
+                &self.cli_cfg,
+                &self.cli_convs,
+                &conversation_id,
+                &ctx.account.account_id,
+                &home,
+                &ws,
+                &cli_model,
+                &prompt,
+                resume_sid,
+                &tools,
+                want_thinking,
+                &req.model,
+            )
+            .await?;
+            // 登记调用方指纹(供下一轮分叉校验)。失败轮的矫正靠调用方重试时
+            // 前缀不一致自然触发重铺,代价只是多铺一次。
+            if let Some(conv) = self.cli_convs.get(&conversation_id) {
+                *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
+            }
+            return Ok(stream);
+        }
+
+        // CLI 形态:服务端持史(2026-08-16 实测成立,见 cli.rs 模块文档),所以必须
+        // 盯住「调用方历史分叉」—— 调用方改写历史(/compact、编辑重发)后继续只发
+        // 增量,等于让模型看两份不一样的历史。逐轮指纹前缀校验,分叉换新会话重铺。
+        let cli_fps: Vec<u64> = if self.tuning.profile.is_cli() {
+            chat::history_fps(&req.body)
+        } else {
+            Vec::new()
+        };
+        let phase = if self.tuning.profile.is_cli() {
+            let history = &cli_fps[..cli_fps.len().saturating_sub(1)];
+            match self
+                .conversations
+                .cli_lookup(&conversation_id, &ctx.account.account_id, history)
+            {
+                CliLookup::Continue => run::Phase::Continuation,
+                CliLookup::Fresh => run::Phase::Opening,
+                CliLookup::Diverged => {
+                    // 分叉必须换 conversation_id:旧的还在服务端手里,直接重铺会把
+                    // 两段历史粘在一起。新 id 吃进全部指纹,内容变即 id 变。
+                    let digest = cli_fps.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, f| {
+                        (h ^ f).wrapping_mul(0x0000_0100_0000_01b3)
+                    });
+                    conversation_id =
+                        chat::conversation_uuid(&format!("{material}\x1f{digest:016x}"));
+                    run::Phase::Opening
+                }
+            }
+        } else {
+            self.conversations
+                .phase_for(&conversation_id, &ctx.account.account_id)
+        };
 
         chat::chat_stream(
             client,
@@ -925,9 +1184,8 @@ impl Provider for CursorProvider {
                 mac_machine_id: Some(mac_machine_id),
                 config_version,
                 timezone: Self::timezone_of(&ctx.account),
-                phase: self
-                    .conversations
-                    .phase_for(&conversation_id, &ctx.account.account_id),
+                phase,
+                profile: self.tuning.profile,
                 conversation_id: conversation_id.clone(),
                 // 与 token/machine_id/phase 同源:都从这一个 ctx.account 取,
                 // 调度换号时缓存键跟着换(服务端会话 per-account,换号=冷启动)。
@@ -946,7 +1204,7 @@ impl Provider for CursorProvider {
                 let account_id = ctx.account.account_id.clone();
                 Some(Arc::new(move |ok: bool| {
                     if ok {
-                        reg.confirm(&conversation_id, &account_id);
+                        reg.confirm_with_fps(&conversation_id, &account_id, cli_fps.clone());
                     } else {
                         reg.forget(&conversation_id);
                     }
