@@ -82,14 +82,24 @@
   加同一条规则 —— 独立改动 + 独立回归。
 - ⚠️ **上线后活跃会话各会重铺一次**:`history_fps` 的取材变了(注入消息不再计入),
   CLI 驱动的 `cli_lookup` 前缀比对首轮必然不匹配 → 走 Fresh 折叠重铺。一次性代价。
-- 本条**尚未部署**。要重建镜像并重启 `caio-worker-cursor`(它是独立容器,
-  与 `caio-router`/`caio-worker0` 无关,**不动 kiro 数据面**);部署注意事项与
-  下一条 `[cursor-driver-switch]` 的 Caveats 同(照抄 env、别用 `docker compose up -d`)。
-  worker-cursor 现跑 `claude-all-in-one:cli-hardening-20260817`,env 只有
-  `RUST_LOG=info` + `CURSOR_DELTA_HISTORY=0`。
-- 止血替代方案(不需要部署):把 `ultra-test` 的 `extra.driver` 清掉退回线协议 ——
-  全量重铺让这条尾巴无伤。代价是丢掉 CLI 驱动的真实 usage(含 `cacheReadTokens`)
-  与 MCP 桥。
+- ✅ **已部署**:镜像 `claude-all-in-one:inject-routing-20260817`(05:51 UTC 构建),
+  `caio-worker-cursor` 05:52:49 UTC 起跑它。`caio-router` / `caio-worker0` /
+  dario 全部未动(仍 `overflow-20260814-061145` / `poison-fix`),**kiro 数据面零变更**。
+  线上验证:切换后带注入 `role:"system"` 的真请求成功返回(105k input / 7.3k output /
+  6k cache_read),响应里既没有「消息是空的」也没有「Ask 模式 / 切到 Agent」;
+  `ultra-test` 工作区的 `AGENTS.md` 已含新 CLI 说明与工具闭集。
+- ⚠️ **本仓库的 `docker-compose.yml` 里没有 `worker-cursor` 这个服务** —— 它只存在于
+  服务器侧那份(rsync 一直排除 compose,两份早已分叉)。别照着仓库这份得出
+  「cursor worker 不受 compose 管理」的结论。
+- 本次顺手消掉两处 compose 漂移(服务器侧):镜像标签从 `cli-driver-20260817-2`
+  改成实际在跑的版本,并补上容器一直手工带着、compose 却漏了的 `CURSOR_DELTA_HISTORY=0`
+  —— 漏这一条时任何人跑一次 `docker compose up -d` 都会**静默改掉行为**。
+  容器此前是 `docker run` 起的(compose 不认它,`up -d` 会报名字冲突),
+  本次 `docker rm -f` + `compose up -d --no-deps worker-cursor` 之后由 compose 接管。
+- ⚠️ **重启把 `pro3` 从内存禁用里放了出来**:它的 `TooManyFailures` 是进程内状态,
+  重启即清,于是欠费号重新进轮转、3 发 0 成功。已 `PATCH disabled=true` 落库止血
+  (这次是持久状态,重启不会再复活)。**下次重启 cursor worker 前先看一眼禁用池里
+  有没有靠内存态压着的死号。**
 
 ## [cursor-driver-switch] 驱动形态成为后台可切项 + `data/` 穿越权限修复 — 2026-08-17
 
