@@ -229,6 +229,27 @@ impl CacheSimStore {
         }
     }
 
+    /// 热调条目 TTL(秒,0 视为 1 避免立即过期)。与 kiro 的同名方法同语义。
+    ///
+    /// ⚠️ 没有这个 setter 之前,cursor 的 store **恒用编译期默认 300s**,而 worker 只
+    /// 同步了 kiro 那一份(`gw_kiro::cache_sim::global().set_ttl_secs`)—— 线上
+    /// `cache_sim_ttl_secs=1800`,于是 cursor 侧短了 **6 倍**,大量本该命中的会话
+    /// 被判成冷启动。2026-08-17 首条标定样本就撞上了:上游真实命中 8180,
+    /// 模拟器 `raw_hit=0`。
+    pub fn set_ttl_secs(&self, secs: u64) {
+        self.ttl_secs.store(secs.max(1), Ordering::Relaxed);
+    }
+
+    /// 热调最大会话数(0 视为 1)。
+    pub fn set_max_sessions(&self, n: usize) {
+        self.max_sessions.store(n.max(1), Ordering::Relaxed);
+    }
+
+    /// 当前生效 TTL(秒)——admin/健康回显读它,别再去猜编译期默认值。
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs.load(Ordering::Relaxed)
+    }
+
     fn ttl(&self) -> Duration {
         Duration::from_secs(self.ttl_secs.load(Ordering::Relaxed).max(1))
     }

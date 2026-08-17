@@ -1394,14 +1394,21 @@ async fn pump(mut a: PumpArgs) {
 
     match outcome {
         Ok(()) => {
-            let (ok, usage) = match &state.result {
+            // `upstream_raw_cache` = 上游 result 里**原始**的 cacheReadTokens,
+            // 未经 `usage_from_result` 的丢弃/口径处理。标定必须用它,不能用
+            // `usage.real_cache_read_tokens`:那一列在「cache > input」时已被置 0,
+            // 于是标定会把「上游报了但我方丢弃」误记成「上游真值 0」,算出假的
+            // ratio=0.000(2026-08-17 首批样本就这么被污染了一条)。
+            let (ok, usage, upstream_raw_cache) = match &state.result {
                 Some(r) if r.get("subtype").and_then(|s| s.as_str()) == Some("success") => {
-                    (true, usage_from_result(&r.get("usage").cloned().unwrap_or_default()))
+                    let u = r.get("usage").cloned().unwrap_or_default();
+                    let raw = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    (true, usage_from_result(&u), raw)
                 }
                 other => {
                     tracing::warn!(result = ?other.as_ref().map(|r| r.to_string().chars().take(200).collect::<String>()),
                         "cursor-cli: 未见成功 result 事件");
-                    (false, ChatUsage::default())
+                    (false, ChatUsage::default(), 0)
                 }
             };
             if ok {
@@ -1419,22 +1426,23 @@ async fn pump(mut a: PumpArgs) {
                 // <1 说明高估(我方白送)。`multiplier` 该取多少看这个比值的中位数,
                 // 而不是沿用 kiro 的 1.8(那是 kiro 自己那套 tokenizer 标出来的)。
                 if let Some(s) = sim.as_ref() {
-                    let real = usage.real_cache_read_tokens;
-                    // 只在两边都有数时才有比值意义;sim_hit=0(冷启动)单独记,
-                    // 它回答的是另一个问题:真值不为 0 时模拟器是不是漏判了整段命中。
+                    // 用**上游原始值**做标定(见上面 upstream_raw_cache 的注释);
+                    // `billed_cache` 另列出来,便于看"丢弃/夹限改了多少"。
                     tracing::info!(
                         account = %a.conv.account_id,
-                        real_cache = real,
+                        upstream_raw_cache,
+                        billed_cache = usage.cache_read_tokens,
                         sim_raw_hit = s.raw_hit,
                         sim_reported = s.cache_read,
                         sim_total = s.sim_total,
                         upstream_input = usage.input_tokens,
-                        // real / raw_hit:>1 模拟器低估(客户少拿折扣)、<1 高估(我方白送)。
-                        // 取这个比值的中位数就是 `read_multiplier` 的实测取值。
+                        // upstream_raw / sim_raw:>1 模拟器低估(客户少拿折扣)、
+                        // <1 高估(我方白送)。取这个比值的中位数就是 multiplier 的实测取值。
+                        // 两边都是"未经运营参数加工"的数,比值才有物理意义。
                         ratio_real_over_raw = if s.raw_hit > 0 {
-                            format!("{:.3}", real as f64 / s.raw_hit as f64)
+                            format!("{:.3}", upstream_raw_cache as f64 / s.raw_hit as f64)
                         } else {
-                            "raw=0".to_string()
+                            "sim_raw=0".to_string()
                         },
                         "cursor-cli:缓存标定样本(真值 vs 模拟,仅观测不计费)"
                     );
