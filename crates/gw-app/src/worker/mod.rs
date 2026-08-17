@@ -959,6 +959,9 @@ pub async fn run(
         if let Err(e) = apply_cursor_tool_guard(&effective_system) {
             tracing::error!("cursor 护栏策略句启动初载失败,本进程沿用内置默认: {e}");
         }
+        if let Err(e) = apply_cursor_cli_notice(&effective_system) {
+            tracing::error!("cursor CLI 说明启动初载失败,本进程沿用内置默认: {e}");
+        }
     }
 
     // Fix6: For dario workers, filter out accounts that fail validate_account
@@ -1205,6 +1208,15 @@ pub async fn run(
                             Err(e) => {
                                 tracing::error!("cursor 护栏策略句未应用(沿用上一份有效值): {e}");
                                 let msg = format!("cursor 护栏策略句未应用: {e}");
+                                if apply_err.is_empty() { msg } else { format!("{apply_err}; {msg}") }
+                            }
+                        };
+                        // CLI 驱动的 ask 模式说明:同一条原则(失败保留上一份 + 说出来)。
+                        let apply_err = match apply_cursor_cli_notice(&eff) {
+                            Ok(()) => apply_err,
+                            Err(e) => {
+                                tracing::error!("cursor CLI 说明未应用(沿用上一份有效值): {e}");
+                                let msg = format!("cursor CLI 说明未应用: {e}");
                                 if apply_err.is_empty() { msg } else { format!("{apply_err}; {msg}") }
                             }
                         };
@@ -1582,6 +1594,11 @@ fn apply_cursor_extra_models(cfg: &gw_core::config::SystemConfig) {
 /// 不静默回默认:护栏的效果正在被按版本分桶比对收口率,悄悄换一版会让那份数据作废。
 fn apply_cursor_tool_guard(cfg: &gw_core::config::SystemConfig) -> Result<(), String> {
     gw_cursor::set_tool_guard_policy(&cfg.cursor_tool_guard)
+}
+
+/// CLI 驱动的 ask 模式说明(见 [`gw_core::config::SystemConfig::cursor_cli_notice`])。
+fn apply_cursor_cli_notice(cfg: &gw_core::config::SystemConfig) -> Result<(), String> {
+    gw_cursor::set_cli_notice(&cfg.cursor_cli_notice)
 }
 
 /// `GET /settings-sync` —— 设置热调实况(轻量,不碰 scheduler 与配额)。

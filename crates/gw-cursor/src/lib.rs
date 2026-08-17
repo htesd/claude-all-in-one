@@ -63,6 +63,72 @@ pub const DEFAULT_TOOL_GUARD_POLICY: &str = "清单里没有的能力,直接向�
 /// 系统提示顶掉几千 token。
 const TOOL_GUARD_POLICY_MAX_CHARS: usize = 2000;
 
+/// CLI 驱动的「ask 模式说明」默认值(见 [`gw_core::config::SystemConfig::cursor_cli_notice`])。
+///
+/// ## 为什么非要有这段话
+///
+/// CLI 驱动把 `cursor-agent` 钉在 `--mode ask`,而 `--mode` **只有 `plan`/`ask` 两个值、
+/// 都是只读**;要写权限只能整个不传 `--mode`,那会放开 CLI 自己的写文件/终端工具,
+/// 让它们作用在容器里那个空工作区 —— 模型报「已改好文件」,调用方机器上什么都没变。
+/// 所以 ask 是刻意留的安全闸,代价是模型会自我审查。
+///
+/// 2026-08-17 生产实测(用户报障):grok 的 thinking 原文「当前处于 Ask 模式,仅可读取
+/// 与分析,无法修改代码」,正文则要求用户「在 Cursor 把模式切到 Agent,再发一句
+/// execute now」—— 用户根本不在 Cursor 里,这条建议无从执行,任务就此卡死。
+///
+/// ## 文案是怎么写的
+///
+/// 要点是**给模型一个明确去处**,而不是再加一条禁令 —— 这是 `builtin_tool_guard`
+/// 第二版翻车换来的教训(点名禁掉的能力与调用方声明的工具逐字重合,把合法工具
+/// 一起吓退)。所以这里说的三件事全是正向事实:
+/// 1. 只读限制**只管 CLI 自己的本地沙箱**,那个工作区不是用户的仓库;
+/// 2. 真正的执行通道是 gwtools 工具,它们跑在**调用方机器**上、有写权限;
+/// 3. 因此不要让用户切模式 —— 直接调工具。
+pub const DEFAULT_CURSOR_CLI_NOTICE: &str = "\
+     [关于你的运行模式]你正被一个网关以 Cursor CLI 的 ask 模式驱动。ask 的只读限制\
+     **只作用于你自己的本地沙箱工具**,而那个本地工作区是空的临时目录、不是用户的仓库,\
+     在里面读写没有任何意义。真正的执行通道是上面列出的 gwtools 工具:它们运行在\
+     **用户自己的机器**上,拥有完整的读写与命令执行权限,你调它们就能真正改文件、跑命令。\
+     所以:需要写文件、改代码、执行命令时,**直接调用对应的 gwtools 工具**;\
+     不要因为「处于 ask/只读模式」而拒绝任务或只给出计划,\
+     也不要让用户去切换模式(他不在 Cursor 界面里,切不了,那只会让任务卡死)。";
+
+/// 热配置的 CLI 说明上限。比策略句宽一些:这段要解释清楚一个反直觉的事实。
+const CLI_NOTICE_MAX_CHARS: usize = 3000;
+
+/// CLI 驱动说明(进程级全局)。`None` = 未配 / 配置非法 → 用
+/// [`DEFAULT_CURSOR_CLI_NOTICE`]。存 `Arc<str>` 的理由同 [`TOOL_GUARD_POLICY`]。
+static CLI_NOTICE: std::sync::RwLock<Option<Arc<str>>> = std::sync::RwLock::new(None);
+
+/// 当前生效的 CLI 驱动说明。
+pub fn cli_notice() -> Arc<str> {
+    let snap = CLI_NOTICE.read().ok().and_then(|g| g.clone());
+    snap.unwrap_or_else(|| Arc::from(DEFAULT_CURSOR_CLI_NOTICE))
+}
+
+/// 热应用 CLI 驱动说明(worker 30s 设置环调用)。空 = 回内置默认。
+///
+/// 语义与 [`set_tool_guard_policy`] 逐条对齐:过长返回 `Err` 并**保留上一份有效值**,
+/// 绝不静默切回默认。非 cursor 进程从不读它,写到它身上是无害 no-op。
+pub fn set_cli_notice(text: &str) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > CLI_NOTICE_MAX_CHARS {
+        return Err(format!(
+            "CLI 说明过长({} 字符,上限 {})",
+            trimmed.chars().count(),
+            CLI_NOTICE_MAX_CHARS
+        ));
+    }
+    let next = (!trimmed.is_empty()).then(|| Arc::from(trimmed));
+    match CLI_NOTICE.write() {
+        Ok(mut g) => {
+            *g = next;
+            Ok(())
+        }
+        Err(_) => Err("CLI 说明锁已中毒".to_string()),
+    }
+}
+
 /// 护栏策略句(进程级全局)。`None` = 未配 / 配置非法 → 用
 /// [`DEFAULT_TOOL_GUARD_POLICY`]。
 ///
@@ -106,6 +172,50 @@ pub fn set_tool_guard_policy(text: &str) -> Result<(), String> {
 /// 配置(与 `models::CATALOG_TEST_LOCK` 同一个理由:`EXTRA_MODELS` 也是全局)。
 #[cfg(test)]
 pub(crate) static GUARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// 串行化「改 CLI 说明」的测试(理由同 [`GUARD_TEST_LOCK`])。
+#[cfg(test)]
+pub(crate) static CLI_NOTICE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod cli_notice_tests {
+    /// 默认文案必须把三件正向事实都说到:ask 的限制只管本地沙箱、真正的通道是
+    /// gwtools 且跑在用户机器上、不要让用户去切模式。少任何一条,模型都能自圆其说地
+    /// 继续拒绝(2026-08-17 那次它就是拿「Ask 模式」当理由要用户切 Agent 的)。
+    #[test]
+    fn 默认文案讲齐三件事() {
+        let d = super::DEFAULT_CURSOR_CLI_NOTICE;
+        assert!(d.contains("gwtools"), "要指明真正的执行通道: {d}");
+        assert!(d.contains("用户自己的机器"), "要说清工具跑在哪一侧: {d}");
+        assert!(d.contains("不要让用户去切换模式"), "必须堵掉「请切 Agent 模式」: {d}");
+        assert!(d.contains("本地沙箱"), "要限定只读限制的作用域: {d}");
+    }
+
+    /// 热开关语义与 `set_tool_guard_policy` 逐条对齐:空=回默认、过长被拒且**保留
+    /// 上一份有效值**(不静默回默认 —— 那会让一次误配置表现成「文案悄悄变了一版」)。
+    #[test]
+    fn 热开关空回默认_过长被拒且保留上一份() {
+        let _g = super::CLI_NOTICE_TEST_LOCK.lock().unwrap();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = super::set_cli_notice("");
+            }
+        }
+        let _r = Restore;
+
+        super::set_cli_notice("").unwrap();
+        assert_eq!(&*super::cli_notice(), super::DEFAULT_CURSOR_CLI_NOTICE);
+        super::set_cli_notice("   ").unwrap();
+        assert_eq!(&*super::cli_notice(), super::DEFAULT_CURSOR_CLI_NOTICE, "全空白也回默认");
+
+        super::set_cli_notice("自定义说明 ALPHA").unwrap();
+        assert_eq!(&*super::cli_notice(), "自定义说明 ALPHA");
+        let err = super::set_cli_notice(&"啊".repeat(4000)).expect_err("过长必须被拒");
+        assert!(err.contains("过长"), "{err}");
+        assert_eq!(&*super::cli_notice(), "自定义说明 ALPHA", "校验失败保留上一份");
+    }
+}
 
 /// 当前策略句的短指纹,给 `/health` 与内建收口日志回显。
 ///
@@ -1043,6 +1153,12 @@ impl Provider for CursorProvider {
                          这些工具直接调就能通。",
                         names.join("、")
                     ));
+                    // ask 模式说明:没有它模型会自我审查成「只读、无法修改代码」并
+                    // 要求用户去 Cursor 切 Agent 模式(用户不在 Cursor 里,任务卡死)。
+                    // 只在**有工具**时追加 —— 一个工具都没声明时它确实什么也改不了,
+                    // 那时说「你能改文件」才是骗它。文案可热改,见 `cli_notice`。
+                    sys.push_str("\n\n");
+                    sys.push_str(&cli_notice());
                 }
                 sys
             };
