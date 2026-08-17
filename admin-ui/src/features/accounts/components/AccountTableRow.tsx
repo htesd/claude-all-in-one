@@ -138,9 +138,9 @@ export function AccountTableRow({
       <TD className="text-muted-foreground">
         <span className="flex flex-wrap items-center gap-1.5">
           {providerTabLabel(row.provider)}
-          {row.driver === 'cli' && (
-            <Badge variant="default" title={t('table.driverCliHint')}>
-              {t('table.driverCli')}
+          {row.driver === 'wire' && (
+            <Badge variant="warning" title={t('table.driverWireHint')}>
+              {t('table.driverWire')}
             </Badge>
           )}
         </span>
@@ -211,6 +211,28 @@ export function AccountTableRow({
           // credits(Kiro·Cursor):剩余/上限;Cursor 附带 auto/api 两条百分比窗口。
           if (quota === undefined || quota === null) {
             return <span className="text-muted-foreground">—</span>
+          }
+          // 被上游**降级成 FREE**:免费号没有套餐内额度字段,used/limit 全 0,
+          // 只显示 "0 / 0" 会和"查询失败"长得一样。直接把档位打出来。
+          if (quota.plan_tier === 'FREE') {
+            return (
+              <span className="tabular-nums" title={t('table.tierFreeHint')}>
+                <Badge variant="destructive">{t('table.tierFree')}</Badge>
+                {quota.windows && quota.windows.length > 0 && (
+                  <span className="block text-xs">
+                    {quota.windows.map((w, i) => (
+                      <span key={w.label}>
+                        {i > 0 && <span className="text-muted-foreground"> · </span>}
+                        <span className="text-muted-foreground">{w.label} </span>
+                        <span className={cn(w.percent_used >= 90 && 'text-destructive')}>
+                          {Math.round(w.percent_used)}%
+                        </span>
+                      </span>
+                    ))}
+                  </span>
+                )}
+              </span>
+            )
           }
           const low = isQuotaLow(quota.remaining, quota.limit)
           return (

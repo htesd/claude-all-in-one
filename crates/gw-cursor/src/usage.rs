@@ -199,22 +199,36 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
         )
     })?;
 
-    // includedSpend/limit 必须同时在场:缺了就是上游改了字段或账号异常,
-    // unwrap_or(0) 会把故障显示成「零用量/零额度」,比报错更难查。
+    // ## 三种形态,不是两种
+    //
+    // `includedSpend`/`limit` 是**套餐内**额度。付费号两个都给;**FREE 号两个都不给**
+    // (免费号没有套餐,上游只给 `totalSpend`/`bonusSpend` 与几个百分比)。
+    // 只缺其中一个才是真异常(上游改字段/账号状态诡异)。
+    //
+    // 此前这里对「两个都缺」也报错,后果是 **FREE 号的配额查询整体失败** →
+    // 后台额度栏空白、档位也拿不到,只能翻上游原始报文才知道号是被降级了。
+    // 2026-08-17 三个新号在 20 分钟内被降级成 FREE 就是这么发现的(先 grok
+    // `ModelNotAvailable`、composer 随后不可用,而面板上什么线索都没有)。
     let missing = || {
         UpstreamError::new(
             UpstreamErrorKind::Other,
-            "Cursor 用量响应缺 includedSpend/limit 字段",
+            "Cursor 用量响应缺 includedSpend/limit 字段(只缺一个 = 上游改了字段)",
         )
     };
+    let free_plan = plan.included_spend.is_none() && plan.limit.is_none();
     // 官方单位美分 → 美元。剩余优先用服务端 remaining,缺则 limit - includedSpend。
-    let used = cents_to_usd(plan.included_spend.ok_or_else(missing)?);
-    let limit = cents_to_usd(plan.limit.ok_or_else(missing)?);
+    // FREE 档没有套餐额度,三个数都是 0(不是"未知":免费号的套餐内额度确实是 0)。
+    let used = if free_plan { 0.0 } else { cents_to_usd(plan.included_spend.ok_or_else(missing)?) };
+    let limit = if free_plan { 0.0 } else { cents_to_usd(plan.limit.ok_or_else(missing)?) };
     let remaining = match plan.remaining {
         Some(r) => cents_to_usd(r),
         None => limit - used,
     };
     let mut q = AccountQuota::from_used_limit(used, limit);
+    // 档位:判据就是上面那个形态差异(有套餐额度 = 付费)。**不去猜具体档位名** ——
+    // GetMe 里没有会员字段(实测只有 authId/email/country/isEnterpriseUser 之类),
+    // 上游也没有别的只读端点给档位名,所以只报能证实的二分。
+    q.plan_tier = Some(if free_plan { "FREE".into() } else { "PAID".into() });
     // from_used_limit 重算 remaining;若服务端给了 remaining(含超额负值语义外的口径),
     // 以服务端为准,避免和 includedSpend/limit 舍入不一致。
     q.remaining = remaining;
@@ -446,11 +460,52 @@ mod tests {
         assert!((q.remaining - 167.78).abs() < 1e-9, "remaining={}", q.remaining);
     }
 
+    /// **只缺一个**金额字段 = 上游改了字段/账号状态诡异 → 报错,绝不显示成零额度。
+    /// (两个都缺是 FREE 档的正常形态,见下一个测试。)
     #[test]
-    fn 缺金额字段报错而不是显示零额度() {
-        let err = parse_period_usage(r#"{"planUsage":{"totalPercentUsed":3.0}}"#)
-            .expect_err("缺 includedSpend/limit 应失败");
-        assert!(err.to_string().contains("includedSpend"));
+    fn 只缺一个金额字段报错而不是显示零额度() {
+        for body in [
+            r#"{"planUsage":{"limit":40000,"totalPercentUsed":3.0}}"#,
+            r#"{"planUsage":{"includedSpend":100,"totalPercentUsed":3.0}}"#,
+        ] {
+            let err = parse_period_usage(body).expect_err("只缺一个应失败");
+            assert!(err.to_string().contains("includedSpend"), "{err}");
+        }
+    }
+
+    /// **FREE 档**:上游不给 `includedSpend`/`limit`(免费号没有套餐内额度),
+    /// 只给 `totalSpend`/`bonusSpend` 与百分比。样例取自 2026-08-17 对真号 team1 的实测。
+    ///
+    /// 回归锁:此前这里被当成故障报错 → FREE 号的配额查询整体失败 → 面板额度栏空白、
+    /// 档位也拿不到,只能翻上游原始报文才知道号是被降级了。
+    #[test]
+    fn free档不报错且报出档位() {
+        let body = r#"{
+          "planUsage": {
+            "totalSpend": 100, "bonusSpend": 100, "remainingBonus": 100,
+            "totalPercentUsed": 50, "autoPercentUsed": 100, "apiPercentUsed": 0
+          },
+          "spendLimitUsage": {"pooledLimit":0,"pooledRemaining":0,"individualLimit":0,
+                              "limitType":"user","overallLimit":0,"overallRemaining":0}
+        }"#;
+        let q = parse_period_usage(body).expect("FREE 档不该报错");
+        assert_eq!(q.plan_tier.as_deref(), Some("FREE"));
+        // 免费号的套餐内额度确实是 0(不是"未知")。
+        assert_eq!(q.used, 0.0);
+        assert_eq!(q.limit, 0.0);
+        // 百分比仍要有:limit=0 时走上游给的 totalPercentUsed。
+        assert!((q.percent_used - 50.0).abs() < 1e-9, "percent={}", q.percent_used);
+        // 两条桶利用率照常承载 —— auto 桶 100% 正是 composer 不可用的直接证据。
+        let auto = q.windows.iter().find(|w| w.label == "auto").expect("应有 auto 窗口");
+        assert!((auto.percent_used - 100.0).abs() < 1e-9);
+    }
+
+    /// 付费号必须报 `PAID`(与 FREE 成对,别让两边都落 None)。
+    #[test]
+    fn 付费档报出档位() {
+        let body = r#"{"planUsage":{"includedSpend":23222,"limit":40000,"totalPercentUsed":58.0}}"#;
+        let q = parse_period_usage(body).expect("付费档应解析");
+        assert_eq!(q.plan_tier.as_deref(), Some("PAID"));
     }
 
     // ─────────── 超额(on-demand)───────────

@@ -343,7 +343,13 @@ impl WorkerState {
         // (FREE 不给 opus)的数据源——只导了 rt 的账号缺 subscription_title,
         // 首次配额查询后在此收敛。
         if let Ok(Some(q)) = &result {
-            if let Some(title) = &q.currency {
+            // **优先 `plan_tier`,`currency` 只是兜底**。历史实现只看 currency,而那是个
+            // 展示标签:kiro 恰好把档位名放在那里,cursor 写死 `"USD"` —— 于是每个 cursor
+            // 号的 `subscription_title` 都被填成 `"USD"`,档位永远看不出来,而且因为
+            // `warm_subscription_titles` 只补「缺这个字段」的号,填错一次就再也不复查
+            // (详见 `AccountQuota::plan_tier` 的文档)。kiro 侧 plan_tier 为 None,
+            // 走 currency 分支,行为逐字节不变。
+            if let Some(title) = q.plan_tier.as_ref().or(q.currency.as_ref()) {
                 self.backfill_subscription_title(account_id, title).await;
             }
         }
@@ -680,6 +686,10 @@ fn quota_to_json(q: Option<AccountQuota>) -> serde_json::Value {
             "remaining": q.remaining,
             "percent_used": q.percent_used,
             "label": q.currency,
+            // 账号档位("FREE"/"PAID"/provider 档位名;null = 判不出来)。
+            // 面板要能一眼看出号是不是被上游降级了 —— FREE 号连额度字段都没有,
+            // 光看 used/limit 是一片空白,分不清"降级"和"查询失败"。
+            "plan_tier": q.plan_tier,
             // 多窗口利用率(dario 的 5h/7d);Kiro 为空数组,前端据此分流显示。
             "windows": q.windows.iter().map(|w| serde_json::json!({
                 "label": w.label,

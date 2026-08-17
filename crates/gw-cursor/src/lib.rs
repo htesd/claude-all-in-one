@@ -1085,11 +1085,30 @@ impl Provider for CursorProvider {
 
         let token = Self::token_of(&ctx.account)?;
 
-        // CLI 驱动(子进程,见 `clidrv`)提前算:它不需要 machine_id / config_version
-        // —— 尤其不能卡在 GetServerConfig 上(那次握手 5–6s,且失败会误伤整条链路)。
-        let cli_driver = (std::env::var("CURSOR_DRIVER").as_deref() == Ok("cli")
-            || Self::opt_str(&ctx.account, "driver").as_deref() == Some("cli"))
-            && chat::cli_eligible(&req.body);
+        // 驱动形态:**CLI 驱动是默认**,线协议要显式退出。提前算是因为 CLI 驱动不需要
+        // machine_id / config_version —— 尤其不能卡在 GetServerConfig 上(那次握手 5–6s,
+        // 且失败会误伤整条链路)。
+        //
+        // ## 为什么 2026-08-17 把默认翻过来
+        //
+        // 线协议给上游发的是**裸模型名**(`to_cursor_model` 出来的 `grok-4.6` 这种),而
+        // CLI 驱动发的是 CLI 那套名字(`cursor-grok-4.6-high`,见 `clidrv::cli_model_name`)。
+        // 当天 06:50 前后上游停止接受裸 `grok-4.6`、随后 `grok-4.5` 也一样,线协议上的
+        // 三个号在几分钟内全部 `ModelNotAvailable`,而同一批号切到 CLI 驱动立刻恢复 ——
+        // `--list-models` 实证上游只有 `cursor-grok-4.x-*` 那一族。
+        //
+        // 结论是:**裸名那套是我方逆出来的、会被上游单方面收走,而 CLI 用的是官方客户端
+        // 自己在用的名字**,后者才是长期能站住的一侧。加上 CLI 驱动本来就带真实 usage
+        // (含 `cacheReadTokens`)与 MCP 工具桥,没有理由再让它做可选项。
+        //
+        // 退出口留两个(出问题时不必重新部署):账号 `extra.driver="wire"` 单号退出,
+        // 环境变量 `CURSOR_DRIVER=wire` 整个 worker 退出。历史值 `"cli"` 仍然合法(等于默认)。
+        let account_driver = Self::opt_str(&ctx.account, "driver");
+        let env_driver = std::env::var("CURSOR_DRIVER").ok();
+        let wire_opt_out = account_driver.as_deref() == Some("wire")
+            || env_driver.as_deref() == Some("wire");
+        // `cli_eligible` 仍是硬前提:assistant 结尾(prefill)这类形态 CLI 接不了,回线协议。
+        let cli_driver = !wire_opt_out && chat::cli_eligible(&req.body);
 
         let machine_id = Self::machine_id_of(&ctx.account, &token);
         let mac_machine_id = Self::mac_machine_id_of(&ctx.account, &token);
@@ -1251,6 +1270,8 @@ impl Provider for CursorProvider {
                 &self.cli_convs,
                 &conversation_id,
                 &ctx.account.account_id,
+                // 出口代理:漏传就是静默直连(封号率 59.5% vs 代理 0%),见 start_conv。
+                Self::opt_str(&ctx.account, "proxy").as_deref(),
                 &home,
                 &ws,
                 &cli_model,

@@ -222,23 +222,29 @@ pub struct UpdateAccountBody {
     #[serde(default)]
     model_allowlist: Option<String>,
     /// 定点切换上游驱动形态(写 `extra.driver`,走 merge_account_extra 绝不碰凭据)。
-    /// 缺省=不动;`""` = 清除(回到默认的线协议形态);`"cli"` = 子进程驱动官方
-    /// cursor-agent(见 `gw-cursor/src/clidrv.rs`)。其余值直接 400 —— fail-closed,
-    /// 不静默收下一个认不出的驱动名(收下了会静默回落线协议,与 UI 显示不符)。
+    ///
+    /// **2026-08-17 起 CLI 驱动是默认**(理由见 `gw-cursor` 里 `cli_driver` 的注释:
+    /// 线协议发的裸模型名被上游收走过,CLI 发的是官方客户端在用的名字)。所以:
+    /// 缺省=不动;`""` = 清除(回**默认**,即 CLI 驱动);`"wire"` = 该号退回线协议;
+    /// `"cli"` = 显式写默认值(历史值,等价于清除)。其余值直接 400 —— fail-closed,
+    /// 不静默收下一个认不出的驱动名(收下了读侧会当默认处理,与 UI 显示不符)。
     ///
     /// 只对 cursor 家族有意义:别的 provider 读不到这个键,写了也是死字段。
     #[serde(default)]
     driver: Option<String>,
 }
 
-/// `driver` 的写侧校验:`""` → `null`(清除,回默认线协议);`"cli"` → `"cli"`。
+/// `driver` 的写侧校验:`""` → `null`(清除 = 回默认 = CLI 驱动);
+/// `"cli"` → `"cli"`(显式默认,历史值);`"wire"` → `"wire"`(退回线协议)。
 /// 其余一律拒绝(fail-closed,理由见 [`UpdateAccountBody::driver`])。
 fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
     match raw.trim() {
         "" => Ok(serde_json::Value::Null),
         "cli" => Ok(serde_json::json!("cli")),
+        "wire" => Ok(serde_json::json!("wire")),
         other => Err(format!(
-            "未知驱动形态 {other:?};只接受 \"cli\"(子进程驱动 cursor-agent)或 \"\"(清除,回线协议)"
+            "未知驱动形态 {other:?};只接受 \"cli\"(默认,子进程驱动 cursor-agent)、\
+             \"wire\"(退回线协议)或 \"\"(清除,回默认)"
         )),
     }
 }
@@ -2589,24 +2595,34 @@ mod tests {
         assert!(row.extra.contains("tok-secret"), "凭据不得被定点合并冲掉");
 
         // 认不出的驱动名:400,库内不动。
-        for bad in ["wire", "CLI", "cli ", "subprocess"] {
+        // 注意 `wire` **不在此列**:2026-08-17 CLI 成为默认后它是合法的退出口。
+        for bad in ["CLI", "WIRE", "protocol", "subprocess"] {
             let body = serde_json::json!({ "driver": bad }).to_string();
             let resp = app
                 .clone()
                 .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
                 .await
                 .unwrap();
-            let expect = if bad.trim() == "cli" {
-                StatusCode::OK // "cli " 前后空白会被 trim 收下,不算非法
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            assert_eq!(resp.status(), expect, "{bad:?} 的判定与预期不符");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?} 的判定与预期不符");
         }
         let row = store.get_account("acc1").unwrap().unwrap();
         assert!(row.extra.contains(r#""driver":"cli""#), "被拒后库内值必须不动: {}", row.extra);
 
-        // 清除:空串 → null(读侧与缺失同义 = 线协议)。
+        // 前后空白照常 trim 收下(不算非法)。
+        for ok in ["cli ", " wire"] {
+            let body = serde_json::json!({ "driver": ok }).to_string();
+            let resp = app
+                .clone()
+                .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{ok:?} 应被 trim 收下");
+        }
+        // `wire` = 退回线协议,库里要真的落这个值(读侧据此退出默认的 CLI 驱动)。
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""driver":"wire""#), "wire 应落库: {}", row.extra);
+
+        // 清除:空串 → null(读侧与缺失同义 = **默认**,即 CLI 驱动)。
         let body = serde_json::json!({"driver": ""}).to_string();
         let resp = app
             .clone()
@@ -2627,8 +2643,12 @@ mod tests {
         assert_eq!(super::normalize_driver("  ").unwrap(), serde_json::Value::Null);
         assert_eq!(super::normalize_driver("cli").unwrap(), serde_json::json!("cli"));
         assert_eq!(super::normalize_driver(" cli ").unwrap(), serde_json::json!("cli"));
+        // 2026-08-17:CLI 成为默认后,`wire` 是**合法的退出口**(此前它是非法值)。
+        assert_eq!(super::normalize_driver("wire").unwrap(), serde_json::json!("wire"));
+        assert_eq!(super::normalize_driver(" wire ").unwrap(), serde_json::json!("wire"));
         assert!(super::normalize_driver("CLI").is_err(), "大小写不宽容:读侧只认小写");
-        assert!(super::normalize_driver("wire").is_err());
+        assert!(super::normalize_driver("WIRE").is_err(), "同上");
+        assert!(super::normalize_driver("protocol").is_err(), "近义词也不收:读侧只认 wire");
     }
 
     /// 写侧校验函数的单元口径(与 PATCH 集成测试互补:这里穷举纯函数分支)。

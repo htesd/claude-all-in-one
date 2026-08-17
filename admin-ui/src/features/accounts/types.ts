@@ -158,6 +158,14 @@ export interface AccountQuota {
   windows?: QuotaWindow[]
   /** 超额(on-demand)额度;null/缺省 = 该 provider 无此概念或未查到。 */
   on_demand?: OnDemandQuota | null
+  /**
+   * 账号档位('FREE' / 'PAID' / provider 档位名);null/缺省 = 判不出来。
+   *
+   * 为什么要单列一栏:被上游**降级成 FREE** 的号,`used`/`limit` 会一起变成 0
+   * (免费号没有套餐内额度字段),面板上和"配额查询失败"长得一模一样。
+   * 有这一栏才能一眼分清"降级"和"查不到"。
+   */
+  plan_tier?: string | null
 }
 
 /**
