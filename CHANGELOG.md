@@ -1,5 +1,42 @@
 # Changelog
 
+## [cursor-cli-hardening] CLI 驱动安全/完整性加固(对抗审查共识落地) — 2026-08-17
+
+### Security
+
+- **每账号独立 uid**(替代所有 CLI 共用 nobody):`clidrv::account_uid` 按
+  account_id 派生稳定 uid(100_000..500_000),HOME chown 给该 uid 且 700。
+  共用 nobody 时同 uid 下 700/600 不构成边界 —— 被 prompt 注入的 A 号 CLI 能
+  `cat` 走 B 号的 auth.json(评审共识 S0-1)。
+- **桥 socket 收口**:0666 → 0600 且属主=本账号 uid。共享 nobody 时任何被注入
+  的 CLI 都能连上别人的桥 socket 注入工具结果(S0-2);bridge/ 目录本就藏在
+  700 的 HOME 里(路径不可达),socket 属主是第二道。
+
+### Fixes
+
+- **token 双写者捕获**(评审共识:唯一不靠流量/攻击者、定时自炸的一条):
+  CLI 自刷新会回写 auth.json,号库里的旧 refresh_token 随之作废 —— 不捕获的话
+  gw-app 下次 OAuth 刷新 invalid_grant,号被永久误判死。现两道捕获:
+  `prepare_home` 按 JWT exp 对账(文件新→上报;号库新→覆写文件)+ 泵任务每 5s
+  观测 auth.json 变更;gw-app sync 循环经新增的 `Provider::poll_token_updates`
+  取走,CAS(同 token 跳过 / expires_at 不更新跳过)后增量落库。
+- **桥挂起槽按 tool_use_id 键控**(S1-7):`resume_conv` 只消费 id 匹配的
+  tool_result,错配显式报错且保留槽位 —— 静默喂错结果是语义损坏,比报错严重。
+  `chat::last_tool_results` 替代旧拼接版,严格形态必须带 id。
+  (跨客户串话此前已由 cursor 专属的 client-key 亲和命名空间挡住,见
+  `affinity_scoped_by_client`,本次未改。)
+- 思考帧一律透传(不再看客户端开没开 thinking):丢思考 = 丢进展信号,还会让
+  stall 看门狗误判掐流。
+- CLI 模型映射一律非 fast 档(fast 变体加急计费,成本高):grok-4.6/4.5 →
+  `cursor-grok-4.x-high`,opus-5 → `claude-opus-5-thinking-high`,
+  composer-2.5 去 -fast。
+
+### Test
+
+- 新增 6 条:uid 派生稳定性/区间、prepare_home 双向对账(文件新上报/号库新
+  覆写/同 token 不重写)、pending 键控消费(错配保留槽位)、last_tool_results
+  严格形态、adopt_provider_token_updates 落库 + 拒旧回声。
+
 ## [cursor-cli-driver] cursor 通道子进程驱动(包裹官方 cursor-agent CLI) — 2026-08-17
 
 ### Features

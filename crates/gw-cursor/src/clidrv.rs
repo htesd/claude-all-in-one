@@ -11,8 +11,8 @@
 //! - **每次请求 spawn 一次** `-p --output-format stream-json --stream-partial-output`;
 //!   首轮新会话,从 `system.init` 事件拿 `session_id`;后续轮 `--resume <id>`。
 //! - **安全闸**:`--mode ask`(read-only)且**绝不**加 `--force`。注意 ask 模式
-//!   仍允许**只读 shell**(ls/cat 会真跑)—— 部署侧用降权 uid + 目录权限隔离
-//!   敏感文件(见部署文档),模型能读到的只有每号工作区。
+//!   仍允许**只读 shell**(ls/cat 会真跑)—— 部署侧用**每账号独立 uid** + 700
+//!   HOME 隔离:别号的 CLI 连目录都进不来,auth.json 互不可读(见 `account_uid`)。
 //! - 调用方 system 提示写进每号工作区的 `AGENTS.md`(CLI 原生 rules 位置)。
 //! - **工具桥**(调用方声明了 tools 时):每号 HOME 写死 `.cursor/mcp.json` +
 //!   `permissions.json`(`{"mcpAllowlist":["gwtools:*"]}`,格式挖自 CLI bundle 的
@@ -34,7 +34,7 @@
 //! 「阶段输出」写进 [`OutQueue`],每个 Anthropic 响应是一条 drain 流;泵在
 //! 桥调用处挂起,等下一轮请求把 tool_result 喂进来再继续泵。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -87,10 +87,109 @@ impl CliDriverConfig {
     }
 }
 
+// ── token 轮换捕获(CLI 是号库凭据的第二个写者)─────────────────────────────
+
+/// CLI 子进程自刷新轮换出的新凭据,等 worker 周期任务 CAS 落库。
+#[derive(Debug, Clone)]
+pub struct TokenUpdate {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    /// `YYYY-MM-DDTHH:MM:SSZ`(与 refresh_auth 回写同格式,字典序可比)。
+    pub expires_at: Option<String>,
+}
+
+impl TokenUpdate {
+    /// 转 accounts.extra 增量字段(键与 refresh_auth 回写口径一致)。
+    pub fn to_delta(&self) -> BTreeMap<String, Value> {
+        let mut d = BTreeMap::new();
+        d.insert("access_token".to_string(), Value::String(self.access_token.clone()));
+        if let Some(rt) = &self.refresh_token {
+            d.insert("refresh_token".to_string(), Value::String(rt.clone()));
+        }
+        if let Some(exp) = &self.expires_at {
+            d.insert("expires_at".to_string(), Value::String(exp.clone()));
+        }
+        d
+    }
+}
+
+/// account_id → 捕获到的轮换凭据。provider 持有;prepare_home / pump 上报,
+/// worker 周期任务经 `Provider::poll_token_updates` 取空。
+pub type TokenUpdates = Arc<Mutex<HashMap<String, TokenUpdate>>>;
+
+/// 记录一次轮换捕获(同号重复捕获只留最新一份)。
+fn report_token_update(
+    updates: &TokenUpdates,
+    account_id: &str,
+    access: &str,
+    refresh: Option<&str>,
+    exp: Option<i64>,
+) {
+    updates
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            account_id.to_string(),
+            TokenUpdate {
+                access_token: access.to_string(),
+                refresh_token: refresh.map(str::to_string),
+                expires_at: exp.map(crate::auth::format_unix_utc),
+            },
+        );
+    tracing::info!(account = %account_id, "cursor-cli:捕获到 CLI 自刷新轮换的 token,待落库");
+}
+
+/// 读 auth.json 的 (accessToken, refreshToken);读不到/缺 accessToken 返回 None。
+fn read_auth_creds(path: &Path) -> Option<(String, Option<String>)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let at = v.get("accessToken").and_then(|x| x.as_str())?.to_string();
+    let rt = v
+        .get("refreshToken")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    Some((at, rt))
+}
+
+/// 原子写 auth.json(tmp + rename,0600)。
+fn write_auth_json(home: &Path, access_token: &str, refresh_token: Option<&str>) -> std::io::Result<()> {
+    let rt = refresh_token.unwrap_or(access_token);
+    let body = json!({"accessToken": access_token, "refreshToken": rt});
+    let tmp = home.join(".config/cursor/.auth.json.tmp");
+    std::fs::write(&tmp, body.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, home.join(".config/cursor/auth.json"))
+}
+
+// ── 每账号独立 uid(隔离边界的最小单位)──────────────────────────────────────
+
+/// 派生本账号的降权 uid(FNV-1a,跨进程稳定)。
+///
+/// 所有号的 CLI 共用 nobody 时,同 uid 下 700/600 **不构成边界**:A 号的 CLI 被
+/// prompt 注入后 `cat` 就走 B 号的 auth.json(对抗审查共识 S0-1)。每号一个 uid
+/// 后,配合 700 HOME,别号进程连目录都不可达。落在 100_000..500_000:不撞
+/// 系统/容器 uid,也不需要 /etc/passwd 条目(setuid 只认数字)。
+pub fn account_uid(account_id: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in account_id.as_bytes() {
+        h = (h ^ u32::from(*b)).wrapping_mul(0x0100_0193);
+    }
+    100_000 + h % 400_000
+}
+
 // ── 每号 HOME ────────────────────────────────────────────────────────────────
 
-/// 备好一个账号的 HOME:auth.json(仅缺失时写 —— CLI 会自行刷新回写,
-/// 用号库里的旧 token 覆盖它会打掉刷新成果)、MCP 权限白名单、工作区。
+/// 备好一个账号的 HOME:auth.json 对账(见下)、MCP 权限白名单、工作区。
+///
+/// auth.json 有**两个写者**:CLI 自刷新回写它,gw-app OAuth 刷新写号库。
+/// 两边都以 JWT exp 论新旧:
+/// - 文件新(CLI 轮换过)→ 上报捕获表 `updates`(不落库的话号库里是已作废的
+///   旧 refresh_token,下次 gw-app 刷新即 invalid_grant,号砖);
+/// - 号库新(gw-app 刷新/人工重录)→ 覆写 auth.json 让 CLI 跟上;
+/// - 都解不出 exp → 信文件(CLI 的活状态),不动。
 ///
 /// `system` 非空时同步到工作区 AGENTS.md(内容没变就不写,免得每轮刷 mtime)。
 pub fn prepare_home(
@@ -99,6 +198,7 @@ pub fn prepare_home(
     access_token: &str,
     refresh_token: Option<&str>,
     system: &str,
+    updates: &TokenUpdates,
 ) -> Result<(PathBuf, PathBuf), UpstreamError> {
     let home = cfg.base_dir.join(account_id);
     let ws = home.join("ws");
@@ -113,17 +213,32 @@ pub fn prepare_home(
     std::fs::create_dir_all(ws.join("assets")).map_err(|e| io("创建工作区", e))?;
 
     let auth_file = home.join(".config/cursor/auth.json");
-    if !auth_file.exists() {
-        let rt = refresh_token.unwrap_or(access_token);
-        let body = json!({"accessToken": access_token, "refreshToken": rt});
-        let tmp = home.join(".config/cursor/.auth.json.tmp");
-        std::fs::write(&tmp, body.to_string()).map_err(|e| io("写 auth.json", e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    if auth_file.exists() {
+        if let Some((fat, frt)) = read_auth_creds(&auth_file) {
+            if fat != access_token {
+                match (
+                    crate::auth::token_expires_at(&fat),
+                    crate::auth::token_expires_at(access_token),
+                ) {
+                    // 文件明显更新(或号库的解不出、文件的能解)→ CLI 轮换过,捕获。
+                    (Some(fexp), Some(aexp)) if fexp > aexp => {
+                        report_token_update(updates, account_id, &fat, frt.as_deref(), Some(fexp));
+                    }
+                    (Some(fexp), None) => {
+                        report_token_update(updates, account_id, &fat, frt.as_deref(), Some(fexp));
+                    }
+                    // 号库更新 → 覆写文件(旧 refresh_token 可能已作废,CLI 要用新的)。
+                    (Some(_), Some(_)) => {
+                        write_auth_json(&home, access_token, refresh_token)
+                            .map_err(|e| io("覆写 auth.json", e))?;
+                    }
+                    // 都解不出 exp:信文件,不动。
+                    _ => {}
+                }
+            }
         }
-        std::fs::rename(&tmp, &auth_file).map_err(|e| io("落 auth.json", e))?;
+    } else {
+        write_auth_json(&home, access_token, refresh_token).map_err(|e| io("落 auth.json", e))?;
     }
 
     // MCP 工具白名单(格式实证:Mcp(server:tool),冒号必填,支持 glob)。
@@ -140,29 +255,34 @@ pub fn prepare_home(
         }
     }
 
-    // 降权隔离:CLI 子进程以 nobody(65534)运行(见 start_conv),HOME 得归它,
-    // 否则它写不了 auth 刷新与本地 transcript。/app/data 等敏感目录对 nobody
-    // 不可读(部署要求 data/ 700、control.db 600,见 CHANGELOG/部署文档)。
+    // 降权隔离:CLI 子进程以**每账号独立 uid** 运行(见 start_conv / account_uid),
+    // HOME 归它且 700 —— 别号的 CLI(不同 uid)连目录都进不来,auth.json 互不可读。
+    // /app/data 等敏感目录对这些 uid 同样不可读(部署要求 data/ 700、control.db 600)。
     // 非 root 环境(本机开发)chown 会失败,忽略即可。
     #[cfg(unix)]
     {
+        let uid = account_uid(account_id);
         let _ = std::process::Command::new("chown")
             .arg("-R")
-            .arg("65534:65534")
+            .arg(format!("{uid}:{uid}"))
             .arg(&home)
             .status();
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
     }
     Ok((home, ws))
 }
 
 /// 对外模型名 → CLI 模型名(`--model` 参数)。
+/// 一律非 fast 档:fast 变体走加急计费,成本高一截(2026-08-17 用户拍板);
+/// 后续要 fast 就单列 `xxx-fast` 对外型号再映射回来。
 pub fn cli_model_name(cursor_model: &str) -> String {
     match cursor_model {
         "default" => "auto".into(),
-        "grok-4.6" => "cursor-grok-4.6-high-fast".into(),
-        "grok-4.5" => "cursor-grok-4.5-high-fast".into(),
-        "composer-2.5" => "composer-2.5-fast".into(),
-        "claude-opus-5" => "claude-opus-5-thinking-high-fast".into(),
+        "grok-4.6" => "cursor-grok-4.6-high".into(),
+        "grok-4.5" => "cursor-grok-4.5-high".into(),
+        "composer-2.5" => "composer-2.5".into(),
+        "claude-opus-5" => "claude-opus-5-thinking-high".into(),
         "claude-sonnet-5" => "claude-sonnet-5-thinking-high".into(),
         "claude-fable-5" => "claude-fable-5-thinking-high".into(),
         "kimi-k3" => "kimi-k3-high".into(),
@@ -309,8 +429,7 @@ impl OutQueue {
 
 /// 待调用方应答的桥调用。
 struct PendingSlot {
-    /// 给调用方的 tool_use.id(排查日志用)。
-    #[allow(dead_code)]
+    /// 给调用方的 tool_use.id —— 消费槽位时**按它键控**(防错配/重放注入)。
     tool_use_id: String,
     /// 把结果还给泵任务的通道。
     responder: oneshot::Sender<Result<String, String>>,
@@ -338,9 +457,32 @@ impl CliConv {
     pub fn has_pending(&self) -> bool {
         self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     }
-    /// 取走待应答槽(消费语义)。
-    fn take_pending(&self) -> Option<PendingSlot> {
-        self.pending.lock().unwrap_or_else(|p| p.into_inner()).take()
+    /// 消费待应答槽:**仅当** `results` 里有与挂起 tool_use_id 匹配的结果。
+    ///
+    /// 不匹配 → Err 且**保留**槽位:错配/重放的 tool_result 注入进 CLI 是静默
+    /// 语义损坏(对抗审查共识 S1-7),宁可显式报错;调用方可带正确结果重试,
+    /// 槽位有 PENDING_TTL 兜底。整个「校验 + 消费」在同一把锁里,无竞态窗口。
+    fn take_pending_matching(
+        &self,
+        results: &[(String, String)],
+    ) -> Result<(PendingSlot, String), UpstreamError> {
+        let mut p = self.pending.lock().unwrap_or_else(|po| po.into_inner());
+        let Some(slot) = p.as_ref() else {
+            return Err(UpstreamError::bad_request(
+                "cursor-cli: 该会话没有等待结果的桥调用(可能已超时或重铺)",
+            ));
+        };
+        match results.iter().find(|(id, _)| *id == slot.tool_use_id) {
+            Some((_, text)) => {
+                let text = text.clone();
+                let slot = p.take().expect("锁内刚确认槽位存在");
+                Ok((slot, text))
+            }
+            None => Err(UpstreamError::bad_request_visible(format!(
+                "cursor-cli: 带回的 tool_result 与挂起的 tool_use({})不匹配,已拒绝(可带正确结果重试)",
+                slot.tool_use_id
+            ))),
+        }
     }
     fn touch(&self) {
         *self.at.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
@@ -572,8 +714,12 @@ struct PumpArgs {
     cli: tokio::process::Child,
     /// 桥 socket(CLI 拉起的桥进程回连;有工具时才有)。
     sock: Option<tokio::net::UnixStream>,
-    want_thinking: bool,
     echo_model: String,
+    /// token 轮换观测:auth.json 路径 + 开泵时的已知 token + 捕获上报表。
+    /// CLI 中途轮换后若崩溃,没捕获到 = 号砖(旧 refresh_token 已作废)。
+    auth_file: PathBuf,
+    known_token: String,
+    updates: TokenUpdates,
 }
 
 /// 泵:读 CLI stdout + 桥 socket,把事件翻译成 SSE 写进 OutQueue。
@@ -583,6 +729,8 @@ async fn pump(mut a: PumpArgs) {
     let mut phase = SsePhase::new(&a.echo_model);
     let mut state = NdjsonState::default();
     let started = Instant::now();
+    let mut last_auth_poll = Instant::now();
+    let mut known_token = a.known_token.clone();
 
     let stdout = a.cli.stdout.take().expect("stdout piped");
     let stderr = a.cli.stderr.take();
@@ -631,8 +779,9 @@ async fn pump(mut a: PumpArgs) {
                 }
                 match handle_line(&mut state, &line) {
                     Ev::Nothing => {}
-                    Ev::Thinking(t) if a.want_thinking => phase.push_text(&out, "thinking", &t, true),
-                    Ev::Thinking(_) => {}
+                    // 思考一律透传(不看客户端要不要):agent 客户端需要思考块,
+                    // 丢掉等于丢进展信号,还会让收侧 stall 看门狗误判掐流。
+                    Ev::Thinking(t) => phase.push_text(&out, "thinking", &t, true),
                     Ev::Delta(t) => phase.push_text(&out, "text", &t, false),
                     Ev::Done => break 'outer Ok(()),
                 }
@@ -689,6 +838,19 @@ async fn pump(mut a: PumpArgs) {
                         UpstreamErrorKind::Other,
                         format!("cursor-cli 单轮超过 {}s,杀进程", CLI_TIMEOUT.as_secs()),
                     ));
+                }
+                // CLI 自刷新会回写 auth.json;中途轮换若没被捕获,CLI 一崩新 token
+                // 就丢了,而旧 refresh_token 已被上游作废 → 号砖。每 5s 看一眼,
+                // 变了就上报(worker 周期任务 CAS 落库)。
+                if last_auth_poll.elapsed() >= Duration::from_secs(5) {
+                    last_auth_poll = Instant::now();
+                    if let Some((at, rt)) = read_auth_creds(&a.auth_file) {
+                        if at != known_token {
+                            let exp = crate::auth::token_expires_at(&at);
+                            report_token_update(&a.updates, &a.conv.account_id, &at, rt.as_deref(), exp);
+                            known_token = at;
+                        }
+                    }
                 }
             }
         }
@@ -753,8 +915,8 @@ pub async fn start_conv(
     prompt: &str,
     resume_sid: Option<String>,
     tools: &[crate::run::ToolDef],
-    want_thinking: bool,
     echo_model: &str,
+    updates: TokenUpdates,
 ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
     // 同号 spawn 串行化:mcp.json 是每号一份的静态路径,桥 socket 每请求一条,
     // 等桥连上(或确认无工具)后再放行下一个,避免后一个请求改写 mcp.json 被
@@ -799,11 +961,19 @@ pub async fn start_conv(
         )
         .map_err(|e| io("写 mcp.json", e))?;
         let l = tokio::net::UnixListener::bind(&sock_path).map_err(|e| io("绑 bridge socket", e))?;
-        // 桥以 nobody 身份回连,socket 得放开写权限。
+        // 桥以本账号的 uid 回连:socket 0600 + 属主=该 uid,别号的 CLI(不同 uid)
+        // 连不上 —— 共享 nobody 时这里曾是 0666,任何被注入的 CLI 都能往别人的
+        // 桥里注结果(对抗审查共识 S0-2)。bridge/ 还在 700 的 HOME 里,路径本身
+        // 就不可达,这里是第二道。
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666));
+            let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
+            let uid = account_uid(account_id);
+            let _ = std::process::Command::new("chown")
+                .arg(format!("{uid}:{uid}"))
+                .arg(&sock_path)
+                .status();
         }
         listener = Some(l);
     }
@@ -834,13 +1004,14 @@ pub async fn start_conv(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // 降权:nobody 运行。ask 模式的只读 shell 仍会真跑命令 —— 不能让模型
-    // 用 `cat` 读走 /app/data 里的号库。nobody 对那些 700/600 目录无权读。
-    // 仅在 root(容器)下启用;本机开发自动跳过(非 root setuid 会 EPERM)。
+    // 降权:每账号独立 uid 运行(见 account_uid)。ask 模式的只读 shell 仍会真跑
+    // 命令 —— 不能让模型用 `cat` 读走 /app/data 的号库,也不能让它读走**别号**
+    // 的 HOME(共用 nobody 时 700/600 不挡同 uid)。仅在 root(容器)下启用;
+    // 本机开发自动跳过(非 root setuid 会 EPERM)。
     #[cfg(unix)]
     if is_root() {
-        use std::os::unix::process::CommandExt;
-        cmd.uid(65534).gid(65534);
+        let uid = account_uid(account_id);
+        cmd.uid(uid).gid(uid);
     }
 
     let mut cli = cmd.spawn().map_err(|e| {
@@ -882,31 +1053,178 @@ pub async fn start_conv(
     });
     convs.insert(conv_key, conv.clone());
     let out = conv.out.clone();
+    // 开泵时的已知 token:以 auth.json 现状为准(prepare_home 对账后文件可能比
+    // 号库还新);读不到就退号库 token。pump 据此探测 CLI 中途的轮换。
+    let auth_file = home.join(".config/cursor/auth.json");
+    let known_token = read_auth_creds(&auth_file)
+        .map(|(at, _)| at)
+        .unwrap_or_default();
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
         conv,
         cli,
         sock,
-        want_thinking,
         echo_model: echo_model.to_string(),
+        auth_file,
+        known_token,
+        updates,
     }));
     Ok(Box::pin(drain_stream(out)))
 }
 
 /// 喂回桥调用结果(调用方带 tool_result 的下一轮请求),返回继续输出的响应流。
+///
+/// `results` = 本轮带回的 (tool_use_id, 文本) 列表。消费槽位**按 id 键控**:
+/// 没有匹配项就显式报错且保留槽位 —— 把别的轮次/别的会话的 tool_result 喂进
+/// CLI 是静默语义损坏,比报错严重得多。
 pub fn resume_conv(
     conv: Arc<CliConv>,
-    result_text: String,
+    results: Vec<(String, String)>,
 ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
     conv.touch();
-    let slot = conv.take_pending().ok_or_else(|| {
-        UpstreamError::bad_request("cursor-cli: 该会话没有等待结果的桥调用(可能已超时或重铺)")
-    })?;
-    slot.responder.send(Ok(result_text)).map_err(|_| {
+    let (slot, text) = conv.take_pending_matching(&results)?;
+    slot.responder.send(Ok(text)).map_err(|_| {
         UpstreamError::new(
             UpstreamErrorKind::Other,
             "cursor-cli: 泵任务已退出,桥调用无法送达".to_string(),
         )
     })?;
     Ok(Box::pin(drain_stream(conv.out.clone())))
+}
+
+// ── 测试 ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一枚只带 exp 的假 JWT(测试用,不验签)。
+    fn fake_jwt(exp: i64) -> String {
+        use base64::Engine;
+        let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("h.{body}.s")
+    }
+
+    fn test_cfg(tag: &str) -> (CliDriverConfig, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "clidrv-test-{}-{}",
+            tag,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cfg = CliDriverConfig {
+            bin: PathBuf::from("/bin/true"),
+            base_dir: base.clone(),
+            self_exe: PathBuf::from("/bin/true"),
+        };
+        (cfg, base)
+    }
+
+    #[test]
+    fn account_uid_稳定且在隔离段内() {
+        let a1 = account_uid("acc-alpha");
+        assert_eq!(a1, account_uid("acc-alpha"), "同账号必须派生同 uid");
+        assert!((100_000..500_000).contains(&a1));
+        assert_ne!(
+            account_uid("acc-alpha"),
+            account_uid("acc-beta"),
+            "这两个测试账号不该撞 uid(撞了说明哈希空间太小)"
+        );
+        assert_ne!(account_uid("acc-alpha"), 65534, "不得落回 nobody");
+    }
+
+    #[test]
+    fn prepare_home_文件更新时上报捕获_且不覆写文件() {
+        let (cfg, base) = test_cfg("rotate");
+        let updates = TokenUpdates::default();
+        let old = fake_jwt(1_000_000);
+        let new = fake_jwt(2_000_000);
+        // 号库 token 旧;文件里是 CLI 轮换后的新 token。
+        prepare_home(&cfg, "acc", &old, None, "", &updates).unwrap();
+        write_auth_json(&base.join("acc"), &new, Some("rt-new")).unwrap();
+
+        prepare_home(&cfg, "acc", &old, None, "", &updates).unwrap();
+
+        let captured = updates.lock().unwrap().get("acc").cloned();
+        let captured = captured.expect("文件更新必须产生捕获");
+        assert_eq!(captured.access_token, new);
+        assert_eq!(captured.refresh_token.as_deref(), Some("rt-new"));
+        assert!(captured.expires_at.is_some());
+        let (at, _) = read_auth_creds(&base.join("acc/.config/cursor/auth.json")).unwrap();
+        assert_eq!(at, new, "文件新时不得用号库旧 token 覆写");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_home_号库更新时覆写文件_且不上报() {
+        let (cfg, base) = test_cfg("dbnewer");
+        let updates = TokenUpdates::default();
+        let old = fake_jwt(1_000_000);
+        let new = fake_jwt(2_000_000);
+        prepare_home(&cfg, "acc", &old, None, "", &updates).unwrap();
+
+        // gw-app 侧刷新过(号库 exp 更新)→ 文件应被覆写跟上。
+        prepare_home(&cfg, "acc", &new, Some("rt-new"), "", &updates).unwrap();
+
+        let (at, rt) = read_auth_creds(&base.join("acc/.config/cursor/auth.json")).unwrap();
+        assert_eq!(at, new);
+        assert_eq!(rt.as_deref(), Some("rt-new"));
+        assert!(updates.lock().unwrap().is_empty(), "号库更新不是轮换,不该上报");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_home_同token不动文件() {
+        let (cfg, base) = test_cfg("same");
+        let updates = TokenUpdates::default();
+        let tok = fake_jwt(1_500_000);
+        prepare_home(&cfg, "acc", &tok, None, "", &updates).unwrap();
+        let file = base.join("acc/.config/cursor/auth.json");
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        prepare_home(&cfg, "acc", &tok, None, "", &updates).unwrap();
+        let after = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(before, after, "同 token 不该重写文件(刷 mtime)");
+        assert!(updates.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pending_按tool_use_id键控消费() {
+        let conv = CliConv {
+            account_id: "acc".into(),
+            cli_session_id: Mutex::new(None),
+            fps: Mutex::new(Vec::new()),
+            out: OutQueue::new(),
+            pending: Mutex::new(None),
+            at: Mutex::new(Instant::now()),
+        };
+        // 无挂起 → 明确报错。
+        assert!(conv
+            .take_pending_matching(&[("toolu_x".into(), "t".into())])
+            .is_err());
+
+        let (tx, _rx) = oneshot::channel::<Result<String, String>>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_abc".into(),
+            responder: tx,
+        });
+        // 错配 → 报错且槽位保留(可带正确结果重试)。
+        let err = match conv.take_pending_matching(&[("toolu_other".into(), "别的结果".into())]) {
+            Ok(_) => panic!("错配不应成功"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("toolu_abc"));
+        assert!(conv.has_pending(), "错配不得消费槽位");
+        // 匹配(即使混在多个结果里)→ 消费成功。
+        let (slot, text) = conv
+            .take_pending_matching(&[
+                ("toolu_other".into(), "别的".into()),
+                ("toolu_abc".into(), "正确结果".into()),
+            ])
+            .expect("匹配应成功");
+        assert_eq!(slot.tool_use_id, "toolu_abc");
+        assert_eq!(text, "正确结果");
+        assert!(!conv.has_pending());
+    }
 }

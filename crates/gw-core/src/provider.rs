@@ -306,6 +306,19 @@ pub trait Provider: Send + Sync {
     /// 用与 chat 相同的按账号出口解析(账号专属代理 → 默认代理 → 进程源 IP,见 [`CallCtx`])。
     async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError>;
 
+    /// 轮询 provider 侧捕获的「外部 token 轮换」,取走上报表(清空语义)。
+    ///
+    /// 有的 provider 的凭据还有**另一个写者**:cursor CLI 驱动的子进程会自刷新并
+    /// 回写自己的 auth.json,号库里的 refresh_token 随之被上游作废 —— 不捕获的话,
+    /// gw-app 下次用旧 rt 刷新直接 invalid_grant,号被判死。provider 观测到轮换
+    /// 就记录在此;worker 周期任务取走后做 CAS 落库(增量键与 `refresh_auth`
+    /// 回写口径一致:access_token / refresh_token / expires_at)。默认空实现。
+    fn poll_token_updates(
+        &self,
+    ) -> Vec<(String, std::collections::BTreeMap<String, serde_json::Value>)> {
+        Vec::new()
+    }
+
     /// 热应用运行时设置(worker 30s 轮询调用),无需重启。`settings` 是有效
     /// [`crate::config::SystemSettings`] 序列化后的 JSON(扁平字段)。默认 no-op;
     /// 支持热调的 provider(KiroProvider)覆盖以更新出口代理/计费/图像参数等。

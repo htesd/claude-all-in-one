@@ -27,3 +27,5 @@
 # 本仓库是**公开**仓库,这类文档不入库。
 /HANDOFF-*.md
 /.review-request-*.md
+# e2e 真号验证时 dump 出来的调试产物(含上百 MB 的测试二进制,勿入库)
+/.tmp-dump

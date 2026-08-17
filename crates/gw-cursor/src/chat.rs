@@ -737,11 +737,12 @@ pub(crate) fn cli_eligible(body: &Value) -> bool {
     to_turns(body).last().is_some_and(|t| t.is_user)
 }
 
-/// 取「整条都是 tool_result」的最后一条 user 消息的文本(CLI 驱动的桥接续用)。
+/// 取「整条都是 tool_result」的最后一条 user 消息:(tool_use_id, 文本) 列表。
 ///
 /// 只认这个严格形态(Anthropic 客户端工具回路的真实形状):最后一条消息是 user、
-/// 内容块**全部**是 tool_result。多个结果按序拼接。不满足就返回 None(走重铺)。
-pub(crate) fn last_tool_result_text(body: &Value) -> Option<String> {
+/// 内容块**全部**是 tool_result 且都带 tool_use_id。不满足就返回 None(走重铺)。
+/// id 必须返回:CLI 驱动的桥接续按它键控消费挂起槽,错配注入是静默语义损坏。
+pub(crate) fn last_tool_results(body: &Value) -> Option<Vec<(String, String)>> {
     let msgs = body.get("messages")?.as_array()?;
     let last = msgs.last()?;
     if last.get("role").and_then(|r| r.as_str()) != Some("user") {
@@ -751,16 +752,13 @@ pub(crate) fn last_tool_result_text(body: &Value) -> Option<String> {
     if blocks.is_empty() {
         return None;
     }
-    let mut out = String::new();
+    let mut out = Vec::with_capacity(blocks.len());
     for b in blocks {
         if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
             return None;
         }
-        let text = extract_text(b.get("content")?);
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(&text);
+        let id = b.get("tool_use_id")?.as_str()?.to_string();
+        out.push((id, extract_text(b.get("content")?)));
     }
     Some(out)
 }
@@ -3462,6 +3460,45 @@ mod tests {
         assert!(!client_wants_thinking(None));
         assert!(!client_wants_thinking(Some(&json!({"type": "weird"}))));
         assert!(!client_wants_thinking(Some(&json!({}))));
+    }
+
+    /// CLI 驱动桥接续按 tool_use_id 键控消费,提取必须带 id(2026-08-17 对抗审查
+    /// 共识 S1-7:不带 id 的拼接文本无法校验错配/重放)。
+    #[test]
+    fn last_tool_results_带id且只认严格形态() {
+        // 严格形态:末条 user、全部 tool_result、都带 tool_use_id。
+        let body = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_a", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_a", "content": "结果甲"},
+                {"type": "tool_result", "tool_use_id": "toolu_b", "content": [{"type": "text", "text": "结果乙"}]},
+            ]},
+        ]});
+        assert_eq!(
+            last_tool_results(&body),
+            Some(vec![
+                ("toolu_a".to_string(), "结果甲".to_string()),
+                ("toolu_b".to_string(), "结果乙".to_string()),
+            ])
+        );
+        // 缺 tool_use_id → None(走重铺,不做无 id 的盲接续)。
+        let no_id = json!({"messages": [
+            {"role": "user", "content": [{"type": "tool_result", "content": "x"}]},
+        ]});
+        assert_eq!(last_tool_results(&no_id), None);
+        // 混入非 tool_result 块 → None。
+        let mixed = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_a", "content": "x"},
+                {"type": "text", "text": "附加话"},
+            ]},
+        ]});
+        assert_eq!(last_tool_results(&mixed), None);
+        // 末条不是 user → None。
+        let tail_ai = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        ]});
+        assert_eq!(last_tool_results(&tail_ai), None);
     }
 
     /// 造一帧思考增量 `1.4.1`(与 run 单测同形,避免依赖私有 helper)。

@@ -634,6 +634,10 @@ impl WorkerState {
         }
         // 先重试上轮回写失败的 extra(脏账号),失败下轮再试。
         flush_dirty_extras(&self.scheduler, &store, &self.refresh_locks, "sync 重试").await;
+        // provider 侧捕获的外部 token 轮换(cursor CLI 自刷新)CAS 落库 —— 不做的话
+        // 号库里是已作废的旧 rt,下次 OAuth 刷新 invalid_grant,号被误判死。
+        adopt_provider_token_updates(&self.provider, &self.scheduler, &store, &self.refresh_locks)
+            .await;
         // 成员边与账号集**先都读出来,两个都成功才发布**(对抗审查 Skeptic#3)。
         // 分别读、分别发布会留下无限期的撕裂态:membership 成功而账号读失败 → 新视图
         // 立即生效但账号快照停在上一轮;反过来 membership 读失败而账号成功 → **已被撤销
@@ -1451,6 +1455,66 @@ async fn flush_dirty_extras(
             }
             Err(e) => tracing::warn!(account = %id,
                 "{context}: 脏 extra 持久化失败: {e}"),
+        }
+    }
+}
+
+/// 把 provider 捕获的外部 token 轮换(cursor CLI 子进程自刷新)合并进 scheduler + 落库。
+///
+/// 为什么必须做:CLI 会自己刷新并回写它 HOME 里的 auth.json,号库里的
+/// refresh_token 随之被上游作废。不采纳的话,`ensure_credentialed` 下次拿旧 rt
+/// 去 OAuth 刷新 → invalid_grant → TokenInvalid → 号被永久判死(对抗审查共识:
+/// 这条不靠流量不靠攻击者,轮换是定时自己发生的)。
+///
+/// CAS 两道(防旧回声覆盖新状态):
+/// 1. access_token 相同 = 已应用过,跳过;
+/// 2. 两边 expires_at 都在且传入的不更新 → 跳过(传入格式 `YYYY-...Z` 零填充,
+///    字典序即时间序;gw-app 可能刚 OAuth 刷过更新的)。
+/// 与 `do_refresh_and_persist` 同尾段:增量 merge 落库 + 置脏,成功才清脏。
+async fn adopt_provider_token_updates(
+    provider: &Arc<dyn Provider>,
+    scheduler: &AccountScheduler,
+    store: &SqliteStore,
+    refresh_locks: &RefreshLocks,
+) {
+    for (account_id, delta) in provider.poll_token_updates() {
+        let Some(incoming_at) = delta.get("access_token").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let lock = lock_for(refresh_locks, &account_id);
+        let _guard = lock.lock().await;
+        let Some(base) = scheduler.account(&account_id) else {
+            continue;
+        };
+        if base.extra_str("access_token") == Some(incoming_at) {
+            continue; // CAS①:已是这枚 token(上轮已应用)。
+        }
+        let stale = match (
+            delta.get("expires_at").and_then(|v| v.as_str()),
+            base.extra_str("expires_at"),
+        ) {
+            (Some(inc), Some(cur)) => inc <= cur,
+            _ => false, // 缺一边没法比:放行(捕获侧已按 exp 比过一轮)。
+        };
+        if stale {
+            tracing::debug!(account = %account_id, "外部 token 轮换是比现存更旧的回声,跳过");
+            continue; // CAS②:旧回声不覆盖新刷新。
+        }
+        let mut updated = (*base).clone();
+        for (k, v) in &delta {
+            updated.extra.insert(k.clone(), v.clone());
+        }
+        scheduler.update_account_dirty(Arc::new(updated));
+        let persisted = serde_json::to_string(&delta)
+            .map_err(anyhow::Error::from)
+            .and_then(|j| store.merge_account_extra(&account_id, &j));
+        match persisted {
+            Ok(_) => {
+                scheduler.clear_extra_dirty(&account_id);
+                tracing::info!(account = %account_id, "已采纳外部轮换的 token(CLI 自刷新捕获)");
+            }
+            Err(e) => tracing::warn!(account = %account_id,
+                "外部轮换 token 落库失败,已置脏待 sync 重试: {e}"),
         }
     }
 }
@@ -4723,6 +4787,102 @@ mod tests {
             "非脏账号不得被旧快照回滚: {}",
             row.extra
         );
+    }
+
+    /// mock provider:携带一批待上报的外部 token 轮换(cursor CLI 自刷新捕获)。
+    struct TokenUpdateMockProvider {
+        updates: std::sync::Mutex<Vec<(String, BTreeMap<String, serde_json::Value>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for TokenUpdateMockProvider {
+        fn family(&self) -> &'static str {
+            "cursor"
+        }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] {
+            &[]
+        }
+        async fn list_models(&self) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> {
+            Ok(vec![])
+        }
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _ctx: &CallCtx,
+        ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+            unreachable!("本测试不打 chat")
+        }
+        async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
+            Ok(account.clone())
+        }
+        fn poll_token_updates(&self) -> Vec<(String, BTreeMap<String, serde_json::Value>)> {
+            std::mem::take(&mut *self.updates.lock().unwrap())
+        }
+    }
+
+    /// CLI 自刷新捕获的轮换:新 token 要进 scheduler + 落库;更旧的回声不得覆盖
+    /// (CAS 两道:同 token 跳过、expires_at 不更新跳过)。
+    #[tokio::test]
+    async fn adopt_provider_token_updates_persists_and_rejects_stale_echo() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_account(
+                "acc-c",
+                "G0",
+                "cursor",
+                1,
+                r#"{"access_token":"at-old","refresh_token":"rt-old","expires_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+        let mut extra = BTreeMap::new();
+        extra.insert("access_token".into(), serde_json::json!("at-old"));
+        extra.insert("refresh_token".into(), serde_json::json!("rt-old"));
+        extra.insert("expires_at".into(), serde_json::json!("2026-01-01T00:00:00Z"));
+        let acc = Arc::new(Account {
+            account_id: "acc-c".into(),
+            provider: "cursor".into(),
+            max_concurrency: 1,
+            disabled: false,
+            created_at: 0,
+            extra,
+        });
+        let scheduler = AccountScheduler::new(vec![acc], &Default::default());
+        let locks: RefreshLocks = parking_lot::Mutex::new(std::collections::HashMap::new());
+
+        // ① 正常轮换:采纳 + 落库 + 清脏。
+        let mut delta = BTreeMap::new();
+        delta.insert("access_token".into(), serde_json::json!("at-new"));
+        delta.insert("refresh_token".into(), serde_json::json!("rt-new"));
+        delta.insert("expires_at".into(), serde_json::json!("2027-01-01T00:00:00Z"));
+        let provider: Arc<dyn Provider> = Arc::new(TokenUpdateMockProvider {
+            updates: std::sync::Mutex::new(vec![("acc-c".into(), delta)]),
+        });
+        adopt_provider_token_updates(&provider, &scheduler, &store, &locks).await;
+        assert_eq!(
+            scheduler.account("acc-c").unwrap().extra_str("access_token"),
+            Some("at-new"),
+            "scheduler 应换上捕获的新 token"
+        );
+        let row = store.get_account("acc-c").unwrap().unwrap();
+        assert!(row.extra.contains("at-new"), "新 token 应落库: {}", row.extra);
+        assert!(row.extra.contains("rt-new"), "新 rt 应落库: {}", row.extra);
+        assert!(scheduler.dirty_accounts().is_empty(), "落库成功应清脏位");
+
+        // ② 旧回声(expires_at 更老):不得覆盖刚采纳的新 token。
+        let mut stale = BTreeMap::new();
+        stale.insert("access_token".into(), serde_json::json!("at-stale"));
+        stale.insert("expires_at".into(), serde_json::json!("2026-06-01T00:00:00Z"));
+        let provider: Arc<dyn Provider> = Arc::new(TokenUpdateMockProvider {
+            updates: std::sync::Mutex::new(vec![("acc-c".into(), stale)]),
+        });
+        adopt_provider_token_updates(&provider, &scheduler, &store, &locks).await;
+        assert_eq!(
+            scheduler.account("acc-c").unwrap().extra_str("access_token"),
+            Some("at-new"),
+            "旧回声不得覆盖新 token"
+        );
+        let row = store.get_account("acc-c").unwrap().unwrap();
+        assert!(row.extra.contains("at-new"), "DB 也不得被旧回声覆盖: {}", row.extra);
     }
 
     /// 记录到内存的假 sink,断言 finalize_usage 的落库决策。

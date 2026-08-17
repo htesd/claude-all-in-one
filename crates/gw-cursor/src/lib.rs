@@ -291,6 +291,9 @@ pub struct CursorProvider {
     /// CLI 驱动(子进程包裹 cursor-agent,见 [`clidrv`])的配置与会话表。
     cli_cfg: clidrv::CliDriverConfig,
     cli_convs: Arc<clidrv::CliConversations>,
+    /// CLI 子进程自刷新的 token 捕获表(CLI 回写 auth.json → 这里 →
+    /// worker 周期任务经 `poll_token_updates` 取走 CAS 落库)。
+    cli_token_updates: clidrv::TokenUpdates,
 }
 
 /// 会话在**服务端**是否已经建立,以及建在哪个号上。
@@ -640,6 +643,7 @@ impl CursorProvider {
             notices: Arc::new(TruncationNotices::default()),
             cli_cfg: clidrv::CliDriverConfig::from_env(),
             cli_convs: Arc::new(clidrv::CliConversations::default()),
+            cli_token_updates: clidrv::TokenUpdates::default(),
         }
     }
 
@@ -1018,7 +1022,6 @@ impl Provider for CursorProvider {
                 )));
             };
             let cli_model = clidrv::cli_model_name(&cursor_model);
-            let want_thinking = chat::client_wants_thinking(req.body.get("thinking"));
             let tools = chat::to_tools(&req.body);
             // 能力指引(实测:不说清楚的话模型会去试网页搜索/内建工具,撞墙后放弃)。
             let system = {
@@ -1043,16 +1046,18 @@ impl Provider for CursorProvider {
                 &token,
                 refresh.as_deref(),
                 &system,
+                &self.cli_token_updates,
             )?;
 
             let fps = chat::history_fps(&req.body);
 
-            // ① 调用方带 tool_result 回来:优先接续挂起的桥调用。
-            if let Some(result_text) = chat::last_tool_result_text(&req.body) {
+            // ① 调用方带 tool_result 回来:优先接续挂起的桥调用(按 tool_use_id
+            //    键控消费,错配显式报错 —— 静默喂错结果是语义损坏)。
+            if let Some(results) = chat::last_tool_results(&req.body) {
                 if let Some(conv) = self.cli_convs.get(&conversation_id) {
                     if conv.has_pending() {
                         *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
-                        return clidrv::resume_conv(conv, result_text);
+                        return clidrv::resume_conv(conv, results);
                     }
                 }
                 // 没有挂起的桥调用(重启/超时):落回重铺,文本里带着工具结果。
@@ -1131,8 +1136,8 @@ impl Provider for CursorProvider {
                 &prompt,
                 resume_sid,
                 &tools,
-                want_thinking,
                 &req.model,
+                self.cli_token_updates.clone(),
             )
             .await?;
             // 登记调用方指纹(供下一轮分叉校验)。失败轮的矫正靠调用方重试时
@@ -1212,6 +1217,20 @@ impl Provider for CursorProvider {
             },
         )
         .await
+    }
+
+    /// CLI 子进程自刷新捕获(见 [`clidrv`]):一次性取空上报表,worker 周期任务
+    /// 负责 CAS 落库。CLI 是号库凭据的第二个写者,不捕获 = 旧 rt 作废后号砖。
+    fn poll_token_updates(&self) -> Vec<(String, std::collections::BTreeMap<String, serde_json::Value>)> {
+        std::mem::take(
+            &mut *self
+                .cli_token_updates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
+        .into_iter()
+        .map(|(id, u)| (id, u.to_delta()))
+        .collect()
     }
 
     /// 用 `refresh_token` 换一份新凭据(标准 OAuth2,见 [`auth`])。
