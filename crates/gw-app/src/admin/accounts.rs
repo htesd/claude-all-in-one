@@ -221,6 +221,26 @@ pub struct UpdateAccountBody {
     /// fail-closed,绝不静默收下一个语义存疑的白名单(规格第 4/5 条)。
     #[serde(default)]
     model_allowlist: Option<String>,
+    /// 定点切换上游驱动形态(写 `extra.driver`,走 merge_account_extra 绝不碰凭据)。
+    /// 缺省=不动;`""` = 清除(回到默认的线协议形态);`"cli"` = 子进程驱动官方
+    /// cursor-agent(见 `gw-cursor/src/clidrv.rs`)。其余值直接 400 —— fail-closed,
+    /// 不静默收下一个认不出的驱动名(收下了会静默回落线协议,与 UI 显示不符)。
+    ///
+    /// 只对 cursor 家族有意义:别的 provider 读不到这个键,写了也是死字段。
+    #[serde(default)]
+    driver: Option<String>,
+}
+
+/// `driver` 的写侧校验:`""` → `null`(清除,回默认线协议);`"cli"` → `"cli"`。
+/// 其余一律拒绝(fail-closed,理由见 [`UpdateAccountBody::driver`])。
+fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
+    match raw.trim() {
+        "" => Ok(serde_json::Value::Null),
+        "cli" => Ok(serde_json::json!("cli")),
+        other => Err(format!(
+            "未知驱动形态 {other:?};只接受 \"cli\"(子进程驱动 cursor-agent)或 \"\"(清除,回线协议)"
+        )),
+    }
 }
 
 pub fn router() -> Router<AdminState> {
@@ -381,6 +401,9 @@ fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serd
         // 模型白名单顶层回显(前端编辑框要能读到现值)。缺失/null = 不限,统一吐 null;
         // 键名不含 token/secret/password/key,不会被上面的脱敏改写。
         "model_allowlist": extra.get("model_allowlist").cloned().unwrap_or(serde_json::Value::Null),
+        // 上游驱动形态顶层回显(前端要能显示某号是不是 CLI 驱动)。缺失/null = 线协议,
+        // 统一吐 null;与 `gw-cursor` 读侧 `opt_str("driver")` 同口径。
+        "driver": extra.get("driver").filter(|v| !v.is_null()).cloned().unwrap_or(serde_json::Value::Null),
         "disabled": row.disabled,
         "extra": extra,
         "created_at": row.created_at,
@@ -1590,6 +1613,20 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
+    // 定点切换驱动形态(同上:增量 merge,绝不碰凭据)。`""` 写 null = 回线协议;
+    // merge 是读-合-写,写 null 不删键,读侧 `opt_str("driver")` 把 null 与缺失同义。
+    if let Some(raw) = &body.driver {
+        let driver_val = match normalize_driver(raw) {
+            Ok(v) => v,
+            Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
+        };
+        let delta = serde_json::json!({ "driver": driver_val }).to_string();
+        match st.store.merge_account_extra(&id, &delta) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     // 落库后 best-effort 捅所有 worker 立即同步(同 delete_account/import 的理由):
     // 否则启用/禁用/换组等改动要等 worker 自己最多 30s 的周期 sync 才生效,期间按号操作
     // (如导入对话框"编辑后立即验活")会误报"没有 worker 持有该账号"。
@@ -1599,6 +1636,7 @@ async fn update_account(
         || body.priority.is_some()
         || body.queue_enabled.is_some()
         || body.model_allowlist.is_some()
+        || body.driver.is_some()
     {
         poke_workers_sync(&st).await;
     }
@@ -2523,6 +2561,74 @@ mod tests {
             row.extra
         );
         assert!(row.extra.contains("tok-secret"), "清除白名单不得动凭据");
+    }
+
+    /// 驱动形态定点切换:设 `cli` → 落库 + 顶层回显;`""` → 写 null 回线协议;
+    /// 认不出的值整单 400 且库内不动(fail-closed:静默收下会让 UI 显示与实际跑的
+    /// 驱动不符)。全程不得碰凭据。
+    #[tokio::test]
+    async fn update_driver_sets_clears_and_rejects_unknown() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account("acc1", "G0", "cursor", 2, r#"{"access_token":"tok-secret"}"#)
+            .unwrap();
+
+        // 设 cli。
+        let body = serde_json::json!({"driver": "cli"}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view: serde_json::Value = json_body(resp).await;
+        assert_eq!(view["driver"], serde_json::json!("cli"), "顶层应回显 cli: {view}");
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""driver":"cli""#), "应落库: {}", row.extra);
+        assert!(row.extra.contains("tok-secret"), "凭据不得被定点合并冲掉");
+
+        // 认不出的驱动名:400,库内不动。
+        for bad in ["wire", "CLI", "cli ", "subprocess"] {
+            let body = serde_json::json!({ "driver": bad }).to_string();
+            let resp = app
+                .clone()
+                .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+                .await
+                .unwrap();
+            let expect = if bad.trim() == "cli" {
+                StatusCode::OK // "cli " 前后空白会被 trim 收下,不算非法
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            assert_eq!(resp.status(), expect, "{bad:?} 的判定与预期不符");
+        }
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""driver":"cli""#), "被拒后库内值必须不动: {}", row.extra);
+
+        // 清除:空串 → null(读侧与缺失同义 = 线协议)。
+        let body = serde_json::json!({"driver": ""}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view: serde_json::Value = json_body(resp).await;
+        assert!(view["driver"].is_null(), "清除后顶层应回 null: {view}");
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""driver":null"#), "清除应写 null: {}", row.extra);
+        assert!(row.extra.contains("tok-secret"), "清除驱动不得动凭据");
+    }
+
+    #[test]
+    fn normalize_driver_rules() {
+        assert_eq!(super::normalize_driver("").unwrap(), serde_json::Value::Null);
+        assert_eq!(super::normalize_driver("  ").unwrap(), serde_json::Value::Null);
+        assert_eq!(super::normalize_driver("cli").unwrap(), serde_json::json!("cli"));
+        assert_eq!(super::normalize_driver(" cli ").unwrap(), serde_json::json!("cli"));
+        assert!(super::normalize_driver("CLI").is_err(), "大小写不宽容:读侧只认小写");
+        assert!(super::normalize_driver("wire").is_err());
     }
 
     /// 写侧校验函数的单元口径(与 PATCH 集成测试互补:这里穷举纯函数分支)。

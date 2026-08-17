@@ -68,6 +68,8 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   // 规范化成 JSON 数组落库。空串 = 清除(不限)。
   const [modelAllowlist, setModelAllowlist] = useState('')
   const [initialModelAllowlist, setInitialModelAllowlist] = useState('')
+  // 上游驱动形态(extra.driver,cursor 专用):'' = 线协议,'cli' = 子进程驱动 cursor-agent。
+  const [driver, setDriver] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
@@ -89,6 +91,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
         : ''
       setModelAllowlist(currentAllowlist)
       setInitialModelAllowlist(currentAllowlist)
+      setDriver(row.driver === 'cli' ? 'cli' : '')
       setError(null)
       setSaving(false)
     }
@@ -140,6 +143,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     // model_allowlist: 不传=不动，'' = 清除（不限），非空 = 逗号分隔条目
     //（后端写侧校验：通配符只许末尾、非法字符 400，规范化成 JSON 数组落库）。
     if (modelAllowlist !== initialModelAllowlist) patch.model_allowlist = modelAllowlist
+    // 驱动形态：与原值比较，没动就不带（同 queue_enabled 的理由：对着不认这个字段的
+    // 旧后端，只改并发也会让整个保存被判 400）。'' = 清除回线协议。
+    if (driver !== (row.driver === 'cli' ? 'cli' : '')) patch.driver = driver
 
     const draft: AccountGroupMembership[] = Object.entries(memberships).map(
       ([name, priority]) => ({ name, priority }),
@@ -312,6 +318,29 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
             </div>
             <p className="text-xs text-muted-foreground">{t('accounts.field.queueHint')}</p>
           </div>
+
+          {/* 上游驱动形态：只对 cursor 家族有意义（别的 provider 读不到 extra.driver，
+              露出来只会误导）。线协议 = 自己拼 protobuf 打 agent.v1.AgentService/Run；
+              CLI = 子进程驱动官方 cursor-agent，usage 是上游真实值（含 cacheRead），
+              工具走 MCP 桥回路。切换约 30s 内经 worker sync 生效，不用重启。 */}
+          {row?.provider === 'cursor' && (
+            <div className="space-y-1.5">
+              <span className="text-xs font-medium text-muted-foreground">
+                {t('accounts.field.driver')}
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <Segment
+                  options={[
+                    { value: '', label: t('accounts.driver.wire') },
+                    { value: 'cli', label: t('accounts.driver.cli') },
+                  ]}
+                  value={driver}
+                  onChange={(v) => setDriver(v)}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">{t('accounts.field.driverHint')}</p>
+            </div>
+          )}
 
           {/* 出口代理（可选） */}
           <div className="space-y-1.5">

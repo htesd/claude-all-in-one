@@ -53,6 +53,16 @@ export interface AccountRow {
    * null / 缺失 = 不限。旧缓存响应可能缺失 → 视为不限。
    */
   model_allowlist?: string[] | null
+  /**
+   * 上游驱动形态（`extra.driver`，后端顶层回显）。
+   * - `'cli'` = 子进程驱动官方 cursor-agent（usage 是上游真实值、含 cacheRead；
+   *   工具经 MCP 桥回路）
+   * - null / 缺失 = 默认的线协议形态（自己拼 protobuf 打 agent.v1.AgentService/Run）
+   *
+   * **只对 cursor 家族有意义**：别的 provider 读不到这个键。
+   * 旧缓存响应可能缺失 → 视为线协议。
+   */
+  driver?: string | null
 }
 
 /** POST /accounts 请求体（注意：这里的分组字段叫 `group`，PATCH 才是 `group_name`）。 */
@@ -100,6 +110,14 @@ export interface UpdateAccountPayload {
    * 走后端定点合并，绝不碰凭据。
    */
   model_allowlist?: string
+  /**
+   * 上游驱动形态（cursor 专用）。
+   * - `'cli'` = 子进程驱动 cursor-agent
+   * - 空字符串 `""` = 清除（回默认线协议）
+   * - 不传 = 不动
+   * 走后端定点合并，绝不碰凭据；认不出的值后端 400。
+   */
+  driver?: string
 }
 
 /** worker 侧账号不可用原因枚举（'' = 无）。 */
