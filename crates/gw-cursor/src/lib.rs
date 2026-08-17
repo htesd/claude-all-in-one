@@ -965,7 +965,14 @@ impl Provider for CursorProvider {
         chat::affinity_key_from_body(&req.body)
     }
 
-    async fn chat(&self, req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
+    async fn chat(&self, mut req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError> {
+        // 第一件事:把中转在 messages 中段注入的 `role:"system"` 消息分流掉。
+        // 必须在 `cli_eligible` / conversation_id 派生 / 任何 to_turns 之前 ——
+        // 下游全部函数(含 CLI 驱动取 prompt、tool_result 接续、指纹)都假定
+        // messages 里只有 user/assistant。不分流的后果见
+        // [`chat::route_system_role_messages`] 的文档(2026-08-17「grok 收到空消息」)。
+        chat::route_system_role_messages(&mut req.body);
+
         let token = Self::token_of(&ctx.account)?;
 
         // CLI 驱动(子进程,见 `clidrv`)提前算:它不需要 machine_id / config_version
@@ -1070,9 +1077,8 @@ impl Provider for CursorProvider {
                 .lookup(&conversation_id, &ctx.account.account_id, history);
             let raw_turns = chat::to_turns(&req.body);
             let mut prompt = match &lookup {
-                clidrv::CliLookup::Resume(_) => {
-                    raw_turns.last().map(|t| t.text.clone()).unwrap_or_default()
-                }
+                // 本轮新增的**整段**,不是末条消息 —— 理由见 `latest_user_input`。
+                clidrv::CliLookup::Resume(_) => chat::latest_user_input(&raw_turns),
                 clidrv::CliLookup::Fresh if raw_turns.len() > 1 => {
                     // 分叉/重铺:历史折进首条消息(与线协议形态同口径)。
                     chat::fold_history(&raw_turns, None)
@@ -1080,9 +1086,7 @@ impl Provider for CursorProvider {
                         .map(|t| t.text.clone())
                         .unwrap_or_default()
                 }
-                clidrv::CliLookup::Fresh => {
-                    raw_turns.last().map(|t| t.text.clone()).unwrap_or_default()
-                }
+                clidrv::CliLookup::Fresh => chat::latest_user_input(&raw_turns),
             };
 
             // 附件:图片落盘 + 提示词带路径(ask 模式只读工具能读图);
