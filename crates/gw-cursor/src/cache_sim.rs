@@ -52,6 +52,106 @@ const MAX_SESSIONS: usize = 4096;
 /// 2KB ≈ 500–700 token,与 kiro 同一阈值同一份理由。
 const FINGERPRINT_CHUNK_BYTES: usize = 2048;
 
+// ── 缓存计费夹限(与 gw-kiro::usage 逐条同口径)────────────────────────────────
+//
+// ⚠️ 为什么必须有这一层:模拟器的**原始命中量**不能直接当上报值。
+// 2026-08-17 生产实测(cursor CLI 驱动接上模拟器之后):48 条有缓存的记录里
+// **26 条(54%)** 的 `cache/input > 0.95`、18 条 > 0.99,最高 **0.9998** ——
+// 客户侧 `input − cache` 只剩 **18 个 token**。也就是"几乎全命中、输入白送"。
+//
+// kiro 早就有这道闸(`gw-kiro::usage::reported_cache_read` 的 `cap_ratio`,注释原话
+// 「杜绝假到全命中」),而**整个 cursor 通道(线协议 + CLI 驱动)从来没接过** ——
+// 三个运营旋钮(`cache_read_multiplier` / `cache_cap_ratio` / `cache_floor_ratio`)
+// 在 cursor 侧一处都没读。这不是 CLI 驱动引入的回归,是 cursor 的 cache_sim
+// 自始缺失;CLI 驱动接上模拟器后把它放大显形了。
+//
+// 口径与 kiro 逐字一致(两条通道的客户账单必须可比):
+// ```text
+// frac     = hit / sim_total
+// reported = clamp(frac × total × mult, total × floor, total × cap)
+// reported = clamp(reported, 0, total)
+// uncached = total − reported          // cap < 1 保证恒为正
+// ```
+
+/// 缩放倍率默认值(同 kiro `DEFAULT_CACHE_READ_MULTIPLIER`)。
+pub const DEFAULT_CACHE_READ_MULTIPLIER: f64 = 1.8;
+/// 命中上限比率默认值(同 kiro):**杜绝"假到全命中"**,保证客户侧输入恒为正。
+pub const DEFAULT_CACHE_CAP_RATIO: f64 = 0.9;
+/// 最低比率默认值(同 kiro):0 = 冷启动如实报 0、不造假。
+pub const DEFAULT_CACHE_FLOOR_RATIO: f64 = 0.0;
+
+/// 缓存计费三参数(admin 热调;worker 每 30s 轮询 settings 后经
+/// `Provider::apply_hot_settings` 灌进来)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheBilling {
+    pub read_multiplier: f64,
+    pub cap_ratio: f64,
+    pub floor_ratio: f64,
+}
+
+impl Default for CacheBilling {
+    fn default() -> Self {
+        Self {
+            read_multiplier: DEFAULT_CACHE_READ_MULTIPLIER,
+            cap_ratio: DEFAULT_CACHE_CAP_RATIO,
+            floor_ratio: DEFAULT_CACHE_FLOOR_RATIO,
+        }
+    }
+}
+
+/// 进程级计费参数(热调即时生效,下一个请求就读到)。
+fn billing_cell() -> &'static Mutex<CacheBilling> {
+    static B: OnceLock<Mutex<CacheBilling>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(CacheBilling::default()))
+}
+
+/// 读当前计费参数。
+pub fn billing() -> CacheBilling {
+    *billing_cell().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 热调计费参数(`apply_hot_settings` 调用)。
+pub fn set_billing(b: CacheBilling) {
+    *billing_cell().lock().unwrap_or_else(|p| p.into_inner()) = b;
+}
+
+/// 把模拟器**原始命中量**换成**上报值**:比例 × 倍率,再用上下限夹住。
+///
+/// 与 `gw-kiro::usage::reported_cache_read` 同式同参(含 NaN/inf 防护:热调值若为
+/// NaN,`f64::clamp` 行为不可靠)。`total` 是本轮上报基准(总输入),`hit`/`sim_total`
+/// 同出模拟器 tokenizer,故 `frac` 才有稳定物理意义。
+pub fn reported_cache_read(total: u64, hit: u64, sim_total: u64, b: CacheBilling) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let mult = if b.read_multiplier > 0.0 {
+        b.read_multiplier
+    } else {
+        DEFAULT_CACHE_READ_MULTIPLIER
+    };
+    let cap = if b.cap_ratio.is_finite() {
+        b.cap_ratio
+    } else {
+        DEFAULT_CACHE_CAP_RATIO
+    }
+    .clamp(0.0, 1.0);
+    let floor = if b.floor_ratio.is_finite() {
+        b.floor_ratio
+    } else {
+        DEFAULT_CACHE_FLOOR_RATIO
+    }
+    .clamp(0.0, cap);
+
+    let total_f = total as f64;
+    let frac = if sim_total > 0 {
+        hit as f64 / sim_total as f64
+    } else {
+        0.0
+    };
+    let reported = (frac * total_f * mult).clamp(total_f * floor, total_f * cap);
+    (reported.round().max(0.0) as u64).min(total)
+}
+
 /// 单条消息/单个 chunk 的指纹:内容哈希 + 估算 token 数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsgFingerprint {
@@ -605,5 +705,54 @@ mod tests {
         // s1 最老,在 s3 插入时就该被淘汰 → 再观测是冷启动
         let r = store.observe_at("s1", "m", vec![fp(1, 10)], t0 + Duration::from_secs(4));
         assert_eq!(r.cache_read_tokens, 0, "LRU 淘汰后应冷启动");
+    }
+
+    /// 夹限口径必须与 kiro 逐条一致 —— 两条通道的客户账单要可比。
+    ///
+    /// 锁三件事:cap 杜绝"假到全命中"(客户侧输入恒为正)、floor 是冷启动下限、
+    /// 倍率放大命中比例。这三个数是**运营旋钮**,不是估算的一部分。
+    #[test]
+    fn 夹限与kiro同口径() {
+        let b = CacheBilling { read_multiplier: 1.0, cap_ratio: 0.9, floor_ratio: 0.0 };
+        // 半命中 × 倍率1.0 → 原样(500/1000 → 0.5 → 1000×0.5=500)
+        assert_eq!(reported_cache_read(1000, 500, 1000, b), 500);
+        // 全命中被 cap 压到 900 —— 客户侧仍留 100,不会是 0
+        assert_eq!(reported_cache_read(1000, 1000, 1000, b), 900);
+        // 冷启动 floor=0 → 如实报 0,不造假
+        assert_eq!(reported_cache_read(1000, 0, 1000, b), 0);
+
+        // 倍率放大:0.5 × 1.8 = 0.9 → 恰好撞 cap
+        let b18 = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.9, floor_ratio: 0.0 };
+        assert_eq!(reported_cache_read(1000, 500, 1000, b18), 900);
+
+        // floor 抬底:0 命中也给 75%(线上 kiro 就是这么让利的)
+        let bf = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.95, floor_ratio: 0.75 };
+        assert_eq!(reported_cache_read(1000, 0, 1000, bf), 750);
+        // 且 floor 永不越过 cap
+        let bad = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.5, floor_ratio: 0.9 };
+        assert!(reported_cache_read(1000, 0, 1000, bad) <= 500, "floor 必须被夹到 cap 以内");
+    }
+
+    /// NaN/inf 热调值不得让夹限失控(admin 填错、YAML 写了 .nan 之类)。
+    #[test]
+    fn 非法参数回退默认不panic() {
+        let nan = CacheBilling { read_multiplier: f64::NAN, cap_ratio: f64::NAN, floor_ratio: f64::NAN };
+        let r = reported_cache_read(1000, 500, 1000, nan);
+        assert!(r <= 1000, "回退默认后仍须 ≤ total");
+        let inf = CacheBilling { read_multiplier: f64::INFINITY, cap_ratio: f64::INFINITY, floor_ratio: -1.0 };
+        assert!(reported_cache_read(1000, 500, 1000, inf) <= 1000);
+        // total=0 / sim_total=0 都不能 panic 或除零
+        assert_eq!(reported_cache_read(0, 0, 0, nan), 0);
+        assert_eq!(reported_cache_read(1000, 500, 0, CacheBilling::default()), 0);
+    }
+
+    /// 热调进程级参数:set 之后立刻读到(worker 30s 轮询靠这条生效)。
+    #[test]
+    fn 热调计费参数即时生效() {
+        let orig = billing();
+        let mine = CacheBilling { read_multiplier: 2.5, cap_ratio: 0.8, floor_ratio: 0.1 };
+        set_billing(mine);
+        assert_eq!(billing(), mine);
+        set_billing(orig); // 还原,免得污染同进程其它测试
     }
 }
