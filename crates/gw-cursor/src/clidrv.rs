@@ -917,15 +917,29 @@ impl SsePhase {
     /// `real_cache_read_tokens` 在此**不动**(恒 0):模拟值是计费策略,不是事实断言,
     /// 对账列只认上游自报 —— 与 `chat.rs` 的补偿闸同一条纪律。
     fn estimated_usage(&self) -> ChatUsage {
+        // 基准 = **本轮实际喂进 CLI 的量**,不是模拟器的上下文总量。
+        //
+        // ⚠️ 这里踩过一次:我曾把基准改成 `sim_total`(理由是"与 kiro 同口径")。
+        // 那个类比是错的 —— kiro **每轮重传全量历史**,所以它的"上下文总量"确实
+        // 等于上游 `input`;而 CLI 驱动下历史留在 CLI 自己的会话文件里(`--resume`),
+        // 我方这一轮只送新增,两个量根本不是一回事。
+        //
+        // 2026-08-17 标定实测(10 条真值样本,`sim_total / upstream_input`):
+        //   min 0.042 / P25 0.609 / **中位 0.741** / P75 0.847 / max 26.633
+        //   9 条低估、1 条极端高估。
+        // 即拿 `sim_total` 当基准会**系统性少收约 25%**(我方贴钱);而那条 26.6 倍
+        // 的离群值出现在**重铺**轮(调用方带回全量历史 → 模拟器按整段算 76890,
+        // 我方实际只喂 2887),那一轮会**超收 27 倍**。两个方向都错。
+        //
+        // `in_tally` 量的就是"这一轮真的送上去的字节",与上游 `inputTokens` 同义,
+        // 所以它才是自估的正确基准(真值轮一律用上游真值,不走这里)。
         let fresh_in = self.in_tally.tokens();
-        // 总量基准:取模拟器的上下文总量;它至少要盖住本轮新增(否则说明模拟器没接上
-        // 或口径漂了,那就以新增量为底,宁可少报缓存也不虚报输入)。
-        let total = self.sim_total.max(fresh_in);
-        // 夹限已在 `SimRequest::peek` 做过(cap 保证 cache < total),这里再 min 一次
-        // 纯属不变式兜底:`input ≥ cache_read` 绝不能破,否则线缆侧又归 0。
-        let cache = self.sim_cache_read.min(total);
+        // 缓存按**同一基准**夹住:模拟命中是按完整上下文算的,可能远超本轮新增,
+        // 直接填会破 `input ≥ cache_read`(线缆侧 `saturating_sub` 让输入归 0)。
+        // 夹到 fresh_in 之内 —— 宁可少报折扣,也不报出自相矛盾的用量。
+        let cache = self.sim_cache_read.min(fresh_in);
         ChatUsage {
-            input_tokens: total,
+            input_tokens: fresh_in,
             output_tokens: self.out_tally.calibrated_tokens(),
             cache_read_tokens: cache,
             ..Default::default()
@@ -1140,6 +1154,31 @@ fn usage_from_result(u: &Value) -> ChatUsage {
         real_cache_read_tokens: cached,
         ..Default::default()
     }
+}
+
+/// 真值轮的**缓存回落**:上游 cache 不可用(被判不可信而丢弃 → 0)时,用模拟值顶上。
+///
+/// 为什么必须回落而不是留 0:`usage_from_result` 丢弃的是"上游那个数不能用",
+/// 不代表本轮真的零命中。不回落的后果是**末轮(有真值那轮)反而一点缓存都没有**,
+/// 而中间自估轮有缓存 —— 客户看到"突然某一条完全没命中"(2026-08-17 用户报障)。
+/// 实测一条:input=85951、上游 cache=162176(累加值)被丢弃 → 计 0,而模拟器同一
+/// 请求给出 57336 命中,客户因此按全价付了约 2.4 倍。
+///
+/// 线协议侧早有同一条闸(`chat.rs` 的 `cache_read_tokens == 0 && sim_cache_read > 0`),
+/// CLI 驱动后加、漏了,这里补齐。
+///
+/// 只动**计费列**;`real_cache_read_tokens` 由调用方保持(对账列只认上游自报)。
+/// 夹到 `input` 之内以保住 `input ≥ cache_read`(否则线缆侧 saturating_sub 归 0)。
+fn fallback_cache_from_sim(usage: &mut ChatUsage, sim_cache_read: u64) -> Option<u64> {
+    if usage.cache_read_tokens > 0 || sim_cache_read == 0 {
+        return None;
+    }
+    let fallback = sim_cache_read.min(usage.input_tokens);
+    if fallback == 0 {
+        return None;
+    }
+    usage.cache_read_tokens = fallback;
+    Some(fallback)
 }
 
 /// drain 一条响应流(到 End 为止)。
@@ -1399,7 +1438,7 @@ async fn pump(mut a: PumpArgs) {
             // `usage.real_cache_read_tokens`:那一列在「cache > input」时已被置 0,
             // 于是标定会把「上游报了但我方丢弃」误记成「上游真值 0」,算出假的
             // ratio=0.000(2026-08-17 首批样本就这么被污染了一条)。
-            let (ok, usage, upstream_raw_cache) = match &state.result {
+            let (ok, mut usage, upstream_raw_cache) = match &state.result {
                 Some(r) if r.get("subtype").and_then(|s| s.as_str()) == Some("success") => {
                     let u = r.get("usage").cloned().unwrap_or_default();
                     let raw = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1412,6 +1451,37 @@ async fn pump(mut a: PumpArgs) {
                 }
             };
             if ok {
+                // ── 真值不可用时回落模拟值(**不要归零**)────────────────────────
+                //
+                // `usage_from_result` 在「上游 cache > input」(跨内部调用累加,生产常态)
+                // 时会丢弃那个不可信的 cache → `cache_read_tokens = 0`。但那只说明
+                // **上游那个数不能用**,不代表这一轮真的没有缓存命中 —— 同一请求模拟器
+                // 往往estimate 出可观的命中量。
+                //
+                // 不回落的后果(2026-08-17 用户报障 + 标定日志双向确认):**末轮(有真值那轮)
+                // 反而一点缓存都没有**,而中间自估轮有缓存,客户看到的就是"突然某一条
+                // 完全没有命中"。实测一条:input=85951、上游 cache=162176 被丢弃 → 计 0,
+                // 而模拟器同一请求给出 57336 命中 —— 客户按全价付了 ¥0.0274,
+                // 若用上模拟值约 ¥0.0103,**多付 2.4 倍**。
+                //
+                // 线协议侧早有同一条闸(`chat.rs` 的 `if usage.cache_read_tokens == 0
+                // && sim_cache_read > 0`),CLI 驱动是后加的,漏了。这里补齐。
+                //
+                // 只动**计费列**:`real_cache_read_tokens` 保持 0(对账列只认上游自报,
+                // 模拟值是计费策略、不是事实断言)。夹到 input 之内保住
+                // `input ≥ cache_read` 不变式。
+                if let Some(fallback) =
+                    fallback_cache_from_sim(&mut usage, sim.as_ref().map(|s| s.cache_read).unwrap_or(0))
+                {
+                    tracing::info!(
+                        account = %a.conv.account_id,
+                        upstream_raw_cache,
+                        upstream_input = usage.input_tokens,
+                        sim_fallback = fallback,
+                        "cursor-cli:上游缓存值不可用,回落模拟值计费(避免整轮按全价收)"
+                    );
+                }
+
                 // ── 模拟器标定(只观测,不参与计费)────────────────────────────
                 //
                 // 这一轮上游给了**真值**,而我们手上同时有模拟器对同一请求的估算 ——
@@ -1839,38 +1909,118 @@ mod tests {
     /// 自估轮必须报出模拟缓存,且 `input_tokens` 是**总输入**(新增 + 命中)。
     ///
     /// 锁两件事:
-    /// ① 模拟命中要出现在 `cache_read_tokens` 里 —— 这条 CLI 路径此前根本没接
-    ///    模拟器,自估轮 cache_read 结构性恒 0(生产 82% 的 grok 请求无缓存)。
-    /// ② `input_tokens` 的基准必须是**上下文总量**(`sim_total`),不是
-    ///    "本轮新增 + 命中"。旧基准下 `uncached ≡ fresh_in`,于是客户侧输入被死死
-    ///    钉在新增量上(2026-08-17 线上只剩 18 token),夹限再调也没用。
+    /// 上游 cache 不可用时必须**回落模拟值**,不能留 0。
+    ///
+    /// 这条锁的是 2026-08-17 用户报障:「为什么总是有这种突然没有任何缓存命中的」——
+    /// 末轮上游报的 cache 是跨内部调用累加值(超过 input),被判不可信丢弃后计 0,
+    /// 于是有真值的那一轮反而全价。实测 input=85951 / 上游 162176 被弃 /
+    /// 模拟 57336 可用 → 客户多付约 2.4 倍。
     #[test]
-    fn 自估轮的input基准是上下文总量而非本轮新增() {
-        let mut t = TokenTally::default();
-        t.push("本轮新增的输入文本");
-        let fresh = t.tokens();
-        assert!(fresh > 0, "新增量必须非零,否则这条测试没有意义");
+    fn 上游缓存不可用时回落模拟值() {
+        // 复刻生产样本:上游 cache=162176 > input=85951 → usage_from_result 丢弃成 0。
+        let mut u = usage_from_result(&json!({
+            "inputTokens": 85951, "outputTokens": 1323, "cacheReadTokens": 162176
+        }));
+        assert_eq!(u.cache_read_tokens, 0, "前提:不可信的上游 cache 已被丢弃");
 
-        // 上下文总量 20000、上报命中 5000(已过夹限)。
-        let slot = test_slot(5000, 20000);
-        let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
-        assert_eq!(u.cache_read_tokens, 5000, "模拟命中必须落到 cache_read");
-        assert_eq!(u.input_tokens, 20000, "input 必须是上下文总量,不是 fresh+cache");
+        // 同一请求模拟器给出 57336 命中 → 必须顶上。
+        let got = fallback_cache_from_sim(&mut u, 57336);
+        assert_eq!(got, Some(57336));
+        assert_eq!(u.cache_read_tokens, 57336, "计费列要用模拟值,不能留 0");
+        assert_eq!(u.input_tokens, 85951, "input 不受回落影响");
+        assert_eq!(u.real_cache_read_tokens, 0, "对账列仍不认模拟值");
+
+        // 客户侧因此拿到折扣,而不是整轮全价。
+        let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
-            u.real_cache_read_tokens, 0,
-            "模拟值是计费策略、不是事实断言,绝不写对账列"
+            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            Some(57336)
         );
+        assert_eq!(
+            wire.get("input_tokens").and_then(|v| v.as_u64()),
+            Some(85951 - 57336)
+        );
+    }
 
-        // 线缆侧减一次 → 客户看到未命中 15000,与 fresh_in 无关。
+    /// 回落只在"上游没给可用值"时发生,且绝不破 `input ≥ cache_read`。
+    #[test]
+    fn 回落不覆盖上游真值且夹到input内() {
+        // ① 上游已有可用 cache → 不回落(真值优先于模拟)。
+        let mut u = usage_from_result(&json!({
+            "inputTokens": 6779, "outputTokens": 35, "cacheReadTokens": 6016
+        }));
+        assert_eq!(fallback_cache_from_sim(&mut u, 99999), None, "有真值就不该回落");
+        assert_eq!(u.cache_read_tokens, 6016);
+
+        // ② 模拟值超过 input → 夹到 input(否则线缆侧 saturating_sub 让输入归 0)。
+        let mut u2 = usage_from_result(&json!({
+            "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 50000
+        }));
+        assert_eq!(u2.cache_read_tokens, 0);
+        assert_eq!(fallback_cache_from_sim(&mut u2, 40000), Some(1000));
+        assert_eq!(u2.cache_read_tokens, 1000, "必须夹到 input");
+
+        // ③ 模拟值为 0 → 无事发生。
+        let mut u3 = usage_from_result(&json!({
+            "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 9999
+        }));
+        assert_eq!(fallback_cache_from_sim(&mut u3, 0), None);
+        assert_eq!(u3.cache_read_tokens, 0);
+    }
+
+    /// 自估轮的 `input_tokens` 基准 = **本轮实际喂进 CLI 的量**,不是模拟器上下文总量。
+    ///
+    /// 这条锁的是 2026-08-17 标定实测顶回来的那次错误:我曾把基准改成 `sim_total`
+    /// (理由"与 kiro 同口径"),但 kiro 每轮重传全量历史、CLI 驱动不传 ——
+    /// 10 条真值样本的 `sim_total / upstream_input` 中位只有 **0.741**(少收 25%),
+    /// 且重铺轮出现 **26.6 倍**离群(超收)。两个方向都错。
+    #[test]
+    fn 自估轮的input基准是本轮实际输入量() {
+        let mut t = TokenTally::default();
+        t.push("本轮新增的输入文本,长度要够让命中值有意义" .repeat(50).as_str());
+        let fresh = t.tokens();
+        assert!(fresh > 100, "新增量要够大,否则夹限会掩盖基准差异: {fresh}");
+
+        // 模拟器按**完整上下文**算,总量远大于本轮新增(生产常态)。
+        let slot = test_slot(fresh / 2, fresh * 20);
+        let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
+        assert_eq!(
+            u.input_tokens, fresh,
+            "input 必须是本轮实际输入,不得用 sim_total(那会超收)"
+        );
+        assert_eq!(u.cache_read_tokens, fresh / 2, "命中在基准之内时原样报");
+        assert_eq!(u.real_cache_read_tokens, 0, "模拟值绝不写对账列");
+
         let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
             wire.get("input_tokens").and_then(|v| v.as_u64()),
-            Some(15000),
-            "客户侧输入 = 总量 − 命中"
+            Some(fresh - fresh / 2),
+            "客户侧 = 基准 − 命中"
         );
+    }
+
+    /// 模拟命中超过本轮基准时必须夹住 —— 否则 `input ≥ cache_read` 被破,
+    /// 线缆侧 `saturating_sub` 又把客户侧输入归 0。
+    ///
+    /// 这在生产是常态:模拟命中按完整上下文算(可达数万),而续轮实际只喂回
+    /// 一条 tool_result(几百 token)。
+    #[test]
+    fn 模拟命中超过本轮输入时夹到基准内() {
+        let mut t = TokenTally::default();
+        t.push("一条不长的 tool_result");
+        let fresh = t.tokens();
+        // 命中值故意给成基准的几十倍(模拟器按整段上下文算出来的那种)。
+        let slot = test_slot(fresh * 40 + 9999, fresh * 60);
+        let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
+        assert_eq!(u.input_tokens, fresh);
+        assert_eq!(u.cache_read_tokens, fresh, "命中必须夹到基准");
+        // 全额命中时客户侧输入为 0 —— 这在 Anthropic 语义下是**合法**形态
+        // (整段命中),NewAPI 按 0.1× 计费,不是 bug。
+        let wire = crate::chat::delta_usage_json_pub(&u);
+        assert_eq!(wire.get("input_tokens").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(
             wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
-            Some(5000)
+            Some(fresh)
         );
     }
 
