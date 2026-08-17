@@ -1,5 +1,71 @@
 # Changelog
 
+## [cursor-tier-and-cli-default] 账号档位可见 + CLI 驱动转默认 + CLI 出口代理透传 — 2026-08-17
+
+同日第三批。前两批见下面两条 —— 这批全部来自那之后 40 分钟的线上排查。
+
+### Fixes
+
+- **档位在后台完全看不出来**(用户报障原话:「为什么 team 号显示不出额度」)。三个当天
+  新买的号在 20 分钟内被上游降级成 FREE,而面板上只有一片空白。三个原因叠在一起:
+  1. FREE 档的 `GetCurrentPeriodUsage` **不给** `includedSpend`/`limit`(免费号没有
+     套餐内额度),而 `parse_period_usage` 对此一律报错 → **整个配额查询失败** →
+     额度栏空白,与"查询失败"长得一模一样;
+  2. 档位回填拿的是 `q.currency`。那对 kiro 成立(currency 装的就是 `KIRO PRO` 这类
+     档位名),对 cursor **不成立**:gw-cursor 写死 `currency = "USD"`,于是每个 cursor
+     号的 `subscription_title` 都被填成字符串 `"USD"`;
+  3. `warm_subscription_titles` 只补「缺这个字段」的号 → **填错一次永不复查**;而判付费
+     用的是「`subscription_title` 存在且不含 FREE」——`"USD"` 不含 FREE,于是**降级号
+     一直被当付费号**,继续被派发它已经没权限的模型。第 3 条正是 grok / composer 反复
+     `ModelNotAvailable` 的下游成因。
+  **修法**:`AccountQuota` 新增 `plan_tier`;cursor 按「有没有套餐内额度」判 `FREE`/`PAID`;
+  FREE 不再报错(`used`/`limit` = 0 是事实而非未知);worker 回填**优先 `plan_tier`、
+  `currency` 兜底**(kiro 走兜底分支,行为逐字节不变);`/health` 与账号表暴露该字段,
+  FREE 直接打红标 + 悬浮提示「额度栏空白 ≠ 查询失败」。
+- **CLI 驱动静默直连**(默认化路上踩出来的,比原问题严重)。`start_conv` 里 `env_clear()`
+  之后只塞了 `HOME`/`PATH` —— 什么都不继承,所以**账号配的代理压根没进 CLI 子进程**。
+  实测:三个代理号切到 CLI 驱动后全部失败(表象是 `cursor-cli 桥连接中断`),而记忆里
+  直连出口的封号率是 **59.5%**(代理 0%)。也就是说漏这段不只是不通,是在烧号。
+  **修法**:从 `extra.proxy` 派生 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`(大小写两套)
+  塞进子进程,回环走 `NO_PROXY` 免得把 MCP 桥绕进代理。
+
+### Features
+
+- **CLI 驱动成为默认**,线协议改成显式退出(`extra.driver="wire"` 单号退出、
+  `CURSOR_DRIVER=wire` 整个 worker 退出;历史值 `"cli"` 仍合法 = 默认)。后台开关与
+  表格徽章同步翻转:默认档不再打标,**只对退出线协议的号打标**(异常才该显眼)。
+
+### Design Rationale
+
+- **为什么把默认翻过来**。线协议给上游发的是**裸模型名**(`grok-4.6`),CLI 驱动发的是
+  CLI 那套名字(`cursor-grok-4.6-high`)。当天 06:50 前后上游停止接受裸 `grok-4.6`、
+  随后 `grok-4.5` 也一样,线协议上的三个号在几分钟内全部 `ModelNotAvailable`,而同一批号
+  切到 CLI 驱动**立刻恢复** —— `cursor-agent --list-models` 实证上游只有
+  `cursor-grok-4.x-*` 那一族。裸名那套是我方逆出来的、会被上游单方面收走;CLI 用的是
+  **官方客户端自己在用的名字**,后者才是长期站得住的一侧。加上 CLI 驱动本来就带真实
+  usage(含 `cacheReadTokens`)与 MCP 工具桥,没有理由再让它当可选项。
+- **代理那段是实测过才写的,不是照惯例猜的**。cursor-agent 是 Node 程序,而 Node 默认
+  并不认 `HTTPS_PROXY`,所以必须先证伪:把 `HTTPS_PROXY` 指向 `127.0.0.1:1`,
+  `--list-models` 当场 `ECONNREFUSED 127.0.0.1:1`;不设则正常 →它走的是认环境变量的
+  HTTP 客户端,`NODE_USE_ENV_PROXY` 不需要(加了也不变)。
+- **档位只报能证实的二分,不猜档位名**。`GetMe` 实测只有 `authId`/`email`/`country`/
+  `isEnterpriseUser` 这些,**没有会员字段**;`GetTeams` 对这些号返回 `{}`(所以它们
+  根本不在任何 team 里,名字只是我方台账);其余 7 个猜测的方法名全 404。唯一稳的判据
+  就是「有没有套餐内额度」,那就只报 `FREE`/`PAID`。
+- **只缺一个金额字段仍然报错**。原注释的顾虑是对的(`unwrap_or(0)` 会把故障显示成
+  零额度),只是漏了 FREE 这个第三种形态。所以判据收窄成「两个都缺 = FREE,只缺一个 =
+  上游改了字段」,两个方向都有单测钉着。
+
+### Notes & Caveats
+
+- ⚠️ **部署必须连带清库**:已有 cursor 号的 `extra.subscription_title` 是被污染的 `"USD"`,
+  不清掉新逻辑也不会复查(只补缺字段的号)。清理语句见部署记录(`json_remove` 该键,
+  条件 `= 'USD'`,不动别的值)。
+- ⚠️ **这批把每个 cursor 号都推上了 CLI 驱动**(除显式 `wire`)。每请求 spawn 一个
+  `cursor-agent` 子进程,并发上限按号累加 —— 上线后要看一眼宿主内存。
+- team1/2/3 当天的临时措施(`driver=wire` + 排 grok 的白名单)在部署后一并撤掉,统一回
+  默认;它们仍是 FREE + disabled,不会因此吃流量。
+
 ## [cursor-cli-ws-isolation] CLI 工作区改每会话一份(修跨会话提示串味)+ 调用方侧空闲闸 — 2026-08-17
 
 上一条 `[cursor-inject-routing]` 部署后盯了 30 分钟,盯出两件新事。
