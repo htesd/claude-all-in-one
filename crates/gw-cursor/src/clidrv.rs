@@ -13,13 +13,16 @@
 //! - **安全闸**:`--mode ask`(read-only)且**绝不**加 `--force`。注意 ask 模式
 //!   仍允许**只读 shell**(ls/cat 会真跑)—— 部署侧用**每账号独立 uid** + 700
 //!   HOME 隔离:别号的 CLI 连目录都进不来,auth.json 互不可读(见 `account_uid`)。
-//! - 调用方 system 提示写进每号工作区的 `AGENTS.md`(CLI 原生 rules 位置)。
+//! - 调用方 system 提示写进**每会话**工作区(`<home>/ws/<conversation_id>/`)的
+//!   `AGENTS.md`(CLI 原生 rules 位置)。**每号一份是错的**:AGENTS.md 装的是调用方
+//!   本次请求的 system,同号并发的两个会话会互相覆盖它,还会让甲客户的提示被乙客户的
+//!   CLI 读到(2026-08-17 线上实测,见 [`prepare_home`])。
 //! - **工具桥**(调用方声明了 tools 时):每号 HOME 写死 `.cursor/mcp.json` +
 //!   `permissions.json`(`{"mcpAllowlist":["gwtools:*"]}`,格式挖自 CLI bundle 的
 //!   `shouldBlockMcp`/`matchesMcpPattern`,必须带冒号)。桥是本网关二进制的
 //!   `--mode cursor-mcp-bridge` 子进程;CLI 调工具 → 桥挂起 → 网关发 tool_use
 //!   给客户 → 客户下次请求带 tool_result → 桥应答 → CLI 继续。
-//! - **图片**:落到每号工作区 `assets/`,提示词带绝对路径(ask 模式只读工具
+//! - **图片**:落到每会话工作区的 `assets/`,提示词带绝对路径(ask 模式只读工具
 //!   能读图,实测左红右蓝识别正确);**PDF**:抽文本层内联进提示词。
 //!
 //! ## 事件流(stream-json,逐行 NDJSON)
@@ -47,13 +50,37 @@ use tokio::sync::{oneshot, Notify};
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
 use gw_core::provider::{ChatUsage, SseEvent, StreamItem};
 
-/// 单轮 CLI 调用的硬上限。gw-app 还有 300s 空闲熔断;这里取 240s,
-/// 保证先于我方上层超时干净地杀掉进程。
+/// CLI 进程的**活跃时间**上限(不含桥挂起等待)。
+///
+/// ⚠️ 注意它量的**不是**墙上时钟。检查点在泵的 `select!` 的 500ms tick 分支里,而桥调用
+/// 挂起是在 `call` 分支**内部** `await` 一个 [`PENDING_TTL`] 的 timeout —— 那段 await 期间
+/// 整个 select 停转、tick 不响,所以挂起等待**不计入**这个预算。
+///
+/// 这不是 bug 而是必要的:一个 CLI 进程横跨调用方的多个 HTTP 回合(每次桥调用都要
+/// 等调用方在自己机器上执行完再发下一个请求),10 轮工具往返的墙上时钟轻易超过 240s。
+/// 若把挂起等待也计进来,正常的长工具回路会被误杀。
+///
+/// 早先这里的注释写的是「单轮 CLI 调用的硬上限……保证先于我方上层超时干净地杀掉进程」,
+/// 那句话是错的:它既不是"单轮",也**兜不住**调用方那一侧的等待 —— 客户可见的空等由
+/// [`DRAIN_IDLE_TIMEOUT`] 负责。2026-08-17 排 300s 空等时查清。
 const CLI_TIMEOUT: Duration = Duration::from_secs(240);
 /// 桥调用等调用方带回 tool_result 的上限。超时给桥回错误,让 CLI 干净收尾。
 const PENDING_TTL: Duration = Duration::from_secs(280);
+/// **调用方一侧**的空闲上限:本次 HTTP 响应连续多久拿不到任何事件就判本轮废了。
+///
+/// 不设它的后果(2026-08-17 生产实测):`resume_conv` 把 tool_result 喂进挂起槽后直接返回
+/// [`drain_stream`],而那个流**没有任何超时** —— CLI 之后若一声不出,调用方就一路等到
+/// gw-app 的 300s `STREAM_IDLE_ABORT` 才收到一个空响应。实测占 tool_result 接续请求的
+/// 1%~7%,客户看到的是**整整 5 分钟没有任何输出**。
+///
+/// 取 90s 与线协议的 `chat::STALL_TIMEOUT` 同值(那边的理由:心跳 10s 一个,容忍 9 个)。
+/// 这里 OutQueue 里没有心跳,思考增量就是进展信号 —— 连续 90s 一个字节都没有等于死了。
+/// 宁可偏大:误判的代价是把一次本来会成功的慢请求变成失败。
+const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// 会话条目 TTL:超时按新会话处理(与线协议形态同值)。
 const SESSION_TTL: Duration = Duration::from_secs(2 * 3600);
+/// 每会话工作区的保留期。与 [`SESSION_TTL`] 同值:会话条目过期后那个目录再没人会用。
+const WS_TTL: Duration = Duration::from_secs(2 * 3600);
 
 /// 解析好的 CLI 二进制与数据根。
 #[derive(Debug, Clone)]
@@ -192,16 +219,65 @@ pub fn account_uid(account_id: &str) -> u32 {
 /// - 都解不出 exp → 信文件(CLI 的活状态),不动。
 ///
 /// `system` 非空时同步到工作区 AGENTS.md(内容没变就不写,免得每轮刷 mtime)。
+/// 当前 unix 秒。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 回收过期的每会话工作区。尽力而为,任何错误一律忽略(它不是请求成功的前置条件)。
+///
+/// **判据取显式写下的 `.last` 而不是目录 mtime**:目录 mtime 只在增删目录项时变,一个
+/// 已经跑了半小时、期间只读文件的活会话,其目录 mtime 可能很旧 —— 拿它当判据会删掉
+/// 正在用的工作区(而 CLI 的 cwd 被删掉之后的行为是另一场排查)。
+///
+/// 没有 `.last` 的目录一律当过期:那只可能是旧版留下的(如老的 `ws/assets`),或写标记
+/// 失败的残骸,两者都没人会再用。当前会话的目录用**路径**排除,不靠名字比较。
+fn gc_workspaces(ws_root: &Path, keep: &Path) {
+    let Ok(rd) = std::fs::read_dir(ws_root) else {
+        return;
+    };
+    let now = now_secs();
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() || p == keep {
+            continue;
+        }
+        let alive = std::fs::read_to_string(p.join(".last"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .is_some_and(|t| now.saturating_sub(t) < WS_TTL.as_secs());
+        if !alive {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
 pub fn prepare_home(
     cfg: &CliDriverConfig,
     account_id: &str,
+    conversation_id: &str,
     access_token: &str,
     refresh_token: Option<&str>,
     system: &str,
     updates: &TokenUpdates,
 ) -> Result<(PathBuf, PathBuf), UpstreamError> {
     let home = cfg.base_dir.join(account_id);
-    let ws = home.join("ws");
+    let ws_root = home.join("ws");
+    // 工作区**每会话一份**。早先是每号一份(`home/ws`),而 AGENTS.md 装的是**调用方本次
+    // 请求的 system 提示** —— 同一个号上并发的两个会话会互相覆盖这个文件:
+    // 2026-08-17 线上实测,一个无工具的角色扮演会话把它覆成「你没有任何工具可用」+ 人设,
+    // 而同号另一个带 46 个工具的 Claude Code 会话的 CLI 读到的就是那份,模型的 thinking 里
+    // 写着「gwtools 未直接列入 MCP 列表」。除了功能错乱,这还是**跨会话的提示串味**:
+    // 甲客户的 system 提示躺在乙客户的 CLI 工作区里。
+    // 目录名用 conversation_id(已是 UUID 形态,见 chat::conversation_uuid,不含路径分隔符)。
+    let ws = if conversation_id.is_empty() {
+        ws_root.join("_noconv")
+    } else {
+        ws_root.join(conversation_id)
+    };
     let io = |what: &str, e: std::io::Error| {
         UpstreamError::new(
             UpstreamErrorKind::Other,
@@ -211,6 +287,17 @@ pub fn prepare_home(
     std::fs::create_dir_all(home.join(".config/cursor")).map_err(|e| io("创建 home", e))?;
     std::fs::create_dir_all(home.join(".cursor")).map_err(|e| io("创建 .cursor", e))?;
     std::fs::create_dir_all(ws.join("assets")).map_err(|e| io("创建工作区", e))?;
+
+    // 迁移:旧版把 AGENTS.md 直接写在 `home/ws` 下,而那正是新工作区的**父目录** ——
+    // Cursor 会往上层找 rules,留着它等于把串味问题原地保留。见到就删。
+    let legacy_agents = ws_root.join("AGENTS.md");
+    if legacy_agents.is_file() {
+        let _ = std::fs::remove_file(&legacy_agents);
+        tracing::info!(account = %account_id, "cursor-cli:清掉旧的每号共享 AGENTS.md(已改每会话)");
+    }
+    // 活跃标记 + 过期目录回收(判据见 gc_workspaces)。
+    let _ = std::fs::write(ws.join(".last"), now_secs().to_string());
+    gc_workspaces(&ws_root, &ws);
 
     let auth_file = home.join(".config/cursor/auth.json");
     if auth_file.exists() {
@@ -699,10 +786,26 @@ impl SsePhase {
 
 /// drain 一条响应流(到 End 为止)。
 fn drain_stream(out: Arc<OutQueue>) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
-    futures::stream::unfold(out, |out| async move {
-        match out.pop().await {
-            OutItem::Item(it) => Some((it, out)),
-            OutItem::End => None,
+    // 状态是 `Option`:超时那一下要**先发一条错误、再终止**,不能继续 pop ——
+    // 否则下一次 poll 又等 90s,变成每 90s 吐一条错误的死循环。
+    futures::stream::unfold(Some(out), |st| async move {
+        let out = st?;
+        match tokio::time::timeout(DRAIN_IDLE_TIMEOUT, out.pop()).await {
+            Ok(OutItem::Item(it)) => Some((it, Some(out))),
+            Ok(OutItem::End) => None,
+            Err(_) => {
+                // 泵还活着(它可能正卡在别处),所以只结束**本次响应**,不动 CLI 进程:
+                // 调用方重试会走 cli_lookup,该重铺就重铺。
+                tracing::warn!(
+                    secs = DRAIN_IDLE_TIMEOUT.as_secs(),
+                    "cursor-cli:调用方一侧连续无事件,按本轮失败收尾"
+                );
+                let e = UpstreamError::new(
+                    UpstreamErrorKind::Other,
+                    format!("cursor-cli: 连续 {}s 没有任何输出", DRAIN_IDLE_TIMEOUT.as_secs()),
+                );
+                Some((Err(e), None))
+            }
         }
     })
 }
@@ -1140,10 +1243,10 @@ mod tests {
         let old = fake_jwt(1_000_000);
         let new = fake_jwt(2_000_000);
         // 号库 token 旧;文件里是 CLI 轮换后的新 token。
-        prepare_home(&cfg, "acc", &old, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &old, None, "", &updates).unwrap();
         write_auth_json(&base.join("acc"), &new, Some("rt-new")).unwrap();
 
-        prepare_home(&cfg, "acc", &old, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &old, None, "", &updates).unwrap();
 
         let captured = updates.lock().unwrap().get("acc").cloned();
         let captured = captured.expect("文件更新必须产生捕获");
@@ -1161,10 +1264,10 @@ mod tests {
         let updates = TokenUpdates::default();
         let old = fake_jwt(1_000_000);
         let new = fake_jwt(2_000_000);
-        prepare_home(&cfg, "acc", &old, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &old, None, "", &updates).unwrap();
 
         // gw-app 侧刷新过(号库 exp 更新)→ 文件应被覆写跟上。
-        prepare_home(&cfg, "acc", &new, Some("rt-new"), "", &updates).unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &new, Some("rt-new"), "", &updates).unwrap();
 
         let (at, rt) = read_auth_creds(&base.join("acc/.config/cursor/auth.json")).unwrap();
         assert_eq!(at, new);
@@ -1173,16 +1276,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **2026-08-17 跨会话提示串味的回归锁**:同号两个会话的 AGENTS.md 必须各是各的。
+    /// 每号一份时,无工具的角色扮演会话会把它覆成「你没有任何工具可用」,同号那个带
+    /// 46 个工具的 Claude Code 会话的 CLI 就读到了那份。
+    #[test]
+    fn prepare_home_工作区每会话一份_互不覆盖() {
+        let (cfg, base) = test_cfg("perconv");
+        let updates = TokenUpdates::default();
+        let tok = fake_jwt(1_500_000);
+        let (_, ws_a) = prepare_home(&cfg, "acc", "conv-a", &tok, None, "甲会话的 system", &updates).unwrap();
+        let (_, ws_b) = prepare_home(&cfg, "acc", "conv-b", &tok, None, "乙会话的 system", &updates).unwrap();
+        assert_ne!(ws_a, ws_b, "两个会话必须是两个目录");
+        assert_eq!(std::fs::read_to_string(ws_a.join("AGENTS.md")).unwrap(), "甲会话的 system");
+        assert_eq!(std::fs::read_to_string(ws_b.join("AGENTS.md")).unwrap(), "乙会话的 system");
+        // 附件也各自隔离(编号 attach-N 是每请求重排的,共用目录会互相盖图)。
+        assert!(ws_a.join("assets").is_dir() && ws_b.join("assets").is_dir());
+        // 会话 id 为空时有确定的兜底目录,不会退回共享父目录。
+        let (_, ws_n) = prepare_home(&cfg, "acc", "", &tok, None, "x", &updates).unwrap();
+        assert_eq!(ws_n, base.join("acc/ws/_noconv"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 迁移:旧版把 AGENTS.md 写在 `ws/` 下,而那是新工作区的**父目录** ——
+    /// Cursor 会往上层找 rules,留着等于串味原地保留。必须删掉。
+    #[test]
+    fn prepare_home_清掉旧的每号共享agents() {
+        let (cfg, base) = test_cfg("legacy");
+        let updates = TokenUpdates::default();
+        let tok = fake_jwt(1_500_000);
+        let ws_root = base.join("acc/ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        std::fs::write(ws_root.join("AGENTS.md"), "别的客户的 system").unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &tok, None, "我的 system", &updates).unwrap();
+        assert!(!ws_root.join("AGENTS.md").exists(), "旧的共享 AGENTS.md 必须被清掉");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GC:过期会话目录回收,当前会话与新鲜会话都不能动。
+    /// **判据是 `.last` 不是目录 mtime** —— 活会话的目录 mtime 可能很旧。
+    #[test]
+    fn 工作区gc_只删过期的_不碰当前和新鲜的() {
+        let (cfg, base) = test_cfg("wsgc");
+        let updates = TokenUpdates::default();
+        let tok = fake_jwt(1_500_000);
+        let ws_root = base.join("acc/ws");
+        // 造三个:过期的、无标记的(旧版残骸)、新鲜的。
+        let stale = ws_root.join("conv-stale");
+        let nomark = ws_root.join("conv-nomark");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&nomark).unwrap();
+        std::fs::write(stale.join(".last"), (now_secs() - WS_TTL.as_secs() - 60).to_string()).unwrap();
+        let (_, fresh) = prepare_home(&cfg, "acc", "conv-fresh", &tok, None, "s", &updates).unwrap();
+        // 再跑一次别的会话触发 GC(当前会话换成 conv-cur)。
+        let (_, cur) = prepare_home(&cfg, "acc", "conv-cur", &tok, None, "s", &updates).unwrap();
+        assert!(!stale.exists(), "过期目录该删");
+        assert!(!nomark.exists(), "无 .last 标记的旧残骸该删");
+        assert!(fresh.exists(), "新鲜会话不能删");
+        assert!(cur.exists(), "当前会话不能删");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn prepare_home_同token不动文件() {
         let (cfg, base) = test_cfg("same");
         let updates = TokenUpdates::default();
         let tok = fake_jwt(1_500_000);
-        prepare_home(&cfg, "acc", &tok, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &tok, None, "", &updates).unwrap();
         let file = base.join("acc/.config/cursor/auth.json");
         let before = std::fs::metadata(&file).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        prepare_home(&cfg, "acc", &tok, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", "conv-a", &tok, None, "", &updates).unwrap();
         let after = std::fs::metadata(&file).unwrap().modified().unwrap();
         assert_eq!(before, after, "同 token 不该重写文件(刷 mtime)");
         assert!(updates.lock().unwrap().is_empty());
