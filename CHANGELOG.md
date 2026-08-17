@@ -112,12 +112,16 @@ CLI 驱动这条路**从来没接过 `cache_sim`** —— peek/commit 只写在 
 - **`cacheWriteTokens` 仍未处理**:上游 result 实测有第四个字段(见上面那条 NDJSON),
   而 `cache_creation_tokens` 至今恒 0。它对应 Anthropic 的 `cache_creation_input_tokens`,
   按量计费通常比普通输入更贵 —— 待评估是否计入。
-- **`result.usage` 的累计范围只查清一半,这是上线前的硬阻断**:已证实
-  `cacheReadTokens` 跨 CLI 内部多次模型调用累加(生产 `max=886,016`,超出上下文窗口,
-  单次调用不可能)。但它是否跨**调用方 HTTP 轮**累加**尚无直接证据** —— 若跨轮,
-  最后一轮的 result 真值会与前面各轮的自估**重复计费**。取证要开
-  `CURSOR_CLI_DUMP_NDJSON` 抓一条含多次 tool_use 的完整会话(需重启 worker-cursor)。
-  **在此之前不部署 Bug 1/2。**
+- **`result.usage` 的累计范围已取证澄清(原为上线阻断,现已排除)**:开
+  `CURSOR_CLI_DUMP_NDJSON` 抓真实会话后确认两件事 ——
+  ① `cacheReadTokens` 跨 CLI **内部**多次模型调用累加而 `inputTokens` 只算末次,
+  故 `cache > input` **只出现在走 MCP 桥的多轮会话**上(桥会话 `input=9844/cache=35840`;
+  单轮会话 `input=50227/cache=5888` 一律正常);
+  ② `result` **不跨调用方 HTTP 轮累计** —— 四条走桥的多轮会话(桥调用 6/6/4/4 次)
+  其 result 都精确等于**单独一条** `request_log`,不是多轮之和。所以桥挂起期间各轮
+  走自估、末轮走 result 真值,两者**不重叠、不重复计费**,评审的这条阻断级担忧不成立。
+  ⚠️ 若将来改动收尾时机(让 result 补算整条会话),这条不变式即失效,须重新取证。
+  取证后已撤掉转储变量并 `shred` 掉转储文件(含客户对话)。
 - 新增 7 条回归测试(口径三态 + `covers_tools` 三态 + 无槽基线);全量 1,401 passed / 0 failed。
 
 ## [cursor-cli-notice-bootstrap] CLI 驱动:提示词与本轮 tools 解耦 — 2026-08-17

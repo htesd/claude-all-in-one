@@ -1046,9 +1046,28 @@ impl SsePhase {
 /// ## `cache > input` 的真实成因与处理
 ///
 /// 生产实测(近 4h grok-4.6 有缓存记录 127 条)有 **49 条(39%)`cache > input`**,
-/// 最极端 239 倍(`input=54 / cache=12928`)。这些是**工具回路**的会话:CLI 一次
-/// 会话内部会发起多次模型调用,`cacheReadTokens` 看起来是跨内部调用**累加**的,
-/// 而 `inputTokens` 不是。两个字段不同口径,不可直接相减。
+/// 最极端 239 倍(`input=54 / cache=12928`)。
+///
+/// 2026-08-17 开 `CURSOR_CLI_DUMP_NDJSON` 抓真实会话**钉死了成因**:`cache > input`
+/// 只出现在**走 MCP 桥的多轮会话**上,单轮会话一律 `input > cache`:
+///
+/// ```text
+/// 桥会话(6 次桥调用) input=9844  cacheRead=35840  ← cache 是 input 的 3.6 倍
+/// 桥会话(6 次桥调用) input=4868  cacheRead=38272
+/// 单轮会话(0 次)     input=50227 cacheRead=5888   ← 正常
+/// 单轮会话(0 次)     input=50165 cacheRead=6016
+/// ```
+///
+/// 即 `cacheReadTokens` 跨 CLI **内部多次模型调用**累加,而 `inputTokens` 只算末次。
+/// 两个字段不同口径,**不可相减、也不可据此反推语义**。
+///
+/// ## `result` 只结算末轮,不跨调用方 HTTP 轮(与自估**不重叠**)
+///
+/// 同批取证顺带排掉了「最终真值与前面各轮自估重复计费」这个担忧(对抗评审的阻断级
+/// 问题之一):四条走桥的多轮会话,其 `result.usage` 都精确等于**单独一条**
+/// `request_log`,而非多轮之和 —— 桥挂起期间每轮走 `estimated_usage` 自估,
+/// CLI 进程退出时那一次 `result` 只落在最后一轮。所以两条路径各管一段,不重复。
+/// ⚠️ 若将来改动收尾时机(比如让 result 补算整条会话),这条不变式就没了,要重新验。
 ///
 /// 不去"修正"input(重构不出可信的总量),只把 cached **封顶到 input** 以恢复
 /// Anthropic 不变式(`input ≥ cache_read`,否则线缆侧 `saturating_sub` 会让
