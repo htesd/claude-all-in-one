@@ -1086,6 +1086,18 @@ impl Provider for CursorProvider {
         "cursor"
     }
 
+    // ⚠️ **故意不实现 `apply_hot_settings` / `hot_settings_supported`。**
+    //
+    // cursor 通道从来不读缓存计费三旋钮(`cache_read_multiplier` / `cache_cap_ratio`
+    // / `cache_floor_ratio`),这是既有事实。实现它是**一步到位的定价变更**:线上
+    // settings 现为 `cap=0.95 / floor=0.75`,一接上,cursor 立刻开始按 floor=0.75
+    // 给折扣 —— 冷启动零命中也按 75% 走缓存价。那是运营决策,不能夹在 bug 修复里
+    // 顺手做掉,所以先只上标定观测(见 pump 收尾处的"缓存标定样本"日志),
+    // 等实测比值出来再由运营定这三个数,然后单独一次改动接上。
+    //
+    // 夹限函数(`cache_sim::reported_cache_read`)与热调入口(`set_billing`)已就位,
+    // 接的时候只要在这里补上两个方法。
+
     fn account_schema(&self) -> &'static [FieldSpec] {
         CURSOR_ACCOUNT_SCHEMA
     }
@@ -1272,20 +1284,6 @@ impl Provider for CursorProvider {
                     &raw_turns,
                     chat::est_text_tokens,
                 );
-                // `system + tools` 段的 token 总量:指纹布局是 `[system][tools][各轮消息]`,
-                // 用「同样的 system+tools + 零条消息」再指纹一次就得到那段
-                // (同 msg_idx、同内容 → 同哈希,即 sim_fps 的前若干项)。前缀命中是
-                // 从头连续的,故「命中量 ≥ 这段总量」⟺ 命中覆盖了整个 tools 块 ——
-                // 用途见 `SimSlot::covers_tools`(防 tools 被计费两次)。
-                let header_tokens: u64 = crate::cache_sim::fingerprints_from_context(
-                    &system,
-                    &tools,
-                    &[],
-                    chat::est_text_tokens,
-                )
-                .iter()
-                .map(|f| f.tokens as u64)
-                .sum();
                 // 这里**只准备材料、不 peek**:peek 读出的代际号从读出到 commit 之间
                 // 越久越容易被同会话的别人推进。真正的 peek 留给 start_conv /
                 // resume_conv(后者还要先校验 tool_result 匹配),见 `SimRequest`。
@@ -1293,7 +1291,6 @@ impl Provider for CursorProvider {
                     key,
                     model: req.model.clone(),
                     fps: sim_fps,
-                    header_tokens,
                 })
             };
 

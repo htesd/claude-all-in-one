@@ -546,19 +546,22 @@ pub struct SimSlot {
     pub fps: Vec<crate::cache_sim::MsgFingerprint>,
     /// peek 时读到的代际号,commit 时做 compare-and-set。
     pub gen: u64,
-    /// 本轮模拟命中的 token 数(自估用量拿它填 cache_read)。
+    /// 本轮上报的 cache_read(**已过三参数夹限**,不是模拟器原始命中量)。
     pub cache_read: u64,
-    /// 命中前缀是否**越过了 tools 块**(即 system + tools 整段都命中)。
+    /// 模拟器的**原始**命中量(未经夹限)。只用于标定观测,不参与计费。
     ///
-    /// 为什么需要这一位:指纹序列是 `[system][tools][各轮消息]`,而首轮喂进 CLI 的
-    /// `in_tally` 是 `prompt + tools`(见 `start_conv`)。两者**都含 tools**,所以
-    /// 命中覆盖 tools 时把它俩直接相加 = tools 被算两次。Claude Code 的工具清单
-    /// 上万 token(见 `cache_sim` 模块注释),这不是舍入误差。
+    /// 标定要的是"模拟器自己估了多少"与上游真值的比值,夹限后的数已经掺进了
+    /// 运营参数(cap/floor/mult),拿它比会把定价决策当成估算误差。
+    pub raw_hit: u64,
+    /// 本轮**上下文总量**(system + tools + 全部历史,模拟器同口径估算)。
     ///
-    /// 不能简单地"有命中就扣掉 tools":工具清单换了的时候前缀正断在 tools 块上
-    /// (只剩 system 命中,见 `tools_change_breaks_prefix_after_system`),那一轮
-    /// tools 确实是新发的,必须计费。所以要按**命中是否越过 tools 块**来判。
-    pub covers_tools: bool,
+    /// ⚠️ 这是 `input_tokens` 的正确基准,而不是"本轮新增"。理由:Anthropic 语义下
+    /// 线缆侧发的是 `input − cache_read`,所以 `input` 必须是**总输入**;若拿
+    /// `fresh_in + cache_read` 当 input,则 `uncached` 恒等于 `fresh_in`,
+    /// 夹限再怎么调都改不了客户看到的数(2026-08-17 实测客户侧输入只剩 18 token)。
+    /// kiro 用的就是总上下文(`final_input_tokens` = tokenUsage/contextUsage/sim_total),
+    /// 两条通道必须同口径,客户账单才可比。
+    pub sim_total: u64,
 }
 
 impl SimSlot {
@@ -580,24 +583,34 @@ pub struct SimRequest {
     pub key: String,
     pub model: String,
     pub fps: Vec<crate::cache_sim::MsgFingerprint>,
-    /// `system + tools` 段的 token 总量,判 `covers_tools` 用(见 [`SimSlot::covers_tools`])。
-    pub header_tokens: u64,
 }
 
 impl SimRequest {
     /// 现在 peek:读模拟表拿本轮计费值与代际号。
+    ///
+    /// ⚠️ 拿到的**原始命中量**要先过 [`crate::cache_sim::reported_cache_read`] 的
+    /// 三参数夹限(与 kiro 同口径)才能当上报值 —— 直接用原始值会出现「几乎全命中、
+    /// 客户侧输入只剩几十个 token」(2026-08-17 实测 54% 的记录 cache/input > 0.95,
+    /// 最高 0.9998)。`cap_ratio` 就是为杜绝这个而存在的。
     pub fn peek(self) -> SimSlot {
         let (sim, gen) = crate::cache_sim::peek(&self.key, &self.model, &self.fps);
-        let cache_read = sim.cache_read_tokens as u64;
+        // 上报基准 = 本轮上下文总量(与 `hit` 同出模拟器 tokenizer,比例才有意义)。
+        let sim_total = sim.total_tokens as u64;
+        let raw_hit = sim.cache_read_tokens as u64;
+        let cache_read = crate::cache_sim::reported_cache_read(
+            sim_total,
+            raw_hit,
+            sim_total,
+            crate::cache_sim::billing(),
+        );
         SimSlot {
+            raw_hit,
             key: self.key,
             model: self.model,
             fps: self.fps,
             gen,
             cache_read,
-            // 前缀命中是从头连续的,所以「命中量 ≥ system+tools 段总量」⟺ 命中覆盖了
-            // 整个 tools 块。等号即恰好覆盖(见 covers_tools 的三态测试)。
-            covers_tools: cache_read >= self.header_tokens,
+            sim_total,
         }
     }
 }
@@ -863,10 +876,12 @@ struct SsePhase {
     /// ⚠️ 只作用于**自估**路径。上游给了 `result` 真值时一律用真值
     /// (见收尾处的 `usage`),模拟值不参与 —— 模拟是计费策略,真值是事实。
     sim_cache_read: u64,
+    /// 本轮上下文总量(见 [`SimSlot::sim_total`]);0 = 未接模拟器,退回按新增量计。
+    sim_total: u64,
 }
 
 impl SsePhase {
-    fn with_input(model: &str, in_tally: TokenTally, sim_cache_read: u64) -> Self {
+    fn with_input(model: &str, in_tally: TokenTally, sim: Option<&SimSlot>) -> Self {
         Self {
             msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             started: false,
@@ -875,7 +890,8 @@ impl SsePhase {
             model: model.to_string(),
             out_tally: TokenTally::default(),
             in_tally,
-            sim_cache_read,
+            sim_cache_read: sim.map(|s| s.cache_read).unwrap_or(0),
+            sim_total: sim.map(|s| s.sim_total).unwrap_or(0),
         }
     }
 
@@ -884,19 +900,34 @@ impl SsePhase {
     /// ⚠️ 系数**只乘在 output 上**:它补的是隐藏推理(见 [`TOOL_ROUND_TOKEN_FACTOR`]),
     /// input 侧没有对应的隐藏量 —— 我方喂进去多少就是多少,乘系数等于凭空多收。
     ///
-    /// `input_tokens` 的契约是**总输入**(含缓存):`chat::delta_usage_json_impl` 发给
-    /// 客户前会减掉 cache_read,`request_logs.input_tokens` 也按 total 存。所以模拟
-    /// 命中必须**加**在自估的新增量上,而不是从里面减 —— 减的话 `in_tally`
-    /// (本轮真实喂进去的新文本)会被 `saturating_sub` 归零,客户看到「输入 0」。
+    /// ## `input_tokens` 的基准是**上下文总量**,不是"本轮新增 + 命中"
+    ///
+    /// Anthropic 语义:线缆侧发 `input − cache_read`,故 `input` 必须是总输入。
+    /// 曾经这里写 `fresh_in + sim_cache_read`,于是 `uncached ≡ fresh_in` ——
+    /// **cache 怎么夹都改不了客户看到的输入**,2026-08-17 实测客户侧输入只剩
+    /// 18 个 token(占比 0.02%)。基准错了,夹限就是白做的。
+    ///
+    /// 现在用 `sim_total`(模拟器算出的 system + tools + 全部历史),与 kiro 的
+    /// `final_input_tokens` 同口径 —— 两条通道的客户账单必须可比。
+    /// `sim_total` 缺失(未接模拟器)时退回 `fresh_in`,保持旧行为不报缓存。
+    ///
+    /// ⚠️ 系数**只乘在 output 上**:它补的是隐藏推理(见 [`TOOL_ROUND_TOKEN_FACTOR`]),
+    /// input 侧没有对应的隐藏量 —— 我方喂进去多少就是多少,乘系数等于凭空多收。
     ///
     /// `real_cache_read_tokens` 在此**不动**(恒 0):模拟值是计费策略,不是事实断言,
     /// 对账列只认上游自报 —— 与 `chat.rs` 的补偿闸同一条纪律。
     fn estimated_usage(&self) -> ChatUsage {
         let fresh_in = self.in_tally.tokens();
+        // 总量基准:取模拟器的上下文总量;它至少要盖住本轮新增(否则说明模拟器没接上
+        // 或口径漂了,那就以新增量为底,宁可少报缓存也不虚报输入)。
+        let total = self.sim_total.max(fresh_in);
+        // 夹限已在 `SimRequest::peek` 做过(cap 保证 cache < total),这里再 min 一次
+        // 纯属不变式兜底:`input ≥ cache_read` 绝不能破,否则线缆侧又归 0。
+        let cache = self.sim_cache_read.min(total);
         ChatUsage {
-            input_tokens: fresh_in.saturating_add(self.sim_cache_read),
+            input_tokens: total,
             output_tokens: self.out_tally.calibrated_tokens(),
-            cache_read_tokens: self.sim_cache_read,
+            cache_read_tokens: cache,
             ..Default::default()
         }
     }
@@ -1164,11 +1195,7 @@ async fn pump(mut a: PumpArgs) {
     let out = a.conv.out.clone();
     // 本阶段的模拟槽:泵独占。阶段切换时换成 resume 送来的那个(见 PendingSlot)。
     let mut sim: Option<SimSlot> = a.sim.take();
-    let mut phase = SsePhase::with_input(
-        &a.echo_model,
-        a.first_in_tally,
-        sim.as_ref().map(|s| s.cache_read).unwrap_or(0),
-    );
+    let mut phase = SsePhase::with_input(&a.echo_model, a.first_in_tally, sim.as_ref());
     let mut state = NdjsonState::default();
     let started = Instant::now();
     let mut last_auth_poll = Instant::now();
@@ -1298,8 +1325,7 @@ async fn pump(mut a: PumpArgs) {
                 // 它按自己的历史 peek(历史更长 → 命中更多)。所有权跟着结果走,
                 // 不经会话共享字段 —— 并发请求不可能互相覆盖。
                 sim = next_sim;
-                let next_cache = sim.as_ref().map(|s| s.cache_read).unwrap_or(0);
-                phase = SsePhase::with_input(&a.echo_model, next_in, next_cache);
+                phase = SsePhase::with_input(&a.echo_model, next_in, sim.as_ref());
                 if let Some(w) = &mut sock_w {
                     let _ = w.write_all(reply.to_string().as_bytes()).await;
                     let _ = w.write_all(b"\n").await;
@@ -1379,6 +1405,40 @@ async fn pump(mut a: PumpArgs) {
                 }
             };
             if ok {
+                // ── 模拟器标定(只观测,不参与计费)────────────────────────────
+                //
+                // 这一轮上游给了**真值**,而我们手上同时有模拟器对同一请求的估算 ——
+                // 两个数并排打出来,就是校准 `read_multiplier` 的唯一实测依据。
+                //
+                // 为什么必须在这里打:自估轮(工具回路中间各轮,占 72%)永远拿不到真值,
+                // 真值轮(末轮,占 28%)默认又不碰模拟器,两个数从不在同一条记录里出现,
+                // 于是「模拟器估得准不准」在库里**无法离线回答**。
+                //
+                // 口径说明:`sim_hit` 是模拟器**夹限前**的原始命中量,`real` 是上游自报。
+                // 比值 = real / sim_hit —— >1 说明模拟器低估(客户少拿折扣),
+                // <1 说明高估(我方白送)。`multiplier` 该取多少看这个比值的中位数,
+                // 而不是沿用 kiro 的 1.8(那是 kiro 自己那套 tokenizer 标出来的)。
+                if let Some(s) = sim.as_ref() {
+                    let real = usage.real_cache_read_tokens;
+                    // 只在两边都有数时才有比值意义;sim_hit=0(冷启动)单独记,
+                    // 它回答的是另一个问题:真值不为 0 时模拟器是不是漏判了整段命中。
+                    tracing::info!(
+                        account = %a.conv.account_id,
+                        real_cache = real,
+                        sim_raw_hit = s.raw_hit,
+                        sim_reported = s.cache_read,
+                        sim_total = s.sim_total,
+                        upstream_input = usage.input_tokens,
+                        // real / raw_hit:>1 模拟器低估(客户少拿折扣)、<1 高估(我方白送)。
+                        // 取这个比值的中位数就是 `read_multiplier` 的实测取值。
+                        ratio_real_over_raw = if s.raw_hit > 0 {
+                            format!("{:.3}", real as f64 / s.raw_hit as f64)
+                        } else {
+                            "raw=0".to_string()
+                        },
+                        "cursor-cli:缓存标定样本(真值 vs 模拟,仅观测不计费)"
+                    );
+                }
                 // 成功收尾:提交本阶段指纹(判据同 tool_use 处 —— 这个响应交付了)。
                 // 失败分支**不提交**:那一轮调用方拿到的是错误,没有可命中的历史。
                 if let Some(s) = sim.take() {
@@ -1570,10 +1630,8 @@ pub async fn start_conv(
         None => None,
     };
 
-    // peek 尽量靠后(离 commit 越近,代际被别人推进的窗口越小),但必须早于
-    // `first_in_tally` —— 那里要按 `covers_tools` 决定 tools 计不计入新增量。
+    // peek 尽量靠后:离 commit 越近,代际被别人推进的窗口越小。
     let sim = sim.map(SimRequest::peek);
-    let covers_tools = sim.as_ref().is_some_and(|s| s.covers_tools);
     let conv = Arc::new(CliConv {
         account_id: account_id.to_string(),
         cli_session_id: Mutex::new(resume_sid),
@@ -1596,24 +1654,19 @@ pub async fn start_conv(
     // 不含 system —— 它经 AGENTS.md 落盘(见 prepare_home),CLI 每轮都会重读,在上游
     // 那一侧基本全是缓存命中;算进"本轮新增输入"会重复计费。同理不含会话历史:
     // --resume 的历史在 CLI 自己的会话文件里,我方这一轮并没有把它送上去。
+    // `first_in_tally` 现在只当**下限兜底**(模拟器没接上时 `estimated_usage` 拿它当
+    // input 基准),正常路径的基准是 `SimSlot::sim_total`(上下文总量)。
+    //
+    // ⚠️ 这里**照常把 tools 计进去**。曾经有过一段"命中覆盖 tools 时就不计 tools"的
+    // 去重逻辑(`covers_tools`),那是为旧基准 `fresh_in + cache_read` 写的 —— 在那个
+    // 公式下 tools 会被算两次。换成 `sim_total` 基准后,总量里 tools 本来就只出现一次,
+    // 再去扣它反而变成**少计**。基准一改,那条去重逻辑就从必要变成错误,故删除。
     let mut first_in_tally = TokenTally::default();
     first_in_tally.push(prompt);
-    // 工具定义只在**没被模拟命中覆盖**时才计进新增量。
-    //
-    // ⚠️ 不计的那种情况不是省略,是**去重**:模拟器的指纹序列是
-    // `[system][tools][各轮消息]`,命中越过 tools 块时那部分 token 已经算在
-    // `SimSlot::cache_read` 里了(自估用量把命中加进 input_tokens,见
-    // `SsePhase::estimated_usage`),这里再 push 一遍就是同一份 tools 计费两次。
-    // Claude Code 的工具清单上万 token,不是舍入误差。
-    //
-    // 反之(命中断在 tools 之前 = 工具清单变了/冷启动)tools 确实是本轮新发的,
-    // 必须计费 —— 所以判据是 `covers_tools` 而不是"有没有命中"。
-    if !covers_tools {
-        for t in tools {
-            first_in_tally.push(&t.name);
-            first_in_tally.push(&t.description);
-            first_in_tally.push(&t.schema);
-        }
+    for t in tools {
+        first_in_tally.push(&t.name);
+        first_in_tally.push(&t.description);
+        first_in_tally.push(&t.schema);
     }
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
@@ -1662,6 +1715,19 @@ pub fn resume_conv(
 mod tests {
     use super::*;
 
+    /// 测试用:造一个只关心 `cache_read` / `sim_total` 的槽。
+    fn test_slot(cache_read: u64, sim_total: u64) -> SimSlot {
+        SimSlot {
+            key: "k".into(),
+            model: "m".into(),
+            fps: Vec::new(),
+            gen: 0,
+            cache_read,
+            raw_hit: cache_read,
+            sim_total,
+        }
+    }
+
     /// 攒字符再算一次 == 把整段文本一次性估算。这是 [`TokenTally`] 存在的理由:
     /// 逐段调 `est_text_tokens` 相加会因为 ASCII 的 `ceil(n/4)` 每段取整而虚高。
     #[test]
@@ -1693,7 +1759,7 @@ mod tests {
     #[test]
     fn 工具轮次报出自估用量_含工具参数且不为零() {
         let out = OutQueue::new();
-        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), 0);
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), None);
         // 纯工具调用轮:一个字正文都没有,产出全在参数 JSON 里。
         phase.finish_tool_use(
             &out,
@@ -1739,7 +1805,7 @@ mod tests {
     #[test]
     fn 正文与thinking都计入output() {
         let out = OutQueue::new();
-        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), 0);
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), None);
         phase.push_text(&out, "thinking", "先想一想这个问题", true);
         let after_thinking = phase.out_tally.tokens();
         assert!(after_thinking > 0, "thinking 必须计入");
@@ -1755,7 +1821,7 @@ mod tests {
     fn 校正系数只作用于output() {
         let mut t = TokenTally::default();
         t.push("这是一段足够长的中文文本用来让取整误差不至于淹没结论");
-        let phase = SsePhase::with_input("grok-4.6", t, 0);
+        let phase = SsePhase::with_input("grok-4.6", t, None);
         let u = phase.estimated_usage();
         assert_eq!(u.input_tokens, t.tokens(), "input 不得乘系数");
         assert_eq!(u.output_tokens, 0, "本阶段没有产出");
@@ -1767,31 +1833,32 @@ mod tests {
     /// 锁两件事:
     /// ① 模拟命中要出现在 `cache_read_tokens` 里 —— 这条 CLI 路径此前根本没接
     ///    模拟器,自估轮 cache_read 结构性恒 0(生产 82% 的 grok 请求无缓存)。
-    /// ② 命中必须**加**在自估新增量上,不是从里面减。`input_tokens` 的契约是
-    ///    总输入,`delta_usage_json_pub` 发给客户前还要减一次;若这里先减过,
-    ///    `saturating_sub` 会把本轮真实喂进去的新文本归零 → 客户看到「输入 0」。
+    /// ② `input_tokens` 的基准必须是**上下文总量**(`sim_total`),不是
+    ///    "本轮新增 + 命中"。旧基准下 `uncached ≡ fresh_in`,于是客户侧输入被死死
+    ///    钉在新增量上(2026-08-17 线上只剩 18 token),夹限再调也没用。
     #[test]
-    fn 自估轮报出模拟缓存且input是总量() {
+    fn 自估轮的input基准是上下文总量而非本轮新增() {
         let mut t = TokenTally::default();
         t.push("本轮新增的输入文本");
         let fresh = t.tokens();
         assert!(fresh > 0, "新增量必须非零,否则这条测试没有意义");
 
-        let phase = SsePhase::with_input("grok-4.6", t, 5000);
-        let u = phase.estimated_usage();
+        // 上下文总量 20000、上报命中 5000(已过夹限)。
+        let slot = test_slot(5000, 20000);
+        let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
         assert_eq!(u.cache_read_tokens, 5000, "模拟命中必须落到 cache_read");
-        assert_eq!(u.input_tokens, fresh + 5000, "input 必须是总量(新增+命中)");
+        assert_eq!(u.input_tokens, 20000, "input 必须是上下文总量,不是 fresh+cache");
         assert_eq!(
             u.real_cache_read_tokens, 0,
             "模拟值是计费策略、不是事实断言,绝不写对账列"
         );
 
-        // 线缆侧再减一次后,客户看到的未命中部分正好等于本轮真实新增 —— 不是 0。
+        // 线缆侧减一次 → 客户看到未命中 15000,与 fresh_in 无关。
         let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
             wire.get("input_tokens").and_then(|v| v.as_u64()),
-            Some(fresh),
-            "客户侧 input 应等于本轮新增,归 0 就是 2026-08-17 那个「输入 0」回归"
+            Some(15000),
+            "客户侧输入 = 总量 − 命中"
         );
         assert_eq!(
             wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
@@ -1799,79 +1866,33 @@ mod tests {
         );
     }
 
-    /// `covers_tools` 的判据必须按「命中是否越过 tools 块」算,不是「有没有命中」。
+    /// 客户侧输入**恒为正**:`cap_ratio < 1` 保证命中不会吃掉全部输入。
     ///
-    /// 这条锁的是 tools 双重计费:指纹序列 `[system][tools][各轮消息]` 与首轮
-    /// `in_tally`(prompt + tools)**都含 tools**,命中覆盖 tools 时两者相加会把
-    /// 上万 token 的工具清单算两次。反之工具清单换了的时候前缀正断在 tools 块上,
-    /// 那一轮 tools 是真新发的、必须计费。
+    /// 这条锁的是 2026-08-17 线上实测的那个 bug:48 条有缓存记录里 26 条
+    /// `cache/input > 0.95`、最高 0.9998,客户侧输入只剩 18 个 token。
+    /// 根因是 cursor 通道从未接 kiro 的三参数夹限(`reported_cache_read`)。
     #[test]
-    fn covers_tools_按前缀是否越过tools块判定() {
-        use crate::cache_sim;
-        use crate::run::{ToolDef, Turn};
-
-        let tool = |n: &str| ToolDef {
-            name: n.into(),
-            description: format!("{n} 的说明文字"),
-            schema: "{\"type\":\"object\"}".into(),
-        };
-        let turn = |t: &str, u: bool| Turn { text: t.into(), is_user: u };
-        let est = crate::chat::est_text_tokens;
-        // system + tools 段的 token 数(零条消息时的指纹总量)。
-        let header = |tools: &[ToolDef]| -> u64 {
-            cache_sim::fingerprints_from_context("sys", tools, &[], est)
-                .iter()
-                .map(|f| f.tokens as u64)
-                .sum()
-        };
-
-        let store = cache_sim::CacheSimStore::new();
-        let t0 = Instant::now();
-        let tools_a = vec![tool("read_file")];
-
-        // 第一轮:冷启动,命中 0 → 绝不能判成 covers_tools(否则白送 tools)。
-        let fps1 = cache_sim::fingerprints_from_context("sys", &tools_a, &[turn("问题一", true)], est);
-        let (r1, g1) = store.peek_at("k", "m", &fps1, t0);
-        assert_eq!(r1.cache_read_tokens, 0, "冷启动应 0 命中");
+    fn 夹限保证客户侧输入恒为正() {
+        use crate::cache_sim::{reported_cache_read, CacheBilling};
+        // 模拟器"几乎全命中"(99.98%)的极端输入,过夹限后必须留出余量。
+        let total = 172_687u64;
+        let raw_hit = 172_626u64;
+        let b = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.95, floor_ratio: 0.75 };
+        let reported = reported_cache_read(total, raw_hit, total, b);
         assert!(
-            (r1.cache_read_tokens as u64) < header(&tools_a),
-            "冷启动必须判 covers_tools=false,tools 要计费"
+            reported <= (total as f64 * 0.95).round() as u64,
+            "上报命中不得超过 cap: {reported} / {total}"
         );
-        assert!(store.commit_at("k", "m", fps1, t0, g1));
-
-        // 第二轮:同 tools、历史续接 → 命中越过 tools 块 → covers_tools=true。
-        let fps2 = cache_sim::fingerprints_from_context(
-            "sys",
-            &tools_a,
-            &[turn("问题一", true), turn("回答一", false), turn("问题二", true)],
-            est,
-        );
-        let (r2, g2) = store.peek_at("k", "m", &fps2, t0 + Duration::from_secs(10));
+        let uncached = total - reported;
         assert!(
-            (r2.cache_read_tokens as u64) >= header(&tools_a),
-            "同工具续轮命中应越过 tools 块: hit={} header={}",
-            r2.cache_read_tokens,
-            header(&tools_a)
+            uncached >= total / 20,
+            "客户侧输入至少留 5%(cap=0.95): uncached={uncached} total={total}"
         );
-        assert!(store.commit_at("k", "m", fps2, t0 + Duration::from_secs(10), g2));
-
-        // 第三轮:换了工具清单 → 前缀断在 tools 块(只剩 system 命中)
-        //          → covers_tools=false,这一轮 tools 必须计费。
-        let tools_b = vec![tool("write_file")];
-        let fps3 = cache_sim::fingerprints_from_context(
-            "sys",
-            &tools_b,
-            &[turn("问题一", true), turn("回答一", false), turn("问题二", true)],
-            est,
-        );
-        let (r3, _) = store.peek_at("k", "m", &fps3, t0 + Duration::from_secs(20));
-        assert!(
-            (r3.cache_read_tokens as u64) < header(&tools_b),
-            "换工具后命中必须断在 tools 之前: hit={} header={}",
-            r3.cache_read_tokens,
-            header(&tools_b)
-        );
-        assert!(r3.cache_read_tokens > 0, "system 仍应命中(对照:不是整段 miss)");
+        // 冷启动(0 命中)时 floor 仍会给出下限,但绝不超过 cap。
+        let cold = reported_cache_read(total, 0, total, b);
+        assert_eq!(cold, (total as f64 * 0.75).round() as u64, "0 命中时按 floor 报");
+        // total=0 不 panic。
+        assert_eq!(reported_cache_read(0, 0, 0, b), 0);
     }
 
     /// `inputTokens` 是**总输入**(含缓存),原样填 —— 绝不能再加 cached。
@@ -1950,7 +1971,7 @@ mod tests {
         let mut t = TokenTally::default();
         t.push("abc 中文");
         let fresh = t.tokens();
-        let u = SsePhase::with_input("grok-4.6", t, 0).estimated_usage();
+        let u = SsePhase::with_input("grok-4.6", t, None).estimated_usage();
         assert_eq!(u.cache_read_tokens, 0);
         assert_eq!(u.input_tokens, fresh);
         let wire = crate::chat::delta_usage_json_pub(&u);
