@@ -249,6 +249,30 @@ async fn put_settings(
             }
             continue;
         }
+        // cursor_cli_notice:CLI 驱动的 ask 模式说明。规则与 cursor_tool_guard 逐条相同
+        // (空串=清除回内置默认;长度在写侧就拦,上限与 gw-cursor 侧同源)。
+        if k == "cursor_cli_notice" {
+            match v.as_str() {
+                Some(s) if s.trim().is_empty() => {
+                    overlay_map.remove(&k);
+                }
+                Some(s) => {
+                    const MAX_CHARS: usize = 3000;
+                    let n = s.trim().chars().count();
+                    if n > MAX_CHARS {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!("cursor_cli_notice 过长({n} 字符,上限 {MAX_CHARS})"),
+                        );
+                    }
+                    overlay_map.insert(k, serde_json::json!(s.trim()));
+                }
+                None => {
+                    return api_error(StatusCode::BAD_REQUEST, "cursor_cli_notice 须为字符串")
+                }
+            }
+            continue;
+        }
         // default_proxy:空串=清除;非空=写入边界校验 + 归一(fail-closed,审查 Skeptic#2)。
         if k == "default_proxy" {
             match v.as_str() {

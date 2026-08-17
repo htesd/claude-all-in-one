@@ -346,6 +346,25 @@ pub struct SystemConfig {
     /// 这个旋钮只影响 cursor 家族,kiro / claude-dario / claude-subprocess 一律不读它。
     #[serde(default)]
     pub cursor_tool_guard: String,
+    /// **CLI 驱动的「ask 模式说明」**(默认空 = 用 gw-cursor 内置默认)。
+    ///
+    /// CLI 驱动(`extra.driver="cli"`)把 `cursor-agent` 钉在 `--mode ask` 上,而
+    /// `--mode` 只接受 `plan`/`ask` **两个只读值** —— 要写权限只能整个不传 `--mode`
+    /// (`-p` 的说明:"Has access to all tools, including write and shell"),那会
+    /// 放开 CLI **自己**的写文件/终端工具,让它们作用在容器里那个空工作区:
+    /// 模型会报告「已改好文件」,而调用方机器上什么都没变(幽灵编辑)。所以 ask
+    /// 模式是刻意保留的安全闸。
+    ///
+    /// 代价是模型会**自我审查**:2026-08-17 生产实测,grok 的 thinking 原文
+    /// 「当前处于 Ask 模式,仅可读取与分析,无法修改代码」,然后反过来要求用户
+    /// 「去 Cursor 把模式切到 Agent」—— 而用户根本不在 Cursor 里,这条建议无从执行。
+    /// 这段文案的作用就是把真相讲清楚:只读限制只管 CLI 自己的本地沙箱,真正的
+    /// 执行通道是 gwtools MCP 工具,它们跑在**调用方机器**上、有写权限。
+    ///
+    /// 与 [`Self::cursor_tool_guard`] 同一理由做成热配置:提示词类的东西必然要
+    /// 反复调,不该每改一版就重建镜像。**只在 CLI 驱动的请求上追加**,线协议不读。
+    #[serde(default)]
+    pub cursor_cli_notice: String,
 }
 
 /// 一个热追加的 cursor 模型条目(见 [`SystemConfig::cursor_extra_models`])。
@@ -1021,6 +1040,10 @@ pub struct SystemSettings {
     /// 详见 [`SystemConfig::cursor_tool_guard`]。**只影响 cursor 家族。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_tool_guard: Option<String>,
+    /// CLI 驱动的 ask 模式说明(None = 用 yaml 基线;空串 = 回 gw-cursor 内置默认)。
+    /// 详见 [`SystemConfig::cursor_cli_notice`]。**只影响 cursor 家族的 CLI 驱动。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_cli_notice: Option<String>,
     /// 兜住本版本**不认识**的 overlay key(新镜像写、旧镜像读的滚动升级窗口)。
     ///
     /// 存在的唯一理由是让「一个陌生 key」不再作废整份 overlay。它有两个消费者:
@@ -1093,6 +1116,9 @@ impl SystemSettings {
         if let Some(v) = &self.cursor_tool_guard {
             base.cursor_tool_guard = v.clone();
         }
+        if let Some(v) = &self.cursor_cli_notice {
+            base.cursor_cli_notice = v.clone();
+        }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -1146,6 +1172,7 @@ impl SystemSettings {
             default_thinking_effort: Some(cfg.thinking.default_effort),
             cursor_extra_models: Some(cfg.cursor_extra_models.clone()),
             cursor_tool_guard: Some(cfg.cursor_tool_guard.clone()),
+            cursor_cli_notice: Some(cfg.cursor_cli_notice.clone()),
             // 全量视图由本进程的有效配置构造,按定义不含未知 key。
             unknown: Default::default(),
         }
