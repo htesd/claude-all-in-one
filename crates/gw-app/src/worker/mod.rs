@@ -926,8 +926,13 @@ pub async fn run(
     };
 
     // cache_sim 全局 store 的 TTL/容量从有效 cache 同步(否则恒用编译期默认 300s/4096)。
+    // ⚠️ **两家都要同步**:cursor 有自己独立的 store(gw-cursor::cache_sim,与 kiro 不共用
+    // 全局),漏掉它 = cursor 恒用 300s 而线上配 1800s,短 6 倍 → 大量该命中的会话被判
+    // 冷启动(2026-08-17 标定实测:上游真实命中 8180 而模拟器 raw_hit=0)。
     gw_kiro::cache_sim::global().set_ttl_secs(effective_system.cache.sim_ttl_secs);
     gw_kiro::cache_sim::global().set_max_sessions(effective_system.cache.max_sessions);
+    gw_cursor::cache_sim::global().set_ttl_secs(effective_system.cache.sim_ttl_secs);
+    gw_cursor::cache_sim::global().set_max_sessions(effective_system.cache.max_sessions);
 
     // provider 工厂 cfg:注入有效 cache(缓存计费)+ image(图像压缩,"image" 子对象)+
     // 可选 default_proxy(全局默认出口代理)。序列化失败退回缺省(provider 各自回退,不致命)。
@@ -1210,6 +1215,9 @@ pub async fn run(
                         st.scheduler.update_tuning(&eff.scheduler);
                         gw_kiro::cache_sim::global().set_ttl_secs(eff.cache.sim_ttl_secs);
                         gw_kiro::cache_sim::global().set_max_sessions(eff.cache.max_sessions);
+                        // cursor 有独立的 sim store,必须一起热调(同启动处的理由)。
+                        gw_cursor::cache_sim::global().set_ttl_secs(eff.cache.sim_ttl_secs);
+                        gw_cursor::cache_sim::global().set_max_sessions(eff.cache.max_sessions);
                         apply_cursor_extra_models(&eff);
                         // 护栏策略句:校验失败保留上一份有效值,并把原因并进本轮同步错误 ——
                         // 与上面 provider 级设置同一条原则(应用失败必须说出来,不能让面板报「一致」)。

@@ -1086,17 +1086,46 @@ impl Provider for CursorProvider {
         "cursor"
     }
 
-    // ⚠️ **故意不实现 `apply_hot_settings` / `hot_settings_supported`。**
-    //
-    // cursor 通道从来不读缓存计费三旋钮(`cache_read_multiplier` / `cache_cap_ratio`
-    // / `cache_floor_ratio`),这是既有事实。实现它是**一步到位的定价变更**:线上
-    // settings 现为 `cap=0.95 / floor=0.75`,一接上,cursor 立刻开始按 floor=0.75
-    // 给折扣 —— 冷启动零命中也按 75% 走缓存价。那是运营决策,不能夹在 bug 修复里
-    // 顺手做掉,所以先只上标定观测(见 pump 收尾处的"缓存标定样本"日志),
-    // 等实测比值出来再由运营定这三个数,然后单独一次改动接上。
-    //
-    // 夹限函数(`cache_sim::reported_cache_read`)与热调入口(`set_billing`)已就位,
-    // 接的时候只要在这里补上两个方法。
+    /// 热应用缓存计费三参数(worker 每 30s 轮询 settings 后调用)。
+    ///
+    /// ⚠️ **在此之前 cursor 通道完全不读这三个旋钮**(整个 provider 没覆盖本方法,
+    /// 用的是 trait 默认 no-op)。后果:admin 上把 `cache_read_multiplier` /
+    /// `cache_cap_ratio` / `cache_floor_ratio` 调成什么,cursor 侧都不生效,
+    /// 而 kiro 侧照常生效 —— 面板显示"已保存",cursor 照旧。
+    ///
+    /// 2026-08-17 用户决定:**照搬 kiro 的数值**(读同一份 settings),
+    /// 两条通道的客户账单口径由此对齐。线上现值 `cap=0.95 / floor=0.75`
+    /// (`multiplier` 未设 → 默认 1.8);`floor=0.75` 是主动让利:冷启动零命中
+    /// 也按 75% 走缓存价(0.1× 输入价)。这是运营决策,不是估算的一部分。
+    ///
+    /// 参数落进 [`crate::cache_sim`] 的进程级 cell(下一个请求即读到),不放 provider
+    /// 字段:自估用量在 `clidrv` 里算,那里拿不到 `&self`。
+    ///
+    /// present 字段才覆盖(与 kiro 同语义):缺失 = 沿用当前值、**不回落默认** ——
+    /// 否则本版本不认识的新字段会把已调好的值悄悄冲掉(记忆
+    /// caio-cache-billing-and-hot-settings 记的两处静默失败之一)。
+    fn apply_hot_settings(&self, settings: &serde_json::Value) {
+        let mut b = crate::cache_sim::billing();
+        if let Some(v) = settings.get("cache_read_multiplier").and_then(|v| v.as_f64()) {
+            b.read_multiplier = v;
+        }
+        if let Some(v) = settings.get("cache_cap_ratio").and_then(|v| v.as_f64()) {
+            b.cap_ratio = v;
+        }
+        if let Some(v) = settings.get("cache_floor_ratio").and_then(|v| v.as_f64()) {
+            b.floor_ratio = v;
+        }
+        crate::cache_sim::set_billing(b);
+    }
+
+    /// 与 [`Self::apply_hot_settings`] 同进退(trait 文档:只覆盖其中一个就是在撒谎)。
+    ///
+    /// 声明 true 之后 `/health` 才会回显 cursor 侧此刻真正在用的计费参数,
+    /// 面板那张「worker 实际生效值」卡才不会对着一个 no-op 报绿 —— 那正是
+    /// claude-dario 踩过的坑(apply_hot_settings 是空壳,面板却显示一致)。
+    fn hot_settings_supported(&self) -> bool {
+        true
+    }
 
     fn account_schema(&self) -> &'static [FieldSpec] {
         CURSOR_ACCOUNT_SCHEMA
