@@ -531,12 +531,90 @@ impl OutQueue {
     }
 }
 
+/// 一次调用方请求的**模拟缓存槽**:peek 出来的计费值 + commit 所需的凭据。
+///
+/// 为什么要按「请求」而不是「会话」存:工具回路里 CLI 进程全程存活,但调用方那侧
+/// 每一轮都是**独立的一次 HTTP 请求**,各自带自己的历史、各自 peek。泵在阶段
+/// 切换处读这个槽,所以它必须由每轮入口(`start_conv` / `resume_conv`)现填。
+///
+/// commit 语义与 `chat.rs` 线协议侧逐条一致:**成功交付才提交**(失败轮上游没落下
+/// 这一轮,提交会让下一轮凭空拿到折扣),带代际 CAS 防同会话并发乱序覆盖。
+pub struct SimSlot {
+    /// `account_id \x1f conversation_id`(与线协议同键)。
+    pub key: String,
+    pub model: String,
+    pub fps: Vec<crate::cache_sim::MsgFingerprint>,
+    /// peek 时读到的代际号,commit 时做 compare-and-set。
+    pub gen: u64,
+    /// 本轮模拟命中的 token 数(自估用量拿它填 cache_read)。
+    pub cache_read: u64,
+    /// 命中前缀是否**越过了 tools 块**(即 system + tools 整段都命中)。
+    ///
+    /// 为什么需要这一位:指纹序列是 `[system][tools][各轮消息]`,而首轮喂进 CLI 的
+    /// `in_tally` 是 `prompt + tools`(见 `start_conv`)。两者**都含 tools**,所以
+    /// 命中覆盖 tools 时把它俩直接相加 = tools 被算两次。Claude Code 的工具清单
+    /// 上万 token(见 `cache_sim` 模块注释),这不是舍入误差。
+    ///
+    /// 不能简单地"有命中就扣掉 tools":工具清单换了的时候前缀正断在 tools 块上
+    /// (只剩 system 命中,见 `tools_change_breaks_prefix_after_system`),那一轮
+    /// tools 确实是新发的,必须计费。所以要按**命中是否越过 tools 块**来判。
+    pub covers_tools: bool,
+}
+
+impl SimSlot {
+    /// 提交本轮指纹(消费自身),让下一轮能命中它。**仅在本轮成功交付后调用**。
+    fn commit(self) {
+        crate::cache_sim::commit(&self.key, &self.model, self.fps, self.gen);
+    }
+}
+
+/// **未 peek** 的模拟缓存材料。
+///
+/// 为什么要把「材料」与「已 peek 的槽」分成两个类型:peek 会读出代际号,而代际号
+/// 从读出到 commit 之间越久越容易被同会话的别人推进(CAS 失配)。更要紧的是
+/// `resume_conv` 那条路 —— 必须**先校验 tool_result 匹配、再 peek**:校验失败的
+/// 请求根本不算一次有效轮次,让它先把状态读出来只会拉长竞态窗口
+/// (对抗评审 high#3)。所以入口只准备材料,peek 由真正要用的那一步做。
+pub struct SimRequest {
+    /// `account_id \x1f conversation_id`(与线协议同键)。
+    pub key: String,
+    pub model: String,
+    pub fps: Vec<crate::cache_sim::MsgFingerprint>,
+    /// `system + tools` 段的 token 总量,判 `covers_tools` 用(见 [`SimSlot::covers_tools`])。
+    pub header_tokens: u64,
+}
+
+impl SimRequest {
+    /// 现在 peek:读模拟表拿本轮计费值与代际号。
+    pub fn peek(self) -> SimSlot {
+        let (sim, gen) = crate::cache_sim::peek(&self.key, &self.model, &self.fps);
+        let cache_read = sim.cache_read_tokens as u64;
+        SimSlot {
+            key: self.key,
+            model: self.model,
+            fps: self.fps,
+            gen,
+            cache_read,
+            // 前缀命中是从头连续的,所以「命中量 ≥ system+tools 段总量」⟺ 命中覆盖了
+            // 整个 tools 块。等号即恰好覆盖(见 covers_tools 的三态测试)。
+            covers_tools: cache_read >= self.header_tokens,
+        }
+    }
+}
+
 /// 待调用方应答的桥调用。
 struct PendingSlot {
     /// 给调用方的 tool_use.id —— 消费槽位时**按它键控**(防错配/重放注入)。
     tool_use_id: String,
-    /// 把结果还给泵任务的通道。
-    responder: oneshot::Sender<Result<String, String>>,
+    /// 把结果**和下一阶段的模拟槽**一起还给泵任务。
+    ///
+    /// ⚠️ 模拟槽走这条通道而不是会话上的共享字段,是刻意的所有权设计:
+    /// 一个 `SimSlot` 描述的是**某一次调用方 HTTP 请求**,而 `CliConv` 是**会话**级、
+    /// 同 `conversation_id` 的并发请求共享它。放在会话上的单槽会被后来者覆盖,
+    /// 于是 A 的账单用到 B 的命中数、甚至 A 的 commit 提交了 B 的指纹
+    /// (对抗评审 high#2:代际 CAS 只保护表的一致性,保护不了"谁的账单用了谁的槽")。
+    /// 顺着这条通道传,槽的所有权就跟着"哪一轮把结果喂回来"走,结构上不可能错配。
+    responder: oneshot::Sender<(Result<String, String>, Option<SimSlot>)>,
 }
 
 /// 一条存活中的 CLI 会话(可能正挂在桥调用上)。
@@ -774,10 +852,21 @@ struct SsePhase {
     /// 缓存命中(实测一次 6 字符的 prompt 也报 inputTokens=6779 / cacheRead=6016),
     /// 把它算进来会把 cache_read 的口径搅乱 —— 见记忆 caio-cache-billing-and-hot-settings。
     in_tally: TokenTally,
+    /// 本请求的**模拟** cache_read(由 [`crate::cache_sim`] 在入口 peek 出来)。
+    ///
+    /// 为什么自估轮需要它:工具回路的每一轮都是调用方独立的一次 HTTP 请求,发
+    /// `tool_use` 那一刻上游还没给 `result`,用量只能自估 —— 而自估这条路
+    /// **从来没接过模拟器**(peek/commit 只存在于 `chat.rs` 线协议侧),于是
+    /// `cache_read` 结构性恒 0:客户在同一条会话里看到「有缓存的轮」与
+    /// 「一点缓存都没有的轮」交替出现,而后者其实上游那侧几乎全是命中。
+    ///
+    /// ⚠️ 只作用于**自估**路径。上游给了 `result` 真值时一律用真值
+    /// (见收尾处的 `usage`),模拟值不参与 —— 模拟是计费策略,真值是事实。
+    sim_cache_read: u64,
 }
 
 impl SsePhase {
-    fn with_input(model: &str, in_tally: TokenTally) -> Self {
+    fn with_input(model: &str, in_tally: TokenTally, sim_cache_read: u64) -> Self {
         Self {
             msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             started: false,
@@ -786,20 +875,28 @@ impl SsePhase {
             model: model.to_string(),
             out_tally: TokenTally::default(),
             in_tally,
+            sim_cache_read,
         }
     }
 
     /// 本阶段的自估用量(上游没给真值时用)。
     ///
-    /// `cache_read` 恒 0:缓存归 [`crate::cache_sim`] 在收尾处统一给,与线协议的
-    /// `estimate_usage_fallback` 同一条纪律(不在两处估同一个量)。
     /// ⚠️ 系数**只乘在 output 上**:它补的是隐藏推理(见 [`TOOL_ROUND_TOKEN_FACTOR`]),
     /// input 侧没有对应的隐藏量 —— 我方喂进去多少就是多少,乘系数等于凭空多收。
+    ///
+    /// `input_tokens` 的契约是**总输入**(含缓存):`chat::delta_usage_json_impl` 发给
+    /// 客户前会减掉 cache_read,`request_logs.input_tokens` 也按 total 存。所以模拟
+    /// 命中必须**加**在自估的新增量上,而不是从里面减 —— 减的话 `in_tally`
+    /// (本轮真实喂进去的新文本)会被 `saturating_sub` 归零,客户看到「输入 0」。
+    ///
+    /// `real_cache_read_tokens` 在此**不动**(恒 0):模拟值是计费策略,不是事实断言,
+    /// 对账列只认上游自报 —— 与 `chat.rs` 的补偿闸同一条纪律。
     fn estimated_usage(&self) -> ChatUsage {
+        let fresh_in = self.in_tally.tokens();
         ChatUsage {
-            input_tokens: self.in_tally.tokens(),
+            input_tokens: fresh_in.saturating_add(self.sim_cache_read),
             output_tokens: self.out_tally.calibrated_tokens(),
-            cache_read_tokens: 0,
+            cache_read_tokens: self.sim_cache_read,
             ..Default::default()
         }
     }
@@ -929,6 +1026,58 @@ impl SsePhase {
     }
 }
 
+/// 把 CLI `result` 事件的 usage 收成 [`ChatUsage`]。
+///
+/// ## `inputTokens` 是**总输入**(含缓存),不要再加 cached
+///
+/// 实测钉死(生产抓的原始 NDJSON,提示词是「只回一个词:ok」约 10 字符):
+/// ```text
+/// {"inputTokens":6779,"outputTokens":35,"cacheReadTokens":6016,"cacheWriteTokens":0}
+/// ```
+/// 10 字符的提示词不可能有 6779 token 的**新增**输入 —— 6779 是总量
+/// (system/AGENTS.md 等),其中 6016 命中缓存,未命中 ≈763。所以
+/// `inputTokens ⊇ cacheReadTokens`,与 [`ChatUsage::input_tokens`] 的"总输入"
+/// 契约天然一致,**原样填**即可。
+///
+/// ⚠️ 我曾据「生产上 39% 的记录 `cache_read > input`」推断上游是"未命中新增"语义,
+/// 于是改成 `up_in + cached` —— **那是错的**,会给绝大多数正常轮次凭空加一倍输入。
+/// 上面那条单次调用的实测是判据:`cache > input` 不能反推字段语义。
+///
+/// ## `cache > input` 的真实成因与处理
+///
+/// 生产实测(近 4h grok-4.6 有缓存记录 127 条)有 **49 条(39%)`cache > input`**,
+/// 最极端 239 倍(`input=54 / cache=12928`)。这些是**工具回路**的会话:CLI 一次
+/// 会话内部会发起多次模型调用,`cacheReadTokens` 看起来是跨内部调用**累加**的,
+/// 而 `inputTokens` 不是。两个字段不同口径,不可直接相减。
+///
+/// 不去"修正"input(重构不出可信的总量),只把 cached **封顶到 input** 以恢复
+/// Anthropic 不变式(`input ≥ cache_read`,否则线缆侧 `saturating_sub` 会让
+/// 客户看到「输入 0」)。封顶同时 warn:这是上游口径异常的信号,不是正常态。
+fn usage_from_result(u: &Value) -> ChatUsage {
+    let input = u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let reported_cache = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let cached = if reported_cache > input {
+        tracing::warn!(
+            input,
+            reported_cache,
+            "cursor-cli:上游 result 的 cacheReadTokens 超过 inputTokens(疑为跨内部调用累加),已封顶到 input"
+        );
+        input
+    } else {
+        reported_cache
+    };
+    ChatUsage {
+        input_tokens: input,
+        output_tokens: u.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_tokens: cached,
+        // 上游自报即**真实**命中,同步对账列(与线协议 `usage_from_upstream` 同一条
+        // 纪律:漏填会让面板「真实缓存」列永远是 0)。存封顶后的值:超过总输入的
+        // 数字放进对账列只会污染对账。
+        real_cache_read_tokens: cached,
+        ..Default::default()
+    }
+}
+
 /// drain 一条响应流(到 End 为止)。
 fn drain_stream(out: Arc<OutQueue>) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
     // 状态是 `Option`:超时那一下要**先发一条错误、再终止**,不能继续 pop ——
@@ -971,13 +1120,22 @@ struct PumpArgs {
     /// 首轮喂给 CLI 的输入量(system + prompt + 工具定义)。工具轮次自估用量要用
     /// (见 [`SsePhase::in_tally`]);续轮的输入是带回的 tool_result,在泵里现算。
     first_in_tally: TokenTally,
+    /// 首轮(= 开启这条 CLI 会话的那次请求)的模拟缓存槽。泵**独占**它,
+    /// 后续阶段的槽由 `resume_conv` 经 responder 通道送进来 —— 见 [`PendingSlot`]。
+    sim: Option<SimSlot>,
 }
 
 /// 泵:读 CLI stdout + 桥 socket,把事件翻译成 SSE 写进 OutQueue。
 /// 桥调用处挂起(等下一轮网关请求喂结果),CLI 进程全程存活。
 async fn pump(mut a: PumpArgs) {
     let out = a.conv.out.clone();
-    let mut phase = SsePhase::with_input(&a.echo_model, a.first_in_tally);
+    // 本阶段的模拟槽:泵独占。阶段切换时换成 resume 送来的那个(见 PendingSlot)。
+    let mut sim: Option<SimSlot> = a.sim.take();
+    let mut phase = SsePhase::with_input(
+        &a.echo_model,
+        a.first_in_tally,
+        sim.as_ref().map(|s| s.cache_read).unwrap_or(0),
+    );
     let mut state = NdjsonState::default();
     let started = Instant::now();
     let mut last_auth_poll = Instant::now();
@@ -1060,27 +1218,55 @@ async fn pump(mut a: PumpArgs) {
                 let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
                 tracing::info!(tool = %name, id = %tool_use_id, "cursor-cli:模型调用桥接工具,转成 tool_use 并挂起");
 
-                let (tx_slot, rx_slot) = oneshot::channel::<Result<String, String>>();
+                // ⚠️ **先把本阶段的槽取到手,再挂 pending**。`pending` 一旦可见,调用方
+                // 就能带着 tool_result 回来(`finish_tool_use` 只是入队、不等于送达),
+                // 而那条路会经 responder 送来**下一轮**的槽。先取后挂,本阶段要提交的
+                // 东西就已经在局部变量里,不可能被后来者换掉。
+                let this_sim = sim.take();
+
+                let (tx_slot, rx_slot) =
+                    oneshot::channel::<(Result<String, String>, Option<SimSlot>)>();
                 {
                     let mut p = a.conv.pending.lock().unwrap_or_else(|p| p.into_inner());
                     *p = Some(PendingSlot { tool_use_id: tool_use_id.clone(), responder: tx_slot });
                 }
                 phase.finish_tool_use(&out, &tool_use_id, &name, &args);
+                // 提交本阶段指纹。**判据是"这个 Anthropic 响应已经交付给调用方"**,
+                // 不是"整条 CLI 会话成功" —— 对调用方而言这就是一次完整的成功响应
+                // (有正文、有 tool_use、stop_reason=tool_use),它已经据此计费了。
+                // 下一轮带 tool_result 回来时那段历史确实在上游手里,该命中。
+                //
+                // 之后调用方断线 / CLI 报错**不该回滚**它:那是**下一**轮的失败,
+                // 而且真发生时 `ConvRegistry` 的分叉校验会换掉 conversation_id
+                // (= 换掉模拟键),旧条目自然命不中。两处收尾的 commit 判据由此统一
+                // (对抗评审 high#1/medium#4:提交时机不能取决于模型是否恰好走了
+                // tool_use 分支)。
+                if let Some(s) = this_sim {
+                    s.commit();
+                }
 
-                // 挂起等调用方结果(带 TTL)。
+                // 挂起等调用方结果(带 TTL)。连同**下一阶段的模拟槽**一起收下。
                 let res = tokio::time::timeout(PENDING_TTL, rx_slot).await;
-                let reply = match res {
-                    Ok(Ok(Ok(text))) => json!({"result": text}),
-                    Ok(Ok(Err(err))) => json!({"error": err}),
-                    Ok(Err(_)) => json!({"error": "网关注销了这次调用"}),
-                    Err(_) => json!({"error": format!("等待调用方 tool_result 超时({}s)", PENDING_TTL.as_secs())}),
+                let (reply, next_sim) = match res {
+                    Ok(Ok((Ok(text), s))) => (json!({"result": text}), s),
+                    Ok(Ok((Err(err), s))) => (json!({"error": err}), s),
+                    Ok(Err(_)) => (json!({"error": "网关注销了这次调用"}), None),
+                    Err(_) => (
+                        json!({"error": format!("等待调用方 tool_result 超时({}s)", PENDING_TTL.as_secs())}),
+                        None,
+                    ),
                 };
                 // 新阶段(下一个 Anthropic 响应)重新开始计数。**在拿到 reply 之后**才重建
                 // —— 喂回 CLI 的这段文本就是下一阶段的输入,要计进它的 in_tally。
                 // (重建时机必须早于下一次 phase.push_text,这里满足。)
                 let mut next_in = TokenTally::default();
                 next_in.push(&reply.to_string());
-                phase = SsePhase::with_input(&a.echo_model, next_in);
+                // 槽随通道换成**这一轮自己的**:新阶段对应调用方的下一次独立请求,
+                // 它按自己的历史 peek(历史更长 → 命中更多)。所有权跟着结果走,
+                // 不经会话共享字段 —— 并发请求不可能互相覆盖。
+                sim = next_sim;
+                let next_cache = sim.as_ref().map(|s| s.cache_read).unwrap_or(0);
+                phase = SsePhase::with_input(&a.echo_model, next_in, next_cache);
                 if let Some(w) = &mut sock_w {
                     let _ = w.write_all(reply.to_string().as_bytes()).await;
                     let _ = w.write_all(b"\n").await;
@@ -1151,16 +1337,7 @@ async fn pump(mut a: PumpArgs) {
         Ok(()) => {
             let (ok, usage) = match &state.result {
                 Some(r) if r.get("subtype").and_then(|s| s.as_str()) == Some("success") => {
-                    let u = r.get("usage").cloned().unwrap_or_default();
-                    (
-                        true,
-                        ChatUsage {
-                            input_tokens: u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                            output_tokens: u.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                            cache_read_tokens: u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                            ..Default::default()
-                        },
-                    )
+                    (true, usage_from_result(&r.get("usage").cloned().unwrap_or_default()))
                 }
                 other => {
                     tracing::warn!(result = ?other.as_ref().map(|r| r.to_string().chars().take(200).collect::<String>()),
@@ -1169,6 +1346,11 @@ async fn pump(mut a: PumpArgs) {
                 }
             };
             if ok {
+                // 成功收尾:提交本阶段指纹(判据同 tool_use 处 —— 这个响应交付了)。
+                // 失败分支**不提交**:那一轮调用方拿到的是错误,没有可命中的历史。
+                if let Some(s) = sim.take() {
+                    s.commit();
+                }
                 phase.finish_done(&out, &usage);
             } else {
                 phase.finish_error(&out, UpstreamError::new(
@@ -1201,6 +1383,8 @@ pub async fn start_conv(
     tools: &[crate::run::ToolDef],
     echo_model: &str,
     updates: TokenUpdates,
+    // 本轮的模拟缓存材料(未 peek)。None = 不模拟,自估轮 cache_read 退回 0。
+    sim: Option<SimRequest>,
 ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
     // 同号 spawn 串行化:mcp.json 是每号一份的静态路径,桥 socket 每请求一条,
     // 等桥连上(或确认无工具)后再放行下一个,避免后一个请求改写 mcp.json 被
@@ -1353,6 +1537,10 @@ pub async fn start_conv(
         None => None,
     };
 
+    // peek 尽量靠后(离 commit 越近,代际被别人推进的窗口越小),但必须早于
+    // `first_in_tally` —— 那里要按 `covers_tools` 决定 tools 计不计入新增量。
+    let sim = sim.map(SimRequest::peek);
+    let covers_tools = sim.as_ref().is_some_and(|s| s.covers_tools);
     let conv = Arc::new(CliConv {
         account_id: account_id.to_string(),
         cli_session_id: Mutex::new(resume_sid),
@@ -1377,10 +1565,22 @@ pub async fn start_conv(
     // --resume 的历史在 CLI 自己的会话文件里,我方这一轮并没有把它送上去。
     let mut first_in_tally = TokenTally::default();
     first_in_tally.push(prompt);
-    for t in tools {
-        first_in_tally.push(&t.name);
-        first_in_tally.push(&t.description);
-        first_in_tally.push(&t.schema);
+    // 工具定义只在**没被模拟命中覆盖**时才计进新增量。
+    //
+    // ⚠️ 不计的那种情况不是省略,是**去重**:模拟器的指纹序列是
+    // `[system][tools][各轮消息]`,命中越过 tools 块时那部分 token 已经算在
+    // `SimSlot::cache_read` 里了(自估用量把命中加进 input_tokens,见
+    // `SsePhase::estimated_usage`),这里再 push 一遍就是同一份 tools 计费两次。
+    // Claude Code 的工具清单上万 token,不是舍入误差。
+    //
+    // 反之(命中断在 tools 之前 = 工具清单变了/冷启动)tools 确实是本轮新发的,
+    // 必须计费 —— 所以判据是 `covers_tools` 而不是"有没有命中"。
+    if !covers_tools {
+        for t in tools {
+            first_in_tally.push(&t.name);
+            first_in_tally.push(&t.description);
+            first_in_tally.push(&t.schema);
+        }
     }
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
@@ -1392,6 +1592,7 @@ pub async fn start_conv(
         known_token,
         updates,
         first_in_tally,
+        sim,
     }));
     Ok(Box::pin(drain_stream(out)))
 }
@@ -1404,10 +1605,16 @@ pub async fn start_conv(
 pub fn resume_conv(
     conv: Arc<CliConv>,
     results: Vec<(String, String)>,
+    sim: Option<SimRequest>,
 ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
     conv.touch();
+    // 先校验、**后 peek**:错配的 tool_result 根本不算一次有效轮次,让它先把模拟
+    // 状态读出来只会白白拉长 peek→commit 的竞态窗口(对抗评审 high#3)。
     let (slot, text) = conv.take_pending_matching(&results)?;
-    slot.responder.send(Ok(text)).map_err(|_| {
+    // 槽随结果一起走通道交给泵 —— 不落会话共享字段,所以并发请求不会互相覆盖,
+    // 也不存在"装槽晚于唤醒"的竞态(两者现在是同一次 send,原子)。
+    let sim = sim.map(SimRequest::peek);
+    slot.responder.send((Ok(text), sim)).map_err(|_| {
         UpstreamError::new(
             UpstreamErrorKind::Other,
             "cursor-cli: 泵任务已退出,桥调用无法送达".to_string(),
@@ -1453,7 +1660,7 @@ mod tests {
     #[test]
     fn 工具轮次报出自估用量_含工具参数且不为零() {
         let out = OutQueue::new();
-        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default());
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), 0);
         // 纯工具调用轮:一个字正文都没有,产出全在参数 JSON 里。
         phase.finish_tool_use(
             &out,
@@ -1499,7 +1706,7 @@ mod tests {
     #[test]
     fn 正文与thinking都计入output() {
         let out = OutQueue::new();
-        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default());
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), 0);
         phase.push_text(&out, "thinking", "先想一想这个问题", true);
         let after_thinking = phase.out_tally.tokens();
         assert!(after_thinking > 0, "thinking 必须计入");
@@ -1515,11 +1722,201 @@ mod tests {
     fn 校正系数只作用于output() {
         let mut t = TokenTally::default();
         t.push("这是一段足够长的中文文本用来让取整误差不至于淹没结论");
-        let phase = SsePhase::with_input("grok-4.6", t);
+        let phase = SsePhase::with_input("grok-4.6", t, 0);
         let u = phase.estimated_usage();
         assert_eq!(u.input_tokens, t.tokens(), "input 不得乘系数");
         assert_eq!(u.output_tokens, 0, "本阶段没有产出");
         assert!(TOOL_ROUND_TOKEN_FACTOR > 1.0, "系数应当>1(补隐藏推理)");
+    }
+
+    /// 自估轮必须报出模拟缓存,且 `input_tokens` 是**总输入**(新增 + 命中)。
+    ///
+    /// 锁两件事:
+    /// ① 模拟命中要出现在 `cache_read_tokens` 里 —— 这条 CLI 路径此前根本没接
+    ///    模拟器,自估轮 cache_read 结构性恒 0(生产 82% 的 grok 请求无缓存)。
+    /// ② 命中必须**加**在自估新增量上,不是从里面减。`input_tokens` 的契约是
+    ///    总输入,`delta_usage_json_pub` 发给客户前还要减一次;若这里先减过,
+    ///    `saturating_sub` 会把本轮真实喂进去的新文本归零 → 客户看到「输入 0」。
+    #[test]
+    fn 自估轮报出模拟缓存且input是总量() {
+        let mut t = TokenTally::default();
+        t.push("本轮新增的输入文本");
+        let fresh = t.tokens();
+        assert!(fresh > 0, "新增量必须非零,否则这条测试没有意义");
+
+        let phase = SsePhase::with_input("grok-4.6", t, 5000);
+        let u = phase.estimated_usage();
+        assert_eq!(u.cache_read_tokens, 5000, "模拟命中必须落到 cache_read");
+        assert_eq!(u.input_tokens, fresh + 5000, "input 必须是总量(新增+命中)");
+        assert_eq!(
+            u.real_cache_read_tokens, 0,
+            "模拟值是计费策略、不是事实断言,绝不写对账列"
+        );
+
+        // 线缆侧再减一次后,客户看到的未命中部分正好等于本轮真实新增 —— 不是 0。
+        let wire = crate::chat::delta_usage_json_pub(&u);
+        assert_eq!(
+            wire.get("input_tokens").and_then(|v| v.as_u64()),
+            Some(fresh),
+            "客户侧 input 应等于本轮新增,归 0 就是 2026-08-17 那个「输入 0」回归"
+        );
+        assert_eq!(
+            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            Some(5000)
+        );
+    }
+
+    /// `covers_tools` 的判据必须按「命中是否越过 tools 块」算,不是「有没有命中」。
+    ///
+    /// 这条锁的是 tools 双重计费:指纹序列 `[system][tools][各轮消息]` 与首轮
+    /// `in_tally`(prompt + tools)**都含 tools**,命中覆盖 tools 时两者相加会把
+    /// 上万 token 的工具清单算两次。反之工具清单换了的时候前缀正断在 tools 块上,
+    /// 那一轮 tools 是真新发的、必须计费。
+    #[test]
+    fn covers_tools_按前缀是否越过tools块判定() {
+        use crate::cache_sim;
+        use crate::run::{ToolDef, Turn};
+
+        let tool = |n: &str| ToolDef {
+            name: n.into(),
+            description: format!("{n} 的说明文字"),
+            schema: "{\"type\":\"object\"}".into(),
+        };
+        let turn = |t: &str, u: bool| Turn { text: t.into(), is_user: u };
+        let est = crate::chat::est_text_tokens;
+        // system + tools 段的 token 数(零条消息时的指纹总量)。
+        let header = |tools: &[ToolDef]| -> u64 {
+            cache_sim::fingerprints_from_context("sys", tools, &[], est)
+                .iter()
+                .map(|f| f.tokens as u64)
+                .sum()
+        };
+
+        let store = cache_sim::CacheSimStore::new();
+        let t0 = Instant::now();
+        let tools_a = vec![tool("read_file")];
+
+        // 第一轮:冷启动,命中 0 → 绝不能判成 covers_tools(否则白送 tools)。
+        let fps1 = cache_sim::fingerprints_from_context("sys", &tools_a, &[turn("问题一", true)], est);
+        let (r1, g1) = store.peek_at("k", "m", &fps1, t0);
+        assert_eq!(r1.cache_read_tokens, 0, "冷启动应 0 命中");
+        assert!(
+            (r1.cache_read_tokens as u64) < header(&tools_a),
+            "冷启动必须判 covers_tools=false,tools 要计费"
+        );
+        assert!(store.commit_at("k", "m", fps1, t0, g1));
+
+        // 第二轮:同 tools、历史续接 → 命中越过 tools 块 → covers_tools=true。
+        let fps2 = cache_sim::fingerprints_from_context(
+            "sys",
+            &tools_a,
+            &[turn("问题一", true), turn("回答一", false), turn("问题二", true)],
+            est,
+        );
+        let (r2, g2) = store.peek_at("k", "m", &fps2, t0 + Duration::from_secs(10));
+        assert!(
+            (r2.cache_read_tokens as u64) >= header(&tools_a),
+            "同工具续轮命中应越过 tools 块: hit={} header={}",
+            r2.cache_read_tokens,
+            header(&tools_a)
+        );
+        assert!(store.commit_at("k", "m", fps2, t0 + Duration::from_secs(10), g2));
+
+        // 第三轮:换了工具清单 → 前缀断在 tools 块(只剩 system 命中)
+        //          → covers_tools=false,这一轮 tools 必须计费。
+        let tools_b = vec![tool("write_file")];
+        let fps3 = cache_sim::fingerprints_from_context(
+            "sys",
+            &tools_b,
+            &[turn("问题一", true), turn("回答一", false), turn("问题二", true)],
+            est,
+        );
+        let (r3, _) = store.peek_at("k", "m", &fps3, t0 + Duration::from_secs(20));
+        assert!(
+            (r3.cache_read_tokens as u64) < header(&tools_b),
+            "换工具后命中必须断在 tools 之前: hit={} header={}",
+            r3.cache_read_tokens,
+            header(&tools_b)
+        );
+        assert!(r3.cache_read_tokens > 0, "system 仍应命中(对照:不是整段 miss)");
+    }
+
+    /// `inputTokens` 是**总输入**(含缓存),原样填 —— 绝不能再加 cached。
+    ///
+    /// 判据是实测单次调用样本(见 [`usage_from_result`] 文档):10 字符的提示词报
+    /// `input=6779 / cache=6016`,只可能是总量语义。这条锁住"别再改回 up_in+cached":
+    /// 那样会给每个正常轮次凭空加一倍输入(我 2026-08-17 犯过,被对抗评审顶回来)。
+    #[test]
+    fn 上游真值轮的input是总量不得再加缓存() {
+        let u = usage_from_result(&json!({
+            "inputTokens": 6779, "outputTokens": 35, "cacheReadTokens": 6016
+        }));
+        assert_eq!(u.input_tokens, 6779, "必须原样填,不得加 cached");
+        assert_eq!(u.cache_read_tokens, 6016);
+        assert_eq!(u.real_cache_read_tokens, 6016, "上游自报是真实命中,要进对账列");
+
+        // 线缆侧减一次 → 客户看到未命中 763 + 缓存 6016,合计正好是总量 6779。
+        let wire = crate::chat::delta_usage_json_pub(&u);
+        assert_eq!(wire.get("input_tokens").and_then(|v| v.as_u64()), Some(763));
+        assert_eq!(
+            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            Some(6016)
+        );
+    }
+
+    /// `cache > input`(上游跨内部调用累加)必须封顶到 input,恢复
+    /// `input ≥ cache_read` 不变式,否则缓存列会报出超过总输入的数字。
+    #[test]
+    fn 上游缓存超过输入时封顶() {
+        // 生产真实样本 id=1572918:input=72811 / cache=366720(5 倍)。
+        let u = usage_from_result(&json!({
+            "inputTokens": 72811, "outputTokens": 3940, "cacheReadTokens": 366720
+        }));
+        assert_eq!(u.input_tokens, 72811, "input 保持上游原值,不去重构总量");
+        assert_eq!(u.cache_read_tokens, 72811, "cached 封顶到 input");
+        assert_eq!(u.real_cache_read_tokens, 72811, "对账列存封顶后的值");
+
+        let wire = crate::chat::delta_usage_json_pub(&u);
+        assert_eq!(
+            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            Some(72811),
+            "缓存列不得报出超过总输入的数字"
+        );
+    }
+
+    /// 上游没报缓存时口径不变(cached=0 → input 就是上游原值),
+    /// 且不会凭空往对账列写数。
+    #[test]
+    fn 上游无缓存时口径不变() {
+        let u = usage_from_result(&json!({
+            "inputTokens": 1234, "outputTokens": 56, "cacheReadTokens": 0
+        }));
+        assert_eq!(u.input_tokens, 1234);
+        assert_eq!(u.cache_read_tokens, 0);
+        assert_eq!(u.real_cache_read_tokens, 0);
+        // 字段缺失也不能 panic,按 0 处理。
+        let empty = usage_from_result(&json!({}));
+        assert_eq!(
+            (empty.input_tokens, empty.output_tokens, empty.cache_read_tokens),
+            (0, 0, 0)
+        );
+    }
+
+    /// 无模拟槽时(sim=None → 0)自估用量与旧行为逐字节一致:不报缓存、
+    /// input 就是本轮新增。锁住「模拟只是叠加,不改变基线」。
+    #[test]
+    fn 无模拟槽时退回旧行为() {
+        let mut t = TokenTally::default();
+        t.push("abc 中文");
+        let fresh = t.tokens();
+        let u = SsePhase::with_input("grok-4.6", t, 0).estimated_usage();
+        assert_eq!(u.cache_read_tokens, 0);
+        assert_eq!(u.input_tokens, fresh);
+        let wire = crate::chat::delta_usage_json_pub(&u);
+        assert!(
+            wire.get("cache_read_input_tokens").is_none(),
+            "没有命中时不该出现缓存字段"
+        );
     }
 
     /// `kill_procs` 必须把**整组**带走 —— 包括子进程自己拉起的孙进程。
@@ -1785,7 +2182,7 @@ mod tests {
             .take_pending_matching(&[("toolu_x".into(), "t".into())])
             .is_err());
 
-        let (tx, _rx) = oneshot::channel::<Result<String, String>>();
+        let (tx, _rx) = oneshot::channel::<(Result<String, String>, Option<SimSlot>)>();
         *conv.pending.lock().unwrap() = Some(PendingSlot {
             tool_use_id: "toolu_abc".into(),
             responder: tx,

@@ -1249,6 +1249,53 @@ impl Provider for CursorProvider {
             )?;
 
             let fps = chat::history_fps(&req.body);
+            let raw_turns = chat::to_turns(&req.body);
+
+            // Prefix 缓存命中模拟(与线协议侧同一份模拟器、同一套键与指纹口径,
+            // 见 `cache_sim` 模块注释)。**这条 CLI 路径此前完全没接模拟器** ——
+            // peek/commit 只写在 `chat.rs` 里,于是所有走自估用量的轮次
+            // (工具回路的每一轮:发 tool_use 时上游还没给 `result`)`cache_read`
+            // 结构性恒 0。2026-08-17 生产实测:grok-4.6 近 4 小时 674 条成功请求里
+            // 555 条(82%)缓存为 0,而同期接了模拟器的 composer-2.5 是
+            // 缓存 6949 / 输入 8214 的正常比例。客户看到的就是「同一条会话里
+            // 有的轮有缓存、有的轮一点没有」。
+            //
+            // 指纹取**稳定语义层**(system + tools + 逐条消息,fold_history 之前),
+            // 与线协议逐字一致 —— 两条通道的客户账单必须可比。
+            // peek 只读不写;**成功交付才 commit**(见 `CliConv::commit_sim` 的两处
+            // 调用点),失败轮不进模拟表。
+            let sim_req = {
+                let key = format!("{}\x1f{}", ctx.account.account_id, conversation_id);
+                let sim_fps = crate::cache_sim::fingerprints_from_context(
+                    &system,
+                    &tools,
+                    &raw_turns,
+                    chat::est_text_tokens,
+                );
+                // `system + tools` 段的 token 总量:指纹布局是 `[system][tools][各轮消息]`,
+                // 用「同样的 system+tools + 零条消息」再指纹一次就得到那段
+                // (同 msg_idx、同内容 → 同哈希,即 sim_fps 的前若干项)。前缀命中是
+                // 从头连续的,故「命中量 ≥ 这段总量」⟺ 命中覆盖了整个 tools 块 ——
+                // 用途见 `SimSlot::covers_tools`(防 tools 被计费两次)。
+                let header_tokens: u64 = crate::cache_sim::fingerprints_from_context(
+                    &system,
+                    &tools,
+                    &[],
+                    chat::est_text_tokens,
+                )
+                .iter()
+                .map(|f| f.tokens as u64)
+                .sum();
+                // 这里**只准备材料、不 peek**:peek 读出的代际号从读出到 commit 之间
+                // 越久越容易被同会话的别人推进。真正的 peek 留给 start_conv /
+                // resume_conv(后者还要先校验 tool_result 匹配),见 `SimRequest`。
+                Some(clidrv::SimRequest {
+                    key,
+                    model: req.model.clone(),
+                    fps: sim_fps,
+                    header_tokens,
+                })
+            };
 
             // ① 调用方带 tool_result 回来:优先接续挂起的桥调用(按 tool_use_id
             //    键控消费,错配显式报错 —— 静默喂错结果是语义损坏)。
@@ -1256,7 +1303,7 @@ impl Provider for CursorProvider {
                 if let Some(conv) = self.cli_convs.get(&conversation_id) {
                     if conv.has_pending() {
                         *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
-                        return clidrv::resume_conv(conv, results);
+                        return clidrv::resume_conv(conv, results, sim_req);
                     }
                 }
                 // 没有挂起的桥调用(重启/超时):落回重铺,文本里带着工具结果。
@@ -1267,7 +1314,6 @@ impl Provider for CursorProvider {
             let lookup = self
                 .cli_convs
                 .lookup(&conversation_id, &ctx.account.account_id, history);
-            let raw_turns = chat::to_turns(&req.body);
             let mut prompt = match &lookup {
                 // 本轮新增的**整段**,不是末条消息 —— 理由见 `latest_user_input`。
                 clidrv::CliLookup::Resume(_) => chat::latest_user_input(&raw_turns),
@@ -1336,6 +1382,7 @@ impl Provider for CursorProvider {
                 &tools,
                 &req.model,
                 self.cli_token_updates.clone(),
+                sim_req,
             )
             .await?;
             // 登记调用方指纹(供下一轮分叉校验)。失败轮的矫正靠调用方重试时

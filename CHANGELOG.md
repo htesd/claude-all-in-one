@@ -1,5 +1,125 @@
 # Changelog
 
+## [cursor-cli-cache-coherence] CLI 驱动:三个缓存计费口径 bug — 2026-08-17
+
+同日第七批。用户原话:「只要有输入,就没有缓存命中,这是个严重的计费bug」。
+查出来是**三个**独立的口径错误,外加一处对抗评审揪出的**发布顺序竞态**。
+
+⚠️ 本批有一个**我方向搞错、被实测推翻**的修复(Bug 1),过程留在下面 —— 那类
+「从聚合统计反推字段语义」的推理方式本身是错的,记下来防复发。
+
+### 口径基础(三处判断都建立在这上面)
+
+`ChatUsage.input_tokens` 的契约是**总输入(含缓存命中)**:
+
+- 发客户前 `chat::delta_usage_json_impl` 做 `input_tokens = input − cache_read`
+  (Anthropic 语义:input 只算未命中);
+- 落库 `request_logs.input_tokens` 存 **total**;
+- 计费 `reported_tokens = input + output`。
+
+两个口径差一层 —— 搞混会得出完全相反的结论(见记忆 caio-cache-billing-and-hot-settings)。
+
+### Bug 1:`cache_read > input` 让客户侧「输入」显示 0
+
+生产实测(近 4 小时 grok-4.6 有缓存记录 127 条):**49 条(39%)`cache_read > input`**,
+线缆侧 `input − cache_read` 的 `saturating_sub` 把 `input_tokens` 归 0 —— 客户面板
+显示「输入 0 / 缓存 36 万」。真实样本 `id=1572918`:`input=72811 / cache=366720`;
+最极端比值 **239 倍**(`input=54 / cache=12928`)。
+
+**⚠️ 我第一版的诊断是错的,已被对抗评审顶回来。** 当时据这 39% 推断
+「上游 `inputTokens` 是未命中新增」,于是改成 `input + cached` —— 那会给**每个正常轮次
+凭空加一倍输入**。判据是实测单次调用(生产抓的原始 NDJSON,提示词「只回一个词:ok」
+约 10 字符):
+
+```json
+{"inputTokens":6779,"outputTokens":35,"cacheReadTokens":6016,"cacheWriteTokens":0}
+```
+
+10 字符的提示词不可能有 6779 token 的**新增**输入 —— 6779 是总量(AGENTS.md/system 等),
+其中 6016 命中。所以 `inputTokens ⊇ cacheReadTokens`,与"总输入"契约天然一致,
+**原样填**。`cache > input` 不能反推字段语义。
+
+真实成因:CLI 一次会话内部会发起多次模型调用,`cacheReadTokens` 是跨内部调用**累加**的,
+`inputTokens` 不是 —— 两个字段不同口径,不可相减。处理:不去重构总量(重构不出可信值),
+只把 cached **封顶到 input** 恢复 `input ≥ cache_read` 不变式,同时 warn(这是上游口径
+异常的信号,不是正常态)。
+
+顺带修:`real_cache_read_tokens` 原来漏填 → 面板「真实缓存」列恒 0(存封顶后的值:
+超过总输入的数字放进对账列只会污染对账)。
+
+### Bug 2:自估轮 cache_read 结构性恒 0(我方贴钱)
+
+CLI 驱动这条路**从来没接过 `cache_sim`** —— peek/commit 只写在 `chat.rs` 线协议侧。
+工具回路的每一轮都是调用方独立的一次 HTTP 请求,发 `tool_use` 那一刻上游还没给
+`result`,只能自估(`SsePhase::estimated_usage`),而自估路径的 `cache_read` 写死 0。
+
+生产实测:grok-4.6 近 4 小时 674 条成功请求,**555 条(82%)缓存为 0**。
+客户看到的现象就是「同一条会话里有的轮有缓存、有的轮一点都没有」。
+
+修法:入口备好指纹材料(`SimRequest`),在 `start_conv` / `resume_conv` 里 peek 成
+`SimSlot`,泵**独占**本阶段那一份、构造 `SsePhase` 时读它的 `cache_read`。命中是
+**加**在自估新增量上 —— `in_tally` 记的是本轮真实喂进 CLI 的新文本,若改成从里面减,
+`saturating_sub` 会把它归零,又变成「输入 0」。
+
+### Bug 3:tools 双重计费(多收客户,自查发现)
+
+写完 Bug 2 自查"加模拟缓存会不会双重计费"时发现真的会:指纹序列是
+`[system][tools][各轮消息]`,而首轮 `in_tally` 是 `prompt + tools` —— **tools 在两边都有**。
+命中覆盖 tools 时两者相加,把上万 token 的工具清单算了两次。
+
+判据**不能**是"有没有命中":工具清单变更时前缀正断在 tools 块上(只剩 system 命中,
+见 `tools_change_breaks_prefix_after_system`),那一轮 tools 确实是新发的、必须计费。
+所以按**命中是否越过 tools 块**判(`SimSlot::covers_tools`,阈值 = system+tools 段
+的 token 总量),为真时 `first_in_tally` 不再 push tools。
+
+### Design Rationale
+
+- **模拟值绝不写 `real_cache_read_tokens`**:模拟是计费策略、不是事实断言,对账列只认
+  上游自报 —— 与 `chat.rs:2640` 的补偿闸同一条纪律。
+- **槽的所有权跟着"哪一轮把结果喂回来"走,不放会话上**(对抗评审 high#2)。
+  一个 `SimSlot` 描述的是**某一次调用方 HTTP 请求**,而 `CliConv` 是会话级、同
+  `conversation_id` 的并发请求共享它 —— 会话单槽会被后来者覆盖,于是 A 的账单用到 B 的
+  命中数、甚至 A 的 commit 提交了 B 的指纹(代际 CAS 只保护表的一致性,保护不了
+  「谁的账单用了谁的槽」)。改成:泵持有本阶段的槽(局部变量,独占),
+  下一阶段的槽经 `PendingSlot.responder` 通道随 tool_result 一起送进来。
+  结构上不可能错配,也消掉了"装槽晚于唤醒"的竞态(两者现在是同一次 `send`)。
+- **peek 尽量靠后**(对抗评审 high#3):代际号从读出到 commit 之间越久越易被推进。
+  入口只造 `SimRequest`(未 peek 的材料),`resume_conv` 里**先校验 tool_result 匹配、
+  后 peek** —— 错配的请求根本不算一次有效轮次,让它先读状态只会白白拉长竞态窗口。
+- **commit 判据 = 「这个 Anthropic 响应已交付给调用方」**,不是「整条 CLI 会话成功」
+  (对抗评审 high#1/medium#4)。tool_use 处交付了就提交:对调用方而言那是一次完整成功
+  响应(有正文、有 tool_use、`stop_reason=tool_use`),它已据此计费,下一轮带
+  tool_result 回来时那段历史确实在上游手里。之后断线/报错**不回滚** —— 那是下一轮的失败,
+  且真发生时 `ConvRegistry` 分叉校验会换掉 conversation_id(= 换掉模拟键),旧条目自然
+  命不中。两处收尾由此统一:提交时机不再取决于模型是否恰好走了 tool_use 分支。
+- `covers_tools` 只在 `start_conv` 消费:续轮 `in_tally` 只含 tool_result,不含 tools,
+  天然无重复。
+
+### Notes & Caveats
+
+- **这三处都改的是口径,不是定价**。Bug 2 修完客户付得更多(原来是运营方贴钱)、
+  Bug 3 修完客户付得更少、Bug 1 只影响显示与缓存列上限。想借机让利应调 `floor_ratio`
+  (记忆里 0.6→0.9 = 输入侧整体让利 41%),不要靠留着 bug 来实现。
+- 存量记录不追溯修正(`request_logs` 硬限 10000 行,15.2h 就滚掉)。
+- **过程教训**:Bug 1 第一版方向搞反了(把封顶写成了加法),靠的是**实测单次调用样本**
+  才判出来 —— 聚合统计(39% 的记录 `cache > input`)证明不了字段语义,单次调用的
+  原始 NDJSON 才行。对抗评审(`gpt-5.6-sol`)顶回了这一条,以及槽所有权 / peek 时机 /
+  commit 判据三条。
+- **仍未做**(评审提的、判为可延后):`cache_sim::peek` 目前返回 token 数,`covers_tools`
+  是拿 token 阈值反推结构边界(`cache_read >= header_tokens`)。当前指纹语义下等价且有
+  三态测试,但更稳的接口是让模拟器直接返回**命中的指纹条数**。若将来改成允许部分
+  fingerprint 命中,这个判据会失真。
+- **`cacheWriteTokens` 仍未处理**:上游 result 实测有第四个字段(见上面那条 NDJSON),
+  而 `cache_creation_tokens` 至今恒 0。它对应 Anthropic 的 `cache_creation_input_tokens`,
+  按量计费通常比普通输入更贵 —— 待评估是否计入。
+- **`result.usage` 的累计范围只查清一半,这是上线前的硬阻断**:已证实
+  `cacheReadTokens` 跨 CLI 内部多次模型调用累加(生产 `max=886,016`,超出上下文窗口,
+  单次调用不可能)。但它是否跨**调用方 HTTP 轮**累加**尚无直接证据** —— 若跨轮,
+  最后一轮的 result 真值会与前面各轮的自估**重复计费**。取证要开
+  `CURSOR_CLI_DUMP_NDJSON` 抓一条含多次 tool_use 的完整会话(需重启 worker-cursor)。
+  **在此之前不部署 Bug 1/2。**
+- 新增 7 条回归测试(口径三态 + `covers_tools` 三态 + 无槽基线);全量 1,401 passed / 0 failed。
+
 ## [cursor-cli-notice-bootstrap] CLI 驱动:提示词与本轮 tools 解耦 — 2026-08-17
 
 同日第六批。用户原话:「用户用 claude 总是说模型不会工具调用」。查出来是我方提示词
