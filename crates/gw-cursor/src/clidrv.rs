@@ -934,10 +934,20 @@ impl SsePhase {
         // `in_tally` 量的就是"这一轮真的送上去的字节",与上游 `inputTokens` 同义,
         // 所以它才是自估的正确基准(真值轮一律用上游真值,不走这里)。
         let fresh_in = self.in_tally.tokens();
-        // 缓存按**同一基准**夹住:模拟命中是按完整上下文算的,可能远超本轮新增,
-        // 直接填会破 `input ≥ cache_read`(线缆侧 `saturating_sub` 让输入归 0)。
-        // 夹到 fresh_in 之内 —— 宁可少报折扣,也不报出自相矛盾的用量。
-        let cache = self.sim_cache_read.min(fresh_in);
+        // 缓存夹到 **fresh_in × cap_ratio**,不是 fresh_in 本身。
+        //
+        // 模拟命中按**完整上下文**算(几万),而自估基准只有本轮实际输入(续轮是一条
+        // tool_result,几十到几千),夹到 fresh_in 会让两者相等 → 客户侧输入 0 →
+        // 整轮按缓存价 0.1× 计。2026-08-17 实测这样会让 **90% 的请求**变成全额折扣
+        // (63 条里 57 条),我方大幅贴钱。用 cap 收口,与
+        // `cache_sim::reported_cache_read` 同源:保证客户侧恒留 `1 − cap` 的余量。
+        let cap = crate::cache_sim::billing().cap_ratio;
+        let cap = if cap.is_finite() {
+            cap.clamp(0.0, 1.0)
+        } else {
+            crate::cache_sim::DEFAULT_CACHE_CAP_RATIO
+        };
+        let cache = self.sim_cache_read.min((fresh_in as f64 * cap).round() as u64);
         ChatUsage {
             input_tokens: fresh_in,
             output_tokens: self.out_tally.calibrated_tokens(),
@@ -1173,7 +1183,20 @@ fn fallback_cache_from_sim(usage: &mut ChatUsage, sim_cache_read: u64) -> Option
     if usage.cache_read_tokens > 0 || sim_cache_read == 0 {
         return None;
     }
-    let fallback = sim_cache_read.min(usage.input_tokens);
+    // ⚠️ 上限用 **input × cap_ratio**,不是 input 本身。
+    //
+    // 夹到 input 会让 `cache == input` → 客户侧输入 0 → **整轮按缓存价(0.1×)计**。
+    // 2026-08-17 部署后实测:63 条里 **57 条(90%)** 被夹成全额折扣,总输入 716,826
+    // 中 635,150(88.6%)按 0.1× 计 —— 远超我部署前估的 19%,方向是我方大幅贴钱。
+    // 根因是自估轮的 `input` 只量"本轮实际喂进 CLI 的量"(续轮就是一条 tool_result,
+    // 几十到几千 token),而模拟命中按**完整上下文**算(几万),一夹必然相等。
+    //
+    // 用 cap 收口:与 `cache_sim::reported_cache_read` 的 `cap_ratio` 同源同语义
+    // (「杜绝假到全命中」),保证客户侧输入恒留 `1 − cap` 的余量,不再出现整轮 0.1×。
+    let cap = crate::cache_sim::billing().cap_ratio;
+    let cap = if cap.is_finite() { cap.clamp(0.0, 1.0) } else { crate::cache_sim::DEFAULT_CACHE_CAP_RATIO };
+    let ceiling = (usage.input_tokens as f64 * cap).round() as u64;
+    let fallback = sim_cache_read.min(ceiling);
     if fallback == 0 {
         return None;
     }
@@ -1952,13 +1975,18 @@ mod tests {
         assert_eq!(fallback_cache_from_sim(&mut u, 99999), None, "有真值就不该回落");
         assert_eq!(u.cache_read_tokens, 6016);
 
-        // ② 模拟值超过 input → 夹到 input(否则线缆侧 saturating_sub 让输入归 0)。
+        // ② 模拟值超过 input → 夹到 **input × cap**(默认 0.9),不是 input 本身。
+        //    夹到 input 会让客户侧输入归 0 → 整轮按缓存价 0.1× 计
+        //    (2026-08-17 实测 63 条里 57 条中招,我方大幅贴钱)。
         let mut u2 = usage_from_result(&json!({
             "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 50000
         }));
         assert_eq!(u2.cache_read_tokens, 0);
-        assert_eq!(fallback_cache_from_sim(&mut u2, 40000), Some(1000));
-        assert_eq!(u2.cache_read_tokens, 1000, "必须夹到 input");
+        let cap = crate::cache_sim::billing().cap_ratio;
+        let expect = (1000.0 * cap).round() as u64;
+        assert_eq!(fallback_cache_from_sim(&mut u2, 40000), Some(expect));
+        assert_eq!(u2.cache_read_tokens, expect, "必须夹到 input × cap");
+        assert!(u2.cache_read_tokens < u2.input_tokens, "客户侧输入必须留余量");
 
         // ③ 模拟值为 0 → 无事发生。
         let mut u3 = usage_from_result(&json!({
@@ -1999,29 +2027,32 @@ mod tests {
         );
     }
 
-    /// 模拟命中超过本轮基准时必须夹住 —— 否则 `input ≥ cache_read` 被破,
-    /// 线缆侧 `saturating_sub` 又把客户侧输入归 0。
+    /// 模拟命中超过本轮基准时夹到 **基准 × cap**,客户侧输入**恒为正**。
     ///
-    /// 这在生产是常态:模拟命中按完整上下文算(可达数万),而续轮实际只喂回
-    /// 一条 tool_result(几百 token)。
+    /// 这条锁的是 2026-08-17 部署后实测到的回归:原先夹到 `fresh_in` 本身,于是
+    /// `cache == input` → 客户侧输入 0 → **整轮按缓存价 0.1× 计**。63 条里 57 条
+    /// (90%)中招,总输入 716,826 中 635,150(88.6%)按 0.1× 走,我方大幅贴钱。
+    /// 根因:模拟命中按**完整上下文**算(几万),自估基准只是本轮实际输入(几十~几千)。
     #[test]
-    fn 模拟命中超过本轮输入时夹到基准内() {
+    fn 模拟命中超过本轮输入时夹到cap而非全额() {
         let mut t = TokenTally::default();
-        t.push("一条不长的 tool_result");
+        t.push("一条不长的 tool_result,但要够长以免取整吃掉余量".repeat(20).as_str());
         let fresh = t.tokens();
-        // 命中值故意给成基准的几十倍(模拟器按整段上下文算出来的那种)。
+        assert!(fresh > 50, "基准要够大才看得出 cap 余量: {fresh}");
+
         let slot = test_slot(fresh * 40 + 9999, fresh * 60);
         let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
         assert_eq!(u.input_tokens, fresh);
-        assert_eq!(u.cache_read_tokens, fresh, "命中必须夹到基准");
-        // 全额命中时客户侧输入为 0 —— 这在 Anthropic 语义下是**合法**形态
-        // (整段命中),NewAPI 按 0.1× 计费,不是 bug。
+
+        let cap = crate::cache_sim::billing().cap_ratio;
+        let expect = (fresh as f64 * cap).round() as u64;
+        assert_eq!(u.cache_read_tokens, expect, "命中必须夹到 基准 × cap");
+        assert!(u.cache_read_tokens < fresh, "绝不能等于基准(那就是整轮 0.1×)");
+
         let wire = crate::chat::delta_usage_json_pub(&u);
-        assert_eq!(wire.get("input_tokens").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(
-            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
-            Some(fresh)
-        );
+        let uncached = wire.get("input_tokens").and_then(|v| v.as_u64()).unwrap();
+        assert!(uncached > 0, "客户侧输入必须为正,got {uncached}");
+        assert_eq!(uncached, fresh - expect);
     }
 
     /// 客户侧输入**恒为正**:`cap_ratio < 1` 保证命中不会吃掉全部输入。
