@@ -77,6 +77,23 @@ const PENDING_TTL: Duration = Duration::from_secs(280);
 /// 这里 OutQueue 里没有心跳,思考增量就是进展信号 —— 连续 90s 一个字节都没有等于死了。
 /// 宁可偏大:误判的代价是把一次本来会成功的慢请求变成失败。
 const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// 工具轮次估算用量的**校正系数**(乘在 [`crate::chat::est_text_tokens`] 的结果上)。
+///
+/// 为什么需要它:CLI 只在整个会话结束时发一次 `result` 事件带真实用量(2026-08-17 抓原始
+/// ndjson 确认:`thinking`/`assistant` 事件里一个 token 字段都没有)。而工具回路里每一轮
+/// 都是调用方独立的一次 HTTP 请求,发 `tool_use` 那一刻上游还没给数 —— 只能自估。
+///
+/// 系数怎么来的:拿 901 条**有上游真值**的 `end_turn` 请求反标定(近 8 小时,team4/5/6 +
+/// ultra-test)。`est_text_tokens(可见正文 + thinking + tool_use 参数)` 只有上游真值的
+/// **0.54 倍**(中位 0.58,P5=0.17/P95=0.97),总量对齐需要 1.85。
+///
+/// 差额的来源是**隐藏推理**:流里的 `thinking` 是摘要,上游按完整 CoT 计费 —— 这与
+/// 「加密 CoT 体积 ≈ 摘要的 2.3 倍」那次测量同向(见记忆 caio-thinking-blob-extraction)。
+///
+/// ⚠️ 这是**估算**,只保证总量口径对得上,单条请求可能偏 2 倍以上(见上面的 P5/P95)。
+/// 取值偏保守一侧:1.85 是总量对齐值而非 P75,宁可少收也不多收。
+/// 重新标定的脚本口径:按 `stop_reason='end_turn'` 且自身正文 ≥50 字符的样本算总量比。
+const TOOL_ROUND_TOKEN_FACTOR: f64 = 1.85;
 /// 会话条目 TTL:超时按新会话处理(与线协议形态同值)。
 const SESSION_TTL: Duration = Duration::from_secs(2 * 3600);
 /// 每会话工作区的保留期。与 [`SESSION_TTL`] 同值:会话条目过期后那个目录再没人会用。
@@ -532,6 +549,15 @@ pub struct CliConv {
     out: Arc<OutQueue>,
     pending: Mutex<Option<PendingSlot>>,
     at: Mutex<Instant>,
+    /// CLI 子进程的**进程组 id**(= 它自己的 pid,见 spawn 处的 `process_group(0)`)。
+    ///
+    /// 为什么要记进程组而不是 pid:`cursor-agent` 会自己再拉起
+    /// `node index.js worker-server` 帮工。SIGKILL **不传播**,只杀主进程会把帮工留下,
+    /// 而 worker 在容器里是 **PID 1**(`/proc/<pid>/status` 的 `NSpid: <host> 1` 实测),
+    /// 孤儿于是重挂到 worker 名下 —— 而 worker 是 tokio 进程,只 wait 自己的 `Child`
+    /// 句柄,**不会去收养/回收陌生孤儿**。2026-08-17 现场:33 个孤儿 `worker-server`
+    /// 各占 ~163MB ≈ 5.4GB。杀整组才收得干净。
+    pgid: Mutex<Option<u32>>,
 }
 
 impl CliConv {
@@ -565,10 +591,22 @@ impl CliConv {
                 let slot = p.take().expect("锁内刚确认槽位存在");
                 Ok((slot, text))
             }
-            None => Err(UpstreamError::bad_request_visible(format!(
-                "cursor-cli: 带回的 tool_result 与挂起的 tool_use({})不匹配,已拒绝(可带正确结果重试)",
-                slot.tool_use_id
-            ))),
+            None => {
+                // 这条以前只回给客户、**不落日志** —— 于是生产上 grep 6 小时日志 0 命中,
+                // 只能从 request_logs 的 400/BadRequest 反查(2026-08-17 客户报障时踩到)。
+                // 带上双方 id:实测客户会带回自己框架生成的 id(形如 `call-<uuid>-0`),
+                // 与我方 `toolu_<32hex>` 天然对不上,不打出来根本判不出是谁的问题。
+                tracing::warn!(
+                    account = %self.account_id,
+                    pending = %slot.tool_use_id,
+                    brought = ?results.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                    "cursor-cli:带回的 tool_result 与挂起的 tool_use 不匹配,已拒绝"
+                );
+                Err(UpstreamError::bad_request_visible(format!(
+                    "cursor-cli: 带回的 tool_result 与挂起的 tool_use({})不匹配,已拒绝(可带正确结果重试)",
+                    slot.tool_use_id
+                )))
+            }
         }
     }
     fn touch(&self) {
@@ -577,8 +615,41 @@ impl CliConv {
     fn fresh(&self) -> bool {
         self.at.lock().unwrap_or_else(|p| p.into_inner()).elapsed() < SESSION_TTL
     }
-    /// 占位:子进程所有权在 pump 里(kill_on_drop 兜底),这里不做显式 kill。
-    fn kill_procs(&self) {}
+    /// 杀掉这条会话的**整个进程组**(CLI 主进程 + 它自己拉起的 node 帮工)。
+    ///
+    /// ⚠️ 这个函数以前是**空壳**(`fn kill_procs(&self) {}`,注释写着"所有权在 pump 里,
+    /// kill_on_drop 兜底")。那个假设是错的,而且错法是**循环等待**:
+    ///
+    /// 1. 泵因为「不是 CLI 自己退出」的原因 break(`CLI_TIMEOUT` 240s、桥连接中断);
+    /// 2. 调 `kill_procs()` —— 空壳,什么都没做,子进程还活着;
+    /// 3. 紧接着 `stderr_task.await`:那个 task 在读子进程 stderr **等 EOF**,
+    ///    而子进程活着 → 永远不 EOF → **await 永久阻塞**;
+    /// 4. 泵任务因此永不返回 → `PumpArgs.cli`(`Child`)永不 drop →
+    ///    `kill_on_drop(true)` **永不触发**;
+    /// 5. 子进程只有被杀才会死,而唯一的杀手正卡在等它 —— 死锁。
+    ///
+    /// 2026-08-17 现场取证:泄漏进程的 stderr 读端全部仍被 worker 持有(= 卡在第 3 步),
+    /// 6 小时内「会 break 但 CLI 不自退」的事件 19 次(12 次 CLI_TIMEOUT + 7 次桥中断),
+    /// 与当时 >600s 的泄漏进程数 13 个同量级;74 个残留进程吃掉 ~13GB。
+    ///
+    /// 用 `kill` 命令而不引 libc:与本文件里 `chown` 的既有做法一致(见 `account_uid`
+    /// 附近),`kill -KILL -- -<pgid>` 的负号参数就是"整组"。
+    fn kill_procs(&self) {
+        let Some(pgid) = *self.pgid.lock().unwrap_or_else(|p| p.into_inner()) else {
+            return;
+        };
+        let ok = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{pgid}"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            // 组已经全退时 kill 会报"no such process",属正常,debug 级别。
+            tracing::debug!(pgid, account = %self.account_id, "cursor-cli:杀进程组无对象(可能已自行退出)");
+        }
+    }
 }
 
 /// 会话表:我方 conversation_id → CLI 会话。
@@ -655,22 +726,81 @@ impl CliConversations {
 
 // ── SSE 辅助 ────────────────────────────────────────────────────────────────
 
+/// 逐段累加文本的 token 估算器。
+///
+/// 为什么攒字符数而不是每段调一次 [`crate::chat::est_text_tokens`] 再相加:那个函数对
+/// ASCII 是 `ceil(n/4)`,**每段都会向上取整** —— 流式几百个 delta 累加下来,光取整误差
+/// 就能把估算抬高一倍多(gw-kiro 的 `estimate_output_tokens` 逐帧累加还额外带 `.max(1)`
+/// 的地板,问题更重)。攒总数最后算一次,结果与"把整段文本一次性估算"完全一致。
+#[derive(Default, Clone, Copy)]
+struct TokenTally {
+    ascii: u64,
+    non_ascii: u64,
+}
+
+impl TokenTally {
+    fn push(&mut self, text: &str) {
+        for c in text.chars() {
+            if c.is_ascii() {
+                self.ascii += 1;
+            } else {
+                self.non_ascii += 1;
+            }
+        }
+    }
+
+    /// 与 [`crate::chat::est_text_tokens`] 同口径:ASCII 4 字符/token、非 ASCII 1 字符/token。
+    fn tokens(&self) -> u64 {
+        self.ascii.div_ceil(4) + self.non_ascii
+    }
+
+    /// 乘上标定系数(见 [`TOOL_ROUND_TOKEN_FACTOR`])。
+    fn calibrated_tokens(&self) -> u64 {
+        (self.tokens() as f64 * TOOL_ROUND_TOKEN_FACTOR) as u64
+    }
+}
+
 struct SsePhase {
     msg_id: String,
     started: bool,
     next_idx: u32,
     open: Option<(u32, &'static str)>,
     model: String,
+    /// 本阶段流出的正文 + thinking + tool_use 参数(自估 output 用)。
+    out_tally: TokenTally,
+    /// 本阶段**喂进 CLI** 的文本(首轮 = system+prompt+tools,续轮 = 带回的 tool_result)。
+    ///
+    /// 只算"这一轮新增的输入"。上游那一侧每轮都会重读整个会话,但那部分绝大多数是
+    /// 缓存命中(实测一次 6 字符的 prompt 也报 inputTokens=6779 / cacheRead=6016),
+    /// 把它算进来会把 cache_read 的口径搅乱 —— 见记忆 caio-cache-billing-and-hot-settings。
+    in_tally: TokenTally,
 }
 
 impl SsePhase {
-    fn new(model: &str) -> Self {
+    fn with_input(model: &str, in_tally: TokenTally) -> Self {
         Self {
             msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             started: false,
             next_idx: 0,
             open: None,
             model: model.to_string(),
+            out_tally: TokenTally::default(),
+            in_tally,
+        }
+    }
+
+    /// 本阶段的自估用量(上游没给真值时用)。
+    ///
+    /// `cache_read` 恒 0:缓存归 [`crate::cache_sim`] 在收尾处统一给,与线协议的
+    /// `estimate_usage_fallback` 同一条纪律(不在两处估同一个量)。
+    /// ⚠️ 系数**只乘在 output 上**:它补的是隐藏推理(见 [`TOOL_ROUND_TOKEN_FACTOR`]),
+    /// input 侧没有对应的隐藏量 —— 我方喂进去多少就是多少,乘系数等于凭空多收。
+    fn estimated_usage(&self) -> ChatUsage {
+        ChatUsage {
+            input_tokens: self.in_tally.tokens(),
+            output_tokens: self.out_tally.calibrated_tokens(),
+            cache_read_tokens: 0,
+            ..Default::default()
         }
     }
 
@@ -693,6 +823,8 @@ impl SsePhase {
     }
 
     fn push_text(&mut self, out: &OutQueue, kind: &'static str, text: &str, is_thinking: bool) {
+        // thinking 也计入 output —— 上游就是这么收费的(与线协议 estimate_usage_fallback 同口径)。
+        self.out_tally.push(text);
         self.ensure_started(out);
         if let Some((_, k)) = self.open {
             if k != kind {
@@ -726,7 +858,18 @@ impl SsePhase {
     }
 
     /// 发 tool_use 块,收尾本阶段(message_delta stop_reason=tool_use + message_stop + End)。
+    ///
+    /// 用量走**自估**:这一轮上游不会给数(见 [`TOOL_ROUND_TOKEN_FACTOR`])。早先这里
+    /// 硬写 `{"input_tokens":0,"output_tokens":0}` 且不 push [`StreamItem::Usage`],于是
+    /// 以工具调用收尾的请求全部记 0 —— 2026-08-17 生产实测占 cursor 全部请求的 **56%**
+    /// (3 小时 1259 条里 632 条,相关性 100%),客户在 new-api 面板看到的就是
+    /// 「输入 11 万 / 输出 0」。正文其实照发,只是账没记(线协议侧早就有
+    /// `estimate_usage_fallback` 兜同一个坑,CLI 驱动是后加的,漏了)。
     fn finish_tool_use(&mut self, out: &OutQueue, tool_use_id: &str, name: &str, args: &Value) {
+        // 纯工具调用轮的产出大头是**参数 JSON**(正文可以是零个字),漏掉它 output≈0。
+        // 与线协议的 tool_call_tokens 同口径:名字 + 整个参数对象序列化后计字。
+        self.out_tally.push(name);
+        self.out_tally.push(&args.to_string());
         self.ensure_started(out);
         self.close_block(out);
         let idx = self.next_idx;
@@ -744,16 +887,18 @@ impl SsePhase {
             "content_block_stop",
             json!({"type":"content_block_stop","index":idx}),
         )))));
+        let usage = self.estimated_usage();
         out.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
             "message_delta",
             json!({"type":"message_delta",
                    "delta":{"stop_reason":"tool_use","stop_sequence":null},
-                   "usage":{"input_tokens":0,"output_tokens":0}}),
+                   "usage":crate::chat::delta_usage_json_pub(&usage)}),
         )))));
         out.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
             "message_stop",
             json!({"type":"message_stop"}),
         )))));
+        out.push(OutItem::Item(Ok(StreamItem::Usage(usage))));
         out.push(OutItem::End);
     }
 
@@ -823,13 +968,16 @@ struct PumpArgs {
     auth_file: PathBuf,
     known_token: String,
     updates: TokenUpdates,
+    /// 首轮喂给 CLI 的输入量(system + prompt + 工具定义)。工具轮次自估用量要用
+    /// (见 [`SsePhase::in_tally`]);续轮的输入是带回的 tool_result,在泵里现算。
+    first_in_tally: TokenTally,
 }
 
 /// 泵:读 CLI stdout + 桥 socket,把事件翻译成 SSE 写进 OutQueue。
 /// 桥调用处挂起(等下一轮网关请求喂结果),CLI 进程全程存活。
 async fn pump(mut a: PumpArgs) {
     let out = a.conv.out.clone();
-    let mut phase = SsePhase::new(&a.echo_model);
+    let mut phase = SsePhase::with_input(&a.echo_model, a.first_in_tally);
     let mut state = NdjsonState::default();
     let started = Instant::now();
     let mut last_auth_poll = Instant::now();
@@ -918,8 +1066,6 @@ async fn pump(mut a: PumpArgs) {
                     *p = Some(PendingSlot { tool_use_id: tool_use_id.clone(), responder: tx_slot });
                 }
                 phase.finish_tool_use(&out, &tool_use_id, &name, &args);
-                // 新阶段(下一个 Anthropic 响应)重新开始计数。
-                phase = SsePhase::new(&a.echo_model);
 
                 // 挂起等调用方结果(带 TTL)。
                 let res = tokio::time::timeout(PENDING_TTL, rx_slot).await;
@@ -929,6 +1075,12 @@ async fn pump(mut a: PumpArgs) {
                     Ok(Err(_)) => json!({"error": "网关注销了这次调用"}),
                     Err(_) => json!({"error": format!("等待调用方 tool_result 超时({}s)", PENDING_TTL.as_secs())}),
                 };
+                // 新阶段(下一个 Anthropic 响应)重新开始计数。**在拿到 reply 之后**才重建
+                // —— 喂回 CLI 的这段文本就是下一阶段的输入,要计进它的 in_tally。
+                // (重建时机必须早于下一次 phase.push_text,这里满足。)
+                let mut next_in = TokenTally::default();
+                next_in.push(&reply.to_string());
+                phase = SsePhase::with_input(&a.echo_model, next_in);
                 if let Some(w) = &mut sock_w {
                     let _ = w.write_all(reply.to_string().as_bytes()).await;
                     let _ = w.write_all(b"\n").await;
@@ -959,14 +1111,40 @@ async fn pump(mut a: PumpArgs) {
         }
     };
 
-    // 收尾
+    // ── 收尾 ────────────────────────────────────────────────────────────────
+    //
+    // 顺序与超时都是**必需的**,不是防御性冗余。这里曾经是
+    // `kill_procs()`(空壳)+ 无限 `stderr_task.await`,构成一个循环等待:
+    // 子进程不死 → stderr 不 EOF → await 不返回 → Child 不 drop → kill_on_drop 不触发
+    // → 子进程不死。详见 [`CliConv::kill_procs`] 的注释与现场取证。
+    //
+    // 现在:① 先 kill 整组(主进程 + node 帮工);② tokio 自己的 kill 兜一手,顺带
+    // reap 掉僵尸;③ 收 stderr 时**带超时**,超时就 abort —— 即便 kill 因为任何原因
+    // 没生效(权限、pid 复用、组已变),泵也一定能返回,`Child` 一定会 drop。
     a.conv.kill_procs();
-    if let Some(t) = stderr_task {
-        let _ = t.await.map(|s| {
-            if !s.trim().is_empty() {
-                tracing::debug!(stderr = %s.chars().take(300).collect::<String>(), "cursor-cli stderr");
+    // tokio 的 kill 只打主进程,但它会 wait 回收,避免留僵尸;组已被杀时报错属正常。
+    let _ = a.cli.kill().await;
+    if let Some(mut t) = stderr_task {
+        const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+        // 传 `&mut t` 而不是 `t`:超时后还要 `abort()`。光丢 JoinHandle 在 tokio 里是
+        // **detach 而非取消**,那个 task 会继续攥着 stderr 读端不放。
+        match tokio::time::timeout(STDERR_DRAIN_TIMEOUT, &mut t).await {
+            Ok(Ok(s)) => {
+                if !s.trim().is_empty() {
+                    tracing::debug!(stderr = %s.chars().take(300).collect::<String>(), "cursor-cli stderr");
+                }
             }
-        });
+            Ok(Err(_)) => {} // task 自身 panic/被取消:stderr 拿不到,不影响收尾
+            Err(_) => {
+                t.abort();
+                // 走到这里说明 kill 没能让 stderr EOF —— 是真出问题了,warn 出来。
+                tracing::warn!(
+                    account = %a.conv.account_id,
+                    secs = STDERR_DRAIN_TIMEOUT.as_secs(),
+                    "cursor-cli:杀完进程组后 stderr 仍未 EOF,放弃收集(泵照常返回)"
+                );
+            }
+        }
     }
 
     match outcome {
@@ -1137,6 +1315,11 @@ pub async fn start_conv(
         let uid = account_uid(account_id);
         cmd.uid(uid).gid(uid);
     }
+    // 自成进程组:`cursor-agent` 会再拉起 `node index.js worker-server` 帮工,
+    // 只杀主进程会把帮工留下变孤儿(见 [`CliConv::pgid`])。自成组之后
+    // `kill -- -<pgid>` 一次收干净。pgid == 子进程 pid。
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut cli = cmd.spawn().map_err(|e| {
         UpstreamError::new(
@@ -1144,6 +1327,9 @@ pub async fn start_conv(
             format!("cursor-cli: 启动 {} 失败: {e}", cfg.bin.display()),
         )
     })?;
+    // 记下进程组(= 子进程 pid,因为上面 process_group(0) 让它自成组),
+    // 下面建 CliConv 时填进去 —— kill_procs 靠它才有的可杀(会话淘汰与泵收尾两处都用)。
+    let cli_pgid = cli.id();
     // 喂 prompt 进 stdin 并立刻关(EOF = 输入完毕)。
     if let Some(mut stdin) = cli.stdin.take() {
         use tokio::io::AsyncWriteExt;
@@ -1173,6 +1359,7 @@ pub async fn start_conv(
         fps: Mutex::new(Vec::new()),
         out: OutQueue::new(),
         pending: Mutex::new(None),
+        pgid: Mutex::new(cli_pgid),
         at: Mutex::new(Instant::now()),
     });
     convs.insert(conv_key, conv.clone());
@@ -1183,6 +1370,18 @@ pub async fn start_conv(
     let known_token = read_auth_creds(&auth_file)
         .map(|(at, _)| at)
         .unwrap_or_default();
+    // 首轮输入量:prompt + 工具定义。
+    //
+    // 不含 system —— 它经 AGENTS.md 落盘(见 prepare_home),CLI 每轮都会重读,在上游
+    // 那一侧基本全是缓存命中;算进"本轮新增输入"会重复计费。同理不含会话历史:
+    // --resume 的历史在 CLI 自己的会话文件里,我方这一轮并没有把它送上去。
+    let mut first_in_tally = TokenTally::default();
+    first_in_tally.push(prompt);
+    for t in tools {
+        first_in_tally.push(&t.name);
+        first_in_tally.push(&t.description);
+        first_in_tally.push(&t.schema);
+    }
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
         conv,
@@ -1192,6 +1391,7 @@ pub async fn start_conv(
         auth_file,
         known_token,
         updates,
+        first_in_tally,
     }));
     Ok(Box::pin(drain_stream(out)))
 }
@@ -1221,6 +1421,202 @@ pub fn resume_conv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 攒字符再算一次 == 把整段文本一次性估算。这是 [`TokenTally`] 存在的理由:
+    /// 逐段调 `est_text_tokens` 相加会因为 ASCII 的 `ceil(n/4)` 每段取整而虚高。
+    #[test]
+    fn 累加器与一次性估算完全一致_且不受分段方式影响() {
+        let segs = ["hello ", "世界", "abc", "d", "又一段中文", "!"];
+        let whole: String = segs.concat();
+
+        let mut t = TokenTally::default();
+        for s in segs {
+            t.push(s);
+        }
+        assert_eq!(
+            t.tokens(),
+            crate::chat::est_text_tokens(&whole),
+            "分段累加必须等于整段估算"
+        );
+
+        // 反例:逐段各自估算再相加会虚高(正是这里要避免的)。
+        let naive: u64 = segs.iter().map(|s| crate::chat::est_text_tokens(s)).sum();
+        assert!(
+            naive > t.tokens(),
+            "逐段取整应当虚高,否则这个测试就失去意义了(naive={naive}, tally={})",
+            t.tokens()
+        );
+    }
+
+    /// 工具轮次必须报出**非零**用量,而且 output 要含工具参数 —— 这条锁的是
+    /// 2026-08-17 那个「56% 请求记 0」的回归(以前这里硬写 0)。
+    #[test]
+    fn 工具轮次报出自估用量_含工具参数且不为零() {
+        let out = OutQueue::new();
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default());
+        // 纯工具调用轮:一个字正文都没有,产出全在参数 JSON 里。
+        phase.finish_tool_use(
+            &out,
+            "toolu_x",
+            "read_file",
+            &json!({"path": "/some/rather/long/path/to/a/file.rs", "limit": 200}),
+        );
+
+        let mut usage = None;
+        let mut delta_usage = None;
+        let drained: Vec<OutItem> = out
+            .q
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect();
+        for item in drained {
+            match item {
+                OutItem::Item(Ok(StreamItem::Usage(u))) => usage = Some(u),
+                OutItem::Item(Ok(StreamItem::Sse(e))) => {
+                    if e.data.get("type").and_then(|t| t.as_str()) == Some("message_delta") {
+                        delta_usage = e.data.get("usage").cloned();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let usage = usage.expect("工具轮次必须 push StreamItem::Usage,否则落库恒 0");
+        assert!(
+            usage.output_tokens > 0,
+            "纯工具轮的产出大头是参数 JSON,不能估成 0"
+        );
+        let du = delta_usage.expect("message_delta 必须带 usage");
+        assert_eq!(
+            du.get("output_tokens").and_then(|v| v.as_u64()),
+            Some(usage.output_tokens),
+            "SSE 里报给客户的与落库的必须是同一个数"
+        );
+    }
+
+    /// 正文与 thinking 都要计进 output(上游就是这么收费的)。
+    #[test]
+    fn 正文与thinking都计入output() {
+        let out = OutQueue::new();
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default());
+        phase.push_text(&out, "thinking", "先想一想这个问题", true);
+        let after_thinking = phase.out_tally.tokens();
+        assert!(after_thinking > 0, "thinking 必须计入");
+        phase.push_text(&out, "text", "然后给出答案", false);
+        assert!(
+            phase.out_tally.tokens() > after_thinking,
+            "正文要在 thinking 之上继续累加"
+        );
+    }
+
+    /// 系数只乘 output,不乘 input —— input 侧没有隐藏推理,乘了就是凭空多收。
+    #[test]
+    fn 校正系数只作用于output() {
+        let mut t = TokenTally::default();
+        t.push("这是一段足够长的中文文本用来让取整误差不至于淹没结论");
+        let phase = SsePhase::with_input("grok-4.6", t);
+        let u = phase.estimated_usage();
+        assert_eq!(u.input_tokens, t.tokens(), "input 不得乘系数");
+        assert_eq!(u.output_tokens, 0, "本阶段没有产出");
+        assert!(TOOL_ROUND_TOKEN_FACTOR > 1.0, "系数应当>1(补隐藏推理)");
+    }
+
+    /// `kill_procs` 必须把**整组**带走 —— 包括子进程自己拉起的孙进程。
+    ///
+    /// 这条锁的是 2026-08-17 的双重泄漏:①`kill_procs` 曾是空壳,导致泵卡在
+    /// `stderr_task.await` 上永不返回(循环等待);②即便杀了主进程,`cursor-agent`
+    /// 拉起的 `node worker-server` 帮工也会活下来变孤儿(容器里 worker 是 PID 1,
+    /// 孤儿重挂到它名下但它不回收)。所以这里造一个"父 + 孙"的进程组来验。
+    #[cfg(unix)]
+    #[test]
+    fn kill_procs_连孙进程一起收干净() {
+        use std::os::unix::process::CommandExt as _;
+
+        // 父进程 fork 出一个长睡的孙进程,然后自己也长睡 —— 模拟 cursor-agent + 帮工。
+        let mut child = unsafe {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("sleep 300 & echo $! ; sleep 300")
+                .stdout(std::process::Stdio::piped())
+                .pre_exec(|| {
+                    // 自成进程组,与生产里 process_group(0) 等价。
+                    if libc_setpgid() != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("起测试进程")
+        };
+        let pgid = child.id();
+
+        // 读出孙进程 pid。
+        let grandchild: u32 = {
+            use std::io::Read as _;
+            let mut s = String::new();
+            let mut out = child.stdout.take().expect("stdout piped");
+            // 只读第一行就够(sh 立刻 echo,之后才 sleep)。
+            let mut buf = [0u8; 64];
+            let n = out.read(&mut buf).expect("读孙进程 pid");
+            s.push_str(&String::from_utf8_lossy(&buf[..n]));
+            s.trim().parse().expect("孙进程 pid 是数字")
+        };
+
+        let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+        assert!(alive(pgid), "父进程应当在跑");
+        assert!(alive(grandchild), "孙进程应当在跑");
+
+        let conv = CliConv {
+            account_id: "acc".into(),
+            cli_session_id: Mutex::new(None),
+            fps: Mutex::new(Vec::new()),
+            out: OutQueue::new(),
+            pending: Mutex::new(None),
+            pgid: Mutex::new(Some(pgid)),
+            at: Mutex::new(Instant::now()),
+        };
+        conv.kill_procs();
+
+        // 组信号是异步送达的,给一点时间。**先判定再收尸** —— 反过来写的话,
+        // kill_procs 万一没生效,`child.wait()` 会一直等那 300s 的 sleep,
+        // 测试表现为挂死而不是干净的断言失败(实测过,别改回去)。
+        let died = (0..100).any(|_| {
+            if !alive(grandchild) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        });
+
+        // 兜底清场:无论断言成不成立,都别把 sleep 进程和僵尸留给别的测试。
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{pgid}"))
+            .status();
+        let _ = child.wait();
+
+        assert!(
+            died,
+            "孙进程必须跟着死 —— 只杀主进程就是那 33 个孤儿 worker-server 的来源"
+        );
+    }
+
+    /// `setpgid(0, 0)`:不引 libc crate,直接走 syscall。
+    #[cfg(unix)]
+    fn libc_setpgid() -> i32 {
+        // SAFETY: setpgid(0,0) 无参数指针,pre_exec 里调用是 async-signal-safe 的。
+        unsafe { syscall_setpgid() }
+    }
+
+    #[cfg(unix)]
+    unsafe fn syscall_setpgid() -> i32 {
+        unsafe extern "C" {
+            fn setpgid(pid: i32, pgid: i32) -> i32;
+        }
+        unsafe { setpgid(0, 0) }
+    }
 
     /// 造一枚只带 exp 的假 JWT(测试用,不验签)。
     fn fake_jwt(exp: i64) -> String {
@@ -1382,6 +1778,7 @@ mod tests {
             out: OutQueue::new(),
             pending: Mutex::new(None),
             at: Mutex::new(Instant::now()),
+            pgid: Mutex::new(None),
         };
         // 无挂起 → 明确报错。
         assert!(conv

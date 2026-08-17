@@ -136,7 +136,7 @@ fn delta_usage_json_impl(usage: &ChatUsage, output_tokens: u64) -> Value {
 /// ASCII ≈ 4 字符/token;非 ASCII 按 1 字符/token 的保守值 —— 中文实测多在
 /// 1~1.5 字符/token,emoji/组合字符甚至超过 1 token/字符。这是计费代码,
 /// 估不准就宁多勿少(低估 = 运营方贴钱)。
-fn est_text_tokens(text: &str) -> u64 {
+pub(crate) fn est_text_tokens(text: &str) -> u64 {
     let mut ascii = 0u64;
     let mut other = 0u64;
     for c in text.chars() {
