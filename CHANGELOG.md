@@ -1,5 +1,53 @@
 # Changelog
 
+## [cursor-driver-switch] 驱动形态成为后台可切项 + `data/` 穿越权限修复 — 2026-08-17
+
+### Fixes
+
+- **CLI 驱动上线即 EACCES 的根因**:`clidrv::start_conv` 用 `cmd.uid()` 降权 +
+  `cmd.current_dir(ws)`,而 Rust `std` 的 `do_exec` **先 setuid 再 chdir**;CLI 的 HOME
+  在 `/app/data/cursor-cli/<acc>/ws`,而上一条 CHANGELOG 要求的 `data/` **700**
+  让降权 uid 连 `/app/data` 都穿不过去 → `chdir` EACCES,被报成「启动 cursor-agent 失败」。
+  **不是二进制权限**(它是 755;`docker exec -u <uid> -w <ws>` 能跑通,因为 docker 的
+  `-w` 是 root 身份先 chdir 再降权 —— 正好反证顺序)。共享 nobody 时同样挡,与每账号
+  uid 改造无关。
+  **修法(运维侧,已在 139 生效)**:`chmod 711 data/`(o+x 可穿越、不可列目录)+
+  `chmod 600 data/gw.db data/state.db`。安全性质不变,已逐条实测:自己 HOME 能 chdir、
+  `control.db`/`gw.db`/`state.db` 全 denied、`ls /app/data` denied、换个 uid 进不了别号 HOME。
+- `models.rs::list_reports_real_context_windows` 漏取 `CATALOG_TEST_LOCK`,与热追加
+  测试撞车偶发 `34 vs 35`(实测三跑必中一次)。补锁后连跑三轮 221/221。
+
+### Features
+
+- `PATCH /admin/api/accounts/{id}` 新增定点字段 **`driver`**:`"cli"` = 子进程驱动
+  官方 cursor-agent,`""` = 清除回线协议,缺省不动。走 `merge_account_extra`,绝不碰
+  凭据;认不出的值 **400**(fail-closed —— 静默收下会让 UI 显示与实际跑的驱动不符)。
+  `GET` 侧顶层回显 `driver`。
+- 后台账号编辑弹窗加「上游驱动」两档切换(**仅 cursor 家族**显示:别的 provider
+  读不到 `extra.driver`,露出来只会误导);账号表 provider 列给 CLI 驱动的号挂徽章 ——
+  同一 provider 下两种上游形态,出问题时第一件要分辨的就是「这号走哪条路」。
+  切换约 30s 内经 worker sync 生效,不用重启。
+
+### 2026-08-17 生产实测
+
+`chmod` 后先用 pro3 的 uid 手工直跑 CLI(不经调度器):进程起来、`apiKeySource=login`、
+模型解析成 `Cursor Grok 4.6 High`,倒在 `ActionRequiredError: unpaid invoice` —— **号欠费**,
+不是代码。换有额度的 `ultra-test` 同法直跑:思考帧 + 正文 + `result.usage`
+`{input 3068, output 41, cacheRead 9728}` 全回来,3.75s 收尾。
+
+随后把 `ultra-test` 切到 `driver=cli` 接生产流量,15 分钟:**grok-4.6 55 成 / composer-2.5
+37 成 / grok-4.5 8 成 1 败(99%)**,`cursor-cli:模型调用桥接工具` **27 次** —— MCP 桥回路
+在容器里也成立。`选号失败:并发已满` 从约 12 条/分降到约 7 条/分。
+
+### Notes & Caveats
+
+- ⚠️ **本地 spawn 失败被记进账号健康**:`scheduler.rs` 把 `UpstreamErrorKind::Other`
+  计入 `failure_count`,3 次即 `TooManyFailures` 停用且**不自动恢复**。于是「我方文件
+  权限配错」把 pro3 判成了坏号(02:11:36 三连 EACCES → 自动禁用,至今未回轮转)。
+  同段注释里 `Overloaded`/`ModelNotAvailable` 都刻意不惩罚账号,spawn 失败该进那一档。**未修。**
+- `pro3` / `test1` 上游均报 unpaid invoice;cursor 池实际可用并发只剩 `test`(2)+
+  `ultra-test`(4),这是 503 的真正来源,属付款/补号范畴。
+
 ## [cursor-cli-hardening] CLI 驱动安全/完整性加固(对抗审查共识落地) — 2026-08-17
 
 ### Security

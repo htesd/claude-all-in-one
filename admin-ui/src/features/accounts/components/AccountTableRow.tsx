@@ -132,8 +132,19 @@ export function AccountTableRow({
         )}
       </TD>
 
-      {/* provider：走 providerTabLabel,与筛选器选项同一处维护(kiro→Kiro / claude-dario→ccmax / cursor→Cursor) */}
-      <TD className="text-muted-foreground">{providerTabLabel(row.provider)}</TD>
+      {/* provider：走 providerTabLabel,与筛选器选项同一处维护(kiro→Kiro / claude-dario→ccmax / cursor→Cursor)
+          CLI 驱动的号在这里挂一枚徽章 —— 同一个 provider 下两种上游形态,
+          出问题时第一件要分辨的就是"这号走的哪条路",不该只能进弹窗才看得到。 */}
+      <TD className="text-muted-foreground">
+        <span className="flex flex-wrap items-center gap-1.5">
+          {providerTabLabel(row.provider)}
+          {row.driver === 'cli' && (
+            <Badge variant="default" title={t('table.driverCliHint')}>
+              {t('table.driverCli')}
+            </Badge>
+          )}
+        </span>
+      </TD>
 
       {/* 运行状态徽章（merge 配置 + runtime） */}
       <TD>

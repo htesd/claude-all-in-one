@@ -648,6 +648,9 @@ mod tests {
 
     #[test]
     fn list_reports_real_context_windows() {
+        // 它读 list() 与 catalog() 两次全局快照并比长度,漏了这把锁就会和
+        // extra_models_override_and_append 的热追加窗口撞车(实测偶发 34 vs 35)。
+        let _g = CATALOG_TEST_LOCK.lock().unwrap();
         let l = list();
         let by = |id: &str| l.iter().find(|m| m.id == id).unwrap().clone();
         assert_eq!(by("claude-opus-5").context_length, Some(300_000));
