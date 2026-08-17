@@ -122,10 +122,12 @@ const zh = {
     'accounts.field.driver': '上游驱动（仅 cursor）',
     'accounts.field.driverHint':
       '「线协议」= 网关自己拼 protobuf 直连推理端点（默认）。「CLI 子进程」= 以子进程驱动官方 cursor-agent：用量是上游真实值（含缓存命中），工具经 MCP 桥回传；代价是每个请求多起一个 node 进程。切换约 30s 内经 worker sync 生效，不用重启。',
-    'accounts.driver.wire': '线协议',
-    'accounts.driver.cli': 'CLI 子进程',
-    'table.driverCli': 'CLI',
-    'table.driverCliHint': '该号走 CLI 子进程驱动（包裹官方 cursor-agent），不是线协议',
+    'accounts.driver.wire': '线协议(退出)',
+    'accounts.driver.cli': 'CLI 子进程(默认)',
+    'table.tierFree': 'FREE',
+    'table.tierFreeHint': '该号已被上游降级为免费档：没有套餐内额度（grok / composer 等会返回不可用）。额度栏空白 ≠ 查询失败。',
+    'table.driverWire': '线协议',
+    'table.driverWireHint': '该号已退出默认的 CLI 子进程驱动，改走线协议（裸模型名，曾被上游收走）',
   'table.priorityHint':
     '两档:高优先级号被优先·积极调度(高层空出老会话回迁),低优先级号兜底。按分组分别设定：',
   'table.groupNone': '无分组',
@@ -713,10 +715,12 @@ const en: Record<I18nKey, string> = {
     'accounts.field.driver': 'Upstream driver (cursor only)',
     'accounts.field.driverHint':
       '"Wire" = the gateway builds protobuf itself and calls the inference endpoint directly (default). "CLI subprocess" = drive the official cursor-agent as a child process: usage comes back as real upstream numbers (including cache reads) and tools round-trip through an MCP bridge, at the cost of one extra node process per request. Takes effect within ~30s via worker sync, no restart.',
-    'accounts.driver.wire': 'Wire',
-    'accounts.driver.cli': 'CLI subprocess',
-    'table.driverCli': 'CLI',
-    'table.driverCliHint': 'This account runs through the CLI subprocess driver (wrapping the official cursor-agent), not the wire protocol',
+    'accounts.driver.wire': 'Wire (opt out)',
+    'accounts.driver.cli': 'CLI subprocess (default)',
+    'table.tierFree': 'FREE',
+    'table.tierFreeHint': 'Upstream demoted this account to the free tier: no included quota (grok / composer come back unavailable). A blank quota cell is not a failed query.',
+    'table.driverWire': 'Wire',
+    'table.driverWireHint': 'This account opted out of the default CLI subprocess driver and uses the wire protocol (bare model names, which upstream has withdrawn before)',
   'table.priorityHint':
     'Two tiers: High accounts scheduled first and aggressively (sessions migrate back up when High frees); Low as fallback. Set per group:',
   'table.groupNone': 'No group',

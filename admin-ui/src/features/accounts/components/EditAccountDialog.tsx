@@ -68,7 +68,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   // 规范化成 JSON 数组落库。空串 = 清除(不限)。
   const [modelAllowlist, setModelAllowlist] = useState('')
   const [initialModelAllowlist, setInitialModelAllowlist] = useState('')
-  // 上游驱动形态(extra.driver,cursor 专用):'' = 线协议,'cli' = 子进程驱动 cursor-agent。
+  // 上游驱动形态(extra.driver,cursor 专用)。2026-08-17 起 **CLI 驱动是默认**:
+  // '' = 默认(CLI 子进程驱动 cursor-agent),'wire' = 该号退回线协议。
+  // 历史值 'cli' 与 '' 等价(都是默认),所以回填时一并归一成 ''。
   const [driver, setDriver] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -91,7 +93,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
         : ''
       setModelAllowlist(currentAllowlist)
       setInitialModelAllowlist(currentAllowlist)
-      setDriver(row.driver === 'cli' ? 'cli' : '')
+      setDriver(row.driver === 'wire' ? 'wire' : '')
       setError(null)
       setSaving(false)
     }
@@ -145,7 +147,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     if (modelAllowlist !== initialModelAllowlist) patch.model_allowlist = modelAllowlist
     // 驱动形态：与原值比较，没动就不带（同 queue_enabled 的理由：对着不认这个字段的
     // 旧后端，只改并发也会让整个保存被判 400）。'' = 清除回线协议。
-    if (driver !== (row.driver === 'cli' ? 'cli' : '')) patch.driver = driver
+    if (driver !== (row.driver === 'wire' ? 'wire' : '')) patch.driver = driver
 
     const draft: AccountGroupMembership[] = Object.entries(memberships).map(
       ([name, priority]) => ({ name, priority }),
@@ -331,8 +333,8 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
               <div className="flex flex-wrap items-center gap-2">
                 <Segment
                   options={[
-                    { value: '', label: t('accounts.driver.wire') },
-                    { value: 'cli', label: t('accounts.driver.cli') },
+                    { value: '', label: t('accounts.driver.cli') },
+                    { value: 'wire', label: t('accounts.driver.wire') },
                   ]}
                   value={driver}
                   onChange={(v) => setDriver(v)}

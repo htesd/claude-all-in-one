@@ -136,6 +136,26 @@ pub struct AccountQuota {
     /// 超额(on-demand / usage-based)额度快照。`None` = 该 provider 无此概念或未查到。
     /// 与 `used`/`limit`(**套餐内**额度)是两笔独立的账:套餐用尽后才开始吃超额。
     pub on_demand: Option<OnDemandQuota>,
+    /// **账号档位**(`"FREE"` / `"PAID"` / provider 自己的档位名)。`None` = 该 provider
+    /// 判不出来 / 未查到。
+    ///
+    /// ## 为什么要独立于 [`Self::currency`]
+    ///
+    /// `currency` 是**展示标签**,但 worker 的档位回填一直拿它当档位用
+    /// (`backfill_subscription_title(account_id, q.currency)`)—— 对 kiro 成立
+    /// (那边 currency 装的就是 `"KIRO PRO"` 这类档位名),对 cursor **不成立**:
+    /// gw-cursor 写死 `currency = "USD"`,于是每个 cursor 号的 `subscription_title`
+    /// 都被填成字符串 `"USD"`。后果有三条,2026-08-17 一次性暴露:
+    ///
+    /// 1. 档位在后台**完全看不出来** —— 号被上游降级成 FREE 也不显示;
+    /// 2. `warm_subscription_titles` 只补「缺这个字段」的号,填了 `"USD"` 就**永不复查**;
+    /// 3. 判付费的地方用的是「`subscription_title` 存在且不含 FREE」——`"USD"` 不含 FREE,
+    ///    于是**降级号仍被当付费号**,继续被派发它已经没权限的模型。
+    ///
+    /// 那天三个新号在 20 分钟内被降级成 FREE,症状是 grok 先 `ModelNotAvailable`、
+    /// composer 随后也不可用,而后台额度栏一片空白(FREE 的 `planUsage` 没有
+    /// `includedSpend`/`limit`)——没有这个字段就只能靠翻上游报文才看得出是降级。
+    pub plan_tier: Option<String>,
 }
 
 /// 超额(on-demand / usage-based pricing)额度快照。
@@ -182,6 +202,7 @@ impl AccountQuota {
             currency: None,
             windows: Vec::new(),
             on_demand: None,
+            plan_tier: None,
         }
     }
 
@@ -198,6 +219,7 @@ impl AccountQuota {
             currency: label,
             windows,
             on_demand: None,
+            plan_tier: None,
         }
     }
 }

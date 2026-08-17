@@ -1012,6 +1012,9 @@ pub async fn start_conv(
     convs: &CliConversations,
     conv_key: &str,
     account_id: &str,
+    // 账号出口代理(`extra.proxy`)。None/空 = 直连。**必须显式传**:env_clear()
+    // 之后不继承任何代理变量,漏传即静默直连(见下方设置处的注释)。
+    proxy: Option<&str>,
     home: &Path,
     ws: &Path,
     cli_model: &str,
@@ -1107,6 +1110,24 @@ pub async fn start_conv(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // 出口:账号配了代理就必须透传给 CLI。
+    //
+    // ⚠️ `env_clear()` 之后**什么都不继承**,所以漏了这段的后果不是"退回容器默认代理",
+    // 而是**静默直连**。2026-08-17 实测:三个代理号切到 CLI 驱动后全部失败,而记忆里
+    // 直连出口的封号率是 59.5%(代理 0%)—— 也就是说漏这段不只是不通,是在烧号。
+    //
+    // cursor-agent 认不认这几个变量是**实测**过的,不是照惯例猜的:把 `HTTPS_PROXY`
+    // 指向 `127.0.0.1:1`,`--list-models` 当场 `ECONNREFUSED 127.0.0.1:1`;不设则正常。
+    // 所以它走的是认环境变量的 HTTP 客户端,`NODE_USE_ENV_PROXY` 不需要(加了也不变)。
+    if let Some(p) = proxy.map(str::trim).filter(|p| !p.is_empty()) {
+        // 大小写两套都给:不同库只认其中一套(curl 系认小写,多数 Node/Python 库认大写)。
+        for k in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"] {
+            cmd.env(k, p);
+        }
+        // 本地回环别走代理,否则 MCP 桥那条 unix/loopback 通路会被绕进代理。
+        cmd.env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost");
+    }
     // 降权:每账号独立 uid 运行(见 account_uid)。ask 模式的只读 shell 仍会真跑
     // 命令 —— 不能让模型用 `cat` 读走 /app/data 的号库,也不能让它读走**别号**
     // 的 HOME(共用 nobody 时 700/600 不挡同 uid)。仅在 root(容器)下启用;
