@@ -1069,9 +1069,23 @@ impl SsePhase {
 /// CLI 进程退出时那一次 `result` 只落在最后一轮。所以两条路径各管一段,不重复。
 /// ⚠️ 若将来改动收尾时机(比如让 result 补算整条会话),这条不变式就没了,要重新验。
 ///
-/// 不去"修正"input(重构不出可信的总量),只把 cached **封顶到 input** 以恢复
-/// Anthropic 不变式(`input ≥ cache_read`,否则线缆侧 `saturating_sub` 会让
-/// 客户看到「输入 0」)。封顶同时 warn:这是上游口径异常的信号,不是正常态。
+/// ## 处理:`cache > input` 时**丢弃**这个不可信的 cache,不封顶到 input
+///
+/// 不去"修正"input(重构不出可信的总量)。对 cache 有两种处理,**第一版选错了**:
+///
+/// - ❌ **封顶到 input**:恢复了 `input ≥ cache_read` 不变式,但让 `cache == input`,
+///   于是线缆侧 `input − cache = 0` —— **客户面板的「输入」列还是 0**,只是从"偶发"
+///   变成了"必然"。2026-08-17 部署后实测:5 条里 3 条(60%)被封成全等,客户看到的
+///   毛病一点没好。而且 `cache == input` 在语义上是**假断言**("本轮输入 100% 命中"),
+///   真实情况只是两个字段口径不同。
+/// - ✅ **丢弃 cache(置 0)**:`input` 是可信的(单次调用实测证明它就是总量),
+///   cache 是跨内部调用累加的、与这个 input 不同口径 —— 两个数没有可信的相对关系,
+///   那就只保留可信的那个。客户侧 `input − 0 = input`,输入列显示真实总量;
+///   代价是这些轮次**不给缓存折扣**(客户按全价付),方向偏向"宁可少给折扣也不谎报"。
+///
+/// ⚠️ 别再改回封顶:那会让「输入 0」以更高的频率回来。
+///
+/// 丢弃时 warn:这是上游口径异常的信号,也是这些轮次没拿到折扣的原因,要可查。
 fn usage_from_result(u: &Value) -> ChatUsage {
     let input = u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
     let reported_cache = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1079,9 +1093,9 @@ fn usage_from_result(u: &Value) -> ChatUsage {
         tracing::warn!(
             input,
             reported_cache,
-            "cursor-cli:上游 result 的 cacheReadTokens 超过 inputTokens(疑为跨内部调用累加),已封顶到 input"
+            "cursor-cli:上游 result 的 cacheReadTokens 超过 inputTokens(跨内部调用累加,与本轮 input 不同口径),已丢弃该缓存值(本轮不给折扣,但输入列保持真实)"
         );
-        input
+        0
     } else {
         reported_cache
     };
@@ -1883,23 +1897,31 @@ mod tests {
         );
     }
 
-    /// `cache > input`(上游跨内部调用累加)必须封顶到 input,恢复
-    /// `input ≥ cache_read` 不变式,否则缓存列会报出超过总输入的数字。
+    /// `cache > input`(上游跨内部调用累加,与本轮 input 不同口径)必须**丢弃**该
+    /// 缓存值,而**不是**封顶到 input。
+    ///
+    /// 这条锁的是 2026-08-17 部署后实测到的回归:封顶让 `cache == input`,线缆侧
+    /// `input − cache` 于是恒 0 —— 客户面板「输入」列照样是 0(5 条里 3 条被封成全等,
+    /// 比封顶前的 39% 更糟),而且 `cache == input` 是"本轮输入 100% 命中"的假断言。
     #[test]
-    fn 上游缓存超过输入时封顶() {
+    fn 上游缓存超过输入时丢弃而非封顶() {
         // 生产真实样本 id=1572918:input=72811 / cache=366720(5 倍)。
         let u = usage_from_result(&json!({
             "inputTokens": 72811, "outputTokens": 3940, "cacheReadTokens": 366720
         }));
         assert_eq!(u.input_tokens, 72811, "input 保持上游原值,不去重构总量");
-        assert_eq!(u.cache_read_tokens, 72811, "cached 封顶到 input");
-        assert_eq!(u.real_cache_read_tokens, 72811, "对账列存封顶后的值");
+        assert_eq!(u.cache_read_tokens, 0, "不可信的 cache 一律丢弃,不得封顶成 input");
+        assert_eq!(u.real_cache_read_tokens, 0, "对账列同样不存不可信的值");
 
         let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
-            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            wire.get("input_tokens").and_then(|v| v.as_u64()),
             Some(72811),
-            "缓存列不得报出超过总输入的数字"
+            "客户侧输入必须是真实总量 —— 归 0 就是那个「输入 0」的回归"
+        );
+        assert!(
+            wire.get("cache_read_input_tokens").is_none(),
+            "丢弃后不该报缓存字段(宁可不给折扣,也不谎报命中)"
         );
     }
 
