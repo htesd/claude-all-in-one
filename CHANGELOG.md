@@ -28,6 +28,26 @@
   同一 provider 下两种上游形态,出问题时第一件要分辨的就是「这号走哪条路」。
   切换约 30s 内经 worker sync 生效,不用重启。
 
+### Design Rationale
+
+- **为什么用一个权限位修,而不是改代码。** 三条候选:①`chmod 711 data/`;②把 CLI HOME
+  挪出 `data/` 挂成独立卷;③自己接管 fork/exec 让 chdir 排在降权之前。选 ① 的理由是
+  它零代码改动、**立即生效不用重启**(正扛生产流量的容器不能动),而且安全性质可以
+  **逐条实测**给出结论:`o+x` 只给穿越、不给列目录,`control.db` 仍是 600 root。
+  ② 要改 compose + 迁移已有 HOME,③ 等于自己重写 `Command` 的 spawn 序列 —— 两者
+  的风险都远大于一个权限位。代价见 Caveats:①是**运维侧状态,不在代码里**。
+- **`driver` 走定点 merge 而不是整块 `extra` 替换**,与 `proxy_url` / `priority` /
+  `queue_enabled` 同一条纪律:整块替换会把「打开弹窗那一刻的凭据快照」写回去,
+  期间若发生过 OAuth 轮换就把新 token 冲掉。定点合并绝不碰凭据字段。
+- **认不出的驱动名为什么 400 而不是静默回落线协议。** 读侧语义是
+  `opt_str("driver") == Some("cli")`,即**除 `"cli"` 以外的一切值都会跑线协议** ——
+  静默回落不是可能,是必然。那样后台写着 CLI、实际跑线协议,排障的人会先去怀疑
+  上游而不是怀疑自己填错了字。fail-closed 把错误钉死在写入侧。
+- **UI 只对 cursor 家族显示这个开关**:`extra.driver` 只有 `gw-cursor` 读。给 kiro 的号
+  露出一个写了也没用的旋钮,比不给更糟 —— 它会让人以为 kiro 也能这么切。
+- **表里挂徽章而不是新开一列**:这个信息只有一个 provider 有,单开一列要动表头和
+  所有行的排布,而「哪条上游路径」本就是 provider 的属性,挂在 provider 列旁边语义更贴。
+
 ### 2026-08-17 生产实测
 
 `chmod` 后先用 pro3 的 uid 手工直跑 CLI(不经调度器):进程起来、`apiKeySource=login`、
@@ -47,6 +67,22 @@
   同段注释里 `Overloaded`/`ModelNotAvailable` 都刻意不惩罚账号,spawn 失败该进那一档。**未修。**
 - `pro3` / `test1` 上游均报 unpaid invoice;cursor 池实际可用并发只剩 `test`(2)+
   `ultra-test`(4),这是 503 的真正来源,属付款/补号范畴。
+- ⚠️ **`data/` 的 711 是运维侧状态,不在代码里。** 换机、重建卷、或照着上一条
+  CHANGELOG 的「部署要求 `data/` 700」重做一遍,CLI 驱动就会**再次** EACCES,
+  而报错文案指向 cursor-agent、不指向权限位。要根治只有两条路:把 711 写进部署
+  脚本/文档,或把 CLI HOME 移出 `data/`(那时 `data/` 可以回到 700)。
+- ⚠️ **本条的 API/UI 改动尚未部署。** UI 内嵌进二进制、admin 平面跑在 `caio-router`
+  上,所以后台要看到这个开关必须**重建镜像并重启 router** —— 而 router 是 kiro 的入口。
+  重启时必须照抄 worker0 的 env(`KIRO_LEGACY_WIRE=1` + `KIRO_THINKING_IN_HISTORY0=1`),
+  并且**不能用 `docker compose up -d`**:compose 里 worker-cursor 仍钉
+  `cli-driver-20260817-2` 且缺 `CURSOR_DELTA_HISTORY=0`,一跑就把已上线的 cursor worker
+  退回旧镜像。线上 `ultra-test` 的 `driver=cli` 目前是直接 SQL 写进 `extra` 的,
+  与本次 API 写入的形态**逐字节等价**(`json_set(extra,'$.driver','cli')`),
+  所以先不部署也不影响它继续跑。
+- 重建 router 会一并把 `b1ed1ab` 之后的累积改动带上 kiro 数据平面。已核过影响面:
+  **无 DB 迁移**(共享 `control.db` 不会被写进旧二进制不认识的 schema)、
+  `Provider::poll_token_updates` 是**默认空实现且 gw-kiro 没覆盖**、kiro 编译单元里
+  只有 `converter/normalize.rs` 改成委托 `gw-core/normalize.rs`(501 条测试锁死逐字节等价)。
 
 ## [cursor-cli-hardening] CLI 驱动安全/完整性加固(对抗审查共识落地) — 2026-08-17
 
