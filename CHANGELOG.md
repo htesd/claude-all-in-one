@@ -1,5 +1,73 @@
 # Changelog
 
+## [cursor-inject-routing] cursor 通道分流中转注入的 `role:"system"` 消息 — 2026-08-17
+
+### Fixes
+
+- **「grok 收到空消息」**(用户报障;线上从 02:11 `ultra-test` 切 `driver=cli` 起持续
+  ~3 小时)。真实流量里客户端经中转会在**每条用户消息之后**再追一条
+  `{"role":"system","content":"<total_tokens>15000000 tokens left</total_tokens>"}`,
+  而 `chat::to_turns` 判 `is_user` 用的是 `role != "assistant"` —— 于是这条**每轮都变的
+  预算计数器成了最后一轮**。两条路径同时被带偏:
+  1. CLI 驱动的 prompt 取 `raw_turns.last()`,发给上游的整条 prompt 就是那行计数器。
+     取证来自 grok 自己的 thinking:*"The user's message contains only a token count
+     indicator."* —— 用户明明打了一大段,看到的回复是「你这条消息是空的」。
+  2. `chat::last_tool_results` 要求末条是 `role=="user"`,尾巴是 system 就返回 `None`
+     → 挂起的 MCP 桥调用**永远接不上** → 模型反复说「MCP 读取被中断了」,
+     伴随 90s stall 与 `incomplete_stream`。
+  **线协议那条路侥幸没露**:`fold_history` 无条件全量重铺,尾巴上多一行计数器无伤。
+  所以症状表现为「切了 CLI 驱动才开始空」,极易误判成 CLI 驱动本身坏了。
+- **修法(三处,均在 gw-cursor)**:
+  - 新增 `chat::route_system_role_messages`,在 `Provider::chat` 的**第一行**原地改写
+    `body`,四级分流:稳定前缀(SessionStart hook / CC 身份行)提升进顶层 `system`;
+    动态噪声(预算计数器、task-tools 催促)丢弃;interrupted-user 取正文转 `user`;
+    其余未知裹 `<system_context>` 转 `user` **原位**保留。无 `role:"system"` 消息时
+    **一个字节都不改**(快路径)。
+  - 新增 `chat::latest_user_input`:CLI 驱动的 prompt 取「最后一条 assistant 之后的
+    整段」,不再取末条。正常形态下与旧行为逐字节相同。
+  - `chat::affinity_key_from_body` 的锚点跳过 `role=="system"`:该函数由 worker 在
+    `chat()` **之前**用原始 body 调用,那时分流还没跑;锚点取到每轮都变的计数器
+    等于亲和归零。
+
+### Design Rationale
+
+- **为什么在入口一次性改写 body,而不是逐个函数打补丁**。被这条尾巴带偏的不止两处:
+  `to_turns` / `history_fps` / `cli_eligible` / `fold_history` / `cache_sim` 全都假定
+  `messages` 里只有 user/assistant。逐个加「跳过 system」是五处各自记得,漏一处就是
+  下一次同类事故;在入口把不变量建立起来,下游一处都不用改。
+- **两道修复刻意冗余**。`route_system_role_messages` 治根(已知注入形态),
+  `latest_user_input` 是兜底:分流器的最后一档是「不认识就裹起来转 user」,那种未知
+  注入照样会落在尾巴上。取整段而不是取末条,这一类只让 prompt 多一段说明,
+  而不是把用户的话整条替换掉。回归测试里两条各自独立断言,证明**任一条单独**
+  都能让用户的话回到 prompt 里。
+- **动态噪声的判据收窄到「整条消息就是这个东西」**。放宽成子串匹配的话,用户正文里
+  提到 `<total_tokens>` 就会让半条消息凭空消失 —— 静默丢用户内容比多带一行噪声坏得多。
+  单测正反两向都钉住了。
+- **没有把实现上收到 gw-core 与 kiro 共用**(`strip_rolling_fingerprints` 当初是那么做的)。
+  kiro 那份 `converter::normalize::route_system_role_messages` 跑在 `Vec<Message>` 强类型上,
+  共用要动 kiro 的转换管线,而 kiro 是生产主力面;这份跑在裸 `Value` 上,且多一条 kiro
+  没有的规则(预算计数器)。两份口径若要合并,应作为一次独立改动、单独回归 kiro。
+- **顺带把 `system` 拍平成字符串是安全的**:全仓 `get("system")` 只有 `extract_system`
+  一处读它,而那本来就是拍平取文本。
+
+### Notes & Caveats
+
+- ⚠️ **kiro 也在吃这条噪声,本次没治**。kiro 的三级分流会把预算计数器归到「未知」
+  → 裹 `<system_context>` 转 user 保留,于是**每轮多一条内容都在变的 user 消息**,
+  前缀缓存在那个位置断掉。kiro 靠全量重铺不会像 cursor 那样功能性失效,所以本次
+  按「别碰 kiro 数据面」的约束留着。要治就是给 kiro 的 `is_dynamic_system_noise`
+  加同一条规则 —— 独立改动 + 独立回归。
+- ⚠️ **上线后活跃会话各会重铺一次**:`history_fps` 的取材变了(注入消息不再计入),
+  CLI 驱动的 `cli_lookup` 前缀比对首轮必然不匹配 → 走 Fresh 折叠重铺。一次性代价。
+- 本条**尚未部署**。要重建镜像并重启 `caio-worker-cursor`(它是独立容器,
+  与 `caio-router`/`caio-worker0` 无关,**不动 kiro 数据面**);部署注意事项与
+  下一条 `[cursor-driver-switch]` 的 Caveats 同(照抄 env、别用 `docker compose up -d`)。
+  worker-cursor 现跑 `claude-all-in-one:cli-hardening-20260817`,env 只有
+  `RUST_LOG=info` + `CURSOR_DELTA_HISTORY=0`。
+- 止血替代方案(不需要部署):把 `ultra-test` 的 `extra.driver` 清掉退回线协议 ——
+  全量重铺让这条尾巴无伤。代价是丢掉 CLI 驱动的真实 usage(含 `cacheReadTokens`)
+  与 MCP 桥。
+
 ## [cursor-driver-switch] 驱动形态成为后台可切项 + `data/` 穿越权限修复 — 2026-08-17
 
 ### Fixes

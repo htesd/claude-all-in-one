@@ -354,6 +354,141 @@ pub(crate) fn extract_system(body: &Value) -> String {
     gw_core::normalize::strip_rolling_fingerprints(&raw)
 }
 
+/// `SessionStart` hook 注入的稳定前缀标记(跨轮不变,值得提升进 system)。
+const SESSION_START_PREFIX: &str = "SessionStart hook additional context:";
+/// Claude Code / Agent SDK 的身份行:出现即说明这条 system 消息是稳定前缀。
+const CC_IDENTITY_LINE: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const SDK_IDENTITY_LINE: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+/// 用户中途插话被中转框成 system 消息时的固定开头。
+const INTERRUPTED_USER_PREFIX: &str = "The user sent a new message while you were working:";
+
+/// 稳定 system 前缀:跨轮不变,提升进顶层 `system` 反而利于前缀缓存。
+fn is_stable_system_prefix(text: &str) -> bool {
+    let head = text.trim_start();
+    head.starts_with(SESSION_START_PREFIX)
+        || text
+            .lines()
+            .map(str::trim_start)
+            .any(|l| l == CC_IDENTITY_LINE || l == SDK_IDENTITY_LINE)
+}
+
+/// **每轮都变、对模型零信息增量**的注入,丢弃。
+///
+/// 这里的判据必须精确到「整条消息就是这个东西」:一旦放宽成子串匹配,用户正文里
+/// 提到 `<total_tokens>` 就会让半条消息凭空消失。
+fn is_dynamic_system_noise(text: &str) -> bool {
+    let t = text.trim();
+    // ① 剩余预算计数器:`<total_tokens>15000000 tokens left</total_tokens>`。
+    //    **它就是本次事故的元凶**(见 route_system_role_messages 的文档)。
+    (t.starts_with("<total_tokens>") && t.ends_with("</total_tokens>"))
+        // ② 「最近没用 task 工具」的周期性催促。
+        || t.starts_with("The task tools haven't been used recently.")
+}
+
+/// interrupted-user 特例:实为用户插话,被中转框成了 system。取出正文当 user。
+fn interrupted_user_payload(text: &str) -> Option<String> {
+    let body = text.trim_start().strip_prefix(INTERRUPTED_USER_PREFIX)?;
+    let payload = body
+        .split_once("\n\nIMPORTANT:")
+        .map_or(body, |(p, _)| p)
+        .trim();
+    (!payload.is_empty()).then(|| payload.to_string())
+}
+
+/// 把 `messages[]` 里**代理链中段注入的 `role:"system"` 消息**分流掉,原地改写 `body`。
+///
+/// ## 这道处理不做的后果(2026-08-17 生产事故,用户报障原话「grok 收到空消息」)
+///
+/// 真实流量里,客户端(经中转)会在**每条用户消息之后**再追一条
+/// `{"role":"system","content":"<total_tokens>15000000 tokens left</total_tokens>"}`。
+/// 而 [`to_turns`] 判 `is_user` 用的是 `role != "assistant"` —— 于是这条计数器成了
+/// **最后一轮**。两条路径同时被带偏:
+///
+/// 1. **CLI 驱动的 prompt 只发最后一轮**([`crate::clidrv::start_conv`]),发出去的
+///    整条 prompt 就是那行计数器。grok 的 thinking 原文:
+///    "The user's message contains only a token count indicator." —— 用户看到的是
+///    「你这条消息是空的」,而他明明打了一大段。
+/// 2. [`last_tool_results`] 要求末条是 `role=="user"`,尾巴是 system 就返回 `None`
+///    → 挂起的桥调用**永远接不上** → 模型反复说「MCP 读取被中断了」,
+///    并伴随 90s stall 与 `incomplete_stream`。
+///
+/// 线协议那条路侥幸没露:[`fold_history`] 无条件全量重铺,尾巴上多一行计数器无伤。
+/// 所以症状是「切了 CLI 驱动才开始空」,很容易误判成 CLI 驱动本身坏了。
+///
+/// ## 四级分流
+///
+/// | 类别 | 处置 | 理由 |
+/// |---|---|---|
+/// | 稳定前缀(hook / 身份行) | 提升进顶层 `system` | 跨轮不变,进 system 才吃得到前缀缓存 |
+/// | 动态噪声(预算计数器等) | 丢弃 | 每轮都变、零信息增量,留着只会毒化尾轮与指纹 |
+/// | interrupted-user | 转 `role:"user"` 原位保留 | 那本来就是用户说的话 |
+/// | 其余未知 | 裹 `<system_context>` 转 user 原位保留 | 不认识就不敢丢:保内容、保位置语义 |
+///
+/// 空 system 消息直接丢。**无 system-role 消息时一个字节都不改**(绝大多数流量的快路径)。
+///
+/// gw-kiro 早有同一道处理(`converter::normalize::route_system_role_messages`,注释里
+/// 写着「代理链中段注入」),cursor 通道一直没有。**没有把实现上收到 gw-core 共用**是
+/// 刻意的:kiro 那份跑在 `Vec<Message>` 强类型上,共用要动 kiro 的转换管线,而 kiro 是
+/// 生产主力面;这份跑在裸 `Value` 上,且多一条 kiro 不需要的规则(动态噪声里的预算
+/// 计数器)。两份的分类口径若要合并,应作为一次独立改动、单独回归 kiro。
+pub(crate) fn route_system_role_messages(body: &mut Value) {
+    let has_system_role = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        });
+    if !has_system_role {
+        return; // 快路径:原样,零拷贝。
+    }
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    let mut out: Vec<Value> = Vec::with_capacity(msgs.len());
+    let mut promoted: Vec<String> = Vec::new();
+    for m in msgs.drain(..) {
+        if m.get("role").and_then(|r| r.as_str()) != Some("system") {
+            out.push(m);
+            continue;
+        }
+        let text = gw_core::normalize::strip_rolling_fingerprints(&extract_text(
+            m.get("content").unwrap_or(&Value::Null),
+        ));
+        if text.trim().is_empty() {
+            continue;
+        }
+        if is_stable_system_prefix(&text) {
+            promoted.push(text);
+        } else if let Some(payload) = interrupted_user_payload(&text) {
+            out.push(json!({"role": "user", "content": payload}));
+        } else if is_dynamic_system_noise(&text) {
+            // 丢弃
+        } else {
+            out.push(json!({
+                "role": "user",
+                "content": format!("<system_context>\n{text}\n</system_context>"),
+            }));
+        }
+    }
+    *msgs = out;
+
+    if !promoted.is_empty() {
+        // 提升的文本接在既有 system 之后。**这里把 system 拍平成字符串是安全的**:
+        // 本 crate 只有 `extract_system` 读它,而那本来就是拍平取文本
+        // (grep `get("system")` 全仓仅一处)。
+        let mut sys = body.get("system").map(extract_text).unwrap_or_default();
+        for p in promoted {
+            if !sys.is_empty() {
+                sys.push_str("\n\n");
+            }
+            sys.push_str(&p);
+        }
+        body["system"] = Value::String(sys);
+    }
+}
+
 /// 拦住模型去调 Cursor 的**内建**工具。
 ///
 /// ## 为什么需要这道护栏
@@ -735,6 +870,28 @@ pub fn history_fps(body: &Value) -> Vec<u64> {
 /// 不支持,回线协议形态。
 pub(crate) fn cli_eligible(body: &Value) -> bool {
     to_turns(body).last().is_some_and(|t| t.is_user)
+}
+
+/// 取「调用方本轮新加的内容」:最后一条 assistant 之后的所有 user 轮,按序拼接。
+///
+/// CLI 驱动只把这一段当 prompt 发出去(历史在 CLI 会话里,不重铺),所以这个"一段"
+/// 取错就等于把用户的话吞了。**为什么不是 `turns.last()`**:中转会在用户消息之后
+/// 再追注入消息(见 [`route_system_role_messages`]),`last()` 拿到的是注入的那条。
+/// 分流器已经把已知的注入形态处理掉了,但它的兜底分支是「不认识就裹 `<system_context>`
+/// 转 user 原位保留」—— 那种未知注入照样会落在尾巴上。取整段而不是取末条,
+/// 这一类注入就只是让 prompt 多一段说明,而不是把用户的话整条替换掉。
+///
+/// 正常形态(末轮就是一条用户消息)下与 `last()` **逐字节相同**。
+pub(crate) fn latest_user_input(turns: &[Turn]) -> String {
+    let start = turns.iter().rposition(|t| !t.is_user).map_or(0, |i| i + 1);
+    let mut out = String::new();
+    for t in &turns[start..] {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&t.text);
+    }
+    out
 }
 
 /// 取「整条都是 tool_result」的最后一条 user 消息:(tool_use_id, 文本) 列表。
@@ -1264,9 +1421,16 @@ pub fn affinity_key_from_body(body: &Value) -> Option<String> {
         }
     }
     let msgs = body.get("messages").and_then(|m| m.as_array())?;
-    let first_user = msgs
-        .iter()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) != Some("assistant"))?;
+    // ⚠️ `role=="system"` 必须跳过。这个函数由 worker 在 `Provider::chat` **之前**
+    // 用原始 body 调用,那时 [`route_system_role_messages`] 还没跑过。中转注入的
+    // system 消息若排在首位,锚点就会取到它 —— 而注入内容往往每轮都变
+    // (预算计数器),亲和键跟着每轮都变,等于没有亲和。
+    let first_user = msgs.iter().find(|m| {
+        !matches!(
+            m.get("role").and_then(|r| r.as_str()),
+            Some("assistant") | Some("system")
+        )
+    })?;
     let anchor = extract_text(first_user.get("content")?);
     if anchor.trim().is_empty() {
         return None;
@@ -2570,6 +2734,173 @@ fn stream_to_anthropic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **2026-08-17 生产事故的回归锁**:真实报文形态 —— 中转在每条用户消息之后
+    /// 追一条 `role:"system"` 的预算计数器。分流前末轮是那条计数器,
+    /// CLI 驱动就把它当 prompt 发出去了(用户看到「你这条消息是空的」)。
+    #[test]
+    fn 分流器_预算计数器不再顶掉用户末轮() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "# 项目 X 交接:第四阶段启动"}]},
+            {"role": "system", "content": [{"type": "text", "text": "<total_tokens>15000000 tokens left</total_tokens>"}]},
+        ]});
+        // 分流前 + 旧的取法(`turns.last()`):末轮是注入的计数器,发出去的就是它。
+        assert_eq!(
+            to_turns(&body).last().unwrap().text,
+            "<total_tokens>15000000 tokens left</total_tokens>",
+            "这就是事故现场:用户打的那段被计数器整条顶掉"
+        );
+        // 两道修复各自独立够用:只上 `latest_user_input`(不分流)时用户的话也回来了。
+        assert_eq!(
+            latest_user_input(&to_turns(&body)),
+            "# 项目 X 交接:第四阶段启动\n\n<total_tokens>15000000 tokens left</total_tokens>"
+        );
+        route_system_role_messages(&mut body);
+        // 分流后:计数器被丢弃,prompt 是用户真正打的那段。
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            latest_user_input(&to_turns(&body)),
+            "# 项目 X 交接:第四阶段启动"
+        );
+    }
+
+    /// 同一条尾巴还会掐死工具回路:`last_tool_results` 要求末条是 user,
+    /// 尾巴是 system 就返回 None → 挂起的桥调用永远接不上(模型报「MCP 读取被中断了」)。
+    #[test]
+    fn 分流器_工具回路的接续不再被尾巴掐死() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": "读一下 STATUS.md"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_a", "content": "文件内容"}]},
+            {"role": "system", "content": "<total_tokens>14990000 tokens left</total_tokens>"},
+        ]});
+        assert_eq!(last_tool_results(&body), None, "分流前:接不上");
+        route_system_role_messages(&mut body);
+        assert_eq!(
+            last_tool_results(&body),
+            Some(vec![("toolu_a".to_string(), "文件内容".to_string())]),
+            "分流后:桥调用能接续"
+        );
+    }
+
+    /// 四级分流各走各的路,且**位置语义保留**(未知注入原位转 user,不前后串位)。
+    #[test]
+    fn 分流器_四级分流() {
+        let mut body = json!({"system": "原有 system", "messages": [
+            {"role": "system", "content": "SessionStart hook additional context:\n项目约定 X"},
+            {"role": "user", "content": "甲"},
+            {"role": "system", "content": "The task tools haven't been used recently. 略"},
+            {"role": "system", "content": "Available agent types for the Agent tool:\n- claude"},
+            {"role": "system", "content": "   "},
+            {"role": "system", "content": "The user sent a new message while you were working:\n先停一下\n\nIMPORTANT: 别提这条"},
+            {"role": "assistant", "content": "乙"},
+        ]});
+        route_system_role_messages(&mut body);
+        let msgs = body["messages"].as_array().unwrap();
+        // 稳定前缀提升 → 不在 messages 里;动态噪声与空消息丢弃。
+        assert_eq!(msgs.len(), 4, "{msgs:#?}");
+        assert_eq!(msgs[0], json!({"role": "user", "content": "甲"}));
+        assert_eq!(
+            msgs[1],
+            json!({"role": "user",
+                   "content": "<system_context>\nAvailable agent types for the Agent tool:\n- claude\n</system_context>"}),
+            "不认识的注入:裹起来转 user,原位保留"
+        );
+        // interrupted-user 取正文、截掉 IMPORTANT 尾巴。
+        assert_eq!(msgs[2], json!({"role": "user", "content": "先停一下"}));
+        assert_eq!(msgs[3]["role"], "assistant");
+        // 提升的稳定前缀接在既有 system 之后。
+        assert_eq!(
+            body["system"],
+            json!("原有 system\n\nSessionStart hook additional context:\n项目约定 X")
+        );
+    }
+
+    /// 快路径:没有 `role:"system"` 消息时**一个字节都不改** ——
+    /// 绝大多数流量走这条,任何改写都是形状漂移。
+    #[test]
+    fn 分流器_无system角色时逐字节不变() {
+        for b in [
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({"system": [{"type": "text", "text": "S"}],
+                   "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                                {"role": "assistant", "content": "yo"}]}),
+            json!({}),
+        ] {
+            let mut got = b.clone();
+            route_system_role_messages(&mut got);
+            assert_eq!(got, b, "{b}");
+        }
+    }
+
+    /// 动态噪声的判据必须精确到「整条就是这个」:带正文的消息不能被误丢。
+    #[test]
+    fn 分流器_动态噪声判据不放宽() {
+        assert!(is_dynamic_system_noise("<total_tokens>123 tokens left</total_tokens>"));
+        assert!(is_dynamic_system_noise(
+            "\n  <total_tokens>123 tokens left</total_tokens>  \n"
+        ));
+        // 前后带正文 → 不是纯噪声,必须保内容。
+        assert!(!is_dynamic_system_noise(
+            "记住这条约定\n<total_tokens>123 tokens left</total_tokens>"
+        ));
+        assert!(!is_dynamic_system_noise(
+            "<total_tokens>123 tokens left</total_tokens>\n顺便说下预算含义"
+        ));
+        let mut body = json!({"messages": [
+            {"role": "system", "content": "记住这条约定\n<total_tokens>1 tokens left</total_tokens>"},
+        ]});
+        route_system_role_messages(&mut body);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1, "不能丢");
+    }
+
+    /// `latest_user_input`:正常形态(末轮一条用户消息)与 `last()` 逐字节相同;
+    /// 末尾有多条 user 轮时取整段。
+    #[test]
+    fn 本轮输入取整段而非末条() {
+        let one = vec![
+            Turn { text: "甲".into(), is_user: true },
+            Turn { text: "乙".into(), is_user: false },
+            Turn { text: "丙".into(), is_user: true },
+        ];
+        assert_eq!(latest_user_input(&one), "丙", "正常形态 = last()");
+        let two = vec![
+            Turn { text: "乙".into(), is_user: false },
+            Turn { text: "丙".into(), is_user: true },
+            Turn { text: "<system_context>\n未知注入\n</system_context>".into(), is_user: true },
+        ];
+        assert_eq!(
+            latest_user_input(&two),
+            "丙\n\n<system_context>\n未知注入\n</system_context>",
+            "未知注入落在尾巴上时,用户的话仍在 prompt 里"
+        );
+        // 全是 user(首轮)→ 整条都是本轮输入。
+        let fresh = vec![Turn { text: "甲".into(), is_user: true }];
+        assert_eq!(latest_user_input(&fresh), "甲");
+        assert_eq!(latest_user_input(&[]), "");
+    }
+
+    /// 亲和键锚点必须跳过注入的 system 消息:worker 是在 `chat()` 之前拿**原始**
+    /// body 调这个函数的,那时分流还没跑。锚点取到每轮都变的计数器 = 亲和归零。
+    #[test]
+    fn 亲和键锚点跳过注入的system消息() {
+        let with_inject = json!({"messages": [
+            {"role": "system", "content": "<total_tokens>15000000 tokens left</total_tokens>"},
+            {"role": "user", "content": "锚点甲"},
+        ]});
+        let next_round = json!({"messages": [
+            {"role": "system", "content": "<total_tokens>14000000 tokens left</total_tokens>"},
+            {"role": "user", "content": "锚点甲"},
+            {"role": "assistant", "content": "回"},
+            {"role": "user", "content": "再问"},
+        ]});
+        let a = affinity_key_from_body(&with_inject);
+        assert!(a.is_some());
+        assert_eq!(a, affinity_key_from_body(&next_round), "同会话跨轮必须稳定");
+        // 无注入时与旧行为一致。
+        let plain = json!({"messages": [{"role": "user", "content": "锚点甲"}]});
+        assert_eq!(a, affinity_key_from_body(&plain));
+    }
 
     /// 线上 usage 口径 = Anthropic 规范:`input_tokens` 是**未命中缓存的新增部分**,
     /// 缓存读取单列;cursor 没有缓存创建计数,绝不出 `cache_creation_input_tokens`。
