@@ -1,5 +1,59 @@
 # Changelog
 
+## [cursor-cli-ws-isolation] CLI 工作区改每会话一份(修跨会话提示串味)+ 调用方侧空闲闸 — 2026-08-17
+
+上一条 `[cursor-inject-routing]` 部署后盯了 30 分钟,盯出两件新事。
+
+### Fixes
+
+- **跨会话提示串味 + 工具闭集错乱**(真事故,线上取证)。`prepare_home` 把调用方**本次请求的
+  system 提示**写进 `AGENTS.md`,而工作区是**每号一份**(`<home>/ws`)—— 同号并发的两个
+  会话互相覆盖这个文件。`ultra-test` 同时在跑两种流量:一个无工具的角色扮演会话
+  和多个带 24~98 个工具的 Claude Code 会话。取证时刻的 `AGENTS.md` 里装的是
+  **「你没有任何工具可用」+ 角色人设**,而同期带工具的请求的 CLI 读的就是那份。
+  后果在模型自己的 thinking 里:
+  - 「已确认可用工具为 Shell、Read、Write 等 Cursor 本地工具,**gwtools 未直接列入 MCP 列表**」
+  - 「注意到 **Ask 模式限制与 gwtools MCP 工具使用之间的冲突**,需按工作区规则处理」
+
+  除功能错乱,这还是**跨会话的提示泄漏**:甲客户的 system 提示躺在乙客户的 CLI 工作区里。
+  HOME 按号隔离(`account_uid` + 700)挡的是**号与号**,同号内的会话之间此前没有边界。
+  **修法**:工作区改 `<home>/ws/<conversation_id>/`,`AGENTS.md` 与 `assets/` 随之隔离;
+  `auth.json` / `mcp.json` / `permissions.json` 仍每号一份(它们本来就是号级的)。
+  另加**迁移清理**:旧版那个 `ws/AGENTS.md` 恰好落在新工作区的**父目录**,而 Cursor 会
+  往上层找 rules —— 不删等于把串味原地保留,所以见到就删。
+- **调用方侧 300s 空等**。`resume_conv` 把 tool_result 喂进挂起槽后直接返回 `drain_stream`,
+  而那个流**没有任何超时**:CLI 之后若一声不出,调用方一路等到 gw-app 的 300s
+  `STREAM_IDLE_ABORT` 才收到一个空响应。实测占 tool_result 接续请求的 1.0%(切换前)~
+  7.0%(切换后 30 分钟,n=43)。**修法**:`drain_stream` 加 90s 空闲闸
+  (`DRAIN_IDLE_TIMEOUT`,与线协议 `chat::STALL_TIMEOUT` 同值),超时发一条带原因的
+  错误并终止本次响应,**不动 CLI 进程**(调用方重试走 `cli_lookup`,该重铺就重铺)。
+
+### Design Rationale
+
+- **为什么不是去修 `CLI_TIMEOUT`**。它的注释写着「单轮 CLI 调用的硬上限……保证先于我方
+  上层超时干净地杀掉进程」,读起来正是该管这件事的那个闸。但它量的**不是墙上时钟**:
+  检查点在泵 `select!` 的 500ms tick 分支,而桥挂起是在 `call` 分支内部 await 一个 280s
+  的 timeout,那段时间 select 停转、tick 不响 —— 挂起等待**不计入**预算。
+  而这恰恰是**必要的**:一个 CLI 进程横跨调用方的多个 HTTP 回合,10 轮工具往返的墙上
+  时钟轻易超过 240s;把挂起算进去会误杀正常的长工具回路。所以该加闸的地方是**调用方
+  那一侧**,不是进程侧。注释已按实际语义改写(原注释是错的,会把下一个人引到误修上)。
+- **GC 判据用显式写下的 `.last`,不用目录 mtime**。目录 mtime 只在增删目录项时变,一个
+  跑了半小时、期间只读文件的活会话其目录 mtime 可能很旧 —— 拿它当判据会删掉**正在用的
+  工作区**,而"CLI 的 cwd 被删掉之后会怎样"是另一场排查。没有 `.last` 的目录一律当过期
+  (只可能是旧版残骸或写标记失败的残骸),当前会话用**路径**排除而不是名字比较。
+- **会话 id 为空时落 `_noconv` 而不是退回父目录**。退回父目录会静默恢复串味;给一个确定
+  的兜底目录,最坏情况是所有无 id 请求共用一个,但不会污染有 id 的会话。
+
+### Notes & Caveats
+
+- ⚠️ **磁盘**:每会话一个目录,靠 `WS_TTL`(2h,与 `SESSION_TTL` 同值)回收,回收在
+  `prepare_home` 里顺手做。`chown -R` 仍作用于整个 HOME,目录多了会略慢 —— GC 保证有界。
+- ⚠️ 上线后活跃会话的工作区会**换路径**(从 `ws/` 到 `ws/<conv>/`),CLI 的 `--resume`
+  靠 HOME 下的会话存储而不是 cwd,所以续写不受影响;但**图片附件的绝对路径变了**,
+  上一轮提示里引用的旧路径在新目录下不存在。影响面限于"刚发过图、下一轮立刻续问"。
+- 本条与 `[cursor-inject-routing]` 的两条修复同属 CLI 驱动,`caio-worker-cursor` 独立容器,
+  仍**不动 kiro 数据面**。
+
 ## [cursor-inject-routing] 分流中转注入的 `role:"system"` 消息 + CLI 驱动 ask 模式说明 — 2026-08-17
 
 ### Fixes

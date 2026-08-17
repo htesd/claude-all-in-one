@@ -1166,6 +1166,7 @@ impl Provider for CursorProvider {
             let (home, ws) = clidrv::prepare_home(
                 &self.cli_cfg,
                 &ctx.account.account_id,
+                &conversation_id, // 工作区每会话一份(AGENTS.md 装的是本次请求的 system)
                 &token,
                 refresh.as_deref(),
                 &system,
