@@ -878,10 +878,24 @@ struct SsePhase {
     sim_cache_read: u64,
     /// 本轮上下文总量(见 [`SimSlot::sim_total`]);0 = 未接模拟器,退回按新增量计。
     sim_total: u64,
+    /// **本阶段开始前,上游 CLI 会话里已经装着的量**(不含本阶段 `in_tally`)。
+    ///
+    /// 这是自估 `input` 的基准的另一半:上游每轮读的是整个会话文件,
+    /// `ctx_base + in_tally` 才是它这一轮真正吃进去的总量。
+    ///
+    /// 取值(见 [`start_conv`] 与泵里的阶段切换):
+    /// - 首阶段、`--resume` 老会话 → `sim_total`(调用方给的全量历史,上游那边也有);
+    /// - 首阶段、**新开**会话 → `0`(上游手里只有我方这一轮喂的,历史根本没送上去);
+    /// - 续阶段 → 上一阶段的 `input_basis() + out_tally`(会话又长了这么多)。
+    ///
+    /// ⚠️ 续阶段**不能**直接改用该轮自己的 `sim_total`。重铺(新开会话)之后,
+    /// 调用方仍然每轮带全量历史,`sim_total` 照旧是整段 —— 但上游那边被丢弃的
+    /// 前缀永远不会回来。累加式只跟"我方实际喂过什么"走,重铺后自动归零重算。
+    ctx_base: u64,
 }
 
 impl SsePhase {
-    fn with_input(model: &str, in_tally: TokenTally, sim: Option<&SimSlot>) -> Self {
+    fn with_input(model: &str, in_tally: TokenTally, sim: Option<&SimSlot>, ctx_base: u64) -> Self {
         Self {
             msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             started: false,
@@ -892,7 +906,13 @@ impl SsePhase {
             in_tally,
             sim_cache_read: sim.map(|s| s.cache_read).unwrap_or(0),
             sim_total: sim.map(|s| s.sim_total).unwrap_or(0),
+            ctx_base,
         }
+    }
+
+    /// 本阶段自估 `input` 的基准 = 上游会话已有量 + 本轮喂进去的新增量。
+    fn input_basis(&self) -> u64 {
+        self.ctx_base.saturating_add(self.in_tally.tokens())
     }
 
     /// 本阶段的自估用量(上游没给真值时用)。
@@ -917,39 +937,51 @@ impl SsePhase {
     /// `real_cache_read_tokens` 在此**不动**(恒 0):模拟值是计费策略,不是事实断言,
     /// 对账列只认上游自报 —— 与 `chat.rs` 的补偿闸同一条纪律。
     fn estimated_usage(&self) -> ChatUsage {
-        // 基准 = **本轮实际喂进 CLI 的量**,不是模拟器的上下文总量。
+        // 基准 = `ctx_base + in_tally` —— 上游会话**已有的量**加上本轮喂进去的新增量。
         //
-        // ⚠️ 这里踩过一次:我曾把基准改成 `sim_total`(理由是"与 kiro 同口径")。
-        // 那个类比是错的 —— kiro **每轮重传全量历史**,所以它的"上下文总量"确实
-        // 等于上游 `input`;而 CLI 驱动下历史留在 CLI 自己的会话文件里(`--resume`),
-        // 我方这一轮只送新增,两个量根本不是一回事。
+        // ## 为什么不是"本轮新增量"(`in_tally`)
         //
-        // 2026-08-17 标定实测(10 条真值样本,`sim_total / upstream_input`):
-        //   min 0.042 / P25 0.609 / **中位 0.741** / P75 0.847 / max 26.633
-        //   9 条低估、1 条极端高估。
-        // 即拿 `sim_total` 当基准会**系统性少收约 25%**(我方贴钱);而那条 26.6 倍
-        // 的离群值出现在**重铺**轮(调用方带回全量历史 → 模拟器按整段算 76890,
-        // 我方实际只喂 2887),那一轮会**超收 27 倍**。两个方向都错。
+        // 上游每轮读的是整个会话文件,不是我方这一轮送的那几十个字节。基准取新增量
+        // 会低估几个数量级 —— 2026-08-18 生产实测(grok-4.6,同一条会话):
+        //   id 1585721  input 121,483(**上游真值**)
+        //   id 1585725  input      10  ← 紧接着的工具轮,真实上下文只会更大
+        //   ……连续 7 条 input 恒为 10(= 喂回的 tool_result JSON 约 40 字符)
+        // 客户按 10 个 token 付输入,我方吃掉 12 万 token 的输入成本。
         //
-        // `in_tally` 量的就是"这一轮真的送上去的字节",与上游 `inputTokens` 同义,
-        // 所以它才是自估的正确基准(真值轮一律用上游真值,不走这里)。
-        let fresh_in = self.in_tally.tokens();
-        // 缓存夹到 **fresh_in × cap_ratio**,不是 fresh_in 本身。
+        // ## 为什么也不是 `sim_total`
         //
-        // 模拟命中按**完整上下文**算(几万),而自估基准只有本轮实际输入(续轮是一条
-        // tool_result,几十到几千),夹到 fresh_in 会让两者相等 → 客户侧输入 0 →
-        // 整轮按缓存价 0.1× 计。2026-08-17 实测这样会让 **90% 的请求**变成全额折扣
-        // (63 条里 57 条),我方大幅贴钱。用 cap 收口,与
+        // 2026-08-17 标定(10 条真值样本,`sim_total / upstream_input`):
+        //   min 0.042 / P25 0.609 / 中位 0.741 / P75 0.847 / max **26.633**
+        // 两个方向的误差各有其因,`ctx_base` 的取值规则正是照这两条定的:
+        // - 系统性低估约 25%:`sim_total` 里没有 Cursor 注入的服务端 system
+        //   (实测约 26k token,见 CHANGELOG 的 cursor 实测段)。少收,方向安全。
+        // - 那条 26.6 倍高估出现在**重铺**轮:调用方带回全量历史(模拟器按整段算
+        //   76,890),而我方新开了 CLI 会话、实际只喂 2,887 —— 上游手里根本没有那段
+        //   历史。拿 `sim_total` 当基准会超收 27 倍。
+        //
+        // 累加式(见 [`SsePhase::ctx_base`])只跟"我方实际喂过什么"走:老会话
+        // `--resume` 时从 `sim_total` 起算(上游那边确实有那些历史),新开会话从 0
+        // 起算,重铺后自动归零重算。两个方向的病因都被这条规则挡住。
+        let basis = self.input_basis();
+        // 缓存夹到 **基准 × cap_ratio**,不是基准本身。
+        //
+        // 夹到基准本身会让 `cache == input` → 线缆侧 `input − cache = 0` → 客户侧
+        // 输入显示 0 且整轮按缓存价 0.1× 计。2026-08-17 实测这样会让 **90% 的请求**
+        // 变成全额折扣(63 条里 57 条)。用 cap 收口,与
         // `cache_sim::reported_cache_read` 同源:保证客户侧恒留 `1 − cap` 的余量。
+        //
+        // ⚠️ 必须 `floor` 不能 `round`:`round` 在小基准上会把上限**抬回基准本身**
+        // (基准 10、cap 0.95 → 9.5 → round 得 10 → 占比 1.0000,余量归零)。
+        // 2026-08-18 生产实测那 7 条 `input=10 / cache=10` 就是这么来的。
         let cap = crate::cache_sim::billing().cap_ratio;
         let cap = if cap.is_finite() {
             cap.clamp(0.0, 1.0)
         } else {
             crate::cache_sim::DEFAULT_CACHE_CAP_RATIO
         };
-        let cache = self.sim_cache_read.min((fresh_in as f64 * cap).round() as u64);
+        let cache = self.sim_cache_read.min((basis as f64 * cap).floor() as u64);
         ChatUsage {
-            input_tokens: fresh_in,
+            input_tokens: basis,
             output_tokens: self.out_tally.calibrated_tokens(),
             cache_read_tokens: cache,
             ..Default::default()
@@ -1195,7 +1227,9 @@ fn fallback_cache_from_sim(usage: &mut ChatUsage, sim_cache_read: u64) -> Option
     // (「杜绝假到全命中」),保证客户侧输入恒留 `1 − cap` 的余量,不再出现整轮 0.1×。
     let cap = crate::cache_sim::billing().cap_ratio;
     let cap = if cap.is_finite() { cap.clamp(0.0, 1.0) } else { crate::cache_sim::DEFAULT_CACHE_CAP_RATIO };
-    let ceiling = (usage.input_tokens as f64 * cap).round() as u64;
+    // `floor` 不能 `round`:`round` 在小 input 上会把上限抬回 input 本身
+    // (input 10、cap 0.95 → 9.5 → 10),余量归零,等于没夹。
+    let ceiling = (usage.input_tokens as f64 * cap).floor() as u64;
     let fallback = sim_cache_read.min(ceiling);
     if fallback == 0 {
         return None;
@@ -1246,6 +1280,9 @@ struct PumpArgs {
     /// 首轮喂给 CLI 的输入量(system + prompt + 工具定义)。工具轮次自估用量要用
     /// (见 [`SsePhase::in_tally`]);续轮的输入是带回的 tool_result,在泵里现算。
     first_in_tally: TokenTally,
+    /// 首阶段的 `ctx_base`(见 [`SsePhase::ctx_base`]):`--resume` 老会话时 =
+    /// `sim_total`(上游那边有那段历史),新开会话时 = 0(上游只有我方这轮喂的)。
+    first_ctx_base: u64,
     /// 首轮(= 开启这条 CLI 会话的那次请求)的模拟缓存槽。泵**独占**它,
     /// 后续阶段的槽由 `resume_conv` 经 responder 通道送进来 —— 见 [`PendingSlot`]。
     sim: Option<SimSlot>,
@@ -1257,7 +1294,8 @@ async fn pump(mut a: PumpArgs) {
     let out = a.conv.out.clone();
     // 本阶段的模拟槽:泵独占。阶段切换时换成 resume 送来的那个(见 PendingSlot)。
     let mut sim: Option<SimSlot> = a.sim.take();
-    let mut phase = SsePhase::with_input(&a.echo_model, a.first_in_tally, sim.as_ref());
+    let mut phase =
+        SsePhase::with_input(&a.echo_model, a.first_in_tally, sim.as_ref(), a.first_ctx_base);
     let mut state = NdjsonState::default();
     let started = Instant::now();
     let mut last_auth_poll = Instant::now();
@@ -1383,11 +1421,17 @@ async fn pump(mut a: PumpArgs) {
                 // (重建时机必须早于下一次 phase.push_text,这里满足。)
                 let mut next_in = TokenTally::default();
                 next_in.push(&reply.to_string());
+                // 上游会话到这一刻装着的量 = 上一阶段的输入基准 + 上一阶段流出的正文。
+                // 下一阶段的 input 基准从这里接着往上加(见 SsePhase::ctx_base)。
+                // 必须**在换 phase 之前**算,换完就读不到上一阶段的 tally 了。
+                let next_ctx = phase
+                    .input_basis()
+                    .saturating_add(phase.out_tally.calibrated_tokens());
                 // 槽随通道换成**这一轮自己的**:新阶段对应调用方的下一次独立请求,
                 // 它按自己的历史 peek(历史更长 → 命中更多)。所有权跟着结果走,
                 // 不经会话共享字段 —— 并发请求不可能互相覆盖。
                 sim = next_sim;
-                phase = SsePhase::with_input(&a.echo_model, next_in, sim.as_ref());
+                phase = SsePhase::with_input(&a.echo_model, next_in, sim.as_ref(), next_ctx);
                 if let Some(w) = &mut sock_w {
                     let _ = w.write_all(reply.to_string().as_bytes()).await;
                     let _ = w.write_all(b"\n").await;
@@ -1653,6 +1697,9 @@ pub async fn start_conv(
     if !tools.is_empty() {
         cmd.arg("--approve-mcps");
     }
+    // 续会话与新开会话在计费基准上是两种东西(见下面的 `first_ctx_base`),
+    // 而 `resume_sid` 后面会被移进 `CliConv`,所以在这里先把这一位留下来。
+    let resumed = resume_sid.is_some();
     if let Some(sid) = &resume_sid {
         cmd.arg("--resume").arg(sid);
     }
@@ -1769,6 +1816,18 @@ pub async fn start_conv(
         first_in_tally.push(&t.description);
         first_in_tally.push(&t.schema);
     }
+    // 首阶段的 `ctx_base`:**只有 `--resume` 才敢从 `sim_total` 起算**。
+    //
+    // `--resume <id>` = 上游那条会话文件里确实装着调用方给的那段历史,`sim_total`
+    // 是对它的估计(偏低约 25%,少的是 Cursor 注入的服务端 system,方向安全)。
+    // 新开会话(含**重铺**)则相反:调用方照旧带全量历史,但我方只把最后一段用户
+    // 输入喂了上去 —— 那段历史上游根本没有。此时从 0 起算,基准就等于
+    // `first_in_tally`,与旧行为一致。标定里那条 26.6 倍高估正是这种轮次。
+    let first_ctx_base = if resumed {
+        sim.as_ref().map(|s| s.sim_total).unwrap_or(0)
+    } else {
+        0
+    };
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
         conv,
@@ -1779,6 +1838,7 @@ pub async fn start_conv(
         known_token,
         updates,
         first_in_tally,
+        first_ctx_base,
         sim,
     }));
     Ok(Box::pin(drain_stream(out)))
@@ -1860,7 +1920,7 @@ mod tests {
     #[test]
     fn 工具轮次报出自估用量_含工具参数且不为零() {
         let out = OutQueue::new();
-        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), None);
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), None, 0);
         // 纯工具调用轮:一个字正文都没有,产出全在参数 JSON 里。
         phase.finish_tool_use(
             &out,
@@ -1906,7 +1966,7 @@ mod tests {
     #[test]
     fn 正文与thinking都计入output() {
         let out = OutQueue::new();
-        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), None);
+        let mut phase = SsePhase::with_input("grok-4.6", TokenTally::default(), None, 0);
         phase.push_text(&out, "thinking", "先想一想这个问题", true);
         let after_thinking = phase.out_tally.tokens();
         assert!(after_thinking > 0, "thinking 必须计入");
@@ -1922,7 +1982,7 @@ mod tests {
     fn 校正系数只作用于output() {
         let mut t = TokenTally::default();
         t.push("这是一段足够长的中文文本用来让取整误差不至于淹没结论");
-        let phase = SsePhase::with_input("grok-4.6", t, None);
+        let phase = SsePhase::with_input("grok-4.6", t, None, 0);
         let u = phase.estimated_usage();
         assert_eq!(u.input_tokens, t.tokens(), "input 不得乘系数");
         assert_eq!(u.output_tokens, 0, "本阶段没有产出");
@@ -1996,34 +2056,63 @@ mod tests {
         assert_eq!(u3.cache_read_tokens, 0);
     }
 
-    /// 自估轮的 `input_tokens` 基准 = **本轮实际喂进 CLI 的量**,不是模拟器上下文总量。
+    /// 自估轮的 `input_tokens` 基准 = **上游会话已有量 + 本轮新增量**。
     ///
-    /// 这条锁的是 2026-08-17 标定实测顶回来的那次错误:我曾把基准改成 `sim_total`
-    /// (理由"与 kiro 同口径"),但 kiro 每轮重传全量历史、CLI 驱动不传 ——
-    /// 10 条真值样本的 `sim_total / upstream_input` 中位只有 **0.741**(少收 25%),
-    /// 且重铺轮出现 **26.6 倍**离群(超收)。两个方向都错。
+    /// 不能只用本轮新增量(`in_tally`):上游每轮读整个会话文件,不是我方这轮送的
+    /// 那几十字节。2026-08-18 生产实测(grok-4.6 同一条会话)——上游真值那轮
+    /// `input=121,483`,紧接着 7 个工具轮全部报 `input=10`(喂回的 tool_result 长度),
+    /// 客户按 10 个 token 付输入,我方吃掉 12 万 token 的成本。
+    ///
+    /// 也不能用 `sim_total`:标定 10 条样本中位 0.741(少收 25%),且重铺轮出现
+    /// **26.6 倍**离群(超收 27 倍)。累加式两个方向都躲开,见 [`SsePhase::ctx_base`]。
     #[test]
-    fn 自估轮的input基准是本轮实际输入量() {
+    fn 自估轮的input基准是会话已有量加本轮新增量() {
         let mut t = TokenTally::default();
-        t.push("本轮新增的输入文本,长度要够让命中值有意义" .repeat(50).as_str());
+        t.push("本轮新增的输入文本,长度要够让命中值有意义".repeat(50).as_str());
         let fresh = t.tokens();
         assert!(fresh > 100, "新增量要够大,否则夹限会掩盖基准差异: {fresh}");
 
-        // 模拟器按**完整上下文**算,总量远大于本轮新增(生产常态)。
-        let slot = test_slot(fresh / 2, fresh * 20);
-        let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
+        // 上游会话里已经攒了一大段(典型工具轮:前面几轮的输入与输出都在里面)。
+        let ctx_base = fresh * 30;
+        let basis = ctx_base + fresh;
+        // 模拟器按完整上下文算命中,取一个落在基准之内的值。
+        let slot = test_slot(basis / 2, basis);
+        let u =
+            SsePhase::with_input("grok-4.6", t, Some(&slot), ctx_base).estimated_usage();
         assert_eq!(
-            u.input_tokens, fresh,
-            "input 必须是本轮实际输入,不得用 sim_total(那会超收)"
+            u.input_tokens, basis,
+            "input 必须是 ctx_base + 本轮新增,只报新增会低估几个数量级"
         );
-        assert_eq!(u.cache_read_tokens, fresh / 2, "命中在基准之内时原样报");
+        assert_eq!(u.cache_read_tokens, basis / 2, "命中在基准之内时原样报");
         assert_eq!(u.real_cache_read_tokens, 0, "模拟值绝不写对账列");
 
         let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
             wire.get("input_tokens").and_then(|v| v.as_u64()),
-            Some(fresh - fresh / 2),
+            Some(basis - basis / 2),
             "客户侧 = 基准 − 命中"
+        );
+    }
+
+    /// 新开会话(含**重铺**)的首阶段 `ctx_base` 必须是 0 —— 上游手里没有那段历史。
+    ///
+    /// 这条锁标定里那个 26.6 倍离群的成因:调用方带回全量历史(模拟器按整段算
+    /// 76,890),而我方新开了 CLI 会话、实际只喂 2,887。若首阶段从 `sim_total`
+    /// 起算就会超收 27 倍。
+    #[test]
+    fn 新开会话首阶段基准不含未送上去的历史() {
+        let mut t = TokenTally::default();
+        t.push("只把最后一段用户输入喂上去".repeat(30).as_str());
+        let fresh = t.tokens();
+        // sim_total 是调用方全量历史(很大),但上游根本没收到它。
+        let slot = test_slot(fresh * 5, fresh * 27);
+        let u = SsePhase::with_input("grok-4.6", t, Some(&slot), 0).estimated_usage();
+        assert_eq!(u.input_tokens, fresh, "新开会话的基准只能是我方实际喂进去的量");
+        let cap = crate::cache_sim::billing().cap_ratio;
+        assert_eq!(
+            u.cache_read_tokens,
+            (fresh as f64 * cap).floor() as u64,
+            "命中仍按 cap 夹,不得因为 sim_total 虚高而放行"
         );
     }
 
@@ -2041,11 +2130,11 @@ mod tests {
         assert!(fresh > 50, "基准要够大才看得出 cap 余量: {fresh}");
 
         let slot = test_slot(fresh * 40 + 9999, fresh * 60);
-        let u = SsePhase::with_input("grok-4.6", t, Some(&slot)).estimated_usage();
+        let u = SsePhase::with_input("grok-4.6", t, Some(&slot), 0).estimated_usage();
         assert_eq!(u.input_tokens, fresh);
 
         let cap = crate::cache_sim::billing().cap_ratio;
-        let expect = (fresh as f64 * cap).round() as u64;
+        let expect = (fresh as f64 * cap).floor() as u64;
         assert_eq!(u.cache_read_tokens, expect, "命中必须夹到 基准 × cap");
         assert!(u.cache_read_tokens < fresh, "绝不能等于基准(那就是整轮 0.1×)");
 
@@ -2160,7 +2249,7 @@ mod tests {
         let mut t = TokenTally::default();
         t.push("abc 中文");
         let fresh = t.tokens();
-        let u = SsePhase::with_input("grok-4.6", t, None).estimated_usage();
+        let u = SsePhase::with_input("grok-4.6", t, None, 0).estimated_usage();
         assert_eq!(u.cache_read_tokens, 0);
         assert_eq!(u.input_tokens, fresh);
         let wire = crate::chat::delta_usage_json_pub(&u);
