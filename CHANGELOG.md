@@ -1,5 +1,51 @@
 # Changelog
 
+## [cursor-cli-ctx-basis-2] 首阶段基准:补 system + 去掉一处重复计费 — 2026-08-18
+
+紧接上一条。部署后做了一次**受控两轮工具回路实测**(自己发,cursor 流量当时已停),
+结果暴露同一个基准还差两块。
+
+### 实测
+
+```
+第 1 轮(新会话,自估)  客户侧输入 3      缓存 45   → DB input 48
+第 2 轮(工具轮,真值)  客户侧输入 16,366 缓存 455  → DB input 16,821
+```
+
+第 2 轮是 `end_turn`,CLI 进程退出、`result` 给了真值 —— **这个新会话的真实首轮输入
+是 16,821**,而我方第 1 轮报 **48**。工具轮的四个数量级修好了,首轮还差 350 倍。
+
+### 缺陷 1:新会话基准漏了 system(我方能算的那半地板)
+
+差的 16.5k 是**每请求的固定地板**:我方写盘的 AGENTS.md(调用方 system)+ Cursor
+注入的服务端 system(CHANGELOG 早前实测约 26k)。`first_in_tally` 只算 prompt + tools,
+把 system 排除在外 —— 那条注释("算进本轮新增输入会重复计费")是为**旧基准**
+(`fresh_in + cache_read`)写的,基准改成上下文总量后它就反了:system 每轮都被 CLI
+重读、上游照样计费,漏算就是我方贴钱。现在计上。
+
+Cursor 注入的那部分我方算不出来,仍缺;它是"每请求固定地板",属于定价要考虑的输入。
+
+### 缺陷 2:续会话基准重复计了 tools 与 prompt(我自己上一条引入的)
+
+上一条写成 `ctx_base = sim_total` **同时**叠 `first_in_tally`(prompt + tools),而
+`sim_total` 的口径本来就是 `system + tools + 全部历史`
+(见 `fingerprints_from_context`)。tools 对 Claude Code 一类客户能有上万 token,
+等于每条会话的首轮凭空多收一份工具清单。
+
+修法:抽出纯函数 `first_phase_basis(resumed_sim_total, system, prompt, tools)`,
+**两条分支互斥、绝不相加** ——
+
+| 会话 | ctx_base | in_tally |
+|---|---|---|
+| `--resume` 老会话 | `sim_total` | **空** |
+| 新开/重铺 | 0 | `system + tools + prompt` |
+
+### 验证
+
+- `cargo test -p gw-cursor`:**257 passed / 0 failed**(+2)
+- 新增两条:①续会话 `in_tally` 必须为空(锁重复计费);②新会话基准必须含 system
+- `cargo check --workspace --all-targets` 干净
+
 ## [cursor-cli-ctx-basis] CLI 驱动:自估轮 input 基准改累加式 — 2026-08-18
 
 用户从生产账单发现:「很多特别低的缓存命中」。查出来是**同一个基准错误的两个表现**,

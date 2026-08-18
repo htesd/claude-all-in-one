@@ -1603,6 +1603,47 @@ async fn pump(mut a: PumpArgs) {
 
 // ── 对外入口 ────────────────────────────────────────────────────────────────
 
+/// 首阶段的 input 基准:返回 `(ctx_base, in_tally)`。
+///
+/// **两条分支互斥,绝不能相加** —— 它们是同一个量的两种算法。上游这一轮真正吃进去的,
+/// 就是那条 CLI 会话文件此刻装着的全部内容:
+///
+/// - **`--resume` 老会话**(`resumed_sim_total > 0`):装着调用方给的那整段历史,
+///   `sim_total` 就是它的估计(口径 = system + tools + 全部历史,见
+///   [`crate::cache_sim::fingerprints_from_context`])。此时 `in_tally` 必须**留空**:
+///   prompt 与 tools 已经计在 `sim_total` 里,再叠一次是重复计费(tools 对 Claude Code
+///   一类客户能有上万 token)。`sim_total` 偏低约 25%(少的是 Cursor 注入的服务端
+///   system),方向安全。
+///
+/// - **新开会话(含重铺)**:调用方照旧带全量历史,但我方只把最后一段用户输入喂了上去
+///   —— 那段历史上游根本没有,拿 `sim_total` 当基准会超收(标定里那条 **26.6 倍**
+///   离群正是这种轮次)。基准 = 我方实际喂进去的 `system + tools + prompt`。
+///   ⚠️ **system 必须计**:它经 AGENTS.md 落盘([`prepare_home`]),CLI 每轮重读,
+///   上游照样按它计费。2026-08-18 受控实测(新会话、空 system、两个小工具):
+///   我方自估首轮 48,同一进程退出时上游真值 **16,821** —— 差的 16.5k 是每请求的
+///   固定地板(AGENTS.md + Cursor 注入的服务端 system),计上 system 补掉我方能算的那半。
+///
+/// 模拟器没接上(`sim_total` 为 0)时退回按实际喂入量算,总比 0 好。
+fn first_phase_basis(
+    resumed_sim_total: u64,
+    system: &str,
+    prompt: &str,
+    tools: &[crate::run::ToolDef],
+) -> (u64, TokenTally) {
+    let mut tally = TokenTally::default();
+    if resumed_sim_total > 0 {
+        return (resumed_sim_total, tally);
+    }
+    tally.push(system);
+    tally.push(prompt);
+    for t in tools {
+        tally.push(&t.name);
+        tally.push(&t.description);
+        tally.push(&t.schema);
+    }
+    (0, tally)
+}
+
 /// 开一条新的 CLI 会话(新 spawn;`lookup` 决定带不带 --resume),返回首阶段响应流。
 #[allow(clippy::too_many_arguments)]
 pub async fn start_conv(
@@ -1617,6 +1658,10 @@ pub async fn start_conv(
     ws: &Path,
     cli_model: &str,
     prompt: &str,
+    // 调用方 system 提示(已经由 `prepare_home` 落进工作区 AGENTS.md)。
+    // 只用于**新会话**的 input 基准:CLI 每轮都会重读 AGENTS.md,上游照样按它计费,
+    // 漏算就是我方贴钱。续会话不用它 —— `SimSlot::sim_total` 的口径本来就含 system。
+    system: &str,
     resume_sid: Option<String>,
     tools: &[crate::run::ToolDef],
     echo_model: &str,
@@ -1797,37 +1842,16 @@ pub async fn start_conv(
     let known_token = read_auth_creds(&auth_file)
         .map(|(at, _)| at)
         .unwrap_or_default();
-    // 首轮输入量:prompt + 工具定义。
-    //
-    // 不含 system —— 它经 AGENTS.md 落盘(见 prepare_home),CLI 每轮都会重读,在上游
-    // 那一侧基本全是缓存命中;算进"本轮新增输入"会重复计费。同理不含会话历史:
-    // --resume 的历史在 CLI 自己的会话文件里,我方这一轮并没有把它送上去。
-    // `first_in_tally` 现在只当**下限兜底**(模拟器没接上时 `estimated_usage` 拿它当
-    // input 基准),正常路径的基准是 `SimSlot::sim_total`(上下文总量)。
-    //
-    // ⚠️ 这里**照常把 tools 计进去**。曾经有过一段"命中覆盖 tools 时就不计 tools"的
-    // 去重逻辑(`covers_tools`),那是为旧基准 `fresh_in + cache_read` 写的 —— 在那个
-    // 公式下 tools 会被算两次。换成 `sim_total` 基准后,总量里 tools 本来就只出现一次,
-    // 再去扣它反而变成**少计**。基准一改,那条去重逻辑就从必要变成错误,故删除。
-    let mut first_in_tally = TokenTally::default();
-    first_in_tally.push(prompt);
-    for t in tools {
-        first_in_tally.push(&t.name);
-        first_in_tally.push(&t.description);
-        first_in_tally.push(&t.schema);
-    }
-    // 首阶段的 `ctx_base`:**只有 `--resume` 才敢从 `sim_total` 起算**。
-    //
-    // `--resume <id>` = 上游那条会话文件里确实装着调用方给的那段历史,`sim_total`
-    // 是对它的估计(偏低约 25%,少的是 Cursor 注入的服务端 system,方向安全)。
-    // 新开会话(含**重铺**)则相反:调用方照旧带全量历史,但我方只把最后一段用户
-    // 输入喂了上去 —— 那段历史上游根本没有。此时从 0 起算,基准就等于
-    // `first_in_tally`,与旧行为一致。标定里那条 26.6 倍高估正是这种轮次。
-    let first_ctx_base = if resumed {
-        sim.as_ref().map(|s| s.sim_total).unwrap_or(0)
-    } else {
-        0
-    };
+    let (first_ctx_base, first_in_tally) = first_phase_basis(
+        if resumed {
+            sim.as_ref().map(|s| s.sim_total).unwrap_or(0)
+        } else {
+            0
+        },
+        system,
+        prompt,
+        tools,
+    );
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
         conv,
@@ -2091,6 +2115,51 @@ mod tests {
             wire.get("input_tokens").and_then(|v| v.as_u64()),
             Some(basis - basis / 2),
             "客户侧 = 基准 − 命中"
+        );
+    }
+
+    /// 续会话的首阶段基准 = `sim_total` 单独一份,**不得再叠 tools/prompt**。
+    ///
+    /// 这条锁我自己在 2026-08-18 引入又发现的重复计费:`ctx_base = sim_total` 的同时
+    /// 还把 `first_in_tally`(prompt + tools)加了上去 —— 而 `sim_total` 的口径本来就
+    /// 含 system + tools + 全部历史。tools 对 Claude Code 一类客户能有上万 token。
+    #[test]
+    fn 续会话首阶段基准不重复计tools与prompt() {
+        let tools = vec![crate::run::ToolDef {
+            name: "read_file".into(),
+            description: "读一个文件,描述写长一点好让 token 数明显".repeat(20),
+            schema: r#"{"type":"object"}"#.repeat(20),
+        }];
+        let sim_total = 123_456u64;
+        let (ctx, tally) =
+            first_phase_basis(sim_total, &"很长的 system 提示".repeat(50), "问题", &tools);
+        assert_eq!(ctx, sim_total, "续会话基准就是 sim_total 本身");
+        assert_eq!(
+            tally.tokens(),
+            0,
+            "in_tally 必须留空,否则 tools/prompt 被算两次(sim_total 里已有)"
+        );
+    }
+
+    /// 新会话首阶段基准必须**含 system**:AGENTS.md 每轮被 CLI 重读,上游照样计费。
+    ///
+    /// 2026-08-18 受控实测:新会话我方自估首轮 48,同一进程退出时上游真值 16,821。
+    #[test]
+    fn 新会话首阶段基准含system() {
+        let tools = vec![crate::run::ToolDef {
+            name: "t".into(),
+            description: "d".into(),
+            schema: "{}".into(),
+        }];
+        let system = "这是一段相当长的 system 提示,客户端通常会塞几千 token 进来".repeat(30);
+        let (ctx, with_sys) = first_phase_basis(0, &system, "问题", &tools);
+        assert_eq!(ctx, 0, "新会话没有已有上下文");
+        let (_, without_sys) = first_phase_basis(0, "", "问题", &tools);
+        assert!(
+            with_sys.tokens() > without_sys.tokens() + 100,
+            "system 必须计进基准: {} vs {}",
+            with_sys.tokens(),
+            without_sys.tokens()
         );
     }
 
