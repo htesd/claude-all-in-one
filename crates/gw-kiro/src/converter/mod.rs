@@ -39,6 +39,8 @@ pub(crate) use cache_point::set_experimental_flags;
 pub(crate) use cache_point::thinking_signature_enabled;
 /// 上游端点开关(供 [`crate::headers::runtime_base_url`] 判定走 runtime.kiro.dev 还是 q.amazonaws.com)。
 pub(crate) use cache_point::q_endpoint_enabled;
+/// 历史 thinking 保留轮数热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
+pub(crate) use history::set_history_thinking_turns;
 use cache_point::*;
 use content::*;
 use document_name::dedup_document_names;

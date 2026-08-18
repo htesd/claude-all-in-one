@@ -1,7 +1,7 @@
 //! 历史构建、user/assistant 合并、thinking 前缀与结构化输出指令。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use super::{ContentBlock, ConversionError, MessagesRequest, EMPTY_CONTENT_PLACEHOLDER, MEDIA_ONLY_PLACEHOLDER};
 // 跨子模块调用(经 mod.rs 的 `use <sub>::*` 提升到 converter 根,故走 super::)
 use super::{normalized_client_system, request_has_chunked_tools, process_message_content, map_tool_name};
@@ -257,6 +257,81 @@ pub(super) fn structured_output_instruction(req: &MessagesRequest) -> Option<Str
     ))
 }
 
+// ───────────────────── 历史 thinking 保留轮数(进程级热配置) ─────────────────────
+
+/// 运行期「历史 thinking 保留轮数」。设置面板改 → DB overlay → worker 30s 轮询 →
+/// [`crate::KiroProvider::apply_hot_settings`] → [`set_history_thinking_turns`],**无需重启**。
+///
+/// 与 `anthropic_types` 的 `default_thinking_effort` 同款进程级全局。为什么不用依赖注入:
+/// 转换层(`build_history` / `convert_assistant_message`)是一组自由函数,`chat_stream`
+/// 与 `render_kiro_payload` 都不持有 provider 句柄,把参数一路穿下去要改到 gw-app 的请求
+/// 日志路径。窗口判定需要「距末尾第几段」的位置信息,全局只提供轮数 N,位置由
+/// `build_history` 预扫描结算后以 `keep_thinking` 显式传参 —— 转换函数本体保持纯函数。
+///
+/// 初值读 env `KIRO_HISTORY_THINKING_TURNS`(解析失败按 0 = 全丢,即 v49 以来现状)。
+/// `gw_core::config::ThinkingConfig::history_thinking_turns` 的基线默认读的是**同一个
+/// env**,所以 worker 首轮设置同步拿到的有效值与这里一致:env 是真正的启动默认,
+/// 之后由 DB overlay 热覆盖。
+fn runtime_history_thinking_turns() -> &'static RwLock<i64> {
+    static G: OnceLock<RwLock<i64>> = OnceLock::new();
+    G.get_or_init(|| {
+        let from_env = std::env::var("KIRO_HISTORY_THINKING_TURNS")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        RwLock::new(from_env)
+    })
+}
+
+/// 当前生效的保留轮数。锁中毒时回退 0(保守:维持全丢的出厂行为)。
+pub(crate) fn history_thinking_turns() -> i64 {
+    runtime_history_thinking_turns()
+        .read()
+        .map(|g| *g)
+        .unwrap_or(0)
+}
+
+/// 热改保留轮数。任意 i64 都合法(0=全丢/默认;>0=保留倒数最近 N 个 assistant 合并单元;
+/// <0=全量保留),无需校验;非法**类型**由调用方(apply_hot_settings)告警拒绝。
+pub(crate) fn set_history_thinking_turns(turns: i64) {
+    if let Ok(mut g) = runtime_history_thinking_turns().write() {
+        *g = turns;
+    }
+}
+
+/// 统计 assistant **合并单元**(极大连续 assistant 段)个数。
+/// 口径必须与 `build_history` 的 user_buffer/assistant_buffer flush 完全一致,
+/// 否则「距末尾第几段」会算错,保留窗口落错位置。
+pub(super) fn count_assistant_units(messages: &[crate::anthropic_types::Message]) -> i64 {
+    let mut n = 0i64;
+    let mut prev_assistant = false;
+    for m in messages {
+        if m.role == "user" {
+            // user 才断段(与 build_history 的 assistant_buffer flush 对应)。
+            prev_assistant = false;
+            continue;
+        }
+        if m.role != "assistant" {
+            // 第三种角色在 build_history 里两个分支都不进 —— 既不 flush 也**不断段**。
+            // 这里必须同样跳过且保持 prev_assistant 不变,否则 `[asst, 其它, asst]`
+            // 会被数成 2 段而 build_history 只产出 1 段,`from_end` 整体偏移、窗口落错位。
+            continue;
+        }
+        if !prev_assistant {
+            n += 1;
+        }
+        prev_assistant = true;
+    }
+    n
+}
+
+/// 某个合并单元是否落在保留窗口内(纯函数,不读全局,便于单测)。
+/// `from_end`:该段距末尾第几段(末段 = 1)。`turns`:保留轮数
+/// (0=全丢 —— 任何 from_end ≥ 1 都 > 0;>0=最近 N 段;<0=全保留)。
+pub(super) fn keep_thinking_for_unit(turns: i64, from_end: i64) -> bool {
+    turns < 0 || from_end <= turns
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -268,6 +343,16 @@ pub(super) fn structured_output_instruction(req: &MessagesRequest) -> Option<Str
 /// * `promoted_system` - 块1a 三级分流从 messages 数组提升上来的稳定 system 文本,
 ///   追加到 top-level system 之后一起折叠进 history[0]。
 pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_types::Message], model_id: &str, promoted_system: &[String], tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+    // 保留轮数在此读一次进程级全局,本体拆成显式传参的 build_history_with_turns ——
+    // 与 normalize_effort/normalize_effort_with 同款拆分:测试可以直接钉死轮数,
+    // 不碰进程级全局(lib 单测同进程并行,改全局会污染其它用例)。
+    let thinking_turns = history_thinking_turns();
+    build_history_with_turns(req, messages, model_id, promoted_system, tool_name_map, thinking_turns)
+}
+
+/// [`build_history`] 的显式传参本体。`thinking_turns`:历史 thinking 保留轮数
+/// (0=全丢;N>0=保留倒数最近 N 个 assistant 合并单元;<0=全保留)。
+pub(super) fn build_history_with_turns(req: &MessagesRequest, messages: &[crate::anthropic_types::Message], model_id: &str, promoted_system: &[String], tool_name_map: &mut HashMap<String, String>, thinking_turns: i64) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 结构化输出指令（客户端请求 json_schema 时；与 thinking 互斥）
@@ -337,6 +422,14 @@ pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_
     // 2. 处理常规消息历史
     // messages 已由调用方切掉当前轮(尾部连续 user),此处整段迭代,不再截尾。
     // 收集并配对消息
+    //
+    // 历史 thinking 保留窗口:先预扫描合并单元总数,循环里给每段结算
+    // 「距末尾第几段」——保留与否**只取决于段序**,与客户端本轮实际给没给 thinking 无关
+    // (客户端滚动裁剪给的轮次不稳定,照透会字节抖动打断 prefix cache,v49 根因)。
+    let total_assistant_units = count_assistant_units(messages);
+    let mut assistant_unit_idx: i64 = 0;
+    // 当前累积段的保留标记,段首(assistant_buffer 为空时推入第一条)结算一次。
+    let mut keep_unit_thinking = false;
     let mut user_buffer: Vec<&crate::anthropic_types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&crate::anthropic_types::Message> = Vec::new();
 
@@ -344,7 +437,7 @@ pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, keep_unit_thinking)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -356,6 +449,13 @@ pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
+            // 新合并单元的段首:结算本段是否落在保留窗口内。
+            // 距末尾第几段 = 总数 - 序号 + 1(末段 = 1);keep = 全保留(<0) || 距末尾 ≤ N。
+            if assistant_buffer.is_empty() {
+                assistant_unit_idx += 1;
+                let from_end = total_assistant_units - assistant_unit_idx + 1;
+                keep_unit_thinking = keep_thinking_for_unit(thinking_turns, from_end);
+            }
             // 累积 assistant 消息（支持连续多条）
             assistant_buffer.push(msg);
         }
@@ -363,7 +463,7 @@ pub(super) fn build_history(req: &MessagesRequest, messages: &[crate::anthropic_
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, keep_unit_thinking)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -445,12 +545,18 @@ pub(super) fn merge_user_messages(
 }
 
 /// 转换 assistant 消息
+///
+/// `keep_thinking`:是否把该消息的 thinking 块拼进产出内容。由 `build_history`
+/// 按「本合并单元距末尾第几段 ≤ 保留轮数」结算后传入 —— 本函数不读进程级全局,
+/// 它拿不到位置信息(显式传参的纯函数,与 `normalize_effort`/`normalize_effort_with`
+/// 的拆分同理)。
 pub(super) fn convert_assistant_message(
     msg: &crate::anthropic_types::Message,
     tool_name_map: &mut HashMap<String, String>,
+    keep_thinking: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     // 注意：本函数仅用于**历史** assistant 消息（build_history 调用），不触及当前轮。
-    // 历史里的 thinking 被刻意丢弃 —— 见下方 final_content 处的说明（缓存稳定性）。
+    // 历史里的 thinking 默认丢弃、仅保留窗口内拼回 —— 见下方 final_content 处的说明（缓存稳定性）。
     let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
@@ -488,7 +594,7 @@ pub(super) fn convert_assistant_message(
         _ => {}
     }
 
-    // 历史 assistant 内容构建 —— **刻意不拼接 thinking 块**。
+    // 历史 assistant 内容构建 —— thinking 块**默认不拼接**(keep_thinking=false)。
     //
     // 根因（v49 修复）：Claude Code 等客户端会做 thinking 滚动裁剪——只在请求历史里
     // 保留最近几轮的 `<thinking>`，更早的 assistant 消息其 thinking 被移除。若我们原样
@@ -496,26 +602,43 @@ pub(super) fn convert_assistant_message(
     // 跨轮抖动 → 打断 Kiro prefix cache → 该点之后全部缓存失效**。实测某 thinking 会话
     // 命中率因此被打到 0.24–0.36（健康会话 0.78）。
     //
-    // 既然客户端本就在裁剪历史 thinking，我们干脆**统一丢弃所有历史 thinking**，让历史
-    // 前缀跨轮恒定，缓存稳定。这只影响发给 Kiro 的"历史推理文本"（客户端已在裁），
-    // **不影响当前轮的 thinking 能力**（当前轮不经本函数；响应侧 thinking_delta/签名照常）。
+    // 现行策略(history_thinking_turns 热配置,默认 0 = 全丢,与 v49 一致):
+    // - 窗口**外**(距末尾 > N 段):一律丢弃,同 v49 —— 这部分前缀跨轮恒定;
+    // - 窗口**内**(距末尾 ≤ N 段):按确定性格式拼回 `<thinking>…</thinking>`(见下)。
+    //   窗口随对话推进整体滑动,一条历史消息只在「滑出窗口」那一轮变一次字节,
+    //   且该变化点位于历史**尾部附近**,其前的缓存前缀不受影响。
+    // - 保留与否只取决于段序,与客户端本轮给没给 thinking 无关(客户端没给的轮次
+    //   不会凭空造出 thinking 字节)——这是抗客户端滚动裁剪抖动的关键。
     //
-    // 格式：仅 `text内容`（含 tool_use 时正文可空，用占位符）。thinking_content 仅用于
-    // 下方的"是否曾有内容"判断，不进最终文本。
-    let _ = &thinking_content; // 明示：thinking 已被刻意丢弃，不参与 final_content
-    let final_content = if !text_content.is_empty() {
+    // 保留窗口只影响发给 Kiro 的"历史推理文本"(客户端已在裁),**不影响当前轮的
+    // thinking 能力**(当前轮不经本函数;响应侧 thinking_delta/签名照常)。
+    //
+    // ⚠️ 前缀稳定性纪律:拼接格式与窗口语义任何改动都会改变历史字节 —— 所有在途会话
+    // 下一轮缓存全量 miss 一次。改这里 = 改前缀,必须低峰刻意切换。
+    //
+    // 格式(keep_thinking=true 且 thinking 非空时,确定性):
+    // - text 非空:`<thinking>{thinking}</thinking>\n{text}`;
+    // - text 为空:content 即 `<thinking>{thinking}</thinking>` 本身(消息非空,
+    //   不落占位符、不触发空消息告警)。
+    // keep=false 或 thinking 为空时,行为与 v49 逐字节一致:仅 `text内容`
+    // (含 tool_use 时正文可空,用占位符)。
+    let final_content = if keep_thinking && !thinking_content.is_empty() {
+        if text_content.is_empty() {
+            format!("<thinking>{thinking_content}</thinking>")
+        } else {
+            format!("<thinking>{thinking_content}</thinking>\n{text_content}")
+        }
+    } else if !text_content.is_empty() {
         text_content
     } else {
-        // text 为空（thinking 已丢弃，不再作为兜底内容）。
+        // text 为空,且 thinking 不可用(在保留窗口外 / 本就没有 / 客户端没给)。
         // - 有 tool_use：正常的"纯工具调用"回合，用空格占位（Kiro 要求 content 非空）。
         // - 无 tool_use：彻底空的 assistant 消息，几乎都是上游空响应/断流后被客户端写回
         //   历史的残留。Kiro 对空 content 返回 400 Improperly formed request，且该消息会
         //   一直留在历史里导致整个会话每轮确定性失败。必须兜底为非空并告警。
-        //   注意：原先 thinking-only 的历史消息（有 thinking 无 text 无 tool_use）此处也会
-        //   落到占位符——这正是我们要的（thinking 不进历史），且这类消息极罕见。
         if tool_uses.is_empty() {
             tracing::warn!(
-                "历史中检测到空 assistant 消息（无 text/tool_use；thinking 已按缓存稳定策略丢弃），已用占位符兜底以避免 Kiro 400 毒化会话"
+                "历史中检测到空 assistant 消息（无 text/tool_use；无 thinking 或 thinking 在保留窗口外），已用占位符兜底以避免 Kiro 400 毒化会话"
             );
         }
         EMPTY_CONTENT_PLACEHOLDER.to_string()
@@ -533,20 +656,25 @@ pub(super) fn convert_assistant_message(
 
 /// 合并多个连续的 assistant 消息为一条
 /// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
+///
+/// `keep_thinking`:本合并单元(= 极大连续 assistant 段)是否落在 thinking 保留窗口内,
+/// 由 `build_history` 按段序结算后传入,原样透传给每条消息的 [`convert_assistant_message`]
+/// —— 同一单元内所有消息同保留同丢弃,保证产出确定性。
 pub(super) fn merge_assistant_messages(
     messages: &[&crate::anthropic_types::Message],
     tool_name_map: &mut HashMap<String, String>,
+    keep_thinking: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
+        return convert_assistant_message(messages[0], tool_name_map, keep_thinking);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
+        let converted = convert_assistant_message(msg, tool_name_map, keep_thinking)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);

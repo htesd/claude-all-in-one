@@ -281,11 +281,36 @@ pub struct ThinkingConfig {
     ///
     /// 只影响**没说话**的客户端:显式点了档位的请求原样透传(非法值除外)。
     pub default_effort: ThinkingEffort,
+    /// 历史 assistant 消息里 thinking 块的**保留轮数**:
+    /// - `0` = 全部丢弃(默认;前缀缓存最稳,即 v49 以来的现状);
+    /// - `N > 0` = 只保留**倒数最近 N 个** assistant 合并单元(极大连续 assistant 段)
+    ///   的 thinking,更早的一律丢弃;
+    /// - `< 0` = 全量保留(测试用)。
+    ///
+    /// 为什么保留轮数必须由我方按「距末尾第几段」写死归一、不能客户端给多少透多少:
+    /// 客户端做 thinking 滚动裁剪,原样透传会让同一条历史消息跨轮从「带 thinking」
+    /// 变「不带」→ 字节抖动 → 打断 Kiro prefix cache(v49 根因,实测命中率 0.24–0.36)。
+    ///
+    /// ⚠️ 从 0 调到非 0(或反向)会改变历史字节:所有在途会话下一轮缓存全量 miss 一次,
+    /// 之后在新字节上重新稳定。
+    pub history_thinking_turns: i64,
+}
+
+/// `history_thinking_turns` 的基线默认:env `KIRO_HISTORY_THINKING_TURNS`(解析失败按 0)。
+/// 与 [`env_experimental_flag`] 同款的「env 作启动默认、DB overlay 热覆盖」口径。
+fn default_history_thinking_turns() -> i64 {
+    std::env::var("KIRO_HISTORY_THINKING_TURNS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
 }
 
 impl Default for ThinkingConfig {
     fn default() -> Self {
-        Self { default_effort: DEFAULT_THINKING_EFFORT }
+        Self {
+            default_effort: DEFAULT_THINKING_EFFORT,
+            history_thinking_turns: default_history_thinking_turns(),
+        }
     }
 }
 
@@ -1032,6 +1057,10 @@ pub struct SystemSettings {
     /// 类型是枚举,所以 `PUT /settings` 那步 `from_value::<SystemSettings>` 就会拒掉非法档位。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_effort: Option<ThinkingEffort>,
+    /// 历史 assistant thinking 保留轮数(0=全丢/默认;N>0=最近 N 个合并单元;负=全保留)。
+    /// None = 用基线默认。语义与缓存影响详见 [`ThinkingConfig::history_thinking_turns`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_thinking_turns: Option<i64>,
     /// 热追加/覆盖的 cursor 模型目录(整表替换;None = 用 yaml 基线)。
     /// 详见 [`SystemConfig::cursor_extra_models`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1110,6 +1139,7 @@ impl SystemSettings {
         if let Some(v) = self.thinking_signature { base.experimental.thinking_signature = v; }
         if let Some(v) = self.q_endpoint { base.experimental.q_endpoint = v; }
         if let Some(v) = self.default_thinking_effort { base.thinking.default_effort = v; }
+        if let Some(v) = self.history_thinking_turns { base.thinking.history_thinking_turns = v; }
         if let Some(v) = &self.cursor_extra_models {
             base.cursor_extra_models = v.clone();
         }
@@ -1170,6 +1200,7 @@ impl SystemSettings {
             thinking_signature: Some(cfg.experimental.thinking_signature),
             q_endpoint: Some(cfg.experimental.q_endpoint),
             default_thinking_effort: Some(cfg.thinking.default_effort),
+            history_thinking_turns: Some(cfg.thinking.history_thinking_turns),
             cursor_extra_models: Some(cfg.cursor_extra_models.clone()),
             cursor_tool_guard: Some(cfg.cursor_tool_guard.clone()),
             cursor_cli_notice: Some(cfg.cursor_cli_notice.clone()),
@@ -1567,6 +1598,28 @@ workers:
         cfg.thinking.default_effort = ThinkingEffort::Medium;
         let full = SystemSettings::from_effective(&cfg, None);
         assert_eq!(full.default_thinking_effort, Some(ThinkingEffort::Medium));
+    }
+
+    #[test]
+    fn settings_history_thinking_turns_overlay_roundtrip() {
+        // 与 default_thinking_effort 同口径:None 保留基线(默认 0=全丢),Some 覆盖;
+        // from_effective 必须回灌 —— worker 30s 轮询走的就是它,缺了会丢掉这个设置。
+        let mut base = SystemConfig::default();
+        assert_eq!(base.thinking.history_thinking_turns, 0, "基线默认必须是 0(全丢)");
+        SystemSettings::default().apply_to(&mut base);
+        assert_eq!(
+            base.thinking.history_thinking_turns, 0,
+            "None 时应保留基线默认(不覆盖)"
+        );
+        let s = SystemSettings { history_thinking_turns: Some(2), ..Default::default() };
+        s.apply_to(&mut base);
+        assert_eq!(base.thinking.history_thinking_turns, 2, "Some 应覆盖基线");
+        // 负数(全量保留,测试用)也要能过 overlay 全链路。
+        let s = SystemSettings { history_thinking_turns: Some(-1), ..Default::default() };
+        s.apply_to(&mut base);
+        assert_eq!(base.thinking.history_thinking_turns, -1);
+        let full = SystemSettings::from_effective(&base, None);
+        assert_eq!(full.history_thinking_turns, Some(-1));
     }
 
     #[test]

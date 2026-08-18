@@ -62,6 +62,8 @@ interface FormState {
   thinking_signature: boolean
   q_endpoint: boolean
   default_thinking_effort: ThinkingEffort
+  /** 历史 thinking 保留轮数(0=全丢/默认;N>0=最近 N 轮;负=全保留)。 */
+  history_thinking_turns: string
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -106,6 +108,8 @@ function settingsToForm(s: SystemSettings): FormState {
     q_endpoint: s.q_endpoint ?? false,
     // 后端总会回灌该字段;真缺了(旧版本后端)退回 high,与后端基线一致。
     default_thinking_effort: s.default_thinking_effort ?? 'high',
+    // 同口径:旧版本后端不返回时按基线 0(全丢)显示。
+    history_thinking_turns: String(s.history_thinking_turns ?? 0),
   }
 }
 
@@ -239,6 +243,17 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
   // 哪怕用户只改了代理也会捎带这个字段，被旧后端的 deny_unknown_fields 判 400，整个保存失败。
   if (form.default_thinking_effort !== (original.default_thinking_effort ?? 'high')) {
     patch.default_thinking_effort = form.default_thinking_effort
+  }
+
+  // history_thinking_turns:允许负数(-1=全部保留),不能用 strictInt(它拦负数)。
+  // 解析与提交口径同上面的新增字段:非法输入不提交该字段;旧后端不返回时按基线 0 比较。
+  const strictSignedInt = (s: string): number | null => {
+    const n = Number(s)
+    return s.trim() !== '' && Number.isInteger(n) ? n : null
+  }
+  const historyTurns = strictSignedInt(form.history_thinking_turns)
+  if (historyTurns !== null && historyTurns !== (original.history_thinking_turns ?? 0)) {
+    patch.history_thinking_turns = historyTurns
   }
 
   return patch
@@ -898,6 +913,22 @@ export default function SettingsPage() {
               </p>
               <p className="mt-1 text-xs text-muted-foreground">
                 {t(`settings.effort.${form?.default_thinking_effort ?? 'high'}Hint`)}
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {t('settings.field.historyThinkingTurns')}
+              </label>
+              <input
+                type="number"
+                step={1}
+                value={form?.history_thinking_turns ?? ''}
+                onChange={(e) => set('history_thinking_turns', e.target.value)}
+                disabled={isLoading || form === null}
+                className={inputClass}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.field.historyThinkingTurnsHint')}
               </p>
             </div>
           </CardContent>

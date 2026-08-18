@@ -57,6 +57,10 @@ export interface SystemSettings {
   /** 客户端**未指定** effort 时的默认思考档位。只影响没说话的客户端——显式点了档位的请求原样透传。
    *  档位越高思考越深也越慢：实测 max 的思考量约为 xhigh 的 1.7 倍。默认 high。 */
   default_thinking_effort: ThinkingEffort
+  /** 历史 assistant thinking 保留轮数：0 = 全部丢弃（默认，前缀缓存最稳）；N > 0 = 只保留倒数
+   *  最近 N 个 assistant 合并单元，更早的一律丢弃；负数 = 全部保留（测试用）。
+   *  ⚠️ 改动会让所有在途会话下一轮缓存全量 miss 一次，建议低峰切换。 */
+  history_thinking_turns: number | null
   /** RPM 闸等待预算（毫秒，默认 10000）：合格号全部仅因 RPM 定频暂不可选时，等窗口腾名额的最长时长。 */
   rpm_wait_ms?: number
   /** 低优先新号暖机总开关（默认开；调度 rank ≥ 100 的号按号龄两期限速，高优号豁免）。 */

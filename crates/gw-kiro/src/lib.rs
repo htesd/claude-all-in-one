@@ -482,6 +482,23 @@ impl Provider for KiroProvider {
                 ),
             }
         }
+        // 历史 thinking 保留轮数(0=全丢/默认;N>0=保留倒数最近 N 个 assistant 合并单元;
+        // 负=全保留)。与 default_thinking_effort 同口径:字段缺失 = 不动当前值,
+        // 非法类型(非整数)只告警不生效 —— 手改 DB 可以绕过 admin 的 PUT 校验。
+        // ⚠️ 从 0 调到非 0(或反向)会改变历史字节:在途会话下一轮缓存全量 miss 一次。
+        match settings.get("history_thinking_turns") {
+            None => {}
+            Some(v) => match v.as_i64() {
+                Some(n) => {
+                    crate::converter::set_history_thinking_turns(n);
+                    tracing::debug!(turns = n, "历史 thinking 保留轮数已热应用");
+                }
+                None => tracing::warn!(
+                    value = %v,
+                    "settings 里的 history_thinking_turns 不是整数，已忽略"
+                ),
+            },
+        }
     }
 
     /// 订阅能力过滤(对齐 kiro.rs `supports_opus`,credentials.rs:256):

@@ -1337,7 +1337,7 @@ fn test_empty_assistant_message_never_produces_empty_content() {
         role: "assistant".to_string(),
         content: serde_json::json!([]),
     };
-    let converted = convert_assistant_message(&empty_msg, &mut tool_name_map).unwrap();
+    let converted = convert_assistant_message(&empty_msg, &mut tool_name_map, false).unwrap();
     assert!(
         !converted.assistant_response_message.content.is_empty(),
         "空 assistant 消息的 content 不能为空"
@@ -1348,7 +1348,7 @@ fn test_empty_assistant_message_never_produces_empty_content() {
         role: "assistant".to_string(),
         content: serde_json::json!(""),
     };
-    let converted2 = convert_assistant_message(&empty_str_msg, &mut tool_name_map).unwrap();
+    let converted2 = convert_assistant_message(&empty_str_msg, &mut tool_name_map, false).unwrap();
     assert!(
         !converted2.assistant_response_message.content.is_empty(),
         "空字符串 assistant 消息的 content 不能为空"
@@ -1358,7 +1358,7 @@ fn test_empty_assistant_message_never_produces_empty_content() {
     let m1 = crate::anthropic_types::Message { role: "assistant".to_string(), content: serde_json::json!([]) };
     let m2 = crate::anthropic_types::Message { role: "assistant".to_string(), content: serde_json::json!("") };
     let refs: Vec<&crate::anthropic_types::Message> = vec![&m1, &m2];
-    let merged = merge_assistant_messages(&refs, &mut tool_name_map).unwrap();
+    let merged = merge_assistant_messages(&refs, &mut tool_name_map, false).unwrap();
     assert!(
         !merged.assistant_response_message.content.is_empty(),
         "合并多条全空 assistant 消息后 content 不能为空"
@@ -1375,7 +1375,7 @@ fn test_empty_assistant_with_tool_use_still_placeholder() {
             {"type": "tool_use", "id": "tu-1", "name": "read", "input": {"path": "/x"}}
         ]),
     };
-    let converted = convert_assistant_message(&msg, &mut tool_name_map).unwrap();
+    let converted = convert_assistant_message(&msg, &mut tool_name_map, false).unwrap();
     assert!(!converted.assistant_response_message.content.is_empty());
     assert!(converted.assistant_response_message.tool_uses.is_some());
 }
@@ -1393,7 +1393,7 @@ fn test_history_assistant_strips_thinking_for_cache_stability() {
             {"type": "text", "text": "最终答案"}
         ]),
     };
-    let c = convert_assistant_message(&msg, &mut m).unwrap();
+    let c = convert_assistant_message(&msg, &mut m, false).unwrap();
     let content = c.assistant_response_message.content;
     assert_eq!(content, "最终答案", "应只保留正文，thinking 被剥离");
     assert!(!content.contains("<thinking>"));
@@ -1406,10 +1406,290 @@ fn test_history_assistant_strips_thinking_for_cache_stability() {
             {"type": "thinking", "thinking": "只有思考没有答案"}
         ]),
     };
-    let c2 = convert_assistant_message(&msg2, &mut m).unwrap();
+    let c2 = convert_assistant_message(&msg2, &mut m, false).unwrap();
     let content2 = c2.assistant_response_message.content;
     assert!(!content2.contains("只有思考"), "thinking-only 不应进历史内容");
     assert!(!content2.is_empty(), "应兜底为非空占位符避免 Kiro 400");
+}
+
+// ───────────── 历史 thinking 保留轮数(history_thinking_turns) ─────────────
+//
+// 进程级全局的「热改 → 下一轮 wire」链路在 tests/history_thinking_turns_hot_reload.rs
+// (独立进程);这里的用例全部走**显式传参**的纯函数层面,不碰全局(lib 单测同进程并行,
+// 动全局会污染其它用例 —— 与 default_thinking_effort 的测试纪律一致)。
+
+#[test]
+fn test_count_assistant_units_matches_flush_semantics() {
+    // 合并单元 = 极大连续 assistant 段,口径必须与 build_history 的 flush 一致,
+    // 否则「距末尾第几段」算错、保留窗口落错位置。
+    let mk = |role: &str| crate::anthropic_types::Message {
+        role: role.to_string(),
+        content: serde_json::json!("x"),
+    };
+    assert_eq!(count_assistant_units(&[]), 0);
+    assert_eq!(count_assistant_units(&[mk("user")]), 0);
+    assert_eq!(count_assistant_units(&[mk("assistant")]), 1);
+    // 连续多条 assistant = 一个单元(Issue #79 的断流合并场景)。
+    assert_eq!(
+        count_assistant_units(&[mk("assistant"), mk("assistant"), mk("assistant")]),
+        1
+    );
+    // user 隔开 = 两个单元;尾部连续 user 不多算。
+    let msgs = vec![
+        mk("user"), mk("assistant"), mk("assistant"), mk("user"), mk("assistant"), mk("user"),
+    ];
+    assert_eq!(count_assistant_units(&msgs), 2);
+}
+
+#[test]
+fn test_count_assistant_units_third_role_does_not_split_unit() {
+    // `[asst, 其它角色, asst]`:build_history 里第三种角色两个分支都不进 → 不 flush、
+    // assistant_buffer 不断 → 只产出 **1** 段。计数必须同口径,否则 from_end 偏移、
+    // 保留窗口落错位。(修复前这里会数成 2。)
+    let mut m3 = hist_asst("t2", "b");
+    m3.role = "system".to_string();
+    let msgs = vec![hist_asst("t1", "a"), m3, hist_asst("t3", "c")];
+    assert_eq!(count_assistant_units(&msgs), 1, "第三种角色不应断段");
+
+    // user 才断段。
+    let msgs = vec![hist_asst("t1", "a"), hist_user("u"), hist_asst("t3", "c")];
+    assert_eq!(count_assistant_units(&msgs), 2, "user 必须断段");
+}
+
+#[test]
+fn test_keep_thinking_for_unit_window_semantics() {
+    // 0 = 全丢(默认):任何距离都不留。
+    assert!(!keep_thinking_for_unit(0, 1));
+    assert!(!keep_thinking_for_unit(0, 5));
+    // N>0 = 距末尾 ≤ N 才留(末段 from_end = 1)。
+    assert!(keep_thinking_for_unit(1, 1));
+    assert!(!keep_thinking_for_unit(1, 2));
+    assert!(keep_thinking_for_unit(2, 2));
+    assert!(!keep_thinking_for_unit(2, 3));
+    // 负数 = 全保留(测试用)。
+    assert!(keep_thinking_for_unit(-1, 1));
+    assert!(keep_thinking_for_unit(-1, 999));
+}
+
+#[test]
+fn test_convert_assistant_message_keep_thinking_deterministic_format() {
+    // keep=true 时拼接格式必须确定性:`<thinking>…</thinking>\n{text}`。
+    let mut m = HashMap::new();
+    let msg = crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "thinking", "thinking": "推理过程T"},
+            {"type": "text", "text": "最终答案X"}
+        ]),
+    };
+    let kept = convert_assistant_message(&msg, &mut m, true).unwrap();
+    assert_eq!(
+        kept.assistant_response_message.content,
+        "<thinking>推理过程T</thinking>\n最终答案X"
+    );
+    // 同一条消息 keep=false 必须与 v49 逐字节一致(只留正文)。
+    let dropped = convert_assistant_message(&msg, &mut m, false).unwrap();
+    assert_eq!(dropped.assistant_response_message.content, "最终答案X");
+}
+
+#[test]
+fn test_convert_assistant_message_keep_thinking_only_not_placeholder() {
+    // thinking-only 消息落在保留窗口内:content 即 thinking 块本身,消息非空 →
+    // 不落占位符、不走空消息告警分支。
+    let mut m = HashMap::new();
+    let msg = crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "thinking", "thinking": "只有思考"}
+        ]),
+    };
+    let kept = convert_assistant_message(&msg, &mut m, true).unwrap();
+    assert_eq!(
+        kept.assistant_response_message.content,
+        "<thinking>只有思考</thinking>"
+    );
+}
+
+#[test]
+fn test_convert_assistant_message_keep_true_without_thinking_byte_identical() {
+    // 窗口内但客户端本轮没给 thinking:不得凭空造字节,产出与 keep=false 逐字节一致。
+    let mut m = HashMap::new();
+    let msg = crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "text", "text": "没思考的回答"},
+            {"type": "tool_use", "id": "tu_1", "name": "read", "input": {}}
+        ]),
+    };
+    let kept = convert_assistant_message(&msg, &mut m, true).unwrap();
+    let dropped = convert_assistant_message(&msg, &mut m, false).unwrap();
+    assert_eq!(kept.assistant_response_message.content, "没思考的回答");
+    assert_eq!(
+        serde_json::to_value(&kept.assistant_response_message).unwrap(),
+        serde_json::to_value(&dropped.assistant_response_message).unwrap(),
+        "无 thinking 时 keep=true/false 产出必须逐字节一致"
+    );
+}
+
+/// build_history_with_turns 用的最小请求(无 system、无 thinking、无 tools)。
+fn bare_history_req() -> MessagesRequest {
+    MessagesRequest {
+        model: "claude-opus-4-8".to_string(),
+        max_tokens: 1024,
+        messages: vec![],
+        stream: false,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: None,
+        context_management: None,
+    }
+}
+
+fn hist_user(text: &str) -> crate::anthropic_types::Message {
+    crate::anthropic_types::Message {
+        role: "user".to_string(),
+        content: serde_json::json!(text),
+    }
+}
+
+fn hist_asst(thinking: &str, text: &str) -> crate::anthropic_types::Message {
+    crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "thinking", "thinking": thinking},
+            {"type": "text", "text": text}
+        ]),
+    }
+}
+
+/// 历史里所有 assistant 消息的 content(含系统对的固定应答,在 index 0)。
+fn history_assistant_contents(history: &[Message]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(|m| match m {
+            Message::Assistant(a) => Some(a.assistant_response_message.content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_build_history_thinking_window_slides_tail_only() {
+    // 本开关存在的意义:模拟同一条会话连续 3 轮(每轮历史末尾追加 assistant+user),
+    // turns=1 时断言**历史前缀跨轮只在尾部变化,更早的字节完全一致** ——
+    // 这正是抗客户端 thinking 滚动裁剪抖动、保住 Kiro prefix cache 的核心性质。
+    let req = bare_history_req();
+    let mut map = HashMap::new();
+
+    // 第 2 轮:历史 = [问1, 答1];第 3 轮:[问1, 答1, 问2, 答2];第 4 轮:再追加 [问3, 答3]。
+    let turn2 = vec![hist_user("问1"), hist_asst("思1", "答1")];
+    let turn3 = vec![
+        hist_user("问1"), hist_asst("思1", "答1"),
+        hist_user("问2"), hist_asst("思2", "答2"),
+    ];
+    let turn4 = vec![
+        hist_user("问1"), hist_asst("思1", "答1"),
+        hist_user("问2"), hist_asst("思2", "答2"),
+        hist_user("问3"), hist_asst("思3", "答3"),
+    ];
+
+    let h2 = build_history_with_turns(&req, &turn2, "claude-opus-4.8", &[], &mut map, 1).unwrap();
+    let h3 = build_history_with_turns(&req, &turn3, "claude-opus-4.8", &[], &mut map, 1).unwrap();
+    let h4 = build_history_with_turns(&req, &turn4, "claude-opus-4.8", &[], &mut map, 1).unwrap();
+
+    // turns=1:只有倒数第 1 个 assistant 单元保留 thinking(contents[0] 是系统对的固定应答)。
+    let a2 = history_assistant_contents(&h2);
+    assert_eq!(a2[1], "<thinking>思1</thinking>\n答1", "末段应保留 thinking");
+    let a3 = history_assistant_contents(&h3);
+    assert_eq!(a3[1], "答1", "滑出窗口后 thinking 必须丢弃");
+    assert_eq!(a3[2], "<thinking>思2</thinking>\n答2");
+    let a4 = history_assistant_contents(&h4);
+    assert_eq!(a4[1], "答1", "丢弃后的形态必须跨轮稳定");
+    assert_eq!(a4[2], "答2", "窗口外的一律丢,且与上一轮丢弃形态逐字节一致");
+    assert_eq!(a4[3], "<thinking>思3</thinking>\n答3");
+
+    // 核心断言:h3 → h4 的变化**只发生在 h3 的尾部**(答2 从保留变丢弃),
+    // 其前所有历史条目跨轮逐字节一致。
+    for (i, (m3, m4)) in h3.iter().zip(h4.iter()).enumerate().take(h3.len() - 1) {
+        assert_eq!(
+            serde_json::to_value(m3).unwrap(),
+            serde_json::to_value(m4).unwrap(),
+            "历史第 {i} 条跨轮必须逐字节一致(前缀稳定性)"
+        );
+    }
+    // h2 → h3 同理:h2 的最后一条(答1 保留形态)之外,前缀逐字节一致。
+    for (i, (m2, m3)) in h2.iter().zip(h3.iter()).enumerate().take(h2.len() - 1) {
+        assert_eq!(
+            serde_json::to_value(m2).unwrap(),
+            serde_json::to_value(m3).unwrap(),
+            "历史第 {i} 条跨轮必须逐字节一致(前缀稳定性)"
+        );
+    }
+}
+
+#[test]
+fn test_build_history_thinking_window_counts_merged_units() {
+    // 窗口按**合并单元**(极大连续 assistant 段)计,不按消息条数:
+    // 连续两条 assistant 同属一个单元,同保留同丢弃。
+    let req = bare_history_req();
+    let mut map = HashMap::new();
+    let msgs = vec![
+        hist_user("问1"), hist_asst("思1a", "答1a"), hist_asst("思1b", "答1b"), // 单元1(2条)
+        hist_user("问2"), hist_asst("思2", "答2"),                              // 单元2
+    ];
+
+    // turns=1:单元1 整体丢,单元2 保留。
+    let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 1).unwrap();
+    let a = history_assistant_contents(&h);
+    assert_eq!(a[1], "答1a\n\n答1b", "窗口外合并单元:thinking 丢弃,正文按 \\n\\n 合并");
+    assert_eq!(a[2], "<thinking>思2</thinking>\n答2");
+
+    // turns=2:两个单元都在窗口内,单元1 每条各自的 thinking 按确定性格式拼回。
+    let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 2).unwrap();
+    let a = history_assistant_contents(&h);
+    assert_eq!(
+        a[1],
+        "<thinking>思1a</thinking>\n答1a\n\n<thinking>思1b</thinking>\n答1b",
+        "窗口内合并单元:每条消息各自的 thinking 都拼回,合并分隔符不变"
+    );
+}
+
+#[test]
+fn test_build_history_turns_zero_two_and_negative() {
+    // 3 个单元;客户端给第 3 轮没给 thinking(text-only)。
+    let req = bare_history_req();
+    let mut map = HashMap::new();
+    let mut msgs = vec![
+        hist_user("问1"), hist_asst("思1", "答1"),
+        hist_user("问2"), hist_asst("思2", "答2"),
+        hist_user("问3"),
+    ];
+    msgs.push(crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([{"type": "text", "text": "答3无思考"}]),
+    });
+
+    // turns=0(默认):全部丢弃 —— 与 v49 逐字节一致的回归金标准。
+    let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 0).unwrap();
+    let a = history_assistant_contents(&h);
+    assert_eq!(a[1..], ["答1", "答2", "答3无思考"], "turns=0 必须全丢");
+
+    // turns=2:窗口外(单元1)一律丢,窗口内(单元2/3)保留;无 thinking 的轮次不凭空造。
+    let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 2).unwrap();
+    let a = history_assistant_contents(&h);
+    assert_eq!(a[1], "答1", "窗口外的一律丢");
+    assert_eq!(a[2], "<thinking>思2</thinking>\n答2");
+    assert_eq!(a[3], "答3无思考", "客户端没给 thinking 的轮次不得凭空造字节");
+
+    // turns=-1:全量保留(用户测试用);无 thinking 的轮次仍然只是正文。
+    let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, -1).unwrap();
+    let a = history_assistant_contents(&h);
+    assert_eq!(a[1], "<thinking>思1</thinking>\n答1");
+    assert_eq!(a[2], "<thinking>思2</thinking>\n答2");
+    assert_eq!(a[3], "答3无思考");
 }
 
 #[test]
@@ -1646,7 +1926,7 @@ fn test_convert_assistant_message_tool_use_only() {
         ]),
     };
 
-    let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+    let result = convert_assistant_message(&msg, &mut HashMap::new(), false).expect("应该成功转换");
 
     // 验证 content 不为空（使用占位符）
     assert!(
@@ -1681,7 +1961,7 @@ fn test_convert_assistant_message_with_text_and_tool_use() {
         ]),
     };
 
-    let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+    let result = convert_assistant_message(&msg, &mut HashMap::new(), false).expect("应该成功转换");
 
     // 验证 content 使用原始文本（不是占位符）
     assert_eq!(
@@ -1794,7 +2074,7 @@ fn test_merge_consecutive_assistant_messages() {
     };
 
     let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-    let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+    let result = merge_assistant_messages(&messages, &mut HashMap::new(), false).expect("合并应成功");
 
     let content = &result.assistant_response_message.content;
     // v49：历史 thinking 被刻意丢弃（缓存稳定性），故合并后**不应**含 thinking 标签

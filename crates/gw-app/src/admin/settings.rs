@@ -342,6 +342,24 @@ async fn put_settings(
             }
             continue;
         }
+        // history_thinking_turns:历史 thinking 保留轮数(0=全丢/默认;N>0=保留倒数最近
+        // N 个 assistant 合并单元;负=全保留)。任意整数都合法,只拦非整数 —— 通用路径的
+        // SystemSettings 反序列化也能拦,但报错是 serde 原文,这里给一句人话(同上面几个
+        // 专用分支的风格)。⚠️ 该值变化会改变历史字节:在途会话下一轮缓存全量 miss 一次。
+        if k == "history_thinking_turns" {
+            match v.as_i64() {
+                Some(n) => {
+                    overlay_map.insert(k, serde_json::json!(n));
+                }
+                None => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "history_thinking_turns 须为整数(0=全部丢弃/默认;N>0=保留最近 N 段;负数=全部保留)",
+                    )
+                }
+            }
+            continue;
+        }
         overlay_map.insert(k, v);
     }
 
@@ -580,6 +598,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "类型不合法应 400,不写坏库");
+    }
+
+    #[tokio::test]
+    async fn put_history_thinking_turns_int_roundtrip_and_rejects_non_int() {
+        let (app, _store) = app();
+        // 任意整数都合法:0=全丢/默认,N>0=保留最近 N 段,负数=全保留。
+        let v = body_json(
+            app.clone()
+                .oneshot(req("PUT", "/settings", Some(r#"{"history_thinking_turns": -1}"#)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["history_thinking_turns"], -1);
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["history_thinking_turns"], -1, "应持久并经 from_effective 回灌");
+
+        // 非整数(字符串/浮点/布尔)必须在写库前就挡下,且库里不留痕迹。
+        for bad in [r#""2""#, "1.5", "true"] {
+            let resp = app
+                .clone()
+                .oneshot(req(
+                    "PUT",
+                    "/settings",
+                    Some(format!(r#"{{"history_thinking_turns": {bad}}}"#).as_str()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad} 不是整数,应 400");
+        }
+        let v3 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v3["history_thinking_turns"], -1, "被拒的写入不该改动已存值");
     }
 
     #[tokio::test]
