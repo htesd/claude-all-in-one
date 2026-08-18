@@ -209,12 +209,15 @@ fn tool_call_tokens(tc: &run::ToolCall) -> u64 {
 /// 双轨口径(与 kiro 同构):收尾处若上游 cached=0,`cache_read` 会被
 /// [`crate::cache_sim`] 的模拟值顶替(客户计费列),而 `real_cache_read`
 /// 永远只认这里填的上游自报值(对账列)。
-fn usage_from_upstream(input: u64, output: u64, cached: u64) -> ChatUsage {
+fn usage_from_upstream(u: crate::run::WireUsage) -> ChatUsage {
     ChatUsage {
-        input_tokens: input,
-        output_tokens: output,
-        cache_read_tokens: cached,
-        real_cache_read_tokens: cached,
+        input_tokens: u.input,
+        output_tokens: u.output,
+        cache_read_tokens: u.cache_read,
+        real_cache_read_tokens: u.cache_read,
+        // 缓存**写入**(线缆 `1.14.4`)。2026-08-18 取证前这一列全平台恒 0 ——
+        // 它对应 Anthropic 的 `cache_creation_input_tokens`,是总输入的一部分。
+        cache_creation_tokens: u.cache_write,
         ..Default::default()
     }
 }
@@ -2345,8 +2348,8 @@ fn stream_to_anthropic(
                 // (见 run::is_turn_commit)。不认它,每轮都要等满看门狗才收口。
                 if cli_mode && run::is_turn_commit(&payload) {
                     // 合帧防御:同帧若有用量先收下(目前 CLI 实测没有,留这条不亏)。
-                    if let Some((input, output, cached)) = usage {
-                        upstream_usage = Some(usage_from_upstream(input, output, cached));
+                    if let Some(wu) = usage {
+                        upstream_usage = Some(usage_from_upstream(wu));
                     }
                     saw_end = true;
                     break 'outer;
@@ -2450,8 +2453,8 @@ fn stream_to_anthropic(
                             // 外部工具臂命中即 break(反代一问一答,不能挂流等工具结果)。
                             // 但同帧若已带 `1.14` 用量,绝不能丢 —— 合帧丢 usage 会让
                             // 面板/new-api 看到 input=0(见 PROTOCOL §残余假设 #2)。
-                            if let Some((input, output, cached)) = usage {
-                                upstream_usage = Some(usage_from_upstream(input, output, cached));
+                            if let Some(wu) = usage {
+                                upstream_usage = Some(usage_from_upstream(wu));
                             }
                             // 外部工具支是正常的 tool_use 收尾。
                             saw_end = true;
@@ -2481,9 +2484,9 @@ fn stream_to_anthropic(
                                 );
                                 tool_call = Some(tc);
                                 // 同帧用量同样要收(与外部工具臂同一条合帧原则)。
-                                if let Some((input, output, cached)) = usage {
+                                if let Some(wu) = usage {
                                     upstream_usage =
-                                        Some(usage_from_upstream(input, output, cached));
+                                        Some(usage_from_upstream(wu));
                                 }
                                 // 与外部工具臂同款:正常的 tool_use 收尾,不是截断。
                                 saw_end = true;
@@ -2531,8 +2534,8 @@ fn stream_to_anthropic(
                                 );
                             }
                             // 同帧用量同样要收(与外部工具臂同一条合帧原则)。
-                            if let Some((input, output, cached)) = usage {
-                                upstream_usage = Some(usage_from_upstream(input, output, cached));
+                            if let Some(wu) = usage {
+                                upstream_usage = Some(usage_from_upstream(wu));
                             }
                             // 内建工具支下面会照常走收尾流程(而不是报错),所以算「见过收尾」。
                             saw_end = true;
@@ -2543,8 +2546,8 @@ fn stream_to_anthropic(
 
                 // 用量帧 = 本轮结束。BiDi 流永远不会自己关,不在这里收口的话
                 // 每个请求都要挂到客户端超时 —— 「答完了却一直转圈」。
-                if let Some((input, output, cached)) = usage {
-                    upstream_usage = Some(usage_from_upstream(input, output, cached));
+                if let Some(wu) = usage {
+                    upstream_usage = Some(usage_from_upstream(wu));
                     saw_end = true;
                     break 'outer;
                 }

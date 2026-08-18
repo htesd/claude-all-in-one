@@ -876,8 +876,6 @@ struct SsePhase {
     /// ⚠️ 只作用于**自估**路径。上游给了 `result` 真值时一律用真值
     /// (见收尾处的 `usage`),模拟值不参与 —— 模拟是计费策略,真值是事实。
     sim_cache_read: u64,
-    /// 本轮上下文总量(见 [`SimSlot::sim_total`]);0 = 未接模拟器,退回按新增量计。
-    sim_total: u64,
     /// **本阶段开始前,上游 CLI 会话里已经装着的量**(不含本阶段 `in_tally`)。
     ///
     /// 这是自估 `input` 的基准的另一半:上游每轮读的是整个会话文件,
@@ -905,7 +903,6 @@ impl SsePhase {
             out_tally: TokenTally::default(),
             in_tally,
             sim_cache_read: sim.map(|s| s.cache_read).unwrap_or(0),
-            sim_total: sim.map(|s| s.sim_total).unwrap_or(0),
             ctx_base,
         }
     }
@@ -1115,85 +1112,76 @@ impl SsePhase {
 
 /// 把 CLI `result` 事件的 usage 收成 [`ChatUsage`]。
 ///
-/// ## `inputTokens` 是**总输入**(含缓存),不要再加 cached
+/// ## `result.usage.inputTokens` 是**未命中量**,不是总量 —— 必须把缓存加回来
 ///
-/// 实测钉死(生产抓的原始 NDJSON,提示词是「只回一个词:ok」约 10 字符):
-/// ```text
-/// {"inputTokens":6779,"outputTokens":35,"cacheReadTokens":6016,"cacheWriteTokens":0}
-/// ```
-/// 10 字符的提示词不可能有 6779 token 的**新增**输入 —— 6779 是总量
-/// (system/AGENTS.md 等),其中 6016 命中缓存,未命中 ≈763。所以
-/// `inputTokens ⊇ cacheReadTokens`,与 [`ChatUsage::input_tokens`] 的"总输入"
-/// 契约天然一致,**原样填**即可。
-///
-/// ⚠️ 我曾据「生产上 39% 的记录 `cache_read > input`」推断上游是"未命中新增"语义,
-/// 于是改成 `up_in + cached` —— **那是错的**,会给绝大多数正常轮次凭空加一倍输入。
-/// 上面那条单次调用的实测是判据:`cache > input` 不能反推字段语义。
-///
-/// ## `cache > input` 的真实成因与处理
-///
-/// 生产实测(近 4h grok-4.6 有缓存记录 127 条)有 **49 条(39%)`cache > input`**,
-/// 最极端 239 倍(`input=54 / cache=12928`)。
-///
-/// 2026-08-17 开 `CURSOR_CLI_DUMP_NDJSON` 抓真实会话**钉死了成因**:`cache > input`
-/// 只出现在**走 MCP 桥的多轮会话**上,单轮会话一律 `input > cache`:
+/// 2026-08-18 用本机安装的 `cursor-agent 2026.08.11-e8db854` 钩住 http2、把
+/// `agent.v1.AgentService/Run` 的服务端帧原样落盘,同一次调用两侧对照:
 ///
 /// ```text
-/// 桥会话(6 次桥调用) input=9844  cacheRead=35840  ← cache 是 input 的 3.6 倍
-/// 桥会话(6 次桥调用) input=4868  cacheRead=38272
-/// 单轮会话(0 次)     input=50227 cacheRead=5888   ← 正常
-/// 单轮会话(0 次)     input=50165 cacheRead=6016
+/// 线缆 InteractionUpdate.turn_ended(field 14):
+///   field 1 input_tokens       = 16664   ← 总量
+///   field 2 output_tokens      = 34
+///   field 3 cache_read_tokens  = 12160
+///   field 4 cache_write_tokens = 0
+///   field 5 reasoning_tokens   = 33
+/// CLI 的 result.usage:
+///   {"inputTokens":4504,"outputTokens":34,"cacheReadTokens":12160,"cacheWriteTokens":0}
+///   16664 − 12160 − 0 = 4504  ✓
 /// ```
 ///
-/// 即 `cacheReadTokens` 跨 CLI **内部多次模型调用**累加,而 `inputTokens` 只算末次。
-/// 两个字段不同口径,**不可相减、也不可据此反推语义**。
+/// CLI 自己的源码(`1931.index.js`)就是这么算的,`result` 事件发的正是这个减过的对象:
+///
+/// ```js
+/// case "turnEnded": { ... ke = f({inputTokens: Number(e.inputTokens), ...}) }
+/// f = e => ({...e, inputTokens: Math.max(e.inputTokens - e.cacheReadTokens - e.cacheWriteTokens, 0)})
+/// ... {type:"result", ..., usage: ke}
+/// ```
+///
+/// 所以:**`total = inputTokens + cacheReadTokens + cacheWriteTokens`**,与
+/// [`ChatUsage::input_tokens`] 的"总输入"契约对齐。线协议侧
+/// (`chat.rs::usage_from_upstream`)读的是**线缆原值**,那边 field 1 本来就是总量、
+/// 原样填就对 —— 同一个字段名在两条路上口径相反,这是本模块最容易踩的坑。
+///
+/// ## ⚠️ 这条我改口过三次,记下每一次错在哪
+///
+/// 1. **08-17 第一版**:据「生产 39% 的记录 `cache > input`」推断上游是未命中语义,
+///    改成 `up_in + cached`。**方向对,但当时没有证据**。
+/// 2. **08-17 撤回**:我用「10 字符的提示词不可能有 6779 token 的新增输入」把自己
+///    说服了,判定 6779 是总量、撤回了修复。**那个论证是错的** —— 新会话的未命中量
+///    本来就包含 AGENTS.md + tools + Cursor 注入的服务端 system(实测 16k 量级),
+///    6779 完全可能是未命中量。用"这个数看起来太大"去反推字段语义,和当初用
+///    聚合统计反推一样不成立。
+/// 3. **08-18 定案**:拿本机 CLI 钩 http2,两侧同时读同一次调用。**只有这种取证
+///    能定语义**:一侧的数字无论多少条都推不出另一侧的口径。
+///
+/// 顺带:`cache > input` 从来不是异常。命中通常远大于未命中(上面这次是 2.7 倍),
+/// 那 39% 是正常分布,旧代码把它当"上游口径异常"丢弃,等于扔掉合法的缓存折扣。
 ///
 /// ## `result` 只结算末轮,不跨调用方 HTTP 轮(与自估**不重叠**)
 ///
-/// 同批取证顺带排掉了「最终真值与前面各轮自估重复计费」这个担忧(对抗评审的阻断级
-/// 问题之一):四条走桥的多轮会话,其 `result.usage` 都精确等于**单独一条**
-/// `request_log`,而非多轮之和 —— 桥挂起期间每轮走 `estimated_usage` 自估,
-/// CLI 进程退出时那一次 `result` 只落在最后一轮。所以两条路径各管一段,不重复。
+/// 四条走桥的多轮会话,其 `result.usage` 都精确等于**单独一条** `request_log`,
+/// 而非多轮之和 —— 桥挂起期间每轮走 `estimated_usage` 自估,CLI 进程退出时那一次
+/// `result` 只落在最后一轮。所以两条路径各管一段,不重复。
 /// ⚠️ 若将来改动收尾时机(比如让 result 补算整条会话),这条不变式就没了,要重新验。
-///
-/// ## 处理:`cache > input` 时**丢弃**这个不可信的 cache,不封顶到 input
-///
-/// 不去"修正"input(重构不出可信的总量)。对 cache 有两种处理,**第一版选错了**:
-///
-/// - ❌ **封顶到 input**:恢复了 `input ≥ cache_read` 不变式,但让 `cache == input`,
-///   于是线缆侧 `input − cache = 0` —— **客户面板的「输入」列还是 0**,只是从"偶发"
-///   变成了"必然"。2026-08-17 部署后实测:5 条里 3 条(60%)被封成全等,客户看到的
-///   毛病一点没好。而且 `cache == input` 在语义上是**假断言**("本轮输入 100% 命中"),
-///   真实情况只是两个字段口径不同。
-/// - ✅ **丢弃 cache(置 0)**:`input` 是可信的(单次调用实测证明它就是总量),
-///   cache 是跨内部调用累加的、与这个 input 不同口径 —— 两个数没有可信的相对关系,
-///   那就只保留可信的那个。客户侧 `input − 0 = input`,输入列显示真实总量;
-///   代价是这些轮次**不给缓存折扣**(客户按全价付),方向偏向"宁可少给折扣也不谎报"。
-///
-/// ⚠️ 别再改回封顶:那会让「输入 0」以更高的频率回来。
-///
-/// 丢弃时 warn:这是上游口径异常的信号,也是这些轮次没拿到折扣的原因,要可查。
 fn usage_from_result(u: &Value) -> ChatUsage {
-    let input = u.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-    let reported_cache = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-    let cached = if reported_cache > input {
-        tracing::warn!(
-            input,
-            reported_cache,
-            "cursor-cli:上游 result 的 cacheReadTokens 超过 inputTokens(跨内部调用累加,与本轮 input 不同口径),已丢弃该缓存值(本轮不给折扣,但输入列保持真实)"
-        );
-        0
-    } else {
-        reported_cache
-    };
+    let num = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let uncached = num("inputTokens");
+    let cache_read = num("cacheReadTokens");
+    let cache_write = num("cacheWriteTokens");
+    // 总输入 = 未命中 + 命中读 + 命中写。三项都是同一次 turn_ended 的分解,
+    // 相加即还原线缆上的 field 1(实测 4504+12160+0 = 16664 ✓)。
+    let total = uncached
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
     ChatUsage {
-        input_tokens: input,
-        output_tokens: u.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
-        cache_read_tokens: cached,
-        // 上游自报即**真实**命中,同步对账列(与线协议 `usage_from_upstream` 同一条
-        // 纪律:漏填会让面板「真实缓存」列永远是 0)。存封顶后的值:超过总输入的
-        // 数字放进对账列只会污染对账。
-        real_cache_read_tokens: cached,
+        input_tokens: total,
+        output_tokens: num("outputTokens"),
+        cache_read_tokens: cache_read,
+        // 上游自报即**真实**命中,同步对账列(漏填会让面板「真实缓存」列永远是 0)。
+        real_cache_read_tokens: cache_read,
+        // 缓存**写入**此前全平台恒 0(2026-08-18 抽查 6430 条)。它对应 Anthropic 的
+        // `cache_creation_input_tokens`,是总输入的一部分,漏计就是我方贴钱。
+        cache_creation_tokens: cache_write,
         ..Default::default()
     }
 }
@@ -2013,31 +2001,27 @@ mod tests {
         assert!(TOOL_ROUND_TOKEN_FACTOR > 1.0, "系数应当>1(补隐藏推理)");
     }
 
-    /// 自估轮必须报出模拟缓存,且 `input_tokens` 是**总输入**(新增 + 命中)。
+    /// 上游没报缓存(真·冷启动,或 `result` 里该字段缺失)时必须**回落模拟值**,不留 0。
     ///
-    /// 锁两件事:
-    /// 上游 cache 不可用时必须**回落模拟值**,不能留 0。
+    /// 这条锁 2026-08-17 用户报障「为什么总是有这种突然没有任何缓存命中的」:末轮
+    /// 一旦缓存计 0,而中间自估轮有缓存,客户就会看到"某一条突然完全没命中"。
+    /// 线协议侧早有同一条闸(`chat.rs`),CLI 驱动后加时漏了。
     ///
-    /// 这条锁的是 2026-08-17 用户报障:「为什么总是有这种突然没有任何缓存命中的」——
-    /// 末轮上游报的 cache 是跨内部调用累加值(超过 input),被判不可信丢弃后计 0,
-    /// 于是有真值的那一轮反而全价。实测 input=85951 / 上游 162176 被弃 /
-    /// 模拟 57336 可用 → 客户多付约 2.4 倍。
+    /// ⚠️ 旧前提是"上游 cache 超过 input 被丢弃" —— 那条丢弃逻辑已随 2026-08-18 的
+    /// 线缆取证删除(`cache > 未命中量` 是正常分布),前提改成"上游报 0"。
     #[test]
-    fn 上游缓存不可用时回落模拟值() {
-        // 复刻生产样本:上游 cache=162176 > input=85951 → usage_from_result 丢弃成 0。
+    fn 上游没报缓存时回落模拟值() {
         let mut u = usage_from_result(&json!({
-            "inputTokens": 85951, "outputTokens": 1323, "cacheReadTokens": 162176
+            "inputTokens": 85951, "outputTokens": 1323, "cacheReadTokens": 0
         }));
-        assert_eq!(u.cache_read_tokens, 0, "前提:不可信的上游 cache 已被丢弃");
+        assert_eq!(u.cache_read_tokens, 0, "前提:上游这一轮没报命中");
 
-        // 同一请求模拟器给出 57336 命中 → 必须顶上。
         let got = fallback_cache_from_sim(&mut u, 57336);
         assert_eq!(got, Some(57336));
         assert_eq!(u.cache_read_tokens, 57336, "计费列要用模拟值,不能留 0");
         assert_eq!(u.input_tokens, 85951, "input 不受回落影响");
         assert_eq!(u.real_cache_read_tokens, 0, "对账列仍不认模拟值");
 
-        // 客户侧因此拿到折扣,而不是整轮全价。
         let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
             wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
@@ -2062,19 +2046,20 @@ mod tests {
         // ② 模拟值超过 input → 夹到 **input × cap**(默认 0.9),不是 input 本身。
         //    夹到 input 会让客户侧输入归 0 → 整轮按缓存价 0.1× 计
         //    (2026-08-17 实测 63 条里 57 条中招,我方大幅贴钱)。
+        // 前提:上游没报命中(报了就走真值,见 ①)。总量 1000 全是未命中。
         let mut u2 = usage_from_result(&json!({
-            "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 50000
+            "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 0
         }));
         assert_eq!(u2.cache_read_tokens, 0);
         let cap = crate::cache_sim::billing().cap_ratio;
-        let expect = (1000.0 * cap).round() as u64;
+        let expect = (1000.0 * cap).floor() as u64;
         assert_eq!(fallback_cache_from_sim(&mut u2, 40000), Some(expect));
         assert_eq!(u2.cache_read_tokens, expect, "必须夹到 input × cap");
         assert!(u2.cache_read_tokens < u2.input_tokens, "客户侧输入必须留余量");
 
         // ③ 模拟值为 0 → 无事发生。
         let mut u3 = usage_from_result(&json!({
-            "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 9999
+            "inputTokens": 1000, "outputTokens": 10, "cacheReadTokens": 0
         }));
         assert_eq!(fallback_cache_from_sim(&mut u3, 0), None);
         assert_eq!(u3.cache_read_tokens, 0);
@@ -2242,54 +2227,75 @@ mod tests {
         assert_eq!(reported_cache_read(0, 0, 0, b), 0);
     }
 
-    /// `inputTokens` 是**总输入**(含缓存),原样填 —— 绝不能再加 cached。
+    /// `result.usage.inputTokens` 是**未命中量**,必须把 cacheRead + cacheWrite 加回来。
     ///
-    /// 判据是实测单次调用样本(见 [`usage_from_result`] 文档):10 字符的提示词报
-    /// `input=6779 / cache=6016`,只可能是总量语义。这条锁住"别再改回 up_in+cached":
-    /// 那样会给每个正常轮次凭空加一倍输入(我 2026-08-17 犯过,被对抗评审顶回来)。
+    /// 数据取自 2026-08-18 本机 `cursor-agent 2026.08.11-e8db854` 钩 http2 的**同一次
+    /// 调用两侧对照**(见 [`usage_from_result`] 文档):线缆 turn_ended 的
+    /// `input=16664 / cache_read=12160 / cache_write=0`,CLI 的 `result` 报 `input=4504`
+    /// —— `16664 − 12160 − 0 = 4504`。
+    ///
+    /// 这条锁两件事:①别再把 CLI 那个 input 当总量(会少报一个缓存量的输入);
+    /// ②`cache > input` 是**正常**的,不得丢弃(命中通常远大于未命中)。
     #[test]
-    fn 上游真值轮的input是总量不得再加缓存() {
+    fn 上游真值轮的input是未命中量要把缓存加回来() {
         let u = usage_from_result(&json!({
-            "inputTokens": 6779, "outputTokens": 35, "cacheReadTokens": 6016
+            "inputTokens": 4504, "outputTokens": 34,
+            "cacheReadTokens": 12160, "cacheWriteTokens": 0
         }));
-        assert_eq!(u.input_tokens, 6779, "必须原样填,不得加 cached");
-        assert_eq!(u.cache_read_tokens, 6016);
-        assert_eq!(u.real_cache_read_tokens, 6016, "上游自报是真实命中,要进对账列");
+        assert_eq!(u.input_tokens, 16664, "总量 = 未命中 + 命中读 + 命中写(线缆 field 1)");
+        assert_eq!(u.cache_read_tokens, 12160);
+        assert_eq!(u.real_cache_read_tokens, 12160, "上游自报是真实命中,要进对账列");
+        assert_eq!(u.cache_creation_tokens, 0);
 
-        // 线缆侧减一次 → 客户看到未命中 763 + 缓存 6016,合计正好是总量 6779。
+        // 线缆侧减一次 → 客户看到的未命中正好还原成 CLI 报的那个数。
         let wire = crate::chat::delta_usage_json_pub(&u);
-        assert_eq!(wire.get("input_tokens").and_then(|v| v.as_u64()), Some(763));
+        assert_eq!(wire.get("input_tokens").and_then(|v| v.as_u64()), Some(4504));
         assert_eq!(
             wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
-            Some(6016)
+            Some(12160)
         );
     }
 
-    /// `cache > input`(上游跨内部调用累加,与本轮 input 不同口径)必须**丢弃**该
-    /// 缓存值,而**不是**封顶到 input。
+    /// `cacheWriteTokens` 必须计进总输入,并落到 `cache_creation_tokens`。
     ///
-    /// 这条锁的是 2026-08-17 部署后实测到的回归:封顶让 `cache == input`,线缆侧
-    /// `input − cache` 于是恒 0 —— 客户面板「输入」列照样是 0(5 条里 3 条被封成全等,
-    /// 比封顶前的 39% 更糟),而且 `cache == input` 是"本轮输入 100% 命中"的假断言。
+    /// 它对应 Anthropic 的 `cache_creation_input_tokens`,通常比普通输入更贵。
+    /// 2026-08-18 抽查生产 6,430 条记录该列**恒为 0** —— 全平台一直没收这块。
     #[test]
-    fn 上游缓存超过输入时丢弃而非封顶() {
-        // 生产真实样本 id=1572918:input=72811 / cache=366720(5 倍)。
+    fn 缓存写入计进总量且落对账列() {
+        let u = usage_from_result(&json!({
+            "inputTokens": 1000, "outputTokens": 10,
+            "cacheReadTokens": 2000, "cacheWriteTokens": 500
+        }));
+        assert_eq!(u.input_tokens, 3500, "1000 + 2000 + 500");
+        assert_eq!(u.cache_creation_tokens, 500, "缓存写入不得丢");
+        assert_eq!(u.cache_read_tokens, 2000);
+    }
+
+    /// `cache > input` 是**正常分布**,绝不能丢弃 —— 这条锁 2026-08-17 那次误判的回归。
+    ///
+    /// 当时看到生产 39% 的记录 `cache_read > input_tokens`,判定"上游口径异常"并丢弃。
+    /// 线缆取证证明那 39% 全是正常的:CLI 报的 input 是未命中量,命中比它大是常态
+    /// (实测那次 2.7 倍)。丢弃等于把合法的缓存折扣扔掉,客户按全价付。
+    #[test]
+    fn 缓存大于未命中量是正常的不得丢弃() {
+        // 生产真实样本 id=1572918:CLI 报 input=72811 / cache=366720。
         let u = usage_from_result(&json!({
             "inputTokens": 72811, "outputTokens": 3940, "cacheReadTokens": 366720
         }));
-        assert_eq!(u.input_tokens, 72811, "input 保持上游原值,不去重构总量");
-        assert_eq!(u.cache_read_tokens, 0, "不可信的 cache 一律丢弃,不得封顶成 input");
-        assert_eq!(u.real_cache_read_tokens, 0, "对账列同样不存不可信的值");
+        assert_eq!(u.input_tokens, 439531, "72811 + 366720 = 总量");
+        assert_eq!(u.cache_read_tokens, 366720, "命中照收,不得因为大于未命中量就丢");
+        assert_eq!(u.real_cache_read_tokens, 366720);
 
         let wire = crate::chat::delta_usage_json_pub(&u);
         assert_eq!(
             wire.get("input_tokens").and_then(|v| v.as_u64()),
             Some(72811),
-            "客户侧输入必须是真实总量 —— 归 0 就是那个「输入 0」的回归"
+            "客户侧未命中量还原成 CLI 报的那个数"
         );
-        assert!(
-            wire.get("cache_read_input_tokens").is_none(),
-            "丢弃后不该报缓存字段(宁可不给折扣,也不谎报命中)"
+        assert_eq!(
+            wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            Some(366720),
+            "折扣必须给到"
         );
     }
 

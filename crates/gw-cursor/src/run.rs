@@ -912,6 +912,15 @@ pub fn encode_read_success_data(id: u64, exec_id: &str, path: &str, data: &[u8])
 /// 不认它的话,每个请求都要等客户端超时才返回 —— 表现为「答完了但一直转圈」。
 const RESP_USAGE: u32 = 14;
 
+/// `1.14` 用量帧的分解。`input` 是**总量**(含 `cache_read` + `cache_write`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WireUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
 /// `1.1.22` 内层仍是字符串 `'ide'`。
 ///
 /// ⚠️ 这与请求头 `x-cursor-client-type: glass` **故意不同** —— 抓包实物就是这样
@@ -1411,7 +1420,17 @@ pub struct RespFrame {
     /// 拼进回答里客户会看到「用户要求我…」这种自言自语。
     pub thinking: String,
     /// `1.14` 用量 `(输入, 输出, 缓存命中)`。出现即表示本轮结束。
-    pub usage: Option<(u64, u64, u64)>,
+    /// `1.14`(`InteractionUpdate.turn_ended`)的用量分解。
+    ///
+    /// 字段号经 2026-08-18 本机取证钉死(钩 `cursor-agent` 的 http2,原始帧落盘):
+    /// `1 input_tokens / 2 output_tokens / 3 cache_read_tokens /
+    ///  4 cache_write_tokens / 5 reasoning_tokens`。
+    /// **field 1 是总量**(含 3 与 4),客户端自己显示时才减 —— 与 CLI `result` 事件
+    /// 的口径相反(那边发的是减过的未命中量),见 `clidrv::usage_from_result`。
+    ///
+    /// `reasoning_tokens` 不入账:实测 `output=34 / reasoning=33`,它是 output 的
+    /// **子集**,单独计会重复收费。
+    pub usage: Option<WireUsage>,
 }
 
 /// 解一帧响应。非 `field 1` 的帧(会话回显 `field 4`、计时 `field 8`)一律返回空。
@@ -1440,12 +1459,14 @@ pub fn parse_frame(payload: &[u8]) -> RespFrame {
                     }
                 }
                 RESP_USAGE => {
-                    let mut u = [0u64; 3];
+                    let mut u = [0u64; 5];
                     let mut seen = 0;
                     for (f3, v3) in Reader::new(inner) {
-                        if let (1..=3, PbValue::Varint(n)) = (f3, v3) {
+                        if let (1..=5, PbValue::Varint(n)) = (f3, v3) {
                             u[(f3 - 1) as usize] = n;
-                            seen += 1;
+                            if f3 <= 3 {
+                                seen += 1;
+                            }
                         }
                     }
                     // 三个数没齐 = 上游改了 wire type 或增减了字段。仍然收口(不收口是
@@ -1454,7 +1475,15 @@ pub fn parse_frame(payload: &[u8]) -> RespFrame {
                     if seen != 3 {
                         tracing::debug!(seen, "cursor 用量帧字段不全,计费数可能失真");
                     }
-                    out.usage = Some((u[0], u[1], u[2]));
+                    out.usage = Some(WireUsage {
+                        input: u[0],
+                        output: u[1],
+                        cache_read: u[2],
+                        cache_write: u[3],
+                    });
+                    if u[4] > 0 {
+                        tracing::debug!(reasoning = u[4], output = u[1], "cursor 用量帧带推理 token(是 output 的子集,不入账)");
+                    }
                 }
                 _ => {}
             }
@@ -2104,7 +2133,7 @@ mod tests {
         let mut outer = Writer::new();
         outer.message(RESP_MESSAGE, &msg);
         let fr = parse_frame(&outer.into_bytes());
-        assert_eq!(fr.usage, Some((12106, 74, 11904)));
+        assert_eq!(fr.usage, Some(WireUsage { input: 12106, output: 74, cache_read: 11904, cache_write: 0 }));
         // 普通文本帧不能被误判成收尾,否则第一个字出来就把流关了。
         assert_eq!(parse_frame(&delta_frame(RESP_TEXT, "x")).usage, None);
     }
@@ -2184,7 +2213,7 @@ mod tests {
         outer.message(RESP_MESSAGE, &msg);
         let fr = parse_frame(&outer.into_bytes());
         assert_eq!(fr.text, "APPLE", "收口帧里的正文必须照样解出来");
-        assert_eq!(fr.usage, Some((10, 2, 0)));
+        assert_eq!(fr.usage, Some(WireUsage { input: 10, output: 2, cache_read: 0, cache_write: 0 }));
     }
 
     #[should_panic(expected = "至少一轮消息")]
@@ -2555,7 +2584,7 @@ mod tests {
         assert!(parse_tool_call(&frame).is_none(), "合帧里没有工具调用");
         assert_eq!(
             parse_frame(&frame).usage,
-            Some((100, 5, 90)),
+            Some(WireUsage { input: 100, output: 5, cache_read: 90, cache_write: 0 }),
             "合帧里的用量绝不能被写调用吞掉"
         );
     }

@@ -1,5 +1,83 @@
 # Changelog
 
+## [cursor-usage-wire-truth] 线缆取证钉死 usage 口径 + 补 cache_write — 2026-08-18
+
+本机装了 `cursor-agent 2026.08.11-e8db854`,钩住它的 http2 把
+`agent.v1.AgentService/Run` 的服务端帧原样落盘,**同一次调用两侧对照** —— 一次把
+反复改口三次的 usage 口径问题定死了。
+
+### 取证
+
+```
+线缆 InteractionUpdate.turn_ended(field 14),13 字节:
+  field 1 input_tokens       = 16664      ← 总量
+  field 2 output_tokens      = 34
+  field 3 cache_read_tokens  = 12160
+  field 4 cache_write_tokens = 0
+  field 5 reasoning_tokens   = 33
+CLI 的 result.usage:
+  {"inputTokens":4504,"outputTokens":34,"cacheReadTokens":12160,"cacheWriteTokens":0}
+  16664 − 12160 − 0 = 4504  ✓
+```
+
+CLI 源码(`1931.index.js`)就是这么算的,`result` 事件发的正是这个减过的对象:
+
+```js
+case "turnEnded": { ... ke = f({inputTokens: Number(e.inputTokens), ...}) }
+f = e => ({...e, inputTokens: Math.max(e.inputTokens - e.cacheReadTokens - e.cacheWriteTokens, 0)})
+... {type:"result", ..., usage: ke}
+```
+
+**结论:同一个字段名在两条路上口径相反。** 线缆 `input` 是总量;CLI `result` 的
+`inputTokens` 是**已减掉 cacheRead 与 cacheWrite 的未命中量**。
+
+### 修的两处
+
+**① CLI 真值轮少报了一个缓存量的输入。** `usage_from_result` 把那个未命中量当总量填,
+而 `ChatUsage::input_tokens` 的契约是总输入。现在
+`total = inputTokens + cacheReadTokens + cacheWriteTokens`。
+
+**② `cache > input` 从来不是异常,旧代码把合法缓存丢了。** 生产 39% 的记录
+`cache_read > input_tokens` —— 命中大于未命中量是**常态**(取证那次 2.7 倍)。
+旧逻辑判它"上游口径异常"并置 0,等于扔掉客户应得的折扣,同时输入也少报。丢弃逻辑删除。
+
+**③ 线缆侧补读 field 4/5。** `run.rs` 原来只解 `1..=3`,三元组换成 `WireUsage`
+结构体,`cache_write` 落到 `cache_creation_tokens`(2026-08-18 抽查生产 6,430 条
+该列恒 0,即这块一直没收)。`reasoning_tokens` **不入账** —— 实测
+`output=34 / reasoning=33`,它是 output 的子集,单独计会重复收费。
+
+### ⚠️ 这条口径我改口过三次,三次的错法都记在 `usage_from_result` 的文档里
+
+1. **08-17 第一版**:据「39% 的记录 cache > input」推断是未命中语义,改成
+   `up_in + cached`。方向对,但**当时没有证据**。
+2. **08-17 撤回**:我用「10 字符的提示词不可能有 6779 token 的新增输入」把自己说服了,
+   判定 6779 是总量并撤回。**那个论证是错的** —— 新会话的未命中量本来就含
+   AGENTS.md + tools + Cursor 注入的服务端 system(实测 16k 量级)。用"这个数看起来
+   太大"反推字段语义,和用聚合统计反推一样不成立。
+3. **08-18 定案**:钩 http2,两侧同时读同一次调用。**只有这种取证能定语义** ——
+   一侧的数字无论多少条都推不出另一侧的口径。
+
+### 影响:又是涨价(修的是少收)
+
+以取证那一次为例(¥0.4/M 输入、缓存 0.1×):
+旧 `4504 × 0.4 = 1,801 µ¥` → 新 `4504 × 0.4 + 12160 × 0.04 = 2,288 µ¥`,**+27%**。
+只作用于**真值轮**(约占 CLI 请求 28%);自估轮不经这条路。
+
+### 验证
+
+- `cargo test -p gw-cursor`:**258 passed / 0 failed**
+- 重写 4 条锁旧口径的测试;新增 `缓存写入计进总量且落对账列`、
+  `缓存大于未命中量是正常的不得丢弃`
+- 顺带删掉 `SsePhase::sim_total` 死字段(基准改 `ctx_base` 后没人读)
+- `cargo check --workspace --all-targets` 干净
+
+### 副产物:一套可复用的抓包装置
+
+`scratchpad/hook.js` —— `NODE_OPTIONS=--require` 注入,patch `http2.connect`,
+只对 `AgentService/Run` 的流 append 落盘,不改任何字节。配沙箱 HOME
+(`auth.json` 只需 `{accessToken, refreshToken}`)即可用池号跑任意实验。
+本次一并确认:出口主机 `agentn.global.api5.cursor.sh`(与我方 `lib.rs` 已有的一致)。
+
 ## [cursor-cli-ctx-basis-2] 首阶段基准:补 system + 去掉一处重复计费 — 2026-08-18
 
 紧接上一条。部署后做了一次**受控两轮工具回路实测**(自己发,cursor 流量当时已停),
