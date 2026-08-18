@@ -1,5 +1,105 @@
 # Changelog
 
+## [cursor-cli-cache-calibration] CLI 驱动:接上计费旋钮 + 两次自我修正 — 2026-08-17
+
+接上一批。用户指出上一批一个根本性口径错误:
+
+> 「你这里说缓存＜输入,这是 openai 的计算方式,anthropic 协议下,输入是指抛去缓存的
+> 输入,你看 kiro,那个是对的」
+
+对的。上一批把「`cache < input`」当健康态,那是**落库口径(total)**;线缆是
+**Anthropic 口径(input 已剔除缓存)**。顺着这条线查下去,发现 cursor 通道**从来没有接过
+kiro 那套计费闸门** —— 三个旋钮、sim store 的 TTL,全都没接。
+
+### 缺陷 4:`apply_hot_settings` 在 cursor 上是空实现
+
+`gw-kiro/src/usage.rs::reported_cache_read` 那三个旋钮
+(`cache_read_multiplier` / `cache_cap_ratio` / `cache_floor_ratio`)cursor 侧根本不存在,
+面板改了没有任何效果。
+
+修:`cache_sim.rs` 移植 `CacheBilling` + `reported_cache_read`(与 kiro 同公式:
+`frac = hit/sim_total`,`reported = clamp(frac × total × mult, total×floor, total×cap)`),
+`gw-cursor/src/lib.rs` 实现 `apply_hot_settings`(仅present字段)并让
+`hot_settings_supported()` 返回 true —— 否则按上一批 `claude-dario` 那个 no-op 的教训,
+面板会显示"已生效"而实际是哑的。
+
+**⚠️ `multiplier` 在 cursor 路径上是死参数**。标定实测 `frac` 落在 0.79~0.998,
+乘 1.8 必然越过 cap —— 有命中的样本 4/4 全部撞 cap。要调让利幅度只能动 `cap_ratio`。
+(kiro 上 multiplier 有意义是因为它每轮重发全量历史,frac 分布低得多。)
+
+### 缺陷 5:cursor 的 sim store 从未接 TTL 配置
+
+`worker/mod.rs` 的启动与 30s 热重载**只同步 `gw_kiro` 的 store**,cursor 那份用编译期
+常量 300s,而线上配的是 1800s —— **短 6 倍**,大量会话被误判冷启动。
+
+`CacheSimStore` 当时连 setter 都没有(`set_ttl_secs` / `set_max_sessions` 本次补),
+所以这个值在生产上从来改不动。第一条标定样本就是证据:上游真值命中 8180,
+我方 `sim_raw_hit=0`。
+
+### 缺陷 6:真值轮丢弃上游 cache 后不回落模拟值 —— 用户报的现象
+
+上一批对不可信的上游 cache 采取「丢弃」,但**丢弃后没有回落到模拟器**。于是:
+自估轮有缓存、拿到真值的那一轮缓存为 0 —— 客户看到的就是
+**「突然完全没有任何缓存命中」**。线协议侧早就有这道回落闸(`chat.rs`),CLI 驱动没有。
+
+实测代价:一条 `input=85951` 的记录,上游 cache 162,176 被丢弃归 0,而模拟器手里有
+57,336 —— 客户被收 ¥0.02744,应收约 ¥0.0103,**多付 2.4 倍**。
+
+修:`fallback_cache_from_sim()`,真值轮 cache 为 0 且模拟器有命中时回落,并夹到
+`input × cap_ratio`。
+
+### ❌ 我引入又撤掉的两个缺陷(必须记下)
+
+**(a) 自估基准误用 `sim_total`。** 理由当时是"和 kiro 对齐"——错了:kiro 每轮重发
+全量历史,所以它的上下文总量 == 上游 input;CLI 驱动不重发(历史在 `--resume`
+会话文件里)。生产标定 10 个样本 `sim_total / upstream_input`:
+min 0.042 / P25 0.609 / **median 0.741** / P75 0.847 / max **26.633** ——
+9 个低估(系统性少收约 25%),而那个 26.6 倍出现在**重铺轮**(超收 27 倍)。
+已退回 `fresh_in`(本轮真实喂进 CLI 的量)。
+
+**(b) 缓存夹到 `input` 本身。** 结果 `cache == input` → 线缆 `input − cache = 0`,
+既是"本轮 100% 命中"的假断言,又让整轮按 0.1× 计。生产实测
+**57/63 条(90%)全额折扣**,740,153/822,784 = 90.0% 的输入按缓存价走。
+**造成约 20 分钟(15:26–15:47)的真实收入损失,不可追回。**
+
+坏估计的根因值得单独记:我拿**真值轮**的样本比例(19%)去推全体,而量在**自估轮**——
+自估轮 `input` 只量本轮新增(几十~几千),模拟命中却覆盖全上下文(几万),两者量级差
+几十倍。**样本选择偏差**:少数派轮次的比例不能外推到多数派轮次。
+
+修:两处(`estimated_usage` / `fallback_cache_from_sim`)统一夹到 `input × cap_ratio`。
+
+### 标定观测(仅记录不计费)
+
+真值轮打一条 `cursor-cli:缓存标定样本`,同时记上游原始值、我方计费值、模拟命中、
+模拟总量。**坑**:第一版读的是 `usage.real_cache_read_tokens` —— 那已经被丢弃逻辑清零,
+于是"上游报了但被我丢弃"被记成"上游真值=0",算出假的 `ratio=0.000`。
+改为在 `usage_from_result` **之前**捕获原始值。
+
+`real_cache_read_tokens` 是对账列(admin `usage.rs` 拿它算真实成本),
+**模拟值一律不写进去** —— 生产验证 `rc=0` 全部正确。
+
+### 生产验证(`cache-cap-20260817`)
+
+| 指标 | 报障时 | 上一版(b) | 现在 |
+|---|---|---|---|
+| 零缓存(用户报的现象) | 频发 | 0 | 0 |
+| 全额折扣(整轮 0.1×) | — | 57/63 = 90% | 0/3 |
+| 客户侧输入 | 常显示 0 | 常为 0 | 35 / 13 / 33,531 全为正 |
+
+两条小额记录占比 **0.9499 / 0.9494**,精确卡在线上 `cap_ratio=0.95`,证明夹限生效。
+`caio-router` / `caio-worker0` 全程未重建(`--no-deps`)。
+
+### 遗留
+
+- `cacheWriteTokens` / `reasoningTokens` 仍未计入(`cache_creation_tokens` 恒 0)。
+  前者对应 Anthropic 的 `cache_creation_input_tokens`,通常比普通输入更贵 —— 计不计是定价决策。
+- 生产 `floor_ratio=0.75` 意味着**冷启动零命中也按 75% 缓存价**,这是明确的让利。
+- 根本问题没解:CLI `result` 事件只在**进程退出**时发一次,中途的
+  `thinking`/`assistant`/`tool_call` 事件不带 token 字段,而一个 CLI 进程横跨调用方
+  多个 HTTP 轮次(实测见过 21 次工具调用)。所以**末轮=真值(28%)、中间轮=估值(72%)**
+  是结构性的,不是实现缺陷。要拿到每轮真值只能改走协议模拟(`agent.v1.AgentService/Run`)。
+
+
 ## [cursor-cli-cache-coherence] CLI 驱动:三个缓存计费口径 bug — 2026-08-17
 
 同日第七批。用户原话:「只要有输入,就没有缓存命中,这是个严重的计费bug」。
