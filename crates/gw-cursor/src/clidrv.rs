@@ -649,6 +649,10 @@ pub struct CliConv {
     /// 句柄,**不会去收养/回收陌生孤儿**。2026-08-17 现场:33 个孤儿 `worker-server`
     /// 各占 ~163MB ≈ 5.4GB。杀整组才收得干净。
     pgid: Mutex<Option<u32>>,
+    /// 本 turn 已经报给调用方的 `input_tokens` 累计(只累**自估轮**,末轮不进)。
+    ///
+    /// 末轮拿到上游真值后据此**补差**:见 [`true_up_input`]。
+    billed_input: std::sync::atomic::AtomicU64,
 }
 
 impl CliConv {
@@ -1046,7 +1050,15 @@ impl SsePhase {
     /// (3 小时 1259 条里 632 条,相关性 100%),客户在 new-api 面板看到的就是
     /// 「输入 11 万 / 输出 0」。正文其实照发,只是账没记(线协议侧早就有
     /// `estimate_usage_fallback` 兜同一个坑,CLI 驱动是后加的,漏了)。
-    fn finish_tool_use(&mut self, out: &OutQueue, tool_use_id: &str, name: &str, args: &Value) {
+    /// 结束本阶段并发 `stop_reason: tool_use`。**返回本阶段报给调用方的 `input_tokens`**
+    /// —— 调用方(泵)要把它累进 [`CliConv::billed_input`],末轮据此补差。
+    fn finish_tool_use(
+        &mut self,
+        out: &OutQueue,
+        tool_use_id: &str,
+        name: &str,
+        args: &Value,
+    ) -> u64 {
         // 纯工具调用轮的产出大头是**参数 JSON**(正文可以是零个字),漏掉它 output≈0。
         // 与线协议的 tool_call_tokens 同口径:名字 + 整个参数对象序列化后计字。
         self.out_tally.push(name);
@@ -1075,12 +1087,14 @@ impl SsePhase {
                    "delta":{"stop_reason":"tool_use","stop_sequence":null},
                    "usage":crate::chat::delta_usage_json_pub(&usage)}),
         )))));
+        let billed = usage.input_tokens;
         out.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
             "message_stop",
             json!({"type":"message_stop"}),
         )))));
         out.push(OutItem::Item(Ok(StreamItem::Usage(usage))));
         out.push(OutItem::End);
+        billed
     }
 
     /// 正常收尾(end_turn + 真实用量)。
@@ -1184,6 +1198,41 @@ fn usage_from_result(u: &Value) -> ChatUsage {
         cache_creation_tokens: cache_write,
         ..Default::default()
     }
+}
+
+/// 末轮**补差**:把整个 turn 的真总量与前几轮已报之和的差额,记在末轮上。
+///
+/// ## 依据:`turn_ended.input` 是本 turn **所有内部模型调用之和**
+///
+/// 2026-08-18 本机三次受控实测(钩 http2 读原始帧,文件各 6 字节所以工具轮之间
+/// 上下文只涨百来 token):
+///
+/// ```text
+/// 工具调用 0 次 → 内部调用 1 次 → turn_ended.input = 16,664   (16,664/次)
+/// 工具调用 1 次 → 内部调用 2 次 → turn_ended.input = 28,550   (14,275/次)
+/// 工具调用 3 次 → 内部调用 4 次 → turn_ended.input = 67,786   (16,946/次)
+/// ```
+///
+/// 若它是"最后一次调用的上下文",三次应当都 ≈16.7k;实际正比于内部调用数。
+/// 三次都**只有一个** `turn_ended` 帧,协议里没有任何 per-call 的用量帧
+/// (`stepCompleted` 只带 `step_id` + `duration_ms`)。
+///
+/// ## 为什么要补差
+///
+/// 调用方每一轮 HTTP 请求 ≈ 一次内部模型调用,而中间各轮只能自估。自估**系统性偏低**:
+/// 漏掉 Cursor 注入的服务端 system(实测约 16k/次的固定地板,我方算不出来)。
+/// 真总量含它,所以把差额记在末轮,**整个 turn 的合计就精确了** —— 中间轮估得准不准
+/// 都不再影响总数,也就不需要去维护任何"地板常量"。
+///
+/// ## 为什么记在末轮而不是回改历史行
+///
+/// 前几轮的记录已经写库、并已上报给计费侧。回改历史行会让下游对账错乱;
+/// 记在末轮只让**一条**记录偏大,而 turn 合计正确 —— 钱是按合计收的。
+///
+/// `max` 是护栏:前几轮若高估导致差额为负(甚至倒挂),末轮至少按自己那份真值走,
+/// 不会出现 0 或负数。
+fn true_up_input(truth_total: u64, already_billed: u64, this_round: u64) -> u64 {
+    truth_total.saturating_sub(already_billed).max(this_round)
 }
 
 /// 真值轮的**缓存回落**:上游 cache 不可用(被判不可信而丢弃 → 0)时,用模拟值顶上。
@@ -1378,7 +1427,12 @@ async fn pump(mut a: PumpArgs) {
                     let mut p = a.conv.pending.lock().unwrap_or_else(|p| p.into_inner());
                     *p = Some(PendingSlot { tool_use_id: tool_use_id.clone(), responder: tx_slot });
                 }
-                phase.finish_tool_use(&out, &tool_use_id, &name, &args);
+                // 本阶段报给调用方的 input 累进会话账本:末轮据此补差(见 `true_up_input`)。
+                // `Relaxed` 足够:同会话的阶段是串行推进的,这里只需要最终可见的总和。
+                let billed = phase.finish_tool_use(&out, &tool_use_id, &name, &args);
+                a.conv
+                    .billed_input
+                    .fetch_add(billed, std::sync::atomic::Ordering::Relaxed);
                 // 提交本阶段指纹。**判据是"这个 Anthropic 响应已经交付给调用方"**,
                 // 不是"整条 CLI 会话成功" —— 对调用方而言这就是一次完整的成功响应
                 // (有正文、有 tool_use、stop_reason=tool_use),它已经据此计费了。
@@ -1506,6 +1560,49 @@ async fn pump(mut a: PumpArgs) {
                 }
             };
             if ok {
+                // ── 末轮补差:把整个 turn 的真总量与前几轮已报之和的差额记在这一轮 ──
+                //
+                // `turn_ended.input`(= 这里的 `usage.input_tokens`)是本 turn **所有
+                // 内部模型调用之和**,而前面各轮只能自估、且系统性偏低(漏掉 Cursor
+                // 注入的约 16k/次服务端 system)。差额记在末轮,turn 合计就精确了。
+                // 判据与取舍见 [`true_up_input`]。
+                let already = a
+                    .conv
+                    .billed_input
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if already > 0 {
+                    let truth_total = usage.input_tokens;
+                    let this_round = phase.input_basis();
+                    let trued = true_up_input(truth_total, already, this_round);
+                    // 缓存**按同一比例缩放**,不是硬夹。
+                    //
+                    // 补差后的 input 通常小于 turn 总量(前几轮已经报掉一部分),而真值的
+                    // cache 是整个 turn 的 —— 不缩放就会 `cache > input`,线缆侧
+                    // `input − cache` 归 0,客户又看到「输入 0」(用户 08-17 报的那个)。
+                    // 按比例缩放同时保住**折扣率**:客户看到的命中占比与上游真实一致。
+                    //
+                    // `real_cache_read_tokens` **不缩放** —— 它是对账列,记上游实际做了
+                    // 多少命中。整个 turn 的真值都归在末轮这一条上,前几轮是 0,合计正确。
+                    if trued < truth_total && truth_total > 0 {
+                        let scale = trued as f64 / truth_total as f64;
+                        usage.cache_read_tokens =
+                            (usage.cache_read_tokens as f64 * scale).floor() as u64;
+                        usage.cache_creation_tokens =
+                            (usage.cache_creation_tokens as f64 * scale).floor() as u64;
+                    }
+                    tracing::info!(
+                        account = %a.conv.account_id,
+                        truth_total,
+                        already_billed = already,
+                        this_round_estimate = this_round,
+                        trued_up = trued,
+                        billed_cache = usage.cache_read_tokens,
+                        real_cache = usage.real_cache_read_tokens,
+                        "cursor-cli:末轮补差(turn 合计对齐上游真总量)"
+                    );
+                    usage.input_tokens = trued;
+                }
+
                 // ── 真值不可用时回落模拟值(**不要归零**)────────────────────────
                 //
                 // `usage_from_result` 在「上游 cache > input」(跨内部调用累加,生产常态)
@@ -1821,6 +1918,7 @@ pub async fn start_conv(
         pending: Mutex::new(None),
         pgid: Mutex::new(cli_pgid),
         at: Mutex::new(Instant::now()),
+        billed_input: std::sync::atomic::AtomicU64::new(0),
     });
     convs.insert(conv_key, conv.clone());
     let out = conv.out.clone();
@@ -2227,6 +2325,42 @@ mod tests {
         assert_eq!(reported_cache_read(0, 0, 0, b), 0);
     }
 
+    /// 末轮补差:turn 合计必须精确等于上游真总量。
+    ///
+    /// 依据是 2026-08-18 三次受控实测钉死的「`turn_ended.input` = 本 turn 所有内部
+    /// 模型调用之和」(见 [`true_up_input`])。这条锁住"中间轮估低了不能就这么算了"。
+    #[test]
+    fn 末轮补差让turn合计等于真总量() {
+        // 实验二的真实数字:4 次内部调用,真总量 67,786。
+        let truth = 67_786u64;
+        // 前 3 轮自估各报 12,000(偏低 —— 漏了 Cursor 注入的地板)。
+        let already = 12_000 * 3;
+        let this_round = 12_000;
+        let trued = true_up_input(truth, already, this_round);
+        assert_eq!(trued, truth - already, "末轮吸收全部残差");
+        assert_eq!(already + trued, truth, "turn 合计必须精确等于真总量");
+        assert!(trued > this_round, "本轮应当被上调:{trued} vs {this_round}");
+    }
+
+    /// 前几轮**高估**时补差不得给出 0 或倒挂 —— 末轮至少按自己那份走。
+    #[test]
+    fn 补差在前几轮高估时退回本轮估值() {
+        let truth = 20_000u64;
+        // 前几轮加起来已经超过真总量(高估)。
+        let already = 25_000;
+        let this_round = 3_000;
+        let trued = true_up_input(truth, already, this_round);
+        assert_eq!(trued, this_round, "差额为负时退回本轮估值,不得为 0");
+        assert!(trued > 0);
+    }
+
+    /// 单轮 turn(没有工具轮)补差是**恒等变换**,不得改动真值。
+    #[test]
+    fn 单轮turn补差不改真值() {
+        let truth = 16_664u64;
+        assert_eq!(true_up_input(truth, 0, 5_000), truth, "没有已报量时原样保留真总量");
+    }
+
     /// `result.usage.inputTokens` 是**未命中量**,必须把 cacheRead + cacheWrite 加回来。
     ///
     /// 数据取自 2026-08-18 本机 `cursor-agent 2026.08.11-e8db854` 钩 http2 的**同一次
@@ -2387,6 +2521,7 @@ mod tests {
             pending: Mutex::new(None),
             pgid: Mutex::new(Some(pgid)),
             at: Mutex::new(Instant::now()),
+            billed_input: std::sync::atomic::AtomicU64::new(0),
         };
         conv.kill_procs();
 
@@ -2591,6 +2726,7 @@ mod tests {
             pending: Mutex::new(None),
             at: Mutex::new(Instant::now()),
             pgid: Mutex::new(None),
+            billed_input: std::sync::atomic::AtomicU64::new(0),
         };
         // 无挂起 → 明确报错。
         assert!(conv
