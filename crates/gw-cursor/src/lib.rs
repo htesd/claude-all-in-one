@@ -1404,6 +1404,9 @@ impl Provider for CursorProvider {
                 &ws,
                 &cli_model,
                 &prompt,
+                // 新会话的 input 基准要含 system(它经 AGENTS.md 落盘,CLI 每轮重读,
+                // 上游照样计费)。续会话不用它 —— `sim_total` 的口径本来就含 system。
+                &system,
                 resume_sid,
                 &tools,
                 &req.model,
