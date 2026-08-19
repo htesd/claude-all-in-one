@@ -2457,46 +2457,81 @@ fn affinity_scoped_by_client(family: &str) -> bool {
 ///
 /// 非文本块(image / tool_use / tool_result / thinking …)不参与判空:一条只带图片、
 /// 没有文字的消息是合法的。
-fn is_empty_message_content(content: Option<&serde_json::Value>) -> bool {
-    match content {
-        None | Some(serde_json::Value::Null) => true,
-        Some(serde_json::Value::String(s)) => s.trim().is_empty(),
-        Some(serde_json::Value::Array(blocks)) => {
-            if blocks.is_empty() {
-                return true;
-            }
-            // 任一空 text 块即非法(上游按块校验,不是按整条消息)。
-            blocks.iter().any(|b| {
-                b.get("type").and_then(|t| t.as_str()) == Some("text")
-                    && b.get("text")
-                        .and_then(|t| t.as_str())
-                        .is_none_or(|t| t.trim().is_empty())
-            })
-        }
-        // 其余类型(数字/布尔/对象)本就不是合法 content,交给上游报错,这里不拦。
-        Some(_) => false,
-    }
+/// 空 text 块判定:空串/纯空白/缺 text 字段(上游按块校验,不是按整条消息)。
+fn is_empty_text_block(b: &serde_json::Value) -> bool {
+    b.get("type").and_then(|t| t.as_str()) == Some("text")
+        && b.get("text")
+            .and_then(|t| t.as_str())
+            .is_none_or(|t| t.trim().is_empty())
 }
 
-/// 校验 `messages` 数组里没有空 content 的消息。
+/// 空内容占位符(单空格)——对齐 kiro converter 的 `EMPTY_CONTENT_PLACEHOLDER`,上游实测合法。
+const EMPTY_MSG_PLACEHOLDER: &str = " ";
+
+/// 入站自愈:清掉 `messages` 里的空 content,而不是整条请求打回去。
 ///
-/// 返回 `Err(人话错误)` —— 点名是第几条、什么角色,让客户端能直接定位;上游那句
-/// "Improperly formed request." 什么都不说。
-fn validate_message_contents(body: &serde_json::Value) -> Result<(), String> {
-    let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else {
+/// 返回 `Ok(修复记录)` —— 空 Vec 表示报文本来就干净;`Err(人话)` 表示无法修复。
+///
+/// 为什么不再硬拒(2026-08-19):旧版在此 400 并点名下标(当时实测零假阳性),但空块的
+/// 头号来源是**被掐断的流** —— 流在 text 块开头后零增量就断,Claude Code 会把带空
+/// `{"type":"text","text":""}` 的 assistant 轮写进本地会话历史,之后该会话每个请求都被拦,
+/// 永久变砖。自动修复让会话自愈;每条修复落 warn 日志,发垃圾的客户端照样看得见。
+///
+/// 修复动作(保序、不动消息条数 —— 会话亲和键与计费口径不漂移):
+/// - content 数组里的空 text 块:删除,其余块原样保留;
+/// - 整条 content 因此变空(或本来就是空串/null/缺字段):用单空格占位 text 块顶替;
+/// - **例外仍拒**:最后一条当前轮 user 消息为空(不能替用户编造输入),报错点名下标。
+fn sanitize_message_contents(body: &mut serde_json::Value) -> Result<Vec<String>, String> {
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         // 缺 messages / 类型不对:交给下游既有路径处理,这里只管空 content 这一件事。
-        return Ok(());
+        return Ok(Vec::new());
     };
-    for (i, m) in msgs.iter().enumerate() {
-        if is_empty_message_content(m.get("content")) {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-            return Err(format!(
-                "messages[{i}] (role={role}) 的 content 为空。Anthropic 协议不允许空消息内容,\
-                 上游会以 \"Improperly formed request\" 拒绝整个请求。请删除该条消息或填入非空内容。"
+    let mut repairs = Vec::new();
+    let last = msgs.len().saturating_sub(1);
+    for (i, m) in msgs.iter_mut().enumerate() {
+        let role = m
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("?")
+            .to_string();
+        // 非对象消息本就不合法,留给下游/上游报错,这里不猜。
+        let Some(obj) = m.as_object_mut() else {
+            continue;
+        };
+        let whole_empty = match obj.get_mut("content") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+            Some(serde_json::Value::Array(blocks)) => {
+                let before = blocks.len();
+                blocks.retain(|b| !is_empty_text_block(b));
+                if blocks.len() != before {
+                    repairs.push(format!(
+                        "messages[{i}] (role={role}) 删除 {} 个空 text 块",
+                        before - blocks.len()
+                    ));
+                }
+                blocks.is_empty()
+            }
+            // 其余类型(数字/布尔/对象)本就不是合法 content,交给上游报错,这里不动。
+            Some(_) => false,
+        };
+        if whole_empty {
+            if i == last && role == "user" {
+                return Err(format!(
+                    "messages[{i}] (role=user) 的 content 为空且是当前轮,无法自动修复\
+                     (不能替用户编造输入)。请填入非空内容。"
+                ));
+            }
+            obj.insert(
+                "content".into(),
+                serde_json::json!([{"type": "text", "text": EMPTY_MSG_PLACEHOLDER}]),
+            );
+            repairs.push(format!(
+                "messages[{i}] (role={role}) content 为空,已用占位符顶替"
             ));
         }
     }
-    Ok(())
+    Ok(repairs)
 }
 
 /// 哪些 provider 家族挂 OpenAI 线缆入口。
@@ -2577,7 +2612,7 @@ async fn openai_entry(
 
 /// 入站转换失败 → OpenAI 形状的 400。
 ///
-/// **不占账号、不消耗配额**:与 `validate_message_contents` 同样的「在门口挡掉」思路,
+/// **不占账号、不消耗配额**:与 `sanitize_message_contents` 同样的「在门口处理」思路,
 /// 而且 `param` 会点名出问题的字段,客户端能直接定位。
 fn openai_convert_error(e: &gw_core::openai::ConvertError) -> axum::response::Response {
     tracing::debug!("OpenAI 入站请求非法,本地拒绝: {e}");
@@ -2599,17 +2634,34 @@ async fn handle_chat(
     body: serde_json::Value,
     wire: Wire,
 ) -> axum::response::Response {
-    let req = ChatRequest::from_anthropic_body(body);
-    // 入站结构校验:空 content 的消息上游必拒(2026-08-02 实测 失败样本命中 8/173、
-    // 成功样本 0/400,零假阳性),且失败时上游回的是含糊的 "Improperly formed request",
-    // 客户根本查不出是哪条消息的问题。在这里挡掉:不占账号、不消耗配额、报错点名下标。
-    if let Err(msg) = validate_message_contents(&req.body) {
-        tracing::debug!("入站请求结构非法,本地拒绝: {msg}");
-        return error_response(wire, StatusCode::BAD_REQUEST, &msg);
-    }
+    let mut req = ChatRequest::from_anthropic_body(body);
     // 请求日志(#③)采集:进入即计时。报文序列化(client/kiro)推迟到收尾的 blocking 任务里做,
     // 不在热路径(handler 入口)同步跑(审查 Skeptic#1)。
     let started_at = std::time::Instant::now();
+    // 客户 key 归属:router 鉴权后经内网头透传(对外 Authorization 不到 worker)。
+    let client_key = headers
+        .get(crate::CLIENT_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    // 入站空 content 自愈:断流会在 Claude Code 会话历史里留下空 text 块,硬拒会让该会话
+    // 永久变砖(2026-08-19 起由 400 改为修复;旧实测依据:失败样本命中 8/173、成功样本
+    // 0/400)。修复不打断请求、不占账号;无法修复(当前轮 user 为空)才拒,报错点名下标。
+    match sanitize_message_contents(&mut req.body) {
+        Ok(repairs) if !repairs.is_empty() => {
+            tracing::warn!(
+                model = %req.model,
+                client_key = %client_key,
+                ?repairs,
+                "入站请求含空 content,已自动修复"
+            );
+        }
+        Ok(_) => {}
+        Err(msg) => {
+            tracing::warn!(model = %req.model, client_key = %client_key, "入站请求空 content 无法修复,拒绝: {msg}");
+            return error_response(wire, StatusCode::BAD_REQUEST, &msg);
+        }
+    }
     // 客户 key 归属:router 鉴权后经内网头透传(对外 Authorization 不到 worker)。
     // 请求所属分组:头由 router 依据 key 的分组生成、经内网白名单转发(客户端伪造的
     // 同名头在白名单转发时被丢弃)。头缺席 = 未分组请求 → 全量池,与重构前逐字节相同。
@@ -2627,11 +2679,6 @@ async fn handle_chat(
     let view = group
         .as_deref()
         .map(|g| st.group_views.read().get(g).cloned().unwrap_or_default());
-    let client_key = headers
-        .get(crate::CLIENT_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
     // 会话亲和键 = provider 派生的 conversationId(Kiro)。None → 无亲和按负载选号。
     // cursor 还要再按客户 key 分一层 —— 不分就是跨客户串话,见 `affinity_scoped_by_client`。
     let client_scope = affinity_scoped_by_client(st.provider.family()).then_some(client_key.as_str());
@@ -4576,26 +4623,11 @@ mod tests {
     use gw_core::store::{UsageRecord, UsageSink};
     use std::collections::BTreeMap;
 
-    /// 空 content 必须在入站被拦下:上游对这类请求回含糊的 "Improperly formed request",
-    /// 客户查不出是哪条消息;放行还会白占一个账号的并发槽。
-    /// (2026-08-02 实测:失败样本命中 8/173,成功样本 0/400 —— 零假阳性。)
+    /// 空 content 在入站被自愈而不是硬拒(2026-08-19 起):断流会在 Claude Code 会话历史
+    /// 留下空 text 块,硬拒 = 会话永久变砖。历史消息变空 → 单空格占位符顶替(对齐 kiro
+    /// converter 的 EMPTY_CONTENT_PLACEHOLDER,上游实测合法);消息条数不变,亲和键不漂移。
     #[test]
-    fn empty_message_content_is_rejected_with_index_and_role() {
-        let body = serde_json::json!({
-            "model": "claude-opus-5",
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "ok"},
-                {"role": "user", "content": ""}
-            ]
-        });
-        let err = validate_message_contents(&body).expect_err("空 content 应被拒");
-        assert!(err.contains("messages[2]"), "应点名下标,实际: {err}");
-        assert!(err.contains("role=user"), "应点名角色,实际: {err}");
-    }
-
-    #[test]
-    fn empty_content_variants_all_rejected() {
+    fn empty_history_message_is_repaired_with_placeholder() {
         for (label, content) in [
             ("空串", serde_json::json!("")),
             ("纯空白", serde_json::json!("   \n ")),
@@ -4607,41 +4639,114 @@ mod tests {
             ),
             ("null", serde_json::Value::Null),
         ] {
-            let body = serde_json::json!({"messages": [{"role": "user", "content": content}]});
+            let mut body = serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": "继续"}
+            ]});
+            let repairs =
+                sanitize_message_contents(&mut body).unwrap_or_else(|e| panic!("{label} 应被修复而非拒绝: {e}"));
+            assert!(!repairs.is_empty(), "{label} 应有修复记录");
             assert!(
-                validate_message_contents(&body).is_err(),
-                "{label} 应被判为空 content"
+                repairs.iter().any(|r| r.contains("messages[1]") && r.contains("占位符")),
+                "{label} 应点名下标并记占位修复: {repairs:?}"
             );
+            assert_eq!(
+                body["messages"][1]["content"],
+                serde_json::json!([{"type": "text", "text": " "}]),
+                "{label} 应被占位符顶替"
+            );
+            assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{label} 消息条数不应变");
         }
-        // content 字段整个缺席
-        let body = serde_json::json!({"messages": [{"role": "user"}]});
-        assert!(validate_message_contents(&body).is_err(), "缺 content 应被拒");
+        // content 字段整个缺席,同理修复。
+        let mut body = serde_json::json!({"messages": [
+            {"role": "assistant"},
+            {"role": "user", "content": "hi"}
+        ]});
+        let repairs = sanitize_message_contents(&mut body).expect("缺 content 应被修复");
+        assert_eq!(repairs.len(), 1, "缺 content 应记一条修复: {repairs:?}");
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!([{"type": "text", "text": " "}])
+        );
+    }
+
+    /// 数组里混着空 text 块:只删空块,其余块(图片/tool_use/thinking)原样保留。
+    #[test]
+    fn empty_text_blocks_stripped_others_kept() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "想了一下", "signature": "s"},
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {}},
+                {"type": "text", "text": "  \n"}
+            ]},
+            {"role": "user", "content": "继续"}
+        ]});
+        let repairs = sanitize_message_contents(&mut body).expect("应修复");
+        assert_eq!(repairs.len(), 1, "只记一条删块修复: {repairs:?}");
+        assert!(repairs[0].contains("2 个空 text 块"), "应报删了 2 块: {repairs:?}");
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "只剩 thinking + tool_use: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[1]["type"], "tool_use");
+    }
+
+    /// 最后一条当前轮 user 消息为空:不能替用户编造输入,仍拒并点名下标。
+    #[test]
+    fn empty_final_user_message_still_rejected() {
+        let mut body = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": ""}
+            ]
+        });
+        let err = sanitize_message_contents(&mut body).expect_err("当前轮空 user 应被拒");
+        assert!(err.contains("messages[2]"), "应点名下标,实际: {err}");
+        assert!(err.contains("role=user"), "应点名角色,实际: {err}");
+
+        // 末尾空 assistant(prefill)则可以安全顶替 —— 一个空格的前缀不影响续写。
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": []}
+        ]});
+        let repairs = sanitize_message_contents(&mut body).expect("末尾空 assistant 应被修复");
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{"type": "text", "text": " "}])
+        );
     }
 
     #[test]
     fn non_empty_and_non_text_blocks_pass() {
-        // 只带图片、没有文字的消息是合法的,不能误伤。
-        let img = serde_json::json!({"messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
-        ]}]});
-        assert!(validate_message_contents(&img).is_ok(), "纯图片消息应放行");
-
-        // tool_result / tool_use 同理。
-        let tool = serde_json::json!({"messages": [{"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "tu_1", "content": "done"}
-        ]}]});
-        assert!(validate_message_contents(&tool).is_ok(), "纯 tool_result 应放行");
-
-        // 正常文本 + 图片混排。
-        let mixed = serde_json::json!({"messages": [{"role": "user", "content": [
-            {"type": "text", "text": "看这张图"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
-        ]}]});
-        assert!(validate_message_contents(&mixed).is_ok(), "文本+图片应放行");
-
-        // 没有 messages 字段:不归本校验管,放行交给下游。
-        let none = serde_json::json!({"model": "claude-opus-5"});
-        assert!(validate_message_contents(&none).is_ok(), "缺 messages 不该在此报错");
+        // 干净的报文:不动一个字节,修复记录为空。
+        for (label, body) in [
+            // 只带图片、没有文字的消息是合法的,不能误伤。
+            ("纯图片", serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+            ]}]})),
+            // tool_result / tool_use 同理。
+            ("纯 tool_result", serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "done"}
+            ]}]})),
+            // 正常文本 + 图片混排。
+            ("文本+图片", serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "看这张图"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}}
+            ]}]})),
+            // 没有 messages 字段:不归本校验管,放行交给下游。
+            ("缺 messages", serde_json::json!({"model": "claude-opus-5"})),
+        ] {
+            let mut b = body.clone();
+            let repairs =
+                sanitize_message_contents(&mut b).unwrap_or_else(|e| panic!("{label} 应放行: {e}"));
+            assert!(repairs.is_empty(), "{label} 不该有修复记录: {repairs:?}");
+            assert_eq!(b, body, "{label} 报文不应被改动");
+        }
     }
 
     #[test]
