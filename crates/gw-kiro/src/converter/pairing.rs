@@ -1,6 +1,6 @@
 //! tool_use/tool_result 配对校验与孤儿清理(防 Kiro 400)。
 
-use super::EMPTY_CONTENT_PLACEHOLDER;
+use super::EMPTY_USER_CONTENT_PLACEHOLDER;
 use crate::kiro_types::conversation::Message;
 use crate::kiro_types::tool::ToolResult;
 
@@ -161,13 +161,14 @@ pub(super) fn remove_orphaned_tool_results(history: &mut [Message]) {
             // 修复排序隐患：merge_user_messages 当初对"无文本但有 tool_result"的回合
             // 故意保留空 content（合法工具结果回合）。若这里把它仅有的 tool_result 作为孤儿
             // 删光，该消息就变成"彻底空"（content/tool_results/images 全空），Kiro 会判 400。
-            // 此处补占位符兜底，保证清理后不残留空 content 消息。
+            // 此处补 user 专用占位符兜底（纯空白 user content 同样被 Kiro 拒，
+            // 见 EMPTY_USER_CONTENT_PLACEHOLDER），保证清理后不残留非法消息。
             if uim.content.trim().is_empty()
                 && uim.user_input_message_context.tool_results.is_empty()
                 && uim.images.is_empty()
                 && uim.documents.is_empty()
             {
-                uim.content = EMPTY_CONTENT_PLACEHOLDER.to_string();
+                uim.content = EMPTY_USER_CONTENT_PLACEHOLDER.to_string();
                 repaired_empty += 1;
             }
         }

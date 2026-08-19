@@ -1,6 +1,6 @@
 use super::*;
 // 测试专用类型(impl 部分不用,集中在此避免 lib 的 unused_imports)
-use crate::kiro_types::conversation::{AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, UserMessage};
+use crate::kiro_types::conversation::{AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, ReasoningContent, UserMessage};
 use crate::kiro_types::tool::ToolResult;
 
 #[test]
@@ -1337,7 +1337,7 @@ fn test_empty_assistant_message_never_produces_empty_content() {
         role: "assistant".to_string(),
         content: serde_json::json!([]),
     };
-    let converted = convert_assistant_message(&empty_msg, &mut tool_name_map, false).unwrap();
+    let converted = convert_assistant_message(&empty_msg, &mut tool_name_map, false, "claude-opus-4.8").unwrap();
     assert!(
         !converted.assistant_response_message.content.is_empty(),
         "空 assistant 消息的 content 不能为空"
@@ -1348,7 +1348,7 @@ fn test_empty_assistant_message_never_produces_empty_content() {
         role: "assistant".to_string(),
         content: serde_json::json!(""),
     };
-    let converted2 = convert_assistant_message(&empty_str_msg, &mut tool_name_map, false).unwrap();
+    let converted2 = convert_assistant_message(&empty_str_msg, &mut tool_name_map, false, "claude-opus-4.8").unwrap();
     assert!(
         !converted2.assistant_response_message.content.is_empty(),
         "空字符串 assistant 消息的 content 不能为空"
@@ -1358,7 +1358,7 @@ fn test_empty_assistant_message_never_produces_empty_content() {
     let m1 = crate::anthropic_types::Message { role: "assistant".to_string(), content: serde_json::json!([]) };
     let m2 = crate::anthropic_types::Message { role: "assistant".to_string(), content: serde_json::json!("") };
     let refs: Vec<&crate::anthropic_types::Message> = vec![&m1, &m2];
-    let merged = merge_assistant_messages(&refs, &mut tool_name_map, false).unwrap();
+    let merged = merge_assistant_messages(&refs, &mut tool_name_map, false, "claude-opus-4.8").unwrap();
     assert!(
         !merged.assistant_response_message.content.is_empty(),
         "合并多条全空 assistant 消息后 content 不能为空"
@@ -1375,7 +1375,7 @@ fn test_empty_assistant_with_tool_use_still_placeholder() {
             {"type": "tool_use", "id": "tu-1", "name": "read", "input": {"path": "/x"}}
         ]),
     };
-    let converted = convert_assistant_message(&msg, &mut tool_name_map, false).unwrap();
+    let converted = convert_assistant_message(&msg, &mut tool_name_map, false, "claude-opus-4.8").unwrap();
     assert!(!converted.assistant_response_message.content.is_empty());
     assert!(converted.assistant_response_message.tool_uses.is_some());
 }
@@ -1393,7 +1393,7 @@ fn test_history_assistant_strips_thinking_for_cache_stability() {
             {"type": "text", "text": "最终答案"}
         ]),
     };
-    let c = convert_assistant_message(&msg, &mut m, false).unwrap();
+    let c = convert_assistant_message(&msg, &mut m, false, "claude-opus-4.8").unwrap();
     let content = c.assistant_response_message.content;
     assert_eq!(content, "最终答案", "应只保留正文，thinking 被剥离");
     assert!(!content.contains("<thinking>"));
@@ -1406,7 +1406,7 @@ fn test_history_assistant_strips_thinking_for_cache_stability() {
             {"type": "thinking", "thinking": "只有思考没有答案"}
         ]),
     };
-    let c2 = convert_assistant_message(&msg2, &mut m, false).unwrap();
+    let c2 = convert_assistant_message(&msg2, &mut m, false, "claude-opus-4.8").unwrap();
     let content2 = c2.assistant_response_message.content;
     assert!(!content2.contains("只有思考"), "thinking-only 不应进历史内容");
     assert!(!content2.is_empty(), "应兜底为非空占位符避免 Kiro 400");
@@ -1472,8 +1472,9 @@ fn test_keep_thinking_for_unit_window_semantics() {
 }
 
 #[test]
-fn test_convert_assistant_message_keep_thinking_deterministic_format() {
-    // keep=true 时拼接格式必须确定性:`<thinking>…</thinking>\n{text}`。
+fn test_convert_assistant_message_unsigned_thinking_dropped_regardless_of_window() {
+    // 2026-08-20 用户决策(对齐官方两个时代的客户端行为):无签名 thinking 一律不回传,
+    // 窗口内外产出逐字节一致(正文永不含 <thinking> 文本嵌入)。
     let mut m = HashMap::new();
     let msg = crate::anthropic_types::Message {
         role: "assistant".to_string(),
@@ -1482,20 +1483,20 @@ fn test_convert_assistant_message_keep_thinking_deterministic_format() {
             {"type": "text", "text": "最终答案X"}
         ]),
     };
-    let kept = convert_assistant_message(&msg, &mut m, true).unwrap();
-    assert_eq!(
-        kept.assistant_response_message.content,
-        "<thinking>推理过程T</thinking>\n最终答案X"
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    assert_eq!(kept.assistant_response_message.content, "最终答案X");
+    assert!(
+        kept.assistant_response_message.reasoning_content.is_none(),
+        "无签名 thinking 不得挂 reasoningContent"
     );
-    // 同一条消息 keep=false 必须与 v49 逐字节一致(只留正文)。
-    let dropped = convert_assistant_message(&msg, &mut m, false).unwrap();
+    let dropped = convert_assistant_message(&msg, &mut m, false, "claude-opus-4.8").unwrap();
     assert_eq!(dropped.assistant_response_message.content, "最终答案X");
+    assert!(dropped.assistant_response_message.reasoning_content.is_none());
 }
 
 #[test]
-fn test_convert_assistant_message_keep_thinking_only_not_placeholder() {
-    // thinking-only 消息落在保留窗口内:content 即 thinking 块本身,消息非空 →
-    // 不落占位符、不走空消息告警分支。
+fn test_convert_assistant_message_unsigned_thinking_only_falls_back_to_placeholder() {
+    // 无签名 thinking-only 消息:不回传、正文为空 → 占位符兜底(Kiro 不接受空 content)。
     let mut m = HashMap::new();
     let msg = crate::anthropic_types::Message {
         role: "assistant".to_string(),
@@ -1503,11 +1504,116 @@ fn test_convert_assistant_message_keep_thinking_only_not_placeholder() {
             {"type": "thinking", "thinking": "只有思考"}
         ]),
     };
-    let kept = convert_assistant_message(&msg, &mut m, true).unwrap();
-    assert_eq!(
-        kept.assistant_response_message.content,
-        "<thinking>只有思考</thinking>"
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    assert!(
+        !kept.assistant_response_message.content.is_empty(),
+        "无签名 thinking-only 消息应落占位符,content 非空"
     );
+    assert!(!kept.assistant_response_message.content.contains("只有思考"));
+    assert!(kept.assistant_response_message.reasoning_content.is_none());
+}
+
+/// 一条真实的 Kiro opus-4.8 thinking 签名(f6 = 内部代号 claude-quince,原装未改写形态)。
+/// 2026-08-19 起下发链路不再改写 f6,客户端回传的就是它。
+const REAL_SIG_QUINCE: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
+
+/// 构造带签名 thinking + text 的历史 assistant 消息。
+fn signed_asst(thinking: &str, sig: &str, text: &str) -> crate::anthropic_types::Message {
+    crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "thinking", "thinking": thinking, "signature": sig},
+            {"type": "text", "text": text}
+        ]),
+    }
+}
+
+#[test]
+fn test_signed_thinking_attaches_reasoning_content_in_window() {
+    // 窗口内 + 真签名 + 模型匹配:挂结构化 reasoningContent,签名逐字节透传(不改写),
+    // 正文保持纯文本(无 <thinking> 嵌入)。
+    let mut m = HashMap::new();
+    let msg = signed_asst("真实推理", REAL_SIG_QUINCE, "最终答案");
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    assert_eq!(kept.assistant_response_message.content, "最终答案");
+    match &kept.assistant_response_message.reasoning_content {
+        Some(ReasoningContent::ReasoningText { reasoning_text }) => {
+            assert_eq!(reasoning_text.text, "真实推理");
+            assert_eq!(reasoning_text.signature, REAL_SIG_QUINCE, "原装签名逐字节透传");
+        }
+        other => panic!("应挂 reasoningText,实际 {other:?}"),
+    }
+    // 窗口外:同一条消息不得挂 reasoningContent。
+    let dropped = convert_assistant_message(&msg, &mut m, false, "claude-opus-4.8").unwrap();
+    assert!(dropped.assistant_response_message.reasoning_content.is_none());
+    assert_eq!(dropped.assistant_response_message.content, "最终答案");
+}
+
+#[test]
+fn test_legacy_rewritten_signature_dropped_not_forwarded() {
+    // 过渡形态:2026-08-19 之前下发的签名 f6 被改写为官方名(claude-opus-4-8)。
+    // 透传原则下不做反写(逆变换已退役),这类签名**直接丢弃** reasoning ——
+    // 宁可少一段历史推理,也不让上游吃 THINKING_SIGNATURE_INVALID。
+    let mut m = HashMap::new();
+    let legacy = crate::signature::rewrite_model_in_signature(REAL_SIG_QUINCE, "claude-opus-4-8")
+        .expect("改写应成功");
+    let msg = signed_asst("旧会话的推理", &legacy, "答");
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    assert!(
+        kept.assistant_response_message.reasoning_content.is_none(),
+        "改写过的存量签名应被丢弃,不上行"
+    );
+    assert_eq!(kept.assistant_response_message.content, "答", "正文不受影响");
+}
+
+#[test]
+fn test_signed_thinking_dropped_when_model_mismatch_or_unsupported() {
+    let mut m = HashMap::new();
+    let msg = signed_asst("推理", REAL_SIG_QUINCE, "答");
+    // quince 是 opus-4.8 的代号,当前请求换成 opus-5 → 模型不匹配,丢(对齐官方)。
+    let mismatched = convert_assistant_message(&msg, &mut m, true, "claude-opus-5").unwrap();
+    assert!(mismatched.assistant_response_message.reasoning_content.is_none());
+    // 无原生签名推理的模型(opus-4.6)→ 整个不上传(modelSupportsReasoning 门)。
+    let unsupported = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.6").unwrap();
+    assert!(unsupported.assistant_response_message.reasoning_content.is_none());
+}
+
+#[test]
+fn test_synthesized_signature_dropped_before_upstream() {
+    // 我方合成的假签名(无原生推理模型的下行兜底)→ 重推导识别后丢弃,
+    // 不带上行白吃 THINKING_SIGNATURE_INVALID。
+    let mut m = HashMap::new();
+    let text = "synthetic reasoning body";
+    let synth = crate::signature::synthesize_signature("claude-opus-4-8", text);
+    let msg = signed_asst(text, &synth, "答");
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    assert!(
+        kept.assistant_response_message.reasoning_content.is_none(),
+        "合成签名必须被识别并丢弃"
+    );
+}
+
+#[test]
+fn test_redacted_thinking_maps_to_redacted_content() {
+    // Anthropic redacted_thinking 块 → {redactedContent: <base64>},优先于 text 形态。
+    let mut m = HashMap::new();
+    let msg = crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "redacted_thinking", "data": "aGVsbG8td29ybGQ="},
+            {"type": "text", "text": "答"}
+        ]),
+    };
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    match &kept.assistant_response_message.reasoning_content {
+        Some(ReasoningContent::Redacted { redacted_content }) => {
+            assert_eq!(redacted_content, "aGVsbG8td29ybGQ=");
+        }
+        other => panic!("应挂 redactedContent,实际 {other:?}"),
+    }
+    // 线缆形态断言:JSON 键名必须是 reasoningContent / redactedContent。
+    let v = serde_json::to_value(&kept.assistant_response_message).unwrap();
+    assert!(v["reasoningContent"]["redactedContent"].is_string(), "实际: {v}");
 }
 
 #[test]
@@ -1521,8 +1627,8 @@ fn test_convert_assistant_message_keep_true_without_thinking_byte_identical() {
             {"type": "tool_use", "id": "tu_1", "name": "read", "input": {}}
         ]),
     };
-    let kept = convert_assistant_message(&msg, &mut m, true).unwrap();
-    let dropped = convert_assistant_message(&msg, &mut m, false).unwrap();
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-4.8").unwrap();
+    let dropped = convert_assistant_message(&msg, &mut m, false, "claude-opus-4.8").unwrap();
     assert_eq!(kept.assistant_response_message.content, "没思考的回答");
     assert_eq!(
         serde_json::to_value(&kept.assistant_response_message).unwrap(),
@@ -1556,13 +1662,8 @@ fn hist_user(text: &str) -> crate::anthropic_types::Message {
 }
 
 fn hist_asst(thinking: &str, text: &str) -> crate::anthropic_types::Message {
-    crate::anthropic_types::Message {
-        role: "assistant".to_string(),
-        content: serde_json::json!([
-            {"type": "thinking", "thinking": thinking},
-            {"type": "text", "text": text}
-        ]),
-    }
+    // 带原装签名的 thinking(2026-08-19 起无签名的一律丢,不参与窗口语义)。
+    signed_asst(thinking, REAL_SIG_QUINCE, text)
 }
 
 /// 历史里所有 assistant 消息的 content(含系统对的固定应答,在 index 0)。
@@ -1576,11 +1677,25 @@ fn history_assistant_contents(history: &[Message]) -> Vec<String> {
         .collect()
 }
 
+/// 历史里每条 assistant 消息是否挂了结构化 reasoningContent(窗口命中标记)。
+fn history_assistant_reasoning(history: &[Message]) -> Vec<bool> {
+    history
+        .iter()
+        .filter_map(|m| match m {
+            Message::Assistant(a) => {
+                Some(a.assistant_response_message.reasoning_content.is_some())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn test_build_history_thinking_window_slides_tail_only() {
     // 本开关存在的意义:模拟同一条会话连续 3 轮(每轮历史末尾追加 assistant+user),
     // turns=1 时断言**历史前缀跨轮只在尾部变化,更早的字节完全一致** ——
     // 这正是抗客户端 thinking 滚动裁剪抖动、保住 Kiro prefix cache 的核心性质。
+    // (2026-08-19 起窗口的载体是结构化 reasoningContent:挂/摘,不再嵌入正文。)
     let req = bare_history_req();
     let mut map = HashMap::new();
 
@@ -1600,18 +1715,15 @@ fn test_build_history_thinking_window_slides_tail_only() {
     let h3 = build_history_with_turns(&req, &turn3, "claude-opus-4.8", &[], &mut map, 1).unwrap();
     let h4 = build_history_with_turns(&req, &turn4, "claude-opus-4.8", &[], &mut map, 1).unwrap();
 
-    // turns=1:只有倒数第 1 个 assistant 单元保留 thinking(contents[0] 是系统对的固定应答)。
-    let a2 = history_assistant_contents(&h2);
-    assert_eq!(a2[1], "<thinking>思1</thinking>\n答1", "末段应保留 thinking");
-    let a3 = history_assistant_contents(&h3);
-    assert_eq!(a3[1], "答1", "滑出窗口后 thinking 必须丢弃");
-    assert_eq!(a3[2], "<thinking>思2</thinking>\n答2");
+    // turns=1:只有倒数第 1 个 assistant 单元挂 reasoning(flags[0] 是系统对的固定应答)。
+    assert_eq!(history_assistant_reasoning(&h2), [false, true], "末段应挂 reasoning");
+    assert_eq!(history_assistant_reasoning(&h3), [false, false, true], "滑出窗口即摘");
+    assert_eq!(history_assistant_reasoning(&h4), [false, false, false, true]);
+    // 正文永远是纯文本,不含 thinking 嵌入。
     let a4 = history_assistant_contents(&h4);
-    assert_eq!(a4[1], "答1", "丢弃后的形态必须跨轮稳定");
-    assert_eq!(a4[2], "答2", "窗口外的一律丢,且与上一轮丢弃形态逐字节一致");
-    assert_eq!(a4[3], "<thinking>思3</thinking>\n答3");
+    assert_eq!(a4[1..], ["答1", "答2", "答3"], "正文不得含 thinking 字节");
 
-    // 核心断言:h3 → h4 的变化**只发生在 h3 的尾部**(答2 从保留变丢弃),
+    // 核心断言:h3 → h4 的变化**只发生在 h3 的尾部**(答2 从挂变摘),
     // 其前所有历史条目跨轮逐字节一致。
     for (i, (m3, m4)) in h3.iter().zip(h4.iter()).enumerate().take(h3.len() - 1) {
         assert_eq!(
@@ -1620,7 +1732,7 @@ fn test_build_history_thinking_window_slides_tail_only() {
             "历史第 {i} 条跨轮必须逐字节一致(前缀稳定性)"
         );
     }
-    // h2 → h3 同理:h2 的最后一条(答1 保留形态)之外,前缀逐字节一致。
+    // h2 → h3 同理:h2 的最后一条(答1 挂形态)之外,前缀逐字节一致。
     for (i, (m2, m3)) in h2.iter().zip(h3.iter()).enumerate().take(h2.len() - 1) {
         assert_eq!(
             serde_json::to_value(m2).unwrap(),
@@ -1633,7 +1745,7 @@ fn test_build_history_thinking_window_slides_tail_only() {
 #[test]
 fn test_build_history_thinking_window_counts_merged_units() {
     // 窗口按**合并单元**(极大连续 assistant 段)计,不按消息条数:
-    // 连续两条 assistant 同属一个单元,同保留同丢弃。
+    // 连续两条 assistant 同属一个单元,同保留同丢弃;合并后只挂**最后一条**的 reasoning。
     let req = bare_history_req();
     let mut map = HashMap::new();
     let msgs = vec![
@@ -1643,18 +1755,26 @@ fn test_build_history_thinking_window_counts_merged_units() {
 
     // turns=1:单元1 整体丢,单元2 保留。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 1).unwrap();
-    let a = history_assistant_contents(&h);
-    assert_eq!(a[1], "答1a\n\n答1b", "窗口外合并单元:thinking 丢弃,正文按 \\n\\n 合并");
-    assert_eq!(a[2], "<thinking>思2</thinking>\n答2");
+    assert_eq!(history_assistant_contents(&h)[1], "答1a\n\n答1b", "合并正文按 \\n\\n 拼接");
+    assert_eq!(history_assistant_reasoning(&h), [false, false, true]);
 
-    // turns=2:两个单元都在窗口内,单元1 每条各自的 thinking 按确定性格式拼回。
+    // turns=2:两个单元都在窗口内;合并单元挂的是最后一条消息(思1b)的 reasoning。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 2).unwrap();
-    let a = history_assistant_contents(&h);
-    assert_eq!(
-        a[1],
-        "<thinking>思1a</thinking>\n答1a\n\n<thinking>思1b</thinking>\n答1b",
-        "窗口内合并单元:每条消息各自的 thinking 都拼回,合并分隔符不变"
-    );
+    assert_eq!(history_assistant_reasoning(&h), [false, true, true]);
+    let unit1 = h.iter().find_map(|m| match m {
+        Message::Assistant(a)
+            if a.assistant_response_message.content == "答1a\n\n答1b" =>
+        {
+            Some(a)
+        }
+        _ => None,
+    }).expect("应有单元1合并消息");
+    match &unit1.assistant_response_message.reasoning_content {
+        Some(ReasoningContent::ReasoningText { reasoning_text }) => {
+            assert_eq!(reasoning_text.text, "思1b", "合并单元挂最后一条的 reasoning");
+        }
+        other => panic!("应挂 reasoningText,实际 {other:?}"),
+    }
 }
 
 #[test]
@@ -1672,24 +1792,23 @@ fn test_build_history_turns_zero_two_and_negative() {
         content: serde_json::json!([{"type": "text", "text": "答3无思考"}]),
     });
 
-    // turns=0(默认):全部丢弃 —— 与 v49 逐字节一致的回归金标准。
+    // turns=0(默认):全部不挂 reasoning,正文纯文本。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 0).unwrap();
     let a = history_assistant_contents(&h);
-    assert_eq!(a[1..], ["答1", "答2", "答3无思考"], "turns=0 必须全丢");
+    assert_eq!(a[1..], ["答1", "答2", "答3无思考"], "turns=0 正文必须全纯文本");
+    assert_eq!(history_assistant_reasoning(&h), [false, false, false, false]);
 
-    // turns=2:窗口外(单元1)一律丢,窗口内(单元2/3)保留;无 thinking 的轮次不凭空造。
+    // turns=2:窗口外(单元1)不挂,窗口内(单元2)挂;无 thinking 的轮次(单元3)不凭空造。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, 2).unwrap();
+    assert_eq!(history_assistant_reasoning(&h), [false, false, true, false]);
     let a = history_assistant_contents(&h);
-    assert_eq!(a[1], "答1", "窗口外的一律丢");
-    assert_eq!(a[2], "<thinking>思2</thinking>\n答2");
-    assert_eq!(a[3], "答3无思考", "客户端没给 thinking 的轮次不得凭空造字节");
+    assert_eq!(a[1..], ["答1", "答2", "答3无思考"]);
 
-    // turns=-1:全量保留(用户测试用);无 thinking 的轮次仍然只是正文。
+    // turns=-1:全量保留;无 thinking 的轮次仍然只是正文。
     let h = build_history_with_turns(&req, &msgs, "claude-opus-4.8", &[], &mut map, -1).unwrap();
+    assert_eq!(history_assistant_reasoning(&h), [false, true, true, false]);
     let a = history_assistant_contents(&h);
-    assert_eq!(a[1], "<thinking>思1</thinking>\n答1");
-    assert_eq!(a[2], "<thinking>思2</thinking>\n答2");
-    assert_eq!(a[3], "答3无思考");
+    assert_eq!(a[1..], ["答1", "答2", "答3无思考"]);
 }
 
 #[test]
@@ -1926,7 +2045,7 @@ fn test_convert_assistant_message_tool_use_only() {
         ]),
     };
 
-    let result = convert_assistant_message(&msg, &mut HashMap::new(), false).expect("应该成功转换");
+    let result = convert_assistant_message(&msg, &mut HashMap::new(), false, "claude-opus-4.8").expect("应该成功转换");
 
     // 验证 content 不为空（使用占位符）
     assert!(
@@ -1961,7 +2080,7 @@ fn test_convert_assistant_message_with_text_and_tool_use() {
         ]),
     };
 
-    let result = convert_assistant_message(&msg, &mut HashMap::new(), false).expect("应该成功转换");
+    let result = convert_assistant_message(&msg, &mut HashMap::new(), false, "claude-opus-4.8").expect("应该成功转换");
 
     // 验证 content 使用原始文本（不是占位符）
     assert_eq!(
@@ -2074,7 +2193,7 @@ fn test_merge_consecutive_assistant_messages() {
     };
 
     let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-    let result = merge_assistant_messages(&messages, &mut HashMap::new(), false).expect("合并应成功");
+    let result = merge_assistant_messages(&messages, &mut HashMap::new(), false, "claude-opus-4.8").expect("合并应成功");
 
     let content = &result.assistant_response_message.content;
     // v49：历史 thinking 被刻意丢弃（缓存稳定性），故合并后**不应**含 thinking 标签

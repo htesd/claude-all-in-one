@@ -452,6 +452,37 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 结构化推理内容(思考链)—— 1.0.212 官方客户端的历史上传通道。
+    ///
+    /// 上线形态由 Smithy 模型定义:`reasoningContent` 是 union,
+    /// 一支 `{reasoningText: {text, signature}}`,另一支 `{redactedContent: <base64>}`。
+    /// 2026-08-19 探针实测:上游验签(`THINKING_SIGNATURE_INVALID`)且**只认签名**,
+    /// `text` 字段被忽略(空文本+真签名,模型仍能还原推理内容)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
+}
+
+/// 历史 assistant 消息的结构化推理内容(对应 Smithy `ReasoningContent` union)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReasoningContent {
+    /// 带签名的推理文本(签名是加密载体,text 仅作形态对齐)。
+    ReasoningText {
+        #[serde(rename = "reasoningText")]
+        reasoning_text: ReasoningText,
+    },
+    /// Anthropic `redacted_thinking` 块的原样映射(base64 密文)。
+    Redacted {
+        #[serde(rename = "redactedContent")]
+        redacted_content: String,
+    },
+}
+
+/// Smithy `ReasoningText` 结构:推理文本 + 上游签名。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningText {
+    pub text: String,
+    pub signature: String,
 }
 
 impl AssistantMessage {
@@ -460,12 +491,19 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    /// 挂上结构化推理内容(历史 thinking 的上行通道)。
+    pub fn with_reasoning_content(mut self, reasoning: ReasoningContent) -> Self {
+        self.reasoning_content = Some(reasoning);
         self
     }
 }

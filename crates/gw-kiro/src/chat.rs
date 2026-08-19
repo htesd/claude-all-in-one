@@ -146,6 +146,22 @@ fn account_scope(account_id: &str, machine_id: &str) -> String {
     machine_id.to_string()
 }
 
+/// 剥离全历史 assistant 消息的 `reasoningContent`(`THINKING_SIGNATURE_INVALID` 兜底,
+/// 对齐官方客户端 Z4:验签失败 → 剥 reasoning 重试一次)。返回是否有实际剥离
+/// (没有则重试无意义,直接走原错误路径)。
+fn strip_reasoning_from_history(req: &mut KiroRequest) -> bool {
+    let mut stripped = false;
+    for msg in &mut req.conversation_state.history {
+        if let crate::kiro_types::conversation::Message::Assistant(a) = msg {
+            if a.assistant_response_message.reasoning_content.is_some() {
+                a.assistant_response_message.reasoning_content = None;
+                stripped = true;
+            }
+        }
+    }
+    stripped
+}
+
 pub async fn chat_stream(
     client: reqwest::Client,
     account: Arc<Account>,
@@ -222,7 +238,7 @@ pub async fn chat_stream(
     // prefix cache 是 per-account 后端会话隔离的。若两账号撞同一派生 conversationId(同 system+
     // 前2条 user),仅用 convId 作键会让 A 账号前缀污染 B 账号命中估算 → 误报折扣/串号计费。
     // 故 key = account_id + '\x1f' + conversationId,与上游缓存粒度对齐。
-    let sim_cache: (i32, i32) = {
+    let mut sim_cache: (i32, i32) = {
         let cs = &kiro_req.conversation_state;
         let session_key = format!("{}\x1f{}", account.account_id, cs.conversation_id);
         let fps = crate::cache_sim::fingerprints_from_state(cs);
@@ -276,22 +292,68 @@ pub async fn chat_stream(
         .map_err(|e| UpstreamError::network(format!("generateAssistantResponse 请求失败: {e}")))?;
 
     let status = resp.status();
+    let mut resp = resp;
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        let err = classify_chat_error(status.as_u16(), &body_text);
-        // 只记**报文格式/体积类**的确定性 400("Improperly formed request")。
-        //
-        // ⚠️ 短语门**不足以**区分「报文坏」与「账号坏」:2026-08-02 实测,`profileArn` 缺失的
-        // 账号(krs-52)对任何请求都回同样的 "Improperly formed request." —— 账号问题穿着
-        // 报文问题的外衣。所以这里只做**记录**,真正判毒由 `poison_memo` 按「同一 body 在
-        // ≥2 个不同账号上都失败」裁决;单账号失败仅留痕,交给账号生命周期处理。
+        // 验签失败兜底(2026-08-19,对齐官方客户端 Z4):历史里带去的 reasoningContent
+        // 签名过期/不被上游接受时,剥掉全历史 reasoningContent 原样重试一次 ——
+        // 请求本体没坏,只是推理存证失效,不应让整个会话失败。
         if status.as_u16() == 400
-            && err.kind == UpstreamErrorKind::BadRequest
-            && body_text.contains("Improperly formed")
+            && body_text.contains("THINKING_SIGNATURE_INVALID")
+            && strip_reasoning_from_history(&mut kiro_req)
         {
-            crate::poison_memo::remember(poison_fp, &account.account_id, body_text.trim());
+            tracing::warn!(
+                "上游 THINKING_SIGNATURE_INVALID,已剥离全历史 reasoningContent 重试一次"
+            );
+            let stripped_body = serde_json::to_string(&kiro_req).map_err(|e| {
+                UpstreamError::new(
+                    UpstreamErrorKind::Other,
+                    format!("序列化 KiroRequest(剥离 reasoning 重试)失败: {e}"),
+                )
+            })?;
+            let rb2 = crate::headers::apply_streaming_headers(
+                client.post(&url),
+                &account,
+                &base_url,
+                &access_token,
+                &machine_id,
+                &version,
+            );
+            let resp2 = rb2.body(stripped_body).send().await.map_err(|e| {
+                UpstreamError::network(format!("generateAssistantResponse 重试请求失败: {e}"))
+            })?;
+            let status2 = resp2.status();
+            if status2.is_success() {
+                // codex 审查:首次观测提交的是**带 reasoning** 的指纹,而实际被上游接受的
+                // 是剥离后的报文 —— 用剥离后的 state 重新观测一次,让本轮计费与缓存状态
+                // 都反映真实发出的字节(observe 同 key 覆盖旧状态,且与上游真实缓存的
+                // 前缀形态一致:上游记住的也是剥离版)。
+                let cs = &kiro_req.conversation_state;
+                let session_key = format!("{}\x1f{}", account.account_id, cs.conversation_id);
+                let fps = crate::cache_sim::fingerprints_from_state(cs);
+                let sim = crate::cache_sim::observe(&session_key, &req.model, fps);
+                sim_cache = (sim.cache_read_tokens as i32, sim.total_tokens as i32);
+                resp = resp2;
+            } else {
+                let body2 = resp2.text().await.unwrap_or_default();
+                return Err(classify_chat_error(status2.as_u16(), &body2));
+            }
+        } else {
+            let err = classify_chat_error(status.as_u16(), &body_text);
+            // 只记**报文格式/体积类**的确定性 400("Improperly formed request")。
+            //
+            // ⚠️ 短语门**不足以**区分「报文坏」与「账号坏」:2026-08-02 实测,`profileArn` 缺失的
+            // 账号(krs-52)对任何请求都回同样的 "Improperly formed request." —— 账号问题穿着
+            // 报文问题的外衣。所以这里只做**记录**,真正判毒由 `poison_memo` 按「同一 body 在
+            // ≥2 个不同账号上都失败」裁决;单账号失败仅留痕,交给账号生命周期处理。
+            if status.as_u16() == 400
+                && err.kind == UpstreamErrorKind::BadRequest
+                && body_text.contains("Improperly formed")
+            {
+                crate::poison_memo::remember(poison_fp, &account.account_id, body_text.trim());
+            }
+            return Err(err);
         }
-        return Err(err);
     }
 
     // 6. 流式读响应字节 → eventstream 解码 → Anthropic SSE StreamItem
@@ -443,13 +505,14 @@ impl BlockTracker {
     /// 处理 reasoningContentEvent:捕获签名 + 逐片发 thinking_delta。
     fn on_reasoning(&mut self, text: &str, signature: Option<&str>) -> Vec<SseEvent> {
         // 1) 先捕获签名(上游在 thinking 流最后一帧单独下发 {"signature":...},无 text)。
-        //    把暴露 Bedrock 渠道的模型代号(claude-quince,f2.f1.f6)换成官方名,保留加密体;
-        //    重写失败则原样透传。必须在 text.is_empty() 早返回前处理。
+        //    **原样透传,不再改写 f6 模型代号**(2026-08-19 起):签名要随客户端历史
+        //    回传上行做结构化 reasoningContent 回放,上游验签只认原代号,改写过的
+        //    签名会吃 400 THINKING_SIGNATURE_INVALID(探针实测)。f6 代号泄漏给
+        //    第三方检测平台的风险,用户已明确不关心(用户体验优先)。
+        //    历史上的改写签名由 converter 在回传时反写兼容(见 history.rs)。
         if let Some(sig) = signature {
             if !sig.is_empty() {
-                let fixed = crate::signature::rewrite_model_in_signature(sig, &self.model)
-                    .unwrap_or_else(|| sig.to_string());
-                self.reasoning_signature = Some(fixed);
+                self.reasoning_signature = Some(sig.to_string());
             }
         }
         if text.is_empty() {
@@ -1282,8 +1345,9 @@ mod tests {
     }
 
     #[test]
-    fn real_signature_rewritten_not_synthesized() {
-        // 上游给真签名(claude-quince)→ 关闭块时应是重写后的(含官方名,无 quince)。
+    fn real_signature_passed_through_untouched() {
+        // 上游给真签名 → 关闭块时**原样透传**(2026-08-19 起不再改写 f6 代号:
+        // 签名要随历史回传上行验签,改写过的会吃 400 THINKING_SIGNATURE_INVALID)。
         const REAL_SIG: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
         let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
         t.on_reasoning("think", Some(REAL_SIG));
@@ -1293,10 +1357,7 @@ mod tests {
             .find(|e| tag(e) == "content_block_delta:signature_delta")
             .expect("应有 signature_delta");
         let sig = sig_ev.data["delta"]["signature"].as_str().unwrap();
-        let raw = base64::engine::general_purpose::STANDARD.decode(sig).unwrap();
-        let s = String::from_utf8_lossy(&raw);
-        assert!(s.contains("claude-opus-4-8"), "签名应含官方模型名");
-        assert!(!s.contains("claude-quince"), "签名不应残留 claude-quince");
+        assert_eq!(sig, REAL_SIG, "真签名必须逐字节透传,不得改写");
     }
 
     #[test]
@@ -1335,8 +1396,57 @@ mod tests {
     }
 
     #[test]
-    fn signature_suppressed_when_emit_disabled_no_upstream_sig() {
-        // emit_signature=false 且上游无签名:不合成、不发 signature_delta,仍闭合块。
+    fn strip_reasoning_from_history_clears_all_and_reports() {
+        use crate::kiro_types::conversation::{
+            AssistantMessage, ConversationState, HistoryAssistantMessage, HistoryUserMessage,
+            Message, ReasoningContent, ReasoningText,
+        };
+        let mut req = KiroRequest {
+            conversation_state: ConversationState::new("conv-strip"),
+            profile_arn: None,
+            additional_model_request_fields: None,
+            agent_mode: None,
+        };
+        // 无 reasoning 时不剥、报 false
+        assert!(!strip_reasoning_from_history(&mut req));
+
+        let with_reasoning =
+            AssistantMessage::new("答").with_reasoning_content(ReasoningContent::ReasoningText {
+                reasoning_text: ReasoningText {
+                    text: "推".into(),
+                    signature: "sig".into(),
+                },
+            });
+        req.conversation_state
+            .history
+            .push(Message::User(HistoryUserMessage::new("问", "claude-opus-4.8")));
+        req.conversation_state
+            .history
+            .push(Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: with_reasoning,
+            }));
+        req.conversation_state
+            .history
+            .push(Message::Assistant(HistoryAssistantMessage::new("纯文本")));
+
+        assert!(strip_reasoning_from_history(&mut req), "有 reasoning 应报 true");
+        for m in &req.conversation_state.history {
+            if let Message::Assistant(a) = m {
+                assert!(
+                    a.assistant_response_message.reasoning_content.is_none(),
+                    "剥离后不得残留 reasoningContent"
+                );
+            }
+        }
+        // 再剥一次:无操作,报 false
+        assert!(!strip_reasoning_from_history(&mut req));
+        // 剥离后的序列化不得再含 reasoningContent 键
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(!s.contains("reasoningContent"), "实际: {s}");
+    }
+
+    #[test]
+    fn signature_suppressed_when_emit_disabled_no_upstream_sig() {        // emit_signature=false 且上游无签名:不合成、不发 signature_delta,仍闭合块。
         let mut t = BlockTracker::new("claude-opus-4-6".to_string(), false);
         t.set_emit_signature(false);
         t.on_reasoning("reasoning text here", None);

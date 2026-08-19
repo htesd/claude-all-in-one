@@ -251,6 +251,7 @@ pub fn fingerprints_from_state(
             Message::Assistant(a) => canon_assistant(
                 &a.assistant_response_message.content,
                 a.assistant_response_message.tool_uses.as_deref(),
+                a.assistant_response_message.reasoning_content.as_ref(),
             ),
         };
         push_chunk_fingerprints(&canon, idx as u32, &mut fps);
@@ -361,9 +362,14 @@ fn canon_user(
 }
 
 /// 规范化一条 assistant 消息为稳定语义字符串。
+///
+/// `reasoning_content`(2026-08-19 结构化历史上传)必须入指纹:它在真实报文里占字节,
+/// 滑窗挂/摘、剥离重试都会改变真实 prefix —— 漏掉它会在 reasoning 摘除后仍误判后续
+/// 历史为缓存命中(高报 cache_read)。
 fn canon_assistant(
     content: &str,
     tool_uses: Option<&[crate::kiro_types::tool::ToolUseEntry]>,
+    reasoning_content: Option<&crate::kiro_types::conversation::ReasoningContent>,
 ) -> String {
     let mut s = String::with_capacity(content.len() + 64);
     s.push_str("A\x1f");
@@ -380,12 +386,65 @@ fn canon_assistant(
             }
         }
     }
+    if let Some(rc) = reasoning_content {
+        use crate::kiro_types::conversation::ReasoningContent;
+        match rc {
+            ReasoningContent::ReasoningText { reasoning_text } => {
+                s.push_str("\x1frt:");
+                s.push_str(&reasoning_text.text);
+                s.push('\x1e');
+                s.push_str(&reasoning_text.signature);
+            }
+            ReasoningContent::Redacted { redacted_content } => {
+                s.push_str("\x1frc:");
+                s.push_str(redacted_content);
+            }
+        }
+    }
     s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canon_assistant_reasoning_changes_fingerprint() {
+        // codex 审查:reasoning_content 必须入指纹 —— 挂/摘/换签名都要产生不同 canon,
+        // 否则滑窗摘掉 reasoning 后模拟器仍按旧前缀判命中,高报 cache_read。
+        use crate::kiro_types::conversation::{ReasoningContent, ReasoningText};
+        let base = canon_assistant("答", None, None);
+        let with_rt = canon_assistant(
+            "答",
+            None,
+            Some(&ReasoningContent::ReasoningText {
+                reasoning_text: ReasoningText {
+                    text: "推".into(),
+                    signature: "sigA".into(),
+                },
+            }),
+        );
+        let other_sig = canon_assistant(
+            "答",
+            None,
+            Some(&ReasoningContent::ReasoningText {
+                reasoning_text: ReasoningText {
+                    text: "推".into(),
+                    signature: "sigB".into(),
+                },
+            }),
+        );
+        let redacted = canon_assistant(
+            "答",
+            None,
+            Some(&ReasoningContent::Redacted {
+                redacted_content: "abc".into(),
+            }),
+        );
+        assert_ne!(base, with_rt, "挂 reasoning 必须改变 canon");
+        assert_ne!(with_rt, other_sig, "换签名必须改变 canon");
+        assert_ne!(with_rt, redacted, "reasoning 两种形态必须区分");
+    }
 
     fn fp(hash: u64, tokens: u32) -> MsgFingerprint {
         MsgFingerprint { hash, tokens }

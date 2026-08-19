@@ -30,7 +30,7 @@ mod tools;
 // 重导出子模块项,使本文件(及测试)无需逐一限定路径即可调用。
 pub use model_map::{
     advertised_models, clamp_effort_for_model, effort_drift, get_context_window_size, map_model,
-    AdvertisedModel, EffortDrift,
+    signature_codename_for, AdvertisedModel, EffortDrift,
 };
 pub use shed::{shed_history_media, MediaShed};
 /// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
@@ -55,7 +55,15 @@ use normalize::*;
 
 /// 空内容占位符。Kiro 要求 message.content 非空(否则 400 Improperly formed request)。
 /// 纯 tool_use 回合或上游空响应残留时,用单空格兜底保持 schema 合法。
+///
+/// ⚠️ 只能用于 **assistant** 消息!2026-08-19 线上实测(V20-V24 变体回放):
+/// user 消息 content 为纯空白(" "/"\\n")时 Kiro 确定性 400 REQUEST_BODY_INVALID,
+/// assistant 纯空白则放行。user 侧请用 [`EMPTY_USER_CONTENT_PLACEHOLDER`]。
 pub(crate) const EMPTY_CONTENT_PLACEHOLDER: &str = " ";
+
+/// user 消息的空内容占位符。Kiro 拒纯空白 user content(见上),但接受任意非空白文本;
+/// 用可见的「(空)」而非隐藏字符,日志/上游两侧都能一眼认出这是兜底痕迹。
+pub(crate) const EMPTY_USER_CONTENT_PLACEHOLDER: &str = "(空)";
 
 /// 媒体附件(image/document)无文本时的占位引导语(实测纯 PDF/纯图无文本 → Kiro 400)。
 pub(crate) const MEDIA_ONLY_PLACEHOLDER: &str = "Please analyze the attached file.";
@@ -325,9 +333,17 @@ pub fn convert_request(
     // Kiro 的 content 非空约束分两种情形：
     //   - 带 image/document 但无文本 → **必须**补非空 content（实测纯 PDF/纯图无文本 → 400，
     //     见 MEDIA_ONLY_PLACEHOLDER）。补一句引导语，让模型明确分析附件。
-    //   - text、tool_results、images、documents 全空 → 补单空格（纯空回合，客户端异常）。
+    //   - text、tool_results、images、documents 全空 → 补 user 专用占位符（纯空回合，
+    //     客户端异常；纯空白 user content 会被 Kiro 拒，见 EMPTY_USER_CONTENT_PLACEHOLDER）。
+    // 归一:纯空白文本视同无文本。否则「text=" " + 有效 tool_result」会把空白原样
+    // 放进当前轮 content —— 纯空白 user content 被 Kiro 确定性 400(2026-08-19 实测)。
+    let text_content = if text_content.trim().is_empty() {
+        String::new()
+    } else {
+        text_content
+    };
     //   - 无文本但有 tool_results（且无媒体）→ 正常工具结果回合，Kiro 接受空文本，不补（否则污染）。
-    let content = if !text_content.trim().is_empty() {
+    let content = if !text_content.is_empty() {
         text_content
     } else if !images.is_empty() || !documents.is_empty() {
         tracing::warn!(
@@ -338,7 +354,7 @@ pub fn convert_request(
         tracing::warn!(
             "当前 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
         );
-        EMPTY_CONTENT_PLACEHOLDER.to_string()
+        EMPTY_USER_CONTENT_PLACEHOLDER.to_string()
     } else {
         // 仅有 tool_results（无媒体、无文本）：正常工具结果回合，保留空文本。
         text_content

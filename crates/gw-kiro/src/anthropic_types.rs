@@ -406,6 +406,12 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// thinking 块的签名(历史回传时携带,用于结构化 reasoningContent 上行)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// redacted_thinking 块的密文数据(base64),上行映射为 `redactedContent`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

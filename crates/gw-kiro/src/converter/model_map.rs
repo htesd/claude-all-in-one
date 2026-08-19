@@ -31,6 +31,18 @@ pub struct KiroModel {
     pub effort_levels: &'static [&'static str],
     /// schema 里标注的 `default`。请求档位不可用时回落到它(对齐真客户端 `A7`)。
     pub default_effort: Option<&'static str>,
+    /// thinking 签名(f2.f1.f6)里的**上游内部模型代号**。
+    ///
+    /// 2026-08-19 探针实测(`kiro_think_probe4/5/6.py`):opus-4.8=`claude-quince`、
+    /// opus-5=`claude-honey`、sonnet-5=`claude-saffron`、opus-4.7 的代号就是官方名
+    /// `claude-opus-4-7` 本身;opus-4.6 / sonnet-4.6 / 4.5 系 / haiku **没有原生签名推理**
+    /// (无 reasoningContentEvent 签名帧,或 inline `<thinking>` 文本形态),它们的客户端
+    /// 签名是我方合成的假签名,上行必过不了验签 → `None`,历史 thinking 不上传
+    /// (对齐官方 `reasoning.unsigned.dropped`)。
+    ///
+    /// 透传原则下代号不做改写/反写,本字段的用途是:「该模型可否做结构化
+    /// reasoningContent 历史上传」的门控 + 签名归属匹配(f6 代号 ≠ 本代号即丢)。
+    pub signature_codename: Option<&'static str>,
 }
 
 /// 5 档全集。opus-5 / sonnet-5 / opus-4.8 / opus-4.7 实测为此形态。
@@ -65,6 +77,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_WITH_XHIGH,
         default_effort: Some("high"),
+        signature_codename: Some("claude-honey"),
     },
     KiroModel {
         advertised_id: "claude-opus-4-8",
@@ -76,6 +89,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_WITH_XHIGH,
         default_effort: Some("high"),
+        signature_codename: Some("claude-quince"),
     },
     KiroModel {
         advertised_id: "claude-opus-4-7",
@@ -88,6 +102,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         effort_levels: EFFORTS_WITH_XHIGH,
         // 全表唯一 default 不是 high 的模型(上游 schema 逐字如此)。
         default_effort: Some("xhigh"),
+        signature_codename: Some("claude-opus-4-7"),
     },
     KiroModel {
         advertised_id: "claude-opus-4-6",
@@ -99,6 +114,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_NO_XHIGH,
         default_effort: Some("high"),
+        signature_codename: None,
     },
     KiroModel {
         advertised_id: "claude-opus-4-5",
@@ -110,6 +126,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: Some("claude-opus-4-5-20251101"),
         effort_levels: EFFORTS_NONE,
         default_effort: None,
+        signature_codename: None,
     },
     KiroModel {
         // 2026-07-02 上游 ListAvailableModels 实测新增(标注 experimental preview),
@@ -123,6 +140,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_WITH_XHIGH,
         default_effort: Some("high"),
+        signature_codename: Some("claude-saffron"),
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-6",
@@ -134,6 +152,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_NO_XHIGH,
         default_effort: Some("high"),
+        signature_codename: None,
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-5",
@@ -145,6 +164,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: Some("claude-sonnet-4-5-20250929"),
         effort_levels: EFFORTS_NONE,
         default_effort: None,
+        signature_codename: None,
     },
     KiroModel {
         advertised_id: "claude-haiku-4-5",
@@ -156,6 +176,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: Some("claude-haiku-4-5-20251001"),
         effort_levels: EFFORTS_NONE,
         default_effort: None,
+        signature_codename: None,
     },
 ];
 
@@ -233,6 +254,19 @@ pub fn effort_drift(upstream: &[(String, Vec<String>, Option<String>)]) -> Vec<E
         }
     }
     out
+}
+
+/// 按上游 kiro_model 查 thinking 签名内部代号(`signature_codename` 字段的门控读口)。
+/// `Some` = 该模型有原生签名推理,历史 thinking 可做结构化 `reasoningContent` 上传;
+/// `None` = 无原生签名推理,历史 thinking 不上传(对齐官方 `reasoning.unsigned.dropped`)。
+///
+/// 透传原则下代号不做改写/反写,用途只剩两个:门控 + 模型匹配(签名 f6 代号必须
+/// 等于当前模型的代号才挂,对齐官方 reasoningModelId 不匹配即丢)。
+pub fn signature_codename_for(kiro_model: &str) -> Option<&'static str> {
+    KIRO_MODELS
+        .iter()
+        .find(|m| m.kiro_model == kiro_model)
+        .and_then(|m| m.signature_codename)
 }
 
 /// 按对外名找权威表行:先精确归一([`resolve_base`]),再走子串兜底反查 `kiro_model`。
@@ -406,6 +440,31 @@ fn dated_label(dated: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 签名代号表回归(codex 审查补):四个实测有原生签名推理的模型必须各有正确代号,
+    /// 其余模型必须 None(门控静默丢弃,不上传 reasoningContent)。
+    /// 代号来自 2026-08-19 线上探针(kiro_think_probe4/5/6),**不要凭印象改**。
+    #[test]
+    fn signature_codename_table_matches_probe_evidence() {
+        let expect: &[(&str, Option<&str>)] = &[
+            ("claude-opus-5", Some("claude-honey")),
+            ("claude-opus-4.8", Some("claude-quince")),
+            ("claude-opus-4.7", Some("claude-opus-4-7")), // 代号=官方名,实测如此
+            ("claude-sonnet-5", Some("claude-saffron")),
+            ("claude-opus-4.6", None),
+            ("claude-opus-4.5", None),
+            ("claude-sonnet-4.6", None),
+            ("claude-sonnet-4.5", None),
+            ("claude-haiku-4.5", None),
+        ];
+        for (kiro_model, want) in expect {
+            assert_eq!(
+                signature_codename_for(kiro_model),
+                *want,
+                "{kiro_model} 的签名代号与探针实测不符"
+            );
+        }
+    }
 
     /// 不变量:每个**公告**对外名都必须能 `map_model`(否则公告了 chat 拿不到)且有正窗口。
     #[test]
