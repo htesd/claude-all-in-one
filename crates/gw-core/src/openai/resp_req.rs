@@ -195,6 +195,102 @@ fn convert_item(
         // 硬把 summary 当 thinking 块塞回去会得到一个**没有签名**的思考块 ——
         // Anthropic 家族上游对无签名 thinking 是直接拒收的,比丢掉它糟得多。
         "reasoning" => {}
+        // 服务端执行类条目(web/file search、code interpreter、computer、mcp 等):
+        // 只是上游侧工具执行的**记录**,结果已经体现在后续消息里,收下即丢(同 reasoning 口径)。
+        // codex 等客户端会把它们带回 input 历史,硬拒等于让这类会话永久 400。
+        // computer_call_output 同理:调用本身已被丢弃,输出留着只会变孤儿 tool_result。
+        "web_search_call" | "file_search_call" | "code_interpreter_call" | "computer_call"
+        | "computer_call_output" | "image_generation_call" | "mcp_call" | "mcp_list_tools"
+        | "mcp_approval_request" | "mcp_approval_response" => {}
+        // codex 的自定义工具调用(apply_patch 等):`input` 是**自由文本**(补丁原文),
+        // 不一定是 JSON —— 与 function_call.arguments 同口径:能解析成对象就用,
+        // 否则收进 `_raw`,绝不能丢调用(丢了后面的 output 就成孤儿 tool_result)。
+        "custom_tool_call" => {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ConvertError::at(format!("input[{i}].name"), "custom_tool_call 缺少 name")
+                })?;
+            // call_id/id 空串等同缺失,**逐键过滤后再回退**(call_id 为空但 id 有值时要用 id);
+            // 都缺时按下标生成唯一 id(同名多次调用不能撞 id,否则历史里出现重复 tool_use id,
+            // 下游配对链会断)。显式重复 id 交给下游 `rewrite_duplicate_tool_use_ids` 兜底。
+            let pick = |k: &str| {
+                item.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            };
+            let id = pick("call_id")
+                .or_else(|| pick("id"))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{name}#{i}"));
+            let input = match item.get("input") {
+                Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+                    Ok(v) if v.is_object() => v,
+                    _ => json!({ "_raw": s }),
+                },
+                // 有的客户端直接给对象,原样收下。
+                Some(v @ Value::Object(_)) => v.clone(),
+                // 数组/数字等异常形状:序列化进 `_raw` 保留原文,不静默丢成 {}。
+                Some(v) if !v.is_null() => json!({ "_raw": v.to_string() }),
+                _ => json!({}),
+            };
+            push_blocks(
+                messages,
+                "assistant",
+                vec![json!({"type":"tool_use","id":id,"name":name,"input":input})],
+            );
+        }
+        // codex 的本地 shell 调用记录:{call_id, action:{type:"exec", command:[..], ..}}。
+        // 历史里它就是一个工具调用,转成名为 `local_shell` 的 tool_use,参数保留 command 等。
+        "local_shell_call" => {
+            let pick = |k: &str| {
+                item.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            };
+            let id = pick("call_id")
+                .or_else(|| pick("id"))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("local_shell#{i}"));
+            let input = match item.get("action") {
+                Some(Value::Object(map)) => {
+                    let mut map = map.clone();
+                    map.remove("type"); // "exec" 对上游没有信息量,删掉省字节
+                    Value::Object(map)
+                }
+                // action 缺失/非对象:保留原文进 _raw,不静默丢。
+                Some(v) if !v.is_null() => json!({ "_raw": v.to_string() }),
+                _ => json!({}),
+            };
+            push_blocks(
+                messages,
+                "assistant",
+                vec![json!({"type":"tool_use","id":id,"name":"local_shell","input":input})],
+            );
+        }
+        "custom_tool_call_output" | "local_shell_call_output" => {
+            let id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ConvertError::at(
+                        format!("input[{i}].call_id"),
+                        "工具输出条目缺少 call_id,无法与工具调用配对",
+                    )
+                })?;
+            push_blocks(
+                messages,
+                "user",
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": tool_output_to_content(item.get("output")),
+                })],
+            );
+        }
         // 引用服务端存量条目:与 previous_response_id 同理,我方无状态,认不了。
         "item_reference" => {
             return Err(ConvertError::at(
@@ -352,7 +448,7 @@ mod tests {
         let e = convert_request(&json!({"model":"m","input":[]})).unwrap_err();
         assert_eq!(e.param.as_deref(), Some("input"));
 
-        let e = convert_request(&json!({"model":"m","input":[{"type":"web_search_call"}]}))
+        let e = convert_request(&json!({"model":"m","input":[{"type":"wat_call"}]}))
             .unwrap_err();
         assert_eq!(e.param.as_deref(), Some("input[0].type"));
 
@@ -360,6 +456,116 @@ mod tests {
             convert_request(&json!({"model":"m","input":[{"type":"function_call_output","output":"x"}]}))
                 .unwrap_err();
         assert_eq!(e.param.as_deref(), Some("input[0].call_id"));
+    }
+
+    #[test]
+    fn codex_自定义工具与本地shell_条目转工具配对() {
+        let out = conv(json!({
+            "model":"m",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"改下代码"}]},
+                {"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},
+                {"type":"custom_tool_call_output","call_id":"c1","output":"applied"},
+                {"type":"local_shell_call","call_id":"c2","action":{"type":"exec","command":["ls","-la"]}},
+                {"type":"local_shell_call_output","call_id":"c2","output":"total 0"},
+                {"type":"web_search_call","id":"ws_1","status":"completed"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]},
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        // user / assistant(c1) / user(c1 result) / assistant(c2) / user(c2 result+继续)
+        // —— web_search_call 收下即丢,不占消息位
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(
+            msgs[1],
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"c1","name":"apply_patch",
+                 "input":{"_raw":"*** Begin Patch\n*** End Patch"}}]})
+        );
+        assert_eq!(
+            msgs[3],
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"c2","name":"local_shell",
+                 "input":{"command":["ls","-la"]}}]})
+        );
+        assert_eq!(
+            msgs[4]["content"][0],
+            json!({"type":"tool_result","tool_use_id":"c2",
+                   "content":[{"type":"text","text":"total 0"}]})
+        );
+        // c1 的 output 与最后的「继续」文本都必须完整保留(对抗评审:此前只查了 c2)
+        assert_eq!(
+            msgs[2],
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"c1",
+                 "content":[{"type":"text","text":"applied"}]}]})
+        );
+        assert_eq!(msgs[4]["content"][1], json!({"type":"text","text":"继续"}));
+    }
+
+    #[test]
+    fn 自定义工具调用的_id_与_input_边界() {
+        // 缺 call_id:按下标生成唯一 id,同名两次调用不撞车
+        let out = conv(json!({
+            "model":"m",
+            "input":[
+                {"type":"message","role":"user","content":"q"},
+                {"type":"custom_tool_call","name":"apply_patch","input":"x"},
+                {"type":"custom_tool_call","name":"apply_patch","input":"y"},
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        let id0 = msgs[1]["content"][0]["id"].as_str().unwrap().to_string();
+        let id1 = msgs[1]["content"][1]["id"].as_str().unwrap().to_string();
+        assert_ne!(id0, id1, "缺 call_id 的同名调用必须拿到不同 id");
+        assert!(id0.starts_with("apply_patch#"), "兜底 id 应可读: {id0}");
+
+        // 空串 call_id 视同缺失(但 id 有值要用 id);input 给对象原样收、给数组进 _raw、缺失为 {}
+        let out = conv(json!({
+            "model":"m",
+            "input":[
+                {"type":"message","role":"user","content":"q"},
+                {"type":"custom_tool_call","call_id":"","id":"real_id","name":"f","input":{"a":1}},
+                {"type":"custom_tool_call","call_id":"c9","name":"g","input":[1,2]},
+                {"type":"local_shell_call","call_id":"","action":"not-an-object"},
+                {"type":"local_shell_call","action":{"command":["ls"],"type":"exec"}},
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["input"], json!({"a":1}));
+        assert_eq!(blocks[0]["id"], "real_id", "call_id 空串但 id 有值时应回退 id");
+        assert_eq!(blocks[1]["input"], json!({"_raw":"[1,2]"}));
+        assert_eq!(blocks[2]["input"], json!({"_raw":"\"not-an-object\""}));
+        assert_eq!(blocks[3]["input"], json!({"command":["ls"]}));
+        assert_eq!(blocks[3]["id"], "local_shell#4");
+    }
+
+    #[test]
+    fn 服务端执行类条目收下即丢() {
+        for t in [
+            "web_search_call",
+            "file_search_call",
+            "code_interpreter_call",
+            "computer_call",
+            "computer_call_output",
+            "image_generation_call",
+            "mcp_call",
+            "mcp_list_tools",
+            "mcp_approval_request",
+            "mcp_approval_response",
+        ] {
+            let out = conv(json!({
+                "model":"m",
+                "input":[
+                    {"type":"message","role":"user","content":"q"},
+                    {"type":t,"id":"x1"},
+                    {"type":"message","role":"assistant","content":"a"},
+                ]
+            }));
+            let msgs = out["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 2, "{t} 应被丢弃不影响消息序列");
+        }
     }
 
     #[test]
