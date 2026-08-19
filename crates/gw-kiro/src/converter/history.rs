@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
-use super::{ContentBlock, ConversionError, MessagesRequest, EMPTY_CONTENT_PLACEHOLDER, MEDIA_ONLY_PLACEHOLDER};
+use super::{ContentBlock, ConversionError, MessagesRequest, EMPTY_CONTENT_PLACEHOLDER, EMPTY_USER_CONTENT_PLACEHOLDER, MEDIA_ONLY_PLACEHOLDER};
 // 跨子模块调用(经 mod.rs 的 `use <sub>::*` 提升到 converter 根,故走 super::)
 use super::{normalized_client_system, request_has_chunked_tools, process_message_content, map_tool_name};
-use crate::kiro_types::conversation::{AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserInputMessageContext, UserMessage};
+use crate::kiro_types::conversation::{AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ReasoningContent, ReasoningText, UserInputMessageContext, UserMessage};
 use crate::kiro_types::tool::{ToolResult, ToolUseEntry};
 
 /// 生成 thinking 标签前缀 —— **已随 Kiro 1.0.212 退役,默认不再注入**。
@@ -437,7 +437,7 @@ pub(super) fn build_history_with_turns(req: &MessagesRequest, messages: &[crate:
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, keep_unit_thinking)?;
+                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, keep_unit_thinking, model_id)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -463,7 +463,7 @@ pub(super) fn build_history_with_turns(req: &MessagesRequest, messages: &[crate:
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, keep_unit_thinking)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, keep_unit_thinking, model_id)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -504,9 +504,17 @@ pub(super) fn merge_user_messages(
     }
 
     let content = content_parts.join("\n");
+    // 归一:纯空白文本视同无文本(否则「空白文本+tool_result」会被原样放行,
+    // 而纯空白 user content 被 Kiro 确定性 400,2026-08-19 实测)。
+    let content = if content.trim().is_empty() {
+        String::new()
+    } else {
+        content
+    };
     // 兜底（与当前消息同规则）：带 image/document 无文本必须补引导语（Kiro 400）；
-    // 全空补单空格；仅 tool_results（无媒体）保留空文本。
-    let content = if !content.trim().is_empty() {
+    // 全空补 user 专用占位符(纯空白 user content 会被 Kiro 确定性 400,见
+    // EMPTY_USER_CONTENT_PLACEHOLDER)；仅 tool_results（无媒体）保留空文本。
+    let content = if !content.is_empty() {
         content
     } else if !all_images.is_empty() || !all_documents.is_empty() {
         tracing::warn!(
@@ -517,7 +525,7 @@ pub(super) fn merge_user_messages(
         tracing::warn!(
             "历史 user 消息为空（无 text/tool_result/image/document），已用占位符兜底以避免 Kiro 400"
         );
-        EMPTY_CONTENT_PLACEHOLDER.to_string()
+        EMPTY_USER_CONTENT_PLACEHOLDER.to_string()
     } else {
         content
     };
@@ -546,18 +554,32 @@ pub(super) fn merge_user_messages(
 
 /// 转换 assistant 消息
 ///
-/// `keep_thinking`:是否把该消息的 thinking 块拼进产出内容。由 `build_history`
-/// 按「本合并单元距末尾第几段 ≤ 保留轮数」结算后传入 —— 本函数不读进程级全局,
-/// 它拿不到位置信息(显式传参的纯函数,与 `normalize_effort`/`normalize_effort_with`
-/// 的拆分同理)。
+/// `keep_thinking`:是否把该消息的 thinking 以结构化 `reasoningContent` 形式上传。
+/// 由 `build_history` 按「本合并单元距末尾第几段 ≤ 保留轮数」结算后传入 —— 本函数不读
+/// 进程级全局,它拿不到位置信息(显式传参的纯函数,与 `normalize_effort`/
+/// `normalize_effort_with` 的拆分同理)。
+/// `model_id`:当前请求的**上游** Kiro 模型 id(门控与签名归属判定用)。
 pub(super) fn convert_assistant_message(
     msg: &crate::anthropic_types::Message,
     tool_name_map: &mut HashMap<String, String>,
     keep_thinking: bool,
+    model_id: &str,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     // 注意：本函数仅用于**历史** assistant 消息（build_history 调用），不触及当前轮。
-    // 历史里的 thinking 默认丢弃、仅保留窗口内拼回 —— 见下方 final_content 处的说明（缓存稳定性）。
-    let mut thinking_content = String::new();
+    //
+    // 历史 thinking 的上行通道(2026-08-19 起):**只有结构化 reasoningContent 一条**。
+    // 依据(拆包 kiro.kiro-agent@1.0.212 + 线上探针 + Amazon Q CLI 源码三方互证):
+    // - 官方历史上传形态 = assistantResponseMessage.reasoningContent:
+    //   {reasoningText:{text,signature}} 或 {redactedContent},且只上传带签名的;
+    // - 上游验签(THINKING_SIGNATURE_INVALID),签名本身是推理内容的加密载体
+    //   (空 text + 真签名,模型仍能还原推理);
+    // - **无原生签名的模型(opus-4.6 / sonnet-4.6 / 4.5 系 / haiku):官方客户端在两个
+    //   时代(0.12.155 / 1.0.212)都从不回传 thinking**(bundle 全树 `<thinking>` 零命中,
+    //   Q CLI 定义了字段但从不赋值)——这些模型的服务端会话形态就是"历史无思考"。
+    //   2026-08-20 用户决策:对齐官方,不回传(嵌入回传是同日循环事故的温床:
+    //   嵌进正文 = 推理降格成文体范例,自我放大)。客户端侧 thinking 显示不受影响。
+    let mut thinking: Option<(String, String)> = None; // 最后一个带签名的 thinking 块 (text, sig)
+    let mut redacted: Option<String> = None; // 最后一个 redacted_thinking 块的 data
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -570,8 +592,19 @@ pub(super) fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
+                            // 只要求签名非空:上游忽略 reasoningText.text(空文本+真签名
+                            // 仍可回放,2026-08-19 探针 E2 实测),空文本不是丢弃理由。
+                            if let (Some(t), Some(sig)) = (block.thinking, block.signature) {
+                                if !sig.is_empty() {
+                                    thinking = Some((t, sig));
+                                }
+                            }
+                        }
+                        "redacted_thinking" => {
+                            if let Some(d) = block.data {
+                                if !d.is_empty() {
+                                    redacted = Some(d);
+                                }
                             }
                         }
                         "text" => {
@@ -594,51 +627,31 @@ pub(super) fn convert_assistant_message(
         _ => {}
     }
 
-    // 历史 assistant 内容构建 —— thinking 块**默认不拼接**(keep_thinking=false)。
+    // 历史 assistant 内容构建。
     //
-    // 根因（v49 修复）：Claude Code 等客户端会做 thinking 滚动裁剪——只在请求历史里
-    // 保留最近几轮的 `<thinking>`，更早的 assistant 消息其 thinking 被移除。若我们原样
-    // 透传，则同一条历史 assistant 消息会随对话推进从"带 thinking"变成"不带"，**内容
-    // 跨轮抖动 → 打断 Kiro prefix cache → 该点之后全部缓存失效**。实测某 thinking 会话
-    // 命中率因此被打到 0.24–0.36（健康会话 0.78）。
+    // 保留窗口(`history_thinking_turns` 热配置)语义不变;窗口内由
+    // [`build_reasoning_content`] 按官方门控决定挂不挂结构化 reasoningContent
+    // (带真签名且模型匹配才挂;挂不上即丢,不做正文嵌入)。
     //
-    // 现行策略(history_thinking_turns 热配置,默认 0 = 全丢,与 v49 一致):
-    // - 窗口**外**(距末尾 > N 段):一律丢弃,同 v49 —— 这部分前缀跨轮恒定;
-    // - 窗口**内**(距末尾 ≤ N 段):按确定性格式拼回 `<thinking>…</thinking>`(见下)。
-    //   窗口随对话推进整体滑动,一条历史消息只在「滑出窗口」那一轮变一次字节,
-    //   且该变化点位于历史**尾部附近**,其前的缓存前缀不受影响。
-    // - 保留与否只取决于段序,与客户端本轮给没给 thinking 无关(客户端没给的轮次
-    //   不会凭空造出 thinking 字节)——这是抗客户端滚动裁剪抖动的关键。
-    //
-    // 保留窗口只影响发给 Kiro 的"历史推理文本"(客户端已在裁),**不影响当前轮的
-    // thinking 能力**(当前轮不经本函数;响应侧 thinking_delta/签名照常)。
-    //
-    // ⚠️ 前缀稳定性纪律:拼接格式与窗口语义任何改动都会改变历史字节 —— 所有在途会话
-    // 下一轮缓存全量 miss 一次。改这里 = 改前缀,必须低峰刻意切换。
-    //
-    // 格式(keep_thinking=true 且 thinking 非空时,确定性):
-    // - text 非空:`<thinking>{thinking}</thinking>\n{text}`;
-    // - text 为空:content 即 `<thinking>{thinking}</thinking>` 本身(消息非空,
-    //   不落占位符、不触发空消息告警)。
-    // keep=false 或 thinking 为空时,行为与 v49 逐字节一致:仅 `text内容`
-    // (含 tool_use 时正文可空,用占位符)。
-    let final_content = if keep_thinking && !thinking_content.is_empty() {
-        if text_content.is_empty() {
-            format!("<thinking>{thinking_content}</thinking>")
-        } else {
-            format!("<thinking>{thinking_content}</thinking>\n{text_content}")
-        }
-    } else if !text_content.is_empty() {
+    // ⚠️ 前缀稳定性纪律不变: reasoningContent 的挂/摘同样改变历史字节 ——
+    // 窗口语义或签名形态的改动会让在途会话下一轮缓存 miss 一次。
+    let reasoning = if keep_thinking {
+        build_reasoning_content(thinking.as_ref(), redacted.as_ref(), model_id)
+    } else {
+        None
+    };
+
+    let final_content = if !text_content.is_empty() {
         text_content
     } else {
-        // text 为空,且 thinking 不可用(在保留窗口外 / 本就没有 / 客户端没给)。
+        // text 为空:
         // - 有 tool_use：正常的"纯工具调用"回合，用空格占位（Kiro 要求 content 非空）。
         // - 无 tool_use：彻底空的 assistant 消息，几乎都是上游空响应/断流后被客户端写回
         //   历史的残留。Kiro 对空 content 返回 400 Improperly formed request，且该消息会
         //   一直留在历史里导致整个会话每轮确定性失败。必须兜底为非空并告警。
-        if tool_uses.is_empty() {
+        if tool_uses.is_empty() && reasoning.is_none() {
             tracing::warn!(
-                "历史中检测到空 assistant 消息（无 text/tool_use；无 thinking 或 thinking 在保留窗口外），已用占位符兜底以避免 Kiro 400 毒化会话"
+                "历史中检测到空 assistant 消息（无 text/tool_use/reasoning），已用占位符兜底以避免 Kiro 400 毒化会话"
             );
         }
         EMPTY_CONTENT_PLACEHOLDER.to_string()
@@ -648,9 +661,52 @@ pub(super) fn convert_assistant_message(
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
+    if let Some(r) = reasoning {
+        assistant = assistant.with_reasoning_content(r);
+    }
 
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
+    })
+}
+
+/// 把客户端历史里的 thinking / redacted_thinking 块翻译成 Kiro 结构化
+/// `reasoningContent`。门控与过滤全部对齐官方客户端(`er5` + `modelSupportsReasoning`):
+///
+/// 1. 当前请求模型无签名代号(= 无原生签名推理能力) → 不上传;
+/// 2. redacted 优先(官方封包逻辑 `oe12`:redactedContent 存在即盖过 text);
+/// 3. 签名**原样透传**(2026-08-19 用户决策:下发链路不改写 f6 代号,检测平台角度不关心)。
+///    f6 读出的代号必须等于当前模型的代号,否则丢弃 —— 覆盖三种情况:
+///    别的模型签发的(官方:reasoningModelId 不匹配即丢)、历史遗留的改写签名
+///    (f6=官方名,无法还原即放弃,上游 400 兜底也用不着)、读不出 f6 的畸形签名;
+/// 4. 我方合成的假签名(无原生推理模型的下行兜底产物)重推导识别后丢弃 ——
+///    上行必过不了验签,发了只会白吃一次 `THINKING_SIGNATURE_INVALID`。
+fn build_reasoning_content(
+    thinking: Option<&(String, String)>,
+    redacted: Option<&String>,
+    model_id: &str,
+) -> Option<ReasoningContent> {
+    let codename = super::signature_codename_for(model_id)?;
+    if let Some(data) = redacted {
+        return Some(ReasoningContent::Redacted {
+            redacted_content: data.clone(),
+        });
+    }
+    let (text, sig) = thinking?;
+    let issued = crate::signature::read_model_from_signature(sig)?;
+    // 合成签名识别用 f6 里的签发名逐字重算(合成时的 model 入参就是当时的客户端请求名)。
+    // 必须先于代号比对:opus-4-7 的代号恰好等于官方名,合成签名会误过代号检查。
+    if crate::signature::is_synthesized_signature(&issued, text, sig) {
+        return None;
+    }
+    if issued != codename {
+        return None;
+    }
+    Some(ReasoningContent::ReasoningText {
+        reasoning_text: ReasoningText {
+            text: text.clone(),
+            signature: sig.clone(),
+        },
     })
 }
 
@@ -660,21 +716,26 @@ pub(super) fn convert_assistant_message(
 /// `keep_thinking`:本合并单元(= 极大连续 assistant 段)是否落在 thinking 保留窗口内,
 /// 由 `build_history` 按段序结算后传入,原样透传给每条消息的 [`convert_assistant_message`]
 /// —— 同一单元内所有消息同保留同丢弃,保证产出确定性。
+/// `model_id`:当前请求的上游 Kiro 模型 id(透传给单消息转换做 reasoning 门控)。
 pub(super) fn merge_assistant_messages(
     messages: &[&crate::anthropic_types::Message],
     tool_name_map: &mut HashMap<String, String>,
     keep_thinking: bool,
+    model_id: &str,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map, keep_thinking);
+        return convert_assistant_message(messages[0], tool_name_map, keep_thinking, model_id);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    // 合并单元只挂一条 reasoningContent:取**最后一条**非空的(对齐官方封包
+    // lastSealedReasoning 的"后写覆盖"语义 —— 越靠后的推理离当前轮越近)。
+    let mut reasoning: Option<ReasoningContent> = None;
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map, keep_thinking)?;
+        let converted = convert_assistant_message(msg, tool_name_map, keep_thinking, model_id)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -682,13 +743,16 @@ pub(super) fn merge_assistant_messages(
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
         }
+        if am.reasoning_content.is_some() {
+            reasoning = am.reasoning_content;
+        }
     }
 
     let content = if content_parts.is_empty() {
         // 合并后无任何文本内容：无论有无 tool_use，content 都不能为空（Kiro 要求非空）。
-        if all_tool_uses.is_empty() {
+        if all_tool_uses.is_empty() && reasoning.is_none() {
             tracing::warn!(
-                "合并后的 assistant 消息为空（无 text/tool_use），疑似上游空响应残留，已用占位符兜底以避免 Kiro 400"
+                "合并后的 assistant 消息为空（无 text/tool_use/reasoning），疑似上游空响应残留，已用占位符兜底以避免 Kiro 400"
             );
         }
         EMPTY_CONTENT_PLACEHOLDER.to_string()
@@ -699,6 +763,9 @@ pub(super) fn merge_assistant_messages(
     let mut assistant = AssistantMessage::new(content);
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
+    }
+    if let Some(r) = reasoning {
+        assistant = assistant.with_reasoning_content(r);
     }
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,

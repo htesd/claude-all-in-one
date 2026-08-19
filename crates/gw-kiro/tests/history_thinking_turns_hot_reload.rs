@@ -8,16 +8,23 @@
 //! 集成测试各自是**独立的二进制与进程**,所以这里可以放心改全局。
 //! ⚠️ 本文件内的用例共享同一个进程全局,必须**串行**跑 —— 靠 `SERIAL` 互斥锁保证,
 //! 别在这里加不加锁就动全局的用例。
+//!
+//! 2026-08-19 起窗口的载体是**结构化 reasoningContent**(带真签名才挂),不再是正文
+//! `<thinking>` 文本嵌入;无签名 thinking 一律丢弃,窗口开关对它无影响。
 
 use std::sync::Mutex;
 
 use gw_kiro::converter::convert_request;
+use gw_kiro::kiro_types::conversation::Message;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// 构造「历史 1 轮(assistant 带 thinking) + 当前轮」的最小请求,走 convert_request 全链路,
-/// 返回发给 Kiro 的 history 里所有 assistant 消息的 content(含系统对的固定应答,在 index 0)。
-fn history_assistant_contents() -> Vec<String> {
+/// 一条真实的 Kiro opus-4.8 thinking 签名(f6 = 内部代号 claude-quince,原装透传形态)。
+const REAL_SIG_QUINCE: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
+
+/// 构造「历史 1 轮(assistant 带**签名** thinking) + 当前轮」的最小请求,走 convert_request
+/// 全链路,返回历史里那条真实 assistant 消息的 (content, 是否挂了 reasoningContent)。
+fn history_answer() -> (String, bool) {
     let req: gw_kiro::anthropic_types::MessagesRequest =
         serde_json::from_value(serde_json::json!({
             "model": "claude-opus-4-8",
@@ -25,7 +32,7 @@ fn history_assistant_contents() -> Vec<String> {
             "messages": [
                 {"role": "user", "content": "问1"},
                 {"role": "assistant", "content": [
-                    {"type": "thinking", "thinking": "历史推理W"},
+                    {"type": "thinking", "thinking": "历史推理W", "signature": REAL_SIG_QUINCE},
                     {"type": "text", "text": "历史答案V"}
                 ]},
                 {"role": "user", "content": "当前问"}
@@ -33,22 +40,20 @@ fn history_assistant_contents() -> Vec<String> {
         }))
         .expect("构造请求");
     let result = convert_request(&req, "").expect("转换应成功");
-    result
+    let (content, has_reasoning) = result
         .conversation_state
         .history
         .iter()
         .filter_map(|m| match m {
-            gw_kiro::kiro_types::conversation::Message::Assistant(a) => {
-                Some(a.assistant_response_message.content.clone())
-            }
+            Message::Assistant(a) => Some((
+                a.assistant_response_message.content.clone(),
+                a.assistant_response_message.reasoning_content.is_some(),
+            )),
             _ => None,
         })
-        .collect()
-}
-
-/// 历史里那条真实 assistant 消息的 content(index 0 是系统对的固定应答)。
-fn history_answer() -> String {
-    history_assistant_contents().remove(1)
+        .nth(1) // index 0 是系统对的固定应答
+        .expect("历史里应有真实 assistant 消息");
+    (content, has_reasoning)
 }
 
 /// worker 每 30s 喂进来的就是这个形状的 JSON:热改 → 下一次请求即生效,可逆。
@@ -59,24 +64,28 @@ fn hot_changed_turns_reaches_the_wire_and_restores() {
         gw_kiro::KiroProvider::from_config(&serde_json::json!({}), reqwest::Client::new())
             .expect("构造 provider");
 
-    // 出厂态(0 = 全丢):历史 thinking 被剥离(v49 以来的行为,上线默认值不改变行为)。
+    // 出厂态(0 = 全丢):历史 thinking 不带 reasoningContent(上线默认值不改变行为)。
     assert_eq!(
         history_answer(),
-        "历史答案V",
+        ("历史答案V".to_string(), false),
         "默认 0 时历史 thinking 应被剥离"
     );
 
-    // 热改 turns=1:倒数最近 1 个 assistant 合并单元的 thinking 按确定性格式拼回。
+    // 热改 turns=1:倒数最近 1 个 assistant 合并单元挂结构化 reasoningContent。
     provider.apply_hot_settings(&serde_json::json!({"history_thinking_turns": 1}));
     assert_eq!(
         history_answer(),
-        "<thinking>历史推理W</thinking>\n历史答案V",
-        "热改 turns=1 后下一次请求就该带 thinking,不需要重启"
+        ("历史答案V".to_string(), true),
+        "热改 turns=1 后下一次请求就该挂 reasoningContent,不需要重启"
     );
 
-    // 再热改回 0:立即恢复全丢(证明不是一次性生效,可逆)。
+    // 再热改回 0:立即恢复不挂(证明不是一次性生效,可逆)。
     provider.apply_hot_settings(&serde_json::json!({"history_thinking_turns": 0}));
-    assert_eq!(history_answer(), "历史答案V", "改回 0 后应立即恢复剥离");
+    assert_eq!(
+        history_answer(),
+        ("历史答案V".to_string(), false),
+        "改回 0 后应立即恢复剥离"
+    );
 }
 
 /// `apply_hot_settings` 这一层的接线纪律:缺字段不动当前值、非法类型只告警不生效。
@@ -90,27 +99,31 @@ fn apply_hot_settings_missing_or_invalid_field_keeps_current_value() {
     provider.apply_hot_settings(&serde_json::json!({"history_thinking_turns": -1}));
     assert_eq!(
         history_answer(),
-        "<thinking>历史推理W</thinking>\n历史答案V",
+        ("历史答案V".to_string(), true),
         "turns=-1 应全量保留"
     );
 
     // 字段缺失 = 不动当前值(轮询响应偶发缺字段时不该悄悄打回出厂值)。
     provider.apply_hot_settings(&serde_json::json!({"cache_read_multiplier": 2.0}));
     assert!(
-        history_answer().contains("历史推理W"),
+        history_answer().1,
         "缺字段不该重置保留轮数"
     );
 
     // 非法类型 = 只告警、不生效(手改 DB 可以绕过 admin 的 PUT 校验)。
     provider.apply_hot_settings(&serde_json::json!({"history_thinking_turns": "many"}));
     assert!(
-        history_answer().contains("历史推理W"),
+        history_answer().1,
         "非整数不该改动生效值"
     );
     provider.apply_hot_settings(&serde_json::json!({"history_thinking_turns": 1.5}));
-    assert!(history_answer().contains("历史推理W"), "浮点不该改动生效值");
+    assert!(history_answer().1, "浮点不该改动生效值");
 
     // 清 overlay 回基线(worker 每轮都用 from_effective 的全量值调用,删 overlay 即回 YAML 默认 0)。
     provider.apply_hot_settings(&serde_json::json!({"history_thinking_turns": 0}));
-    assert_eq!(history_answer(), "历史答案V", "回 0 后应恢复剥离");
+    assert_eq!(
+        history_answer(),
+        ("历史答案V".to_string(), false),
+        "回 0 后应恢复剥离"
+    );
 }

@@ -2465,8 +2465,10 @@ fn is_empty_text_block(b: &serde_json::Value) -> bool {
             .is_none_or(|t| t.trim().is_empty())
 }
 
-/// 空内容占位符(单空格)——对齐 kiro converter 的 `EMPTY_CONTENT_PLACEHOLDER`,上游实测合法。
-const EMPTY_MSG_PLACEHOLDER: &str = " ";
+/// 空内容占位符 —— **不能用纯空白**:2026-08-19 线上实测 Kiro 对纯空白 user content
+/// 确定性 400 REQUEST_BODY_INVALID(assistant 纯空白则放行)。用可见的「(空)」,
+/// 与 kiro converter 的 EMPTY_USER_CONTENT_PLACEHOLDER 同文,日志里一眼可辨。
+const EMPTY_MSG_PLACEHOLDER: &str = "(空)";
 
 /// 入站自愈:清掉 `messages` 里的空 content,而不是整条请求打回去。
 ///
@@ -2479,7 +2481,9 @@ const EMPTY_MSG_PLACEHOLDER: &str = " ";
 ///
 /// 修复动作(保序、不动消息条数 —— 会话亲和键与计费口径不漂移):
 /// - content 数组里的空 text 块:删除,其余块原样保留;
-/// - 整条 content 因此变空(或本来就是空串/null/缺字段):用单空格占位 text 块顶替;
+/// - 整条 content 因此变空(或本来就是空串/null/缺字段):按角色选占位符顶替 ——
+///   user 用可见的「(空)」(Kiro 拒纯空白 user content),assistant 用单空格
+///   (上游放行纯空白 assistant;不给模型塞可见文本);
 /// - **例外仍拒**:最后一条当前轮 user 消息为空(不能替用户编造输入),报错点名下标。
 fn sanitize_message_contents(body: &mut serde_json::Value) -> Result<Vec<String>, String> {
     let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
@@ -2522,9 +2526,14 @@ fn sanitize_message_contents(body: &mut serde_json::Value) -> Result<Vec<String>
                      (不能替用户编造输入)。请填入非空内容。"
                 ));
             }
+            let placeholder = if role == "user" {
+                EMPTY_MSG_PLACEHOLDER
+            } else {
+                " "
+            };
             obj.insert(
                 "content".into(),
-                serde_json::json!([{"type": "text", "text": EMPTY_MSG_PLACEHOLDER}]),
+                serde_json::json!([{"type": "text", "text": placeholder}]),
             );
             repairs.push(format!(
                 "messages[{i}] (role={role}) content 为空,已用占位符顶替"
@@ -4624,8 +4633,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// 空 content 在入站被自愈而不是硬拒(2026-08-19 起):断流会在 Claude Code 会话历史
-    /// 留下空 text 块,硬拒 = 会话永久变砖。历史消息变空 → 单空格占位符顶替(对齐 kiro
-    /// converter 的 EMPTY_CONTENT_PLACEHOLDER,上游实测合法);消息条数不变,亲和键不漂移。
+    /// 留下空 text 块,硬拒 = 会话永久变砖。历史消息变空 → 按角色顶替:user 用「(空)」
+    /// (Kiro 拒纯空白 user content,2026-08-19 实测),assistant 用单空格(上游放行);
+    /// 消息条数不变,亲和键不漂移。
     #[test]
     fn empty_history_message_is_repaired_with_placeholder() {
         for (label, content) in [
@@ -4654,11 +4664,25 @@ mod tests {
             assert_eq!(
                 body["messages"][1]["content"],
                 serde_json::json!([{"type": "text", "text": " "}]),
-                "{label} 应被占位符顶替"
+                "{label} assistant 应用单空格顶替"
             );
             assert_eq!(body["messages"].as_array().unwrap().len(), 3, "{label} 消息条数不应变");
         }
-        // content 字段整个缺席,同理修复。
+        // 历史 user 消息变空:必须用「(空)」(纯空白 user content 会被 Kiro 拒)。
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "好"},
+            {"role": "user", "content": ""},
+            {"role": "assistant", "content": "嗯"},
+            {"role": "user", "content": "继续"}
+        ]});
+        sanitize_message_contents(&mut body).expect("历史空 user 应被修复");
+        assert_eq!(
+            body["messages"][2]["content"],
+            serde_json::json!([{"type": "text", "text": "(空)"}]),
+            "历史 user 应用「(空)」顶替"
+        );
+        // content 字段整个缺席,同理修复(assistant → 单空格)。
         let mut body = serde_json::json!({"messages": [
             {"role": "assistant"},
             {"role": "user", "content": "hi"}

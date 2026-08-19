@@ -1,14 +1,12 @@
-//! Thinking 签名重写：把 Kiro 上游真实签名 protobuf 里暴露渠道的模型代号
-//! （`claude-quince`，位于 `f2.f1.f6`）替换成客户端请求的官方模型名
-//! （如 `claude-opus-4-8`），其余加密字节原样保留。
+//! Thinking 签名工具:读取/改写签名 protobuf 里的模型标识字段(f2.f1.f6)、
+//! 识别我方合成的假签名。
 //!
-//! 背景：检测平台（hvoy.ai / cctest.ai）会 base64 解码 thinking 块的 `signature`，
-//! 解析其 protobuf，读取内嵌模型标识字段。Kiro 透传的真实签名里该字段是
-//! `claude-quince`（Opus 的 Bedrock 内部代号），与响应 `model` 字段声称的
-//! `claude-opus-4-8` 不一致 → 被判"签名部分合格 + 身份不一致"。
-//!
-//! 本模块只重写那**一个**字符串字段，保留全部加密体（f5/f3/f4 等），
-//! 因为检测平台无 Anthropic 私钥、无法做密码学验签，只能做结构/标识启发式校验。
+//! 历史背景:曾用 `rewrite_model_in_signature` 把 Kiro 真实签名里的内部代号
+//! (`claude-quince` 等)改写成官方模型名再下发客户端,防检测平台解签发现身份不一致。
+//! **2026-08-19 起下发链路已改为原样透传**(用户决策:签名要随历史回传上行验签,
+//! 改写的签名会吃 400 THINKING_SIGNATURE_INVALID;检测平台角度明确不关心)。
+//! 改写/读取函数保留用于:识别历史会话里遗留的改写签名(读出官方名 ≠ 代号 → 丢弃)、
+//! 以及单测构造样本。
 //!
 //! protobuf 结构（实测，三个不同 thinking 样本对比稳定）：
 //! ```text
@@ -16,7 +14,7 @@
 //!   f2.f1 = <bytes 子消息 header>
 //!     f1=14  f2=1  f3=2 (varint 结构常量)
 //!     f5 = <加密 header body>
-//!     f6 = "claude-quince"  ← 要替换的模型标识
+//!     f6 = "claude-quince"  ← 模型标识字段
 //!     f7=0  f8 = "thinking"
 //!   f2.f2/f3/f4/f5 = 加密 nonce/proof/body
 //! ```
@@ -150,6 +148,70 @@ pub fn rewrite_model_in_signature(signature_b64: &str, model: &str) -> Option<St
     // 路径 f2 → f1，目标字段 f6（模型标识字符串）
     let rewritten = rewrite_message(&raw, &[2, 1], 6, model.as_bytes())?;
     Some(base64::engine::general_purpose::STANDARD.encode(rewritten))
+}
+
+/// 只读下钻：按 `path` 进入嵌套子消息后读取 `target_field` 的字符串值。
+/// 与 `rewrite_message` 同结构假设；任何异常返回 None。
+fn read_string_field(buf: &[u8], path: &[u32], target_field: u32) -> Option<String> {
+    let mut i = 0usize;
+    while i < buf.len() {
+        let (key, ni) = read_varint(buf, i)?;
+        i = ni;
+        let field = (key >> 3) as u32;
+        let wire = (key & 7) as u8;
+        match wire {
+            0 => {
+                let (_, after) = read_varint(buf, i)?;
+                i = after;
+            }
+            2 => {
+                let (len, after_len) = read_varint(buf, i)?;
+                let start = after_len;
+                let end = start.checked_add(len as usize)?;
+                if end > buf.len() {
+                    return None;
+                }
+                if !path.is_empty() && field == path[0] {
+                    return read_string_field(&buf[start..end], &path[1..], target_field);
+                }
+                if path.is_empty() && field == target_field {
+                    return String::from_utf8(buf[start..end].to_vec()).ok();
+                }
+                i = end;
+            }
+            5 => {
+                let end = i.checked_add(4)?;
+                if end > buf.len() {
+                    return None;
+                }
+                i = end;
+            }
+            1 => {
+                let end = i.checked_add(8)?;
+                if end > buf.len() {
+                    return None;
+                }
+                i = end;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// 读出签名 f2.f1.f6 里的模型标识（上游内部代号如 `claude-quince`，或已被我方
+/// 改写的官方名如 `claude-opus-4-8`）。结构不符返回 None。
+pub fn read_model_from_signature(signature_b64: &str) -> Option<String> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .ok()?;
+    read_string_field(&raw, &[2, 1], 6)
+}
+
+/// 判断 `signature_b64` 是否为我方合成的假签名（上行必过不了验签）。
+/// 合成算法对同 (model, thinking) 确定性可复现，直接重算比对。
+pub fn is_synthesized_signature(model: &str, thinking: &str, signature_b64: &str) -> bool {
+    synthesize_signature(model, thinking) == signature_b64
 }
 
 // ===== 合成签名（上游不下发签名时的兜底，如 opus-4-6 走 fake `<thinking>` 路径）=====
@@ -333,6 +395,43 @@ mod tests {
         assert_eq!(a, b, "同 model+thinking 应得稳定签名");
         let c = synthesize_signature("claude-opus-4-6", "different thinking");
         assert_ne!(a, c, "不同 thinking 应得不同签名");
+    }
+
+    #[test]
+    fn read_model_from_real_signature() {
+        // REAL_SIG 的 f2.f1.f6 = "claude-quince"(opus-4.8 的上游内部代号)
+        assert_eq!(
+            read_model_from_signature(REAL_SIG).as_deref(),
+            Some("claude-quince")
+        );
+    }
+
+    #[test]
+    fn rewrite_then_read_back_shows_official_name() {
+        // 改写是单向事实记录:改完后 f6 读出官方名,其余字节不动(另一测试钉)。
+        let client_side = rewrite_model_in_signature(REAL_SIG, "claude-opus-4-8").unwrap();
+        assert_eq!(
+            read_model_from_signature(&client_side).as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn is_synthesized_signature_detects_own_output() {
+        let thinking = "let me think about this problem";
+        let synth = synthesize_signature("claude-opus-4-6", thinking);
+        assert!(is_synthesized_signature("claude-opus-4-6", thinking, &synth));
+        // 模型名或文本不同则不算同一个合成签名
+        assert!(!is_synthesized_signature("claude-opus-4-8", thinking, &synth));
+        assert!(!is_synthesized_signature("claude-opus-4-6", "other", &synth));
+        // 真实签名不是合成的
+        assert!(!is_synthesized_signature("claude-opus-4-8", thinking, REAL_SIG));
+    }
+
+    #[test]
+    fn read_model_rejects_garbage() {
+        assert_eq!(read_model_from_signature(""), None);
+        assert_eq!(read_model_from_signature("not!!base64!!"), None);
     }
 
     #[test]
