@@ -1116,6 +1116,23 @@ impl Provider for CursorProvider {
             b.floor_ratio = v;
         }
         crate::cache_sim::set_billing(b);
+
+        // CLI 驱动单阶段活跃上限(秒)。present 字段才覆盖(与上面计费参数同语义:
+        // 缺失 = 沿用当前值、不回落默认);非法类型只告警 —— 手改 DB 可绕过 admin 校验。
+        // 值语义(0=未设回落默认 / <30 夹到下限)在 `clidrv::set_phase_timeout_secs`。
+        match settings.get("cursor_cli_phase_timeout_secs") {
+            None => {}
+            Some(v) => match v.as_u64() {
+                Some(n) => {
+                    let applied = crate::clidrv::set_phase_timeout_secs(n);
+                    tracing::debug!(secs = applied, "cursor CLI 阶段超时已热应用");
+                }
+                None => tracing::warn!(
+                    value = %v,
+                    "settings 里的 cursor_cli_phase_timeout_secs 不是非负整数，已忽略"
+                ),
+            },
+        }
     }
 
     /// 与 [`Self::apply_hot_settings`] 同进退(trait 文档:只覆盖其中一个就是在撒谎)。

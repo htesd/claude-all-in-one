@@ -39,7 +39,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -50,23 +50,87 @@ use tokio::sync::{oneshot, Notify};
 use gw_core::error::{UpstreamError, UpstreamErrorKind};
 use gw_core::provider::{ChatUsage, SseEvent, StreamItem};
 
-/// CLI 进程的**活跃时间**上限(不含桥挂起等待)。
+/// CLI 进程**单阶段活跃时间**上限的**默认值**(热配置 `cursor_cli_phase_timeout_secs`
+/// 与 env `CURSOR_CLI_PHASE_TIMEOUT_SECS` 可改;本常量只是缺省,别直接拿它做判断)。
 ///
-/// ⚠️ 注意它量的**不是**墙上时钟。检查点在泵的 `select!` 的 500ms tick 分支里,而桥调用
-/// 挂起是在 `call` 分支**内部** `await` 一个 [`PENDING_TTL`] 的 timeout —— 那段 await 期间
-/// 整个 select 停转、tick 不响,所以挂起等待**不计入**这个预算。
+/// 语义 = **单个阶段**的活跃时间上限:从阶段开始(泵启动 / 上一次桥挂起结束)到
+/// 下一次桥调用挂起为止。桥挂起(等调用方在自己机器上执行完工具、带 tool_result
+/// 回来)**不计入**:挂起发生在 `call` 分支**内部** `await` 一个 [`PENDING_TTL`]
+/// 的 timeout,那段 await 期间整个 `select!` 停转、tick 不响;挂起结束、新阶段
+/// 开始时计时器重置(见 `pump` 里的 `started = Instant::now()`)。
 ///
-/// 这不是 bug 而是必要的:一个 CLI 进程横跨调用方的多个 HTTP 回合(每次桥调用都要
-/// 等调用方在自己机器上执行完再发下一个请求),10 轮工具往返的墙上时钟轻易超过 240s。
-/// 若把挂起等待也计进来,正常的长工具回路会被误杀。
+/// 为什么必须按阶段重置 —— 2026-08-18 生产事故(grok-4.6 连续秒败):
+/// 旧实现 `started` 从泵启动起**全程不重置**,唯一的检查点在 tick 分支。挂起期间
+/// tick 停转但墙钟照走,resume 唤醒后 tick 立即补发,`elapsed()` 把挂起时间全计入 →
+/// 累计墙钟超 240s 的会话**每次 resume 即秒杀**(生产大量 87~100ms 秒败报
+/// 「单轮超过 240s」)。而一个 CLI 进程横跨调用方的多个 HTTP 回合,10 轮工具往返的
+/// 累计墙钟轻易超过 240s —— 按全程计时必然误杀,只能按阶段计。
 ///
-/// 早先这里的注释写的是「单轮 CLI 调用的硬上限……保证先于我方上层超时干净地杀掉进程」,
-/// 那句话是错的:它既不是"单轮",也**兜不住**调用方那一侧的等待 —— 客户可见的空等由
-/// [`DRAIN_IDLE_TIMEOUT`] 负责。2026-08-17 排 300s 空等时查清。
-const CLI_TIMEOUT: Duration = Duration::from_secs(240);
+/// 客户可见的空等( resumed 后 CLI 一声不出)由 [`DRAIN_IDLE_TIMEOUT`] 负责,不归这里管。
+const CLI_TIMEOUT: Duration =
+    Duration::from_secs(gw_core::config::DEFAULT_CURSOR_CLI_PHASE_TIMEOUT_SECS);
+
+/// 阶段超时的下限(秒)。低于 30s 没有任何模型能完成首阶段(CLI 冷启动 + 首 token
+/// 就要这个量级),更小的值只会把每个请求都变成超时 —— [`set_phase_timeout_secs`]
+/// 把它们夹到这个下限。
+const MIN_PHASE_TIMEOUT_SECS: u64 = 30;
+
+/// `cursor_cli_phase_timeout_secs` 的启动默认:env `CURSOR_CLI_PHASE_TIMEOUT_SECS`,
+/// 解析失败按 [`CLI_TIMEOUT`](240s)。gw-core 侧 yaml 基线缺省值读的也是同一个 env,
+/// 所以 worker 首轮设置同步拿到的有效值与这里一致:env 是真正的启动默认,
+/// 之后由 DB overlay 热覆盖。
+fn default_phase_timeout_secs() -> u64 {
+    std::env::var("CURSOR_CLI_PHASE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(CLI_TIMEOUT.as_secs())
+}
+
+/// 运行期「单阶段活跃上限」(秒)。设置面板改 → DB overlay → worker 30s 轮询 →
+/// provider 的 `apply_hot_settings` → [`set_phase_timeout_secs`],**无需重启**。
+///
+/// 与 gw-kiro 的 `default_thinking_effort` / `history_thinking_turns` 同款进程级全局,
+/// 不用依赖注入:泵(`pump`)是自由函数,拿不到 provider 句柄,把参数一路穿下去
+/// 要改到 gw-app 的请求路径。
+fn runtime_phase_timeout() -> &'static RwLock<u64> {
+    static G: OnceLock<RwLock<u64>> = OnceLock::new();
+    G.get_or_init(|| RwLock::new(default_phase_timeout_secs()))
+}
+
+/// 当前生效的单阶段活跃上限。锁中毒时回退 [`CLI_TIMEOUT`](保守:维持出厂行为)。
+pub(crate) fn phase_timeout() -> Duration {
+    let secs = runtime_phase_timeout()
+        .read()
+        .map(|g| *g)
+        .unwrap_or_else(|_| CLI_TIMEOUT.as_secs());
+    Duration::from_secs(secs)
+}
+
+/// 热改阶段超时(秒),返回实际生效值:
+/// - `0` = 未设(`SystemConfig` derive 零值 / yaml 缺省 → from_effective 回灌的 0),
+///   回落启动默认(env 或 240),与 `egress.rs` 的「0=未设」先例同口径;
+/// - `1..MIN_PHASE_TIMEOUT_SECS` 夹到下限(理由见该常量);
+/// - 非法**类型**由调用方(`apply_hot_settings`)告警拒绝,到不了这里。
+/// 热改输入 → 生效秒数的纯映射(不碰全局,便于单测):`0` = 未设 → 启动默认
+/// (env 或 [`CLI_TIMEOUT`]);`1..MIN_PHASE_TIMEOUT_SECS` 夹到下限(理由见该常量)。
+fn resolve_phase_timeout_secs(secs: u64) -> u64 {
+    match secs {
+        0 => default_phase_timeout_secs(),
+        n => n.max(MIN_PHASE_TIMEOUT_SECS),
+    }
+}
+
+pub(crate) fn set_phase_timeout_secs(secs: u64) -> u64 {
+    let v = resolve_phase_timeout_secs(secs);
+    if let Ok(mut g) = runtime_phase_timeout().write() {
+        *g = v;
+    }
+    v
+}
 /// 桥调用等调用方带回 tool_result 的上限。超时给桥回错误,让 CLI 干净收尾。
 const PENDING_TTL: Duration = Duration::from_secs(280);
-/// **调用方一侧**的空闲上限:本次 HTTP 响应连续多久拿不到任何事件就判本轮废了。
+/// **调用方一侧**的空闲上限:本次 HTTP 响应连续多久拿不到任何**真实**事件
+/// (心跳不算,见下)就判本轮废了。
 ///
 /// 不设它的后果(2026-08-17 生产实测):`resume_conv` 把 tool_result 喂进挂起槽后直接返回
 /// [`drain_stream`],而那个流**没有任何超时** —— CLI 之后若一声不出,调用方就一路等到
@@ -74,9 +138,30 @@ const PENDING_TTL: Duration = Duration::from_secs(280);
 /// 1%~7%,客户看到的是**整整 5 分钟没有任何输出**。
 ///
 /// 取 90s 与线协议的 `chat::STALL_TIMEOUT` 同值(那边的理由:心跳 10s 一个,容忍 9 个)。
-/// 这里 OutQueue 里没有心跳,思考增量就是进展信号 —— 连续 90s 一个字节都没有等于死了。
+/// 心跳只证明 CLI 活着、**不算进展**(见下);连续 90s 没有任何真实事件等于死了。
 /// 宁可偏大:误判的代价是把一次本来会成功的慢请求变成失败。
+///
+/// 四层保活/超时关系(2026-08-18 起,误杀 grok 长思考事故后的分层):
+/// 1. **泵侧心跳保活**(15s 一发,仅 OutQueue 内部项):泵确认 CLI 在 60s 窗口内有
+///    任何原始活动(stdout 任意一行,含 system/status 等 Ev::Nothing,或桥 socket
+///    事件)就推 `Heartbeat`;drain 收到只重置本计时器,不上线缆。
+/// 2. **本死闸**(90s):心跳停了(= CLI 真死透,60s 无任何原始行)才触发,照旧收尸。
+///    心跳不是免死金牌 —— 它只在泵确认 CLI 活着时发。
+/// 3. **gw-app 300s `STREAM_IDLE_ABORT`** 总闸:心跳是内部的、不上线缆,骗不过它;
+///    全程无真实 SSE 的流照样被掐死。这是**刻意的兜底**,天花板语义不变。
+/// 4. **阶段超时硬顶**(`cursor_cli_phase_timeout_secs` 热配,默认 240s):单阶段
+///    活跃时间上限,挂起不计入。一个阶段连心跳带正文跑过这个上限,照样杀进程。
+///
+/// 桥挂起期间(call 分支 await)tick 停转、不发心跳 —— 这是对的:那时本次响应
+/// 已随 tool_use 交付结束,drain 已收尾,没有需要保活的对象。
 const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// 泵侧心跳间隔。drain 死闸 90s,15s 一发给足 6 次冗余(队列丢几下也不误杀),
+/// 又足够稀:心跳只是 OutQueue 里的内部项,不上线缆、不进计费。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// 「CLI 还活着」的判定窗口:60s 内有过任何原始活动(stdout 任意一行 —— 包括
+/// 解析成 Ev::Nothing 的 system/status/未知 NDJSON —— 或桥 socket 事件)才发心跳。
+/// 取 60s = 死闸 90s 的 2/3:真死透的 CLI 停发后最多再陪跑一个窗口,drain 照旧 90s 收尸。
+const HEARTBEAT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 /// 工具轮次估算用量的**校正系数**(乘在 [`crate::chat::est_text_tokens`] 的结果上)。
 ///
 /// 为什么需要它:CLI 只在整个会话结束时发一次 `result` 事件带真实用量(2026-08-17 抓原始
@@ -502,6 +587,13 @@ enum OutItem {
     Item(Result<StreamItem, UpstreamError>),
     /// 阶段结束:drain 流收到它就收尾(本次 Anthropic 响应完结)。
     End,
+    /// **内部心跳**:泵确认 CLI 活着(60s 窗口内有任何原始活动)时按 15s 间隔推入。
+    /// drain 收到只重置 idle 计时、**不产生任何 SSE 输出**(不上线缆,客户端零感知;
+    /// 也骗不过 gw-app 的 300s 总闸)。存在的唯一理由:把「CLI 有原始活动」与「模型有
+    /// 语义输出」拆成两个信号 —— grok 的隐藏推理期一个 thinking 增量都不发,但 CLI
+    /// 的 status/system 行还在走(2026-08-18 生产:team6 一小时被 90s 死闸误杀 9 次,
+    /// 同一轮重试 10 次全死)。
+    Heartbeat,
 }
 
 /// 泵 → 响应流的单向队列。空时 drain 等在 notify 上。
@@ -1277,25 +1369,38 @@ fn fallback_cache_from_sim(usage: &mut ChatUsage, sim_cache_read: u64) -> Option
 
 /// drain 一条响应流(到 End 为止)。
 fn drain_stream(out: Arc<OutQueue>) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
+    drain_stream_with_idle(out, DRAIN_IDLE_TIMEOUT)
+}
+
+/// [`drain_stream`] 的显式传参本体(idle 超时可注入,便于测试)。
+///
+/// `Heartbeat` 的处理:只重置 idle 计时继续等,**不产生任何 SSE 输出** ——
+/// 它不上线缆、客户端零感知,也骗不过 gw-app 的 300s 总闸(那是刻意的兜底)。
+/// 心跳停止(CLI 真死透,泵不再确认活动)后,idle 死闸照旧收尸。
+fn drain_stream_with_idle(out: Arc<OutQueue>, idle: Duration) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
     // 状态是 `Option`:超时那一下要**先发一条错误、再终止**,不能继续 pop ——
     // 否则下一次 poll 又等 90s,变成每 90s 吐一条错误的死循环。
-    futures::stream::unfold(Some(out), |st| async move {
+    futures::stream::unfold(Some(out), move |st| async move {
         let out = st?;
-        match tokio::time::timeout(DRAIN_IDLE_TIMEOUT, out.pop()).await {
-            Ok(OutItem::Item(it)) => Some((it, Some(out))),
-            Ok(OutItem::End) => None,
-            Err(_) => {
-                // 泵还活着(它可能正卡在别处),所以只结束**本次响应**,不动 CLI 进程:
-                // 调用方重试会走 cli_lookup,该重铺就重铺。
-                tracing::warn!(
-                    secs = DRAIN_IDLE_TIMEOUT.as_secs(),
-                    "cursor-cli:调用方一侧连续无事件,按本轮失败收尾"
-                );
-                let e = UpstreamError::new(
-                    UpstreamErrorKind::Other,
-                    format!("cursor-cli: 连续 {}s 没有任何输出", DRAIN_IDLE_TIMEOUT.as_secs()),
-                );
-                Some((Err(e), None))
+        loop {
+            match tokio::time::timeout(idle, out.pop()).await {
+                Ok(OutItem::Item(it)) => break Some((it, Some(out))),
+                Ok(OutItem::End) => break None,
+                // 泵确认 CLI 活着:重置 idle 计时(继续下一轮 pop),不产出任何 item。
+                Ok(OutItem::Heartbeat) => continue,
+                Err(_) => {
+                    // 泵还活着(它可能正卡在别处),所以只结束**本次响应**,不动 CLI 进程:
+                    // 调用方重试会走 cli_lookup,该重铺就重铺。
+                    tracing::warn!(
+                        secs = idle.as_secs(),
+                        "cursor-cli:调用方一侧连续无事件,按本轮失败收尾"
+                    );
+                    let e = UpstreamError::new(
+                        UpstreamErrorKind::Other,
+                        format!("cursor-cli: 连续 {}s 没有任何输出", idle.as_secs()),
+                    );
+                    break Some((Err(e), None));
+                }
             }
         }
     })
@@ -1334,7 +1439,16 @@ async fn pump(mut a: PumpArgs) {
     let mut phase =
         SsePhase::with_input(&a.echo_model, a.first_in_tally, sim.as_ref(), a.first_ctx_base);
     let mut state = NdjsonState::default();
-    let started = Instant::now();
+    // 阶段计时器:**每阶段独立**——桥挂起结束、新阶段开始时重置(见下方 call 分支)。
+    // 千万别改成全程不重置:挂起期间墙钟照走而 tick 停转,resume 后 tick 补发会把
+    // 挂起时间全计入 → 长会话每次 resume 即秒杀(2026-08-18 生产事故,见 CLI_TIMEOUT)。
+    let mut started = Instant::now();
+    // CLI 原始活动观测:stdout 任何一行(含解析成 Ev::Nothing 的 system/status)或
+    // 桥 socket 事件都刷新 last_activity;tick 据此发内部心跳(OutItem::Heartbeat),
+    // 防 drain 侧 90s 死闸误杀 grok 长思考(隐藏推理期一个 thinking 增量都不发,
+    // 2026-08-18 生产:team6 一小时被杀 9 次,同一轮重试 10 次全死)。
+    let mut last_activity = Instant::now();
+    let mut last_heartbeat = Instant::now();
     let mut last_auth_poll = Instant::now();
     let mut known_token = a.known_token.clone();
 
@@ -1376,6 +1490,9 @@ async fn pump(mut a: PumpArgs) {
                     Ok(None) => break 'outer Ok(()), // EOF:CLI 退出
                     Err(e) => break 'outer Err(UpstreamError::network(format!("读 cursor-cli 输出失败: {e}"))),
                 };
+                // 任何原始行都算活动(不管解析成什么事件):心跳保活只关心「CLI 死没死」,
+                // 不关心「模型有没有语义输出」——两个信号必须分开。
+                last_activity = Instant::now();
                 // 逆向排障:原始 NDJSON 落盘(仅设了 CURSOR_CLI_DUMP_NDJSON 时)。
                 if let Ok(f) = std::env::var("CURSOR_CLI_DUMP_NDJSON") {
                     use std::io::Write as _;
@@ -1408,6 +1525,8 @@ async fn pump(mut a: PumpArgs) {
                     Ok(Some(c)) => c,
                     _ => break 'outer Err(UpstreamError::new(UpstreamErrorKind::Other, "cursor-cli 桥连接中断".to_string())),
                 };
+                // 桥事件同样算 CLI 活动(桥进程是 CLI 拉起的,它说话 = CLI 活着)。
+                last_activity = Instant::now();
                 let Ok(v) = serde_json::from_str::<Value>(&call) else { continue };
                 let Some(call) = v.get("call") else { continue };
                 let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
@@ -1458,6 +1577,10 @@ async fn pump(mut a: PumpArgs) {
                         None,
                     ),
                 };
+                // 新阶段开始 = 重置阶段计时:挂起等 reply 的墙钟(最坏 PENDING_TTL)
+                // **不计入**下一阶段(2026-08-18 误杀事故的修复点,见 CLI_TIMEOUT 注释)。
+                // PENDING_TTL 超时路径同样走到这里:旧阶段已终结,重置无害。
+                started = Instant::now();
                 // 新阶段(下一个 Anthropic 响应)重新开始计数。**在拿到 reply 之后**才重建
                 // —— 喂回 CLI 的这段文本就是下一阶段的输入,要计进它的 in_tally。
                 // (重建时机必须早于下一次 phase.push_text,这里满足。)
@@ -1481,11 +1604,23 @@ async fn pump(mut a: PumpArgs) {
                 }
             }
             _ = tick.tick() => {
-                if started.elapsed() > CLI_TIMEOUT {
+                // 单阶段活跃上限(热配置可读,见 runtime_phase_timeout);桥挂起不计入 ——
+                // 挂起在 call 分支内部 await,tick 停转,resume 后 started 已重置。
+                let budget = phase_timeout();
+                if started.elapsed() > budget {
                     break 'outer Err(UpstreamError::new(
                         UpstreamErrorKind::Other,
-                        format!("cursor-cli 单轮超过 {}s,杀进程", CLI_TIMEOUT.as_secs()),
+                        format!("cursor-cli 单阶段超过 {}s,杀进程", budget.as_secs()),
                     ));
+                }
+                // CLI 活着(60s 窗口内有原始活动)且距上次心跳 ≥15s → 推内部心跳,
+                // 让 drain 侧 90s 死闸重置计时(心跳不上线缆,客户端零感知)。
+                // 桥挂起期间 tick 停转不会发 —— 那时本次响应已随 tool_use 交付,无需保活。
+                if last_activity.elapsed() < HEARTBEAT_ACTIVITY_WINDOW
+                    && last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL
+                {
+                    last_heartbeat = Instant::now();
+                    out.push(OutItem::Heartbeat);
                 }
                 // CLI 自刷新会回写 auth.json;中途轮换若没被捕获,CLI 一崩新 token
                 // 就丢了,而旧 refresh_token 已被上游作废 → 号砖。每 5s 看一眼,
@@ -2755,5 +2890,68 @@ mod tests {
         assert_eq!(slot.tool_use_id, "toolu_abc");
         assert_eq!(text, "正确结果");
         assert!(!conv.has_pending());
+    }
+
+    /// 阶段超时的纯映射(不碰进程全局):0 = 未设回落默认;< 下限夹到下限;其余原样。
+    /// 下限的存在理由:低于 30s 没有任何模型能完成首阶段(CLI 冷启动 + 首 token)。
+    #[test]
+    fn 阶段超时_纯映射_0回落_下限夹取() {
+        assert_eq!(resolve_phase_timeout_secs(0), CLI_TIMEOUT.as_secs(), "0 = 未设回落默认");
+        assert_eq!(resolve_phase_timeout_secs(1), MIN_PHASE_TIMEOUT_SECS);
+        assert_eq!(resolve_phase_timeout_secs(29), MIN_PHASE_TIMEOUT_SECS);
+        assert_eq!(resolve_phase_timeout_secs(30), MIN_PHASE_TIMEOUT_SECS);
+        assert_eq!(resolve_phase_timeout_secs(31), 31);
+        assert_eq!(resolve_phase_timeout_secs(3600), 3600);
+    }
+
+    /// 进程全局的读/热改/回落。**集中在一个用例里串行断言**:本 crate 只有这里
+    /// 碰这个全局,但 lib 单测同进程并行,拆开写就是给未来埋污染。
+    #[test]
+    fn 阶段超时_进程全局_热改与回落() {
+        assert_eq!(phase_timeout(), CLI_TIMEOUT, "env 未设时应为默认 240s");
+        assert_eq!(set_phase_timeout_secs(120), 120);
+        assert_eq!(phase_timeout(), Duration::from_secs(120), "热改立即生效");
+        assert_eq!(set_phase_timeout_secs(5), MIN_PHASE_TIMEOUT_SECS, "低于下限被夹");
+        assert_eq!(phase_timeout(), Duration::from_secs(30));
+        // 0 = 未设(worker 轮询拿到 derive 零值时)→ 回落启动默认,绝不把超时打成 0。
+        assert_eq!(set_phase_timeout_secs(0), CLI_TIMEOUT.as_secs());
+        assert_eq!(phase_timeout(), CLI_TIMEOUT, "回落后恢复默认");
+    }
+
+    /// 心跳把 drain 的 idle 计时无限续上,但**不上线缆**(客户端零感知)。
+    /// 用 20~100ms 的真实小时间而不 mock tokio 时间:快、没有 test-util 依赖,
+    /// 每个窗口留 5 倍余量不怕 CI 抖动。
+    #[tokio::test]
+    async fn drain_心跳只重置计时_不产生_sse() {
+        use futures::StreamExt;
+        let out = OutQueue::new();
+        let q = out.clone();
+        tokio::spawn(async move {
+            // 每 20ms 一个心跳连发 10 个(~200ms)—— 若心跳不算数,100ms 死闸早就杀了。
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                q.push(OutItem::Heartbeat);
+            }
+            q.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new("ping", json!({}))))));
+            q.push(OutItem::End);
+        });
+        let items: Vec<_> = drain_stream_with_idle(out, Duration::from_millis(100)).collect().await;
+        assert_eq!(items.len(), 1, "心跳不该产生任何 SSE item");
+        assert!(matches!(&items[0], Ok(StreamItem::Sse(_))), "唯一产出应是真实事件");
+    }
+
+    /// 心跳不是免死金牌:停发(= 泵确认 CLI 已无原始活动)后,idle 死闸照旧收尸。
+    #[tokio::test]
+    async fn drain_心跳停发后_idle死闸照旧收尸() {
+        use futures::StreamExt;
+        let out = OutQueue::new();
+        let q = out.clone();
+        tokio::spawn(async move {
+            q.push(OutItem::Heartbeat); // 只有一个心跳,之后再无动静
+        });
+        let items: Vec<_> = drain_stream_with_idle(out, Duration::from_millis(60)).collect().await;
+        assert_eq!(items.len(), 1, "超时后应只发一条错误再终止(不是每 90s 一条的死循环)");
+        let err = items[0].as_ref().err().expect("应按 idle 超时错误收尾");
+        assert!(format!("{err}").contains("没有任何输出"), "实际={err}");
     }
 }
