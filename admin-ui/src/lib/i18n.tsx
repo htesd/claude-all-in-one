@@ -463,6 +463,9 @@ const zh = {
   'settings.field.historyThinkingTurns': '历史 thinking 保留轮数',
   'settings.field.historyThinkingTurnsHint':
     '历史 assistant 消息里的 thinking 块保留几轮：0 = 全部丢弃（默认，缓存最稳）；N = 只保留最近 N 轮，更早的一律丢弃（由网关闭一，防客户端滚动裁剪造成字节抖动打断缓存）；-1 = 全部保留（测试用）。改动后所有在途会话下一轮缓存会全量 miss 一次，建议低峰切换。',
+  'settings.field.cursorCliPhaseTimeoutSecs': 'cursor CLI 单阶段超时（秒）',
+  'settings.field.cursorCliPhaseTimeoutSecsHint':
+    'CLI 驱动单个阶段的活跃时间上限（默认 240）：两次桥挂起之间的活跃段，等调用方执行工具的挂起时间不计入——长工具回路不会被误杀。低于 30 会被夹到 30。只影响 cursor 家族的 CLI 驱动，改完约 30 秒内生效，无需重启。',
   'settings.field.defaultProxy': '默认出口代理',
   'settings.field.defaultProxyPlaceholder': 'socks5://user:pass@host:port 或 http://host:port，留空走默认源 IP',
   'settings.field.egressPool': '出口代理池（每行一个）',
@@ -1076,6 +1079,9 @@ const en: Record<I18nKey, string> = {
   'settings.field.historyThinkingTurns': 'History thinking turns kept',
   'settings.field.historyThinkingTurnsHint':
     'How many recent turns keep their thinking blocks in history assistant messages: 0 = drop all (default, most cache-stable); N = keep only the last N turns, older ones always dropped (normalized by the gateway so client-side trimming cannot jitter bytes and break the cache prefix); -1 = keep all (for testing). Changing this causes one full cache miss for every in-flight session on its next turn — switch during off-peak.',
+  'settings.field.cursorCliPhaseTimeoutSecs': 'Cursor CLI phase timeout (secs)',
+  'settings.field.cursorCliPhaseTimeoutSecsHint':
+    "Active-time budget for a single CLI-driver phase (default 240): the span between bridge suspensions — time spent suspended waiting for the caller's tool_result does not count, so long tool loops are not killed by mistake. Values below 30 are clamped to 30. Only affects the cursor CLI driver; takes effect within ~30s, no restart needed.",
   'settings.field.defaultProxy': 'Default egress proxy',
   'settings.field.defaultProxyPlaceholder': 'socks5://user:pass@host:port or http://host:port, leave blank for default source IP',
   'settings.field.egressPool': 'Egress proxy pool (one per line)',

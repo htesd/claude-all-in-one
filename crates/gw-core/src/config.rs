@@ -273,6 +273,12 @@ impl ThinkingEffort {
 /// 深度与延迟的取舍依据见 `gw_kiro::anthropic_types::DEFAULT_EFFORT` 的文档表格。
 pub const DEFAULT_THINKING_EFFORT: ThinkingEffort = ThinkingEffort::High;
 
+/// cursor CLI 驱动「单阶段活跃时间上限」的默认秒数(env `CURSOR_CLI_PHASE_TIMEOUT_SECS` /
+/// 热配置 `cursor_cli_phase_timeout_secs` 可改)。「阶段」= 两次桥挂起之间的活跃段,
+/// 等调用方 tool_result 的挂起时间**不计入** —— 语义与 2026-08-18 误杀事故根因见
+/// `gw_cursor::clidrv` 的 `CLI_TIMEOUT` 注释。
+pub const DEFAULT_CURSOR_CLI_PHASE_TIMEOUT_SECS: u64 = 240;
+
 /// thinking(思维链)策略参数。可经设置面板热控(worker 30s 轮询生效)。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -390,6 +396,27 @@ pub struct SystemConfig {
     /// 反复调,不该每改一版就重建镜像。**只在 CLI 驱动的请求上追加**,线协议不读。
     #[serde(default)]
     pub cursor_cli_notice: String,
+    /// **CLI 驱动的单阶段活跃时间上限**(秒)。「阶段」= 两次桥挂起之间的活跃段;
+    /// 等调用方 tool_result 的挂起时间**不计入**(2026-08-18 误杀事故的修复语义,
+    /// 见 `gw_cursor::clidrv` 的 `CLI_TIMEOUT` 注释)。**只在 CLI 驱动的泵里生效**,
+    /// 线协议不读。命名空间同 [`Self::cursor_tool_guard`]。
+    ///
+    /// ⚠️ **0 = 未设**(derive(Default) 的零值也走这条路),消费侧回落默认
+    /// [`DEFAULT_CURSOR_CLI_PHASE_TIMEOUT_SECS`] —— 与 `egress.rs` 对
+    /// `upstream_timeout_secs` 零值的处理同口径。yaml 缺省值读 env
+    /// `CURSOR_CLI_PHASE_TIMEOUT_SECS`(解析失败按默认),面板热配置再覆盖它。
+    #[serde(default = "default_cursor_cli_phase_timeout_secs")]
+    pub cursor_cli_phase_timeout_secs: u64,
+}
+
+/// `cursor_cli_phase_timeout_secs` 的 yaml 缺省:env `CURSOR_CLI_PHASE_TIMEOUT_SECS`,
+/// 解析失败按 [`DEFAULT_CURSOR_CLI_PHASE_TIMEOUT_SECS`]。gw-cursor 侧进程全局的初值
+/// 读的是同一个 env,所以 worker 首轮设置同步拿到的有效值与泵的初值一致。
+fn default_cursor_cli_phase_timeout_secs() -> u64 {
+    std::env::var("CURSOR_CLI_PHASE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CURSOR_CLI_PHASE_TIMEOUT_SECS)
 }
 
 /// 一个热追加的 cursor 模型条目(见 [`SystemConfig::cursor_extra_models`])。
@@ -1073,6 +1100,10 @@ pub struct SystemSettings {
     /// 详见 [`SystemConfig::cursor_cli_notice`]。**只影响 cursor 家族的 CLI 驱动。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_cli_notice: Option<String>,
+    /// CLI 驱动单阶段活跃上限(秒;None = 用基线默认)。语义与「0=未设」约定见
+    /// [`SystemConfig::cursor_cli_phase_timeout_secs`]。**只影响 cursor 家族的 CLI 驱动。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_cli_phase_timeout_secs: Option<i64>,
     /// 兜住本版本**不认识**的 overlay key(新镜像写、旧镜像读的滚动升级窗口)。
     ///
     /// 存在的唯一理由是让「一个陌生 key」不再作废整份 overlay。它有两个消费者:
@@ -1149,6 +1180,11 @@ impl SystemSettings {
         if let Some(v) = &self.cursor_cli_notice {
             base.cursor_cli_notice = v.clone();
         }
+        if let Some(v) = self.cursor_cli_phase_timeout_secs {
+            // 负数按 0(=未设)钳:正整数校验在 admin PUT;手改 DB 的脏值不该
+            // 经 `as u64` 变成一个巨大的超时(等于把 watchdog 关了)。
+            base.cursor_cli_phase_timeout_secs = u64::try_from(v).unwrap_or(0);
+        }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -1204,6 +1240,7 @@ impl SystemSettings {
             cursor_extra_models: Some(cfg.cursor_extra_models.clone()),
             cursor_tool_guard: Some(cfg.cursor_tool_guard.clone()),
             cursor_cli_notice: Some(cfg.cursor_cli_notice.clone()),
+            cursor_cli_phase_timeout_secs: Some(cfg.cursor_cli_phase_timeout_secs as i64),
             // 全量视图由本进程的有效配置构造,按定义不含未知 key。
             unknown: Default::default(),
         }
@@ -1620,6 +1657,31 @@ workers:
         assert_eq!(base.thinking.history_thinking_turns, -1);
         let full = SystemSettings::from_effective(&base, None);
         assert_eq!(full.history_thinking_turns, Some(-1));
+    }
+
+    #[test]
+    fn settings_cursor_cli_phase_timeout_overlay_roundtrip() {
+        // 与 history_thinking_turns 同口径:None 保留基线,Some 覆盖,from_effective 回灌。
+        // 特有语义:derive 零值 0 = 未设(消费侧回落默认);overlay 里的负数钳成 0
+        // 而不是经 `as u64` 变成巨大超时(手改 DB 可绕过 admin PUT 的正整数校验)。
+        let mut base = SystemConfig::default();
+        assert_eq!(base.cursor_cli_phase_timeout_secs, 0, "derive 零值 = 未设");
+        SystemSettings::default().apply_to(&mut base);
+        assert_eq!(base.cursor_cli_phase_timeout_secs, 0, "None 时不覆盖");
+        let s = SystemSettings {
+            cursor_cli_phase_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        s.apply_to(&mut base);
+        assert_eq!(base.cursor_cli_phase_timeout_secs, 120, "Some 应覆盖基线");
+        let s = SystemSettings {
+            cursor_cli_phase_timeout_secs: Some(-5),
+            ..Default::default()
+        };
+        s.apply_to(&mut base);
+        assert_eq!(base.cursor_cli_phase_timeout_secs, 0, "负数应钳成 0(未设)");
+        let full = SystemSettings::from_effective(&base, None);
+        assert_eq!(full.cursor_cli_phase_timeout_secs, Some(0));
     }
 
     #[test]

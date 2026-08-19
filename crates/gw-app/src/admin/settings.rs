@@ -360,6 +360,23 @@ async fn put_settings(
             }
             continue;
         }
+        // cursor_cli_phase_timeout_secs:cursor CLI 驱动单阶段活跃上限(秒)。必须**正**
+        // 整数:0/负数的语义是「未设回落默认」,但那该用 null(上面的通用清理)表达 ——
+        // 写一个看着像值实际是「未设」的东西,面板会显示一个没生效的数字。
+        if k == "cursor_cli_phase_timeout_secs" {
+            match v.as_i64() {
+                Some(n) if n > 0 => {
+                    overlay_map.insert(k, serde_json::json!(n));
+                }
+                _ => {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        "cursor_cli_phase_timeout_secs 须为正整数(秒;单阶段活跃上限,桥挂起等待不计入;要回默认请传 null)",
+                    )
+                }
+            }
+            continue;
+        }
         overlay_map.insert(k, v);
     }
 
@@ -630,6 +647,42 @@ mod tests {
         }
         let v3 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
         assert_eq!(v3["history_thinking_turns"], -1, "被拒的写入不该改动已存值");
+    }
+
+    #[tokio::test]
+    async fn put_cursor_cli_phase_timeout_positive_int_roundtrip_and_rejects_bad() {
+        let (app, _store) = app();
+        let v = body_json(
+            app.clone()
+                .oneshot(req(
+                    "PUT",
+                    "/settings",
+                    Some(r#"{"cursor_cli_phase_timeout_secs": 120}"#),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["cursor_cli_phase_timeout_secs"], 120);
+        let v2 = body_json(app.clone().oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v2["cursor_cli_phase_timeout_secs"], 120, "应持久并经 from_effective 回灌");
+
+        // 0/负数/非整数都拒:0 与负数的语义是「未设回落默认」,该用 null 表达;
+        // 脏值不得落库,也不得改动已存值。
+        for bad in ["0", "-5", r#""120""#, "1.5"] {
+            let resp = app
+                .clone()
+                .oneshot(req(
+                    "PUT",
+                    "/settings",
+                    Some(format!(r#"{{"cursor_cli_phase_timeout_secs": {bad}}}"#).as_str()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{bad} 应 400");
+        }
+        let v3 = body_json(app.oneshot(req("GET", "/settings", None)).await.unwrap()).await;
+        assert_eq!(v3["cursor_cli_phase_timeout_secs"], 120, "被拒的写入不该改动已存值");
     }
 
     #[tokio::test]

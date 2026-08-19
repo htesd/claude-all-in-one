@@ -64,6 +64,8 @@ interface FormState {
   default_thinking_effort: ThinkingEffort
   /** 历史 thinking 保留轮数(0=全丢/默认;N>0=最近 N 轮;负=全保留)。 */
   history_thinking_turns: string
+  /** cursor CLI 驱动单阶段活跃上限(秒;0/缺省=默认 240)。 */
+  cursor_cli_phase_timeout_secs: string
 }
 
 function settingsToForm(s: SystemSettings): FormState {
@@ -110,6 +112,9 @@ function settingsToForm(s: SystemSettings): FormState {
     default_thinking_effort: s.default_thinking_effort ?? 'high',
     // 同口径:旧版本后端不返回时按基线 0(全丢)显示。
     history_thinking_turns: String(s.history_thinking_turns ?? 0),
+    // 0 = 未设(后端 derive 零值/旧版本后端不返回),归一显示为默认 240 ——
+    // 与 buildPatch 里的比较口径必须一致,否则每次保存都会捎带这个字段。
+    cursor_cli_phase_timeout_secs: String((s.cursor_cli_phase_timeout_secs ?? 0) || 240),
   }
 }
 
@@ -254,6 +259,14 @@ function buildPatch(form: FormState, original: SystemSettings): SystemSettingsPa
   const historyTurns = strictSignedInt(form.history_thinking_turns)
   if (historyTurns !== null && historyTurns !== (original.history_thinking_turns ?? 0)) {
     patch.history_thinking_turns = historyTurns
+  }
+
+  // cursor_cli_phase_timeout_secs:0/缺失 = 未设(默认 240),比较口径与 settingsToForm
+  // 同样归一到 240;后端 PUT 只收正整数(0/负数的「回默认」语义走 null,UI 不提供)。
+  const phaseTimeout = strictSignedInt(form.cursor_cli_phase_timeout_secs)
+  const phaseTimeoutCur = (original.cursor_cli_phase_timeout_secs ?? 0) || 240
+  if (phaseTimeout !== null && phaseTimeout > 0 && phaseTimeout !== phaseTimeoutCur) {
+    patch.cursor_cli_phase_timeout_secs = phaseTimeout
   }
 
   return patch
@@ -630,6 +643,23 @@ export default function SettingsPage() {
                 className={inputClass}
               />
               <p className="text-xs text-muted-foreground">{t('settings.field.rpmWaitMsHint')}</p>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">
+                {t('settings.field.cursorCliPhaseTimeoutSecs')}
+              </label>
+              <input
+                type="number"
+                step={1}
+                min={1}
+                value={form?.cursor_cli_phase_timeout_secs ?? ''}
+                onChange={(e) => set('cursor_cli_phase_timeout_secs', e.target.value)}
+                disabled={isLoading || form === null}
+                className={inputClass}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.field.cursorCliPhaseTimeoutSecsHint')}
+              </p>
             </div>
             <label className="flex cursor-pointer items-center gap-3 sm:col-span-2 lg:col-span-3">
               <input

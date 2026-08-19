@@ -61,6 +61,9 @@ export interface SystemSettings {
    *  最近 N 个 assistant 合并单元，更早的一律丢弃；负数 = 全部保留（测试用）。
    *  ⚠️ 改动会让所有在途会话下一轮缓存全量 miss 一次，建议低峰切换。 */
   history_thinking_turns: number | null
+  /** cursor CLI 驱动：单阶段活跃时间上限（秒）。「阶段」= 两次桥挂起之间的活跃段，
+   *  等调用方 tool_result 的挂起时间不计入。0/缺省 = 默认 240。只影响 cursor 家族的 CLI 驱动。 */
+  cursor_cli_phase_timeout_secs: number | null
   /** RPM 闸等待预算（毫秒，默认 10000）：合格号全部仅因 RPM 定频暂不可选时，等窗口腾名额的最长时长。 */
   rpm_wait_ms?: number
   /** 低优先新号暖机总开关（默认开；调度 rank ≥ 100 的号按号龄两期限速，高优号豁免）。 */
