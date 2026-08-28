@@ -156,7 +156,6 @@ const MODEL_PARAMS: u32 = 3; // repeated {1:key, 2:val}
 const PARAM_KEY: u32 = 1;
 const PARAM_VAL: u32 = 2;
 
-
 // ── 响应 ────────────────────────────────────────────────────────────────────
 const RESP_MESSAGE: u32 = 1; // 响应 field 1 = 流式消息
 /// `1.1` = **正文**增量块,`1.1.1` 是本体。
@@ -169,10 +168,10 @@ const RESP_MESSAGE: u32 = 1; // 响应 field 1 = 流式消息
 const RESP_TEXT: u32 = 1; // 1.1  正文增量块
 const RESP_THINKING: u32 = 4; // 1.4  思考增量块
 const RESP_DELTA_TEXT: u32 = 1; // 1.{1,4}.1 增量本体
-// ── 图片附件(1.2.1.1.3)内部 ───────────────────────────────────────────────
-//
-// 逐字对齐 2026-08-07 带图抓包。**内联原始字节,不走 FileSync** ——
-// 文档 §5 猜的「图片走 blob 上传」是错的:带图那次请求里没有任何 FSSyncFile 调用。
+                                // ── 图片附件(1.2.1.1.3)内部 ───────────────────────────────────────────────
+                                //
+                                // 逐字对齐 2026-08-07 带图抓包。**内联原始字节,不走 FileSync** ——
+                                // 文档 §5 猜的「图片走 blob 上传」是错的:带图那次请求里没有任何 FSSyncFile 调用。
 const ATT_UUID: u32 = 2;
 const ATT_PATH: u32 = 3; // 客户端本地路径,如 '…/images/粘贴的图像-<uuid>.png'
 const ATT_DIMS: u32 = 4; // {1: 宽, 2: 高}
@@ -543,7 +542,11 @@ pub fn parse_tool_call(payload: &[u8]) -> Option<ToolCall> {
             tool = %name, synth = %synth,
             "cursor 工具调用帧缺 call id(1.2.1),合成一个 —— 疑似上游字段号漂移,值得查"
         );
-        return Some(ToolCall { id: synth, name, args });
+        return Some(ToolCall {
+            id: synth,
+            name,
+            args,
+        });
     }
     Some(ToolCall { id, name, args })
 }
@@ -718,6 +721,261 @@ pub fn is_turn_commit(payload: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Run 响应的「续轮描述符」(顶层 field 3,2026-08-23 抓包实证):服务端把跨轮
+/// 状态当**不透明字节**回声给客户端,客户端下一轮原样回放(请求侧 `.1`)。
+///
+/// 实测形态(官方 CLI 两轮抓包,/tmp/cursor-capture):turn1(新会话)响应尾部
+/// 两帧(resp-011/013)顶层各带一份 `.3`,内容逐字节相同;turn2(resume)尾部
+/// 同样是两份相同的 `.3`,但 blob 引用从 4 个涨到 6 个(多出 turn1 产生的新
+/// blob)。schema 与请求 `.1` 相同:{repeated .1 = 32B blob 引用, .5 = 预算表,
+/// .8 = 32B, .9 = cwd, .10 = mode, .22 = 'cli', .26 = ts, .27 = tz}。
+///
+/// 对我们是**不透明字节:永不解析修改、永不构造**,只捕获存储(影子模式)。
+/// 这里唯一的"读"是定位顶层 field 3 本身。一帧内多次出现时取**最后一份**
+/// (尾部更接近流尾,状态最新)。
+pub fn descriptor_field3(payload: &[u8]) -> Option<&[u8]> {
+    let mut last = None;
+    for (f, v) in Reader::new(payload) {
+        if f == 3 {
+            if let PbValue::Len(s) = v {
+                // ⚠️ **零长度不算捕获**(codex 审查 #4)。空 `.3` 会让上层
+                // `is_some()` 判成「有料」→ 选增量消息 + `1.1` 零长度 = 服务端没有
+                // 历史、我方也没发 = 静默失忆。空描述符没有任何回放价值,当没有。
+                if !s.is_empty() {
+                    last = Some(s);
+                }
+            }
+        }
+    }
+    last
+}
+
+/// 数描述符里 32B blob 引用(`.1`)的个数 —— 影子日志的元数据。
+/// 这是影子模式对描述符内容的**唯一**一次读取,除此之外不碰内部字节。
+pub fn descriptor_ref_count(desc: &[u8]) -> usize {
+    Reader::new(desc)
+        .filter(|(f, v)| *f == 1 && matches!(v, PbValue::Len(s) if s.len() == 32))
+        .count()
+}
+
+/// 服务端「要求补传内容分节」的哈希回显个数(field-4 通道的 `4.2 = {1: bin[32]}`)。
+///
+/// ## 这是描述符路线唯一的地基风险
+///
+/// PROTOCOL §20.2 实测:我方**合成**的续轮(帧级照抄真包)被服务端用一串
+/// `4.2={1:bin[32]}` 卡住 —— 那是内容寻址存储(CAS)在要客户端按需把内容分节
+/// 补上来。而 §P3a(2026-08-23)观察官方 CLI 的 resume 时**零 FileSync/零上传**,
+/// 于是结论写成「blob 闸门不存在,捕获 `.3` 回放即可」。
+///
+/// 两件事不矛盾但**不能互推**:官方首轮 Run 期间内容已经在服务端落好了,
+/// 它 resume 时当然不用补;我方回放描述符时服务端手里有没有那些分节,
+/// **没有任何证据**。所以每轮都数一次:一旦这个数 > 0,说明描述符回放在我方
+/// 流量上还缺一条 CAS 上传腿,`.3` 回放不足以走通,必须回退并把这件事报上来。
+///
+/// 与 [`is_turn_commit`] 的区别:提交记录住在 `4.3.2.1`,哈希需求住在 `4.2.1`,
+/// 同一个 field-4 回显通道的两个不同分支。
+pub fn content_hash_echo(payload: &[u8]) -> usize {
+    content_hash_demands(payload).len()
+}
+
+/// 服务端点名要的内容分节哈希(field-4 通道的 `4.2.1 = bin[32]`)。
+///
+/// ## 机制(2026-08-23 turn4 抓包 + 时序实证,已推翻早先的定性)
+///
+/// 这**不是错误信号,是正常协议事件**。turn4(resume,距首轮 2.4h)的时序:
+///
+/// ```text
+/// .042  req-000  帧0(带描述符)
+/// .365  resp-000
+/// 212.236–.244  resp-001..007  ← 服务端 7 个 4.2 需求,一帧一个哈希
+/// 212.246–.255  req-001..007   ← 客户端 2ms 后交出 7 个内容槽
+/// 213.495 req-008  ENV         ← ENV 在内容交换之后
+/// ```
+///
+/// 需求 7 个、上传 7 个、**逐一配对**(每个上传节的 sha256 正好等于被点名的哈希),
+/// slot 序号 = 需求顺序 0..6。turn1/turn2 的响应里 `4.2` **零出现** —— 服务端当时
+/// 还缓存着内容,不需要问。
+///
+/// 所以描述符 `.1`/`.8` 是一张**内容寻址清单**:`.1` 装消息节哈希、`.8` 装轮次提交
+/// 记录哈希(实测 slot1 就是上一轮的 commit 记录 `{1:bin32, 2:bin32×N, 3:turn uuid,
+/// 4:182B 签名, 5:3}`)。回放清单只是第一条腿,**按需交出内容是第二条腿**。
+pub fn content_hash_demands(payload: &[u8]) -> Vec<[u8; 32]> {
+    let mut out = Vec::new();
+    for (f, v) in Reader::new(payload) {
+        if f != 4 {
+            continue;
+        }
+        let PbValue::Len(echo) = v else { continue };
+        for (f2, v2) in Reader::new(echo) {
+            if f2 != 2 {
+                continue;
+            }
+            let PbValue::Len(dem) = v2 else { continue };
+            for (f3, v3) in Reader::new(dem) {
+                if f3 == 1 {
+                    if let PbValue::Len(s) = v3 {
+                        if let Ok(h) = <[u8; 32]>::try_from(s) {
+                            out.push(h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 服务端回显的内容分节(field-4 通道的 `4.3.2` 那一层的**原始字节**)。
+///
+/// ## 这是内容供给的唯一来源(2026-08-23 实证)
+///
+/// 服务端把它创建的每一个内容节都在响应流里回显一次,节字节就是 `4.3.2` 这层的原始
+/// 字节 —— `sha256(那段字节)` 正好等于描述符里的引用。逐条验过:
+///
+/// ```text
+/// turn2 resp-006  590B → 49efdd84…  = turn4 slot6(user 消息)
+/// turn2 resp-008  330B → 8ef11f32…  = turn4 slot1(轮次提交记录)
+/// turn2 resp-010 1269B → 055fd9c0…  = turn4 slot0(assistant 消息)
+/// turn1 resp-002 2025B → 83ccb7a5…  = Composer 系统提示节
+/// ```
+///
+/// turn4 描述符的 8 个引用(6 refs + 2 f8)**8/8** 都能在前几轮的回显里找到。
+/// 官方 CLI 的 `~/.cursor/chats/*/*/store.db` `blobs` 表就是这么攒出来的 ——
+/// 它不是知识库,是**回显缓存**(实测 70/70 条 `id == sha256(data)`)。
+///
+/// 所以我方**不需要自建任何节**,也不需要复现服务端的 JSON 序列化(那本来是做不到的:
+/// hash 差一个字节就不认)。只要把回显存下来,后续被点名就能原样交回去。
+pub fn section_echoes(payload: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    for (f, v) in Reader::new(payload) {
+        if f != 4 {
+            continue;
+        }
+        let PbValue::Len(echo) = v else { continue };
+        for (f2, v2) in Reader::new(echo) {
+            if f2 != 3 {
+                continue;
+            }
+            let PbValue::Len(l3) = v2 else { continue };
+            for (f3, v3) in Reader::new(l3) {
+                if f3 == 2 {
+                    if let PbValue::Len(section) = v3 {
+                        if !section.is_empty() {
+                            out.push(section);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 一轮 wire(CLI 形态)请求的收尾体检表 —— **正向判据**。
+///
+/// ## 为什么回退判据不能写成「服务端拒绝描述符」
+///
+/// 描述符不被接受时上游**不报错**:200 + 每 10s 心跳 + 永不 trailer,与 IDE 形态缺
+/// `1.2.1.2` 同族。等一个 4xx 永远等不到 —— 请求会挂到超时再返回空,而那正是生产上
+/// 偶发 `EmptyResponse` 的形态(3 次/60s → 该号冷却 60s)。所以判据是「**该出现的
+/// 没出现**」,不是「出现了错误」。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WireTurnOutcome {
+    /// 见到顶层 `.3` 续轮描述符(= 下一轮回放的清单)。
+    pub saw_descriptor: bool,
+    /// 见到干净收尾:CLI 的 turn_commit 回显,或用量帧 / trailer。
+    pub saw_finish: bool,
+    /// 正文增量累计字符数。**思考不计** —— 只吐思考不吐正文对客户就是空回复。
+    pub content_chars: usize,
+    /// 服务端点名要的内容分节个数(见 [`content_hash_demands`])。
+    pub demanded: usize,
+    /// 其中**我方拿不出来**的个数。这才是失败信号。
+    pub unavailable: usize,
+}
+
+/// [`WireTurnOutcome`] 的判决。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireVerdict {
+    /// 有正文、有收尾。
+    Ok,
+    /// 服务端点名的分节里有我方拿不出来的 —— 描述符清单指向我方未持有的内容。
+    ///
+    /// 已知必然踩中的一类:每份描述符的第一个 `.1` 引用都是 Cursor 自己那 2025B 的
+    /// Composer 系统提示节(`{"role":"system","content":"You are an AI coding
+    /// assistant, powered by Composer…"}`),它**不在任何 ENV 帧里**(turn1/turn4 实测
+    /// 都没有),是官方 CLI 自己持有的。我方无法自建,被点名就只能重铺。
+    ContentUnavailable { missing: usize, demanded: usize },
+    /// 裸态:接受了请求,一个字没吐,也没收尾。
+    Barren,
+    /// 干净收尾但**没有新的 `.3`**。
+    ///
+    /// 官方每轮尾部都给新描述符(实测 turn1/turn2/turn4 各 3 份 `.3`),不给就是异常。
+    /// 后果不对称:本轮的回答是好的(不该扔),但**旧描述符已经缺了本轮** ——
+    /// 留着它下轮回放就是只发增量却配一张少一轮的清单 = 静默失忆。
+    /// 所以 `needs_reflow` 为真、`should_fallback` 为假。
+    NoDescriptor,
+    /// 出了字但没干净收尾:轮次可用,但**描述符不可信**(可能装着未完结的状态)。
+    NoFinish,
+}
+
+impl WireVerdict {
+    /// 这个判决是否要求**作废描述符**(下一轮重铺)。
+    ///
+    /// 比 [`WireTurnOutcome::should_fallback`] 宽一档:`NoFinish` 不让本轮失败
+    /// (出了字的轮次对客户有价值),但它的描述符**不可信** —— 可能装着未完结轮次的
+    /// 状态,留着下轮回放就是静默失忆。所以它进作废、不进本轮回退。
+    pub fn needs_reflow(self) -> bool {
+        !matches!(self, WireVerdict::Ok)
+    }
+
+    /// 本轮是否该判失败并回退成内联全量重铺。
+    ///
+    /// `NoFinish` **不**回退:出了字的轮次对客户是有价值的,扔掉等于白烧一次上游
+    /// 额度;它的代价由 [`Self::needs_reflow`](作废描述符)承担。
+    pub fn should_fallback(self) -> bool {
+        matches!(
+            self,
+            WireVerdict::ContentUnavailable { .. } | WireVerdict::Barren
+        )
+    }
+}
+
+impl WireTurnOutcome {
+    pub fn verdict(self) -> WireVerdict {
+        // ⚠️ 顺序:拿不出内容排最前 —— 它通常同时表现为裸态,但它是解释裸态成因的
+        // 那个诊断,判成 Barren 会把根因盖掉。
+        //
+        // 注意**只有 `unavailable > 0` 才是失败**。`demanded > 0` 本身是正常协议事件
+        // (服务端缓存过期后按需索取,见 `content_hash_demands`);早先把
+        // 「出现 4.2」当 NO-GO 是错的,会把一次健康的 resume 判成方案不可行。
+        if self.unavailable > 0 {
+            return WireVerdict::ContentUnavailable {
+                missing: self.unavailable,
+                demanded: self.demanded,
+            };
+        }
+        if self.content_chars == 0 && !self.saw_finish {
+            return WireVerdict::Barren;
+        }
+        if !self.saw_finish {
+            return WireVerdict::NoFinish;
+        }
+        if !self.saw_descriptor {
+            return WireVerdict::NoDescriptor;
+        }
+        WireVerdict::Ok
+    }
+
+    /// 本轮是否该判失败并回退成内联全量重铺(委托给 [`WireVerdict::should_fallback`])。
+    ///
+    /// ⚠️ **`saw_descriptor == false` 不进这个判断。** 那说的是「下一轮没有回放的料」,
+    /// 不是「这一轮失败了」—— 首轮本来就没有描述符可捕获,把它算进回退会让每条新会话
+    /// 的首轮都白跑一次。没料的处理是下一轮走首轮形态,不是重试这一轮。
+    pub fn should_fallback(self) -> bool {
+        self.verdict().should_fallback()
+    }
 }
 
 /// 会话登记通知(CLI 形态抓包新帧,2026-08-16):顶层 field 2 的
@@ -1093,7 +1351,10 @@ pub fn build_frame0(
     let mut detail = Writer::new();
     if shape.context_block {
         let mut envd = Writer::new();
-        envd.string(ENV_OS, &format!("{} {}", crate::wire::CLIENT_OS, env_os_release()));
+        envd.string(
+            ENV_OS,
+            &format!("{} {}", crate::wire::CLIENT_OS, env_os_release()),
+        );
         envd.string(ENV_SHELL, "bash");
         envd.string(ENV_TZ, timezone);
         envd.string(ENV_CWD, "/");
@@ -1127,7 +1388,10 @@ pub fn build_frame0(
     // `1.2.1.2` 是出不出字的开关(见 TURN_CONTEXT),而空 `turns` 会让下面的循环
     // 一次都不执行 → 造出的正是那个 445B 的静默挂起形态。invariant 收回函数本地:
     // 这是 `pub fn`,不能只靠 `chat_stream` 那一个调用点偶然守住。
-    assert!(!turns.is_empty(), "build_frame0 需要至少一轮消息,否则会造出不生成的请求");
+    assert!(
+        !turns.is_empty(),
+        "build_frame0 需要至少一轮消息,否则会造出不生成的请求"
+    );
 
     let mut conv = Writer::new();
     // 上下文块挂**最后一条用户轮**,不是最后一轮。Anthropic 允许以 assistant 消息
@@ -1482,7 +1746,11 @@ pub fn parse_frame(payload: &[u8]) -> RespFrame {
                         cache_write: u[3],
                     });
                     if u[4] > 0 {
-                        tracing::debug!(reasoning = u[4], output = u[1], "cursor 用量帧带推理 token(是 output 的子集,不入账)");
+                        tracing::debug!(
+                            reasoning = u[4],
+                            output = u[1],
+                            "cursor 用量帧带推理 token(是 output 的子集,不入账)"
+                        );
                     }
                 }
                 _ => {}
@@ -1625,6 +1893,63 @@ impl TrailerError {
     }
 }
 
+/// 影子模式测试向量:官方 CLI 两轮抓包(2026-08-23)里响应尾部的真实续轮
+/// 描述符帧(顶层 `.3`;已去 connect 帧头,flag=0 未压缩)。
+/// turn1(新会话)= 4 个 blob 引用;turn2(resume)= 6 个(多出的 2 个是 turn1
+/// 产生的新 blob)。chat.rs 的影子状态机测试也复用这份样本。
+#[cfg(test)]
+pub(crate) mod descriptor_samples {
+    const TURN1_HEX: &str = concat!(
+        "1a93040a2083ccb7a56d69b4e802e6d3e5bd95f480c74e90509a99c0e7e86199a253420e9d0a209d3e7d77",
+        "8fe69cee10f80bc46cc6b488b3e9647c6c685c405bfcdaf853a81b190a200e854779b77b9c42c1cce78cb4",
+        "4f5a20a0bdebf3e7bff700f02275e9382909a90a20eba17aceecd9f9f0cc20147089bef4c5e54395096e6d",
+        "d791abe4aa0722be1ec62aaf0208938a011080d00f1aa40208938a011080d00f1a240a0d73797374656d5f",
+        "70726f6d7074120d53797374656d2070726f6d707418ea0320a20f1a200a05746f6f6c731210546f6f6c",
+        "20646566696e6974696f6e7318ea3820eae2011a140a0572756c6573120552756c657318c01420ea511a",
+        "170a06736b696c6c731206536b696c6c7318fd2720cf9f011a200a036d637012134d435020262064796e",
+        "616d696320746f6f6c73189e0720ee1c1a270a097375626167656e747312145375626167656e74206465",
+        "66696e6974696f6e7318df0520f8161a340a1773756d6d6172697a65645f636f6e766572736174696f6e",
+        "121753756d6d6172697a656420636f6e766572736174696f6e20001a220a0c636f6e766572736174696f",
+        "6e120c436f6e766572736174696f6e18850420931042202079b7f951d09870cf25df5f3fad51d63d0c7d",
+        "f18f0382782a0964568a7eacae4a1566696c653a2f2f2f746d702f636c692d70726f62655002b2010363",
+        "6c69d001b0cd9fe68234da010d417369612f5368616e67686169",
+    );
+    const TURN2_HEX: &str = concat!(
+        "1af9040a2083ccb7a56d69b4e802e6d3e5bd95f480c74e90509a99c0e7e86199a253420e9d0a209d3e7d77",
+        "8fe69cee10f80bc46cc6b488b3e9647c6c685c405bfcdaf853a81b190a200e854779b77b9c42c1cce78cb4",
+        "4f5a20a0bdebf3e7bff700f02275e9382909a90a20eba17aceecd9f9f0cc20147089bef4c5e54395096e6d",
+        "d791abe4aa0722be1ec60a2049efdd84a6f34b5a5627262f8be867f55519b8fdd912c8d9a09974eec1b18b",
+        "bc0a20055fd9c055dde4c3ceaa81df885f49e5a601f8a1339952d96042ecc669e610cb2aaf0208b98b0110",
+        "80d00f1aa40208b98b011080d00f1a240a0d73797374656d5f70726f6d7074120d53797374656d2070726f",
+        "6d707418ea0320a20f1a200a05746f6f6c731210546f6f6c20646566696e6974696f6e7318ea3820eae201",
+        "1a140a0572756c6573120552756c657318c01420ea511a170a06736b696c6c731206536b696c6c7318fd27",
+        "20cf9f011a200a036d637012134d435020262064796e616d696320746f6f6c73189e0720ee1c1a270a0973",
+        "75626167656e747312145375626167656e7420646566696e6974696f6e7318df0520f8161a340a177375",
+        "6d6d6172697a65645f636f6e766572736174696f6e121753756d6d6172697a656420636f6e7665727361",
+        "74696f6e20001a220a0c636f6e766572736174696f6e120c436f6e766572736174696f6e18ab0520a513",
+        "42202079b7f951d09870cf25df5f3fad51d63d0c7df18f0382782a0964568a7eacae42208ef11f326b346f",
+        "31a60f7404fc4e2fae4e3e43335adeada5207242c3e5d0f34a4a1566696c653a2f2f2f746d702f636c69",
+        "2d70726f62655002b20103636c69d001b0cd9fe68234da010d417369612f5368616e67686169",
+    );
+
+    pub(crate) fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("样本必须是合法 hex"))
+            .collect()
+    }
+
+    /// turn1(新会话)响应尾部的描述符帧 payload:4 个 blob 引用。
+    pub(crate) fn turn1() -> Vec<u8> {
+        hex_to_bytes(TURN1_HEX)
+    }
+
+    /// turn2(resume)响应尾部的描述符帧 payload:6 个 blob 引用。
+    pub(crate) fn turn2() -> Vec<u8> {
+        hex_to_bytes(TURN2_HEX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1658,7 +1983,6 @@ mod tests {
         assert!(!is_session_notice(&exec.into_bytes()));
     }
 
-
     /// 测试包装:绝大多数用例不关心 `1.14` 清单,统一传空。
     fn f0(
         turns: &[Turn],
@@ -1669,7 +1993,19 @@ mod tests {
         shape: RunShape,
         phase: Phase,
     ) -> Vec<u8> {
-        build_frame0(turns, "", &[], Media::default(), model, &[], conversation_id, timezone, now_ms, shape, phase)
+        build_frame0(
+            turns,
+            "",
+            &[],
+            Media::default(),
+            model,
+            &[],
+            conversation_id,
+            timezone,
+            now_ms,
+            shape,
+            phase,
+        )
     }
 
     /// 按字段号路径取一个 length-delimited 子消息。
@@ -1759,7 +2095,10 @@ mod tests {
 
         let env = dig(body, &[BODY_ENV]).unwrap();
         assert_eq!(varint_at(env, ENV_TIMESTAMP_MS), Some(1_700_000_000_123));
-        assert_eq!(string_at(env, ENV_TIMEZONE).as_deref(), Some("Asia/Shanghai"));
+        assert_eq!(
+            string_at(env, ENV_TIMEZONE).as_deref(),
+            Some("Asia/Shanghai")
+        );
         assert_eq!(varint_at(env, ENV_FLAG10), Some(1));
     }
 
@@ -1956,13 +2295,29 @@ mod tests {
             model_catalog: false,
             context_block: false,
         };
-        let bytes = f0(&one_user("hi"), &Model::new("default"), "c", "UTC", 1, off,
+        let bytes = f0(
+            &one_user("hi"),
+            &Model::new("default"),
+            "c",
+            "UTC",
+            1,
+            off,
             Phase::Continuation,
         );
         let body = dig(&bytes, &[FRAME_BODY]).unwrap();
-        assert!(dig(body, &[BODY_ENV]).is_none(), "env_block=false 应整块不发");
-        let m = dig(dig(body, &[BODY_CONVERSATION]).unwrap(), &[CONV_TURN, TURN_MESSAGE]).unwrap();
-        assert!(string_at(m, MSG_RICH).is_none(), "prosemirror=false 应不发富文本");
+        assert!(
+            dig(body, &[BODY_ENV]).is_none(),
+            "env_block=false 应整块不发"
+        );
+        let m = dig(
+            dig(body, &[BODY_CONVERSATION]).unwrap(),
+            &[CONV_TURN, TURN_MESSAGE],
+        )
+        .unwrap();
+        assert!(
+            string_at(m, MSG_RICH).is_none(),
+            "prosemirror=false 应不发富文本"
+        );
         // 会话与模型是骨架,任何 shape 下都要在
         assert_eq!(string_at(m, MSG_TEXT).as_deref(), Some("hi"));
         assert!(dig(body, &[BODY_MODEL]).is_some());
@@ -1972,7 +2327,13 @@ mod tests {
             budget_table: false,
             ..RunShape::default()
         };
-        let b2 = f0(&one_user("hi"), &Model::new("default"), "c", "UTC", 1, no_budget,
+        let b2 = f0(
+            &one_user("hi"),
+            &Model::new("default"),
+            "c",
+            "UTC",
+            1,
+            no_budget,
             Phase::Continuation,
         );
         let env2 = dig(dig(&b2, &[FRAME_BODY]).unwrap(), &[BODY_ENV]).unwrap();
@@ -1999,7 +2360,11 @@ mod tests {
         let env = dig(dig(&bytes, &[FRAME_BODY]).unwrap(), &[BODY_ENV]).unwrap();
         // 三层:1.1.5{1:合计,2:上限,3:{1:合计,2:上限,3:[分节…]}}
         let outer = dig(env, &[ENV_BUDGET]).unwrap();
-        assert_eq!(varint_at(outer, 2), Some(BUDGET_MAX_TOKENS), "上限恒为 256000");
+        assert_eq!(
+            varint_at(outer, 2),
+            Some(BUDGET_MAX_TOKENS),
+            "上限恒为 256000"
+        );
         let inner = dig(outer, &[3]).unwrap();
         assert_eq!(varint_at(inner, 2), Some(BUDGET_MAX_TOKENS));
         let secs: Vec<&[u8]> = Reader::new(inner)
@@ -2009,7 +2374,10 @@ mod tests {
             })
             .collect();
         assert_eq!(secs.len(), 8, "真客户端报 8 节");
-        let conv = secs.iter().find(|s| string_at(s, 1).as_deref() == Some("conversation")).unwrap();
+        let conv = secs
+            .iter()
+            .find(|s| string_at(s, 1).as_deref() == Some("conversation"))
+            .unwrap();
         assert_eq!(varint_at(conv, 4), Some(8), "chars 必须是真实字符数");
         assert_eq!(varint_at(conv, 3), Some(2), "tokens = ceil(chars/4)");
         // 合计 = 各节之和(抓包实物这条恒成立)
@@ -2018,7 +2386,10 @@ mod tests {
         assert_eq!(varint_at(inner, 1), Some(sum));
         // 工具/mcp/subagents 必须报 0 —— 声明了就会收到无法应答的工具调用
         for k in ["tools", "mcp", "subagents", "rules", "skills"] {
-            let sec = secs.iter().find(|s| string_at(s, 1).as_deref() == Some(k)).unwrap();
+            let sec = secs
+                .iter()
+                .find(|s| string_at(s, 1).as_deref() == Some(k))
+                .unwrap();
             assert_eq!(varint_at(sec, 3).unwrap_or(0), 0, "{k} 必须报 0");
         }
     }
@@ -2043,7 +2414,10 @@ mod tests {
         assert_eq!(node["attrs"]["mentionType"], "file");
         assert_eq!(node["attrs"]["label"], "doc-0.pdf");
         assert_eq!(node["attrs"]["rawText"], "/tmp/gw-cursor/doc-0.pdf");
-        assert_eq!(node["attrs"]["payload"]["uri"]["path"], "/tmp/gw-cursor/doc-0.pdf");
+        assert_eq!(
+            node["attrs"]["payload"]["uri"]["path"],
+            "/tmp/gw-cursor/doc-0.pdf"
+        );
         // id/uuid 是 `file:file://<百分号编码路径>`,与真客户端同形。
         assert_eq!(node["attrs"]["id"], "file:file:///tmp/gw-cursor/doc-0.pdf");
         // 文本仍在后面的段落里。
@@ -2054,7 +2428,10 @@ mod tests {
     fn 路径百分号编码只转非ascii() {
         assert_eq!(percent_encode_path("/tmp/a-b_c.pdf"), "/tmp/a-b_c.pdf");
         // 中文按 UTF-8 逐字节转,与真客户端的 %E4%B8%8B%E8%BD%BD 同形。
-        assert_eq!(percent_encode_path("/下载/x.pdf"), "/%E4%B8%8B%E8%BD%BD/x.pdf");
+        assert_eq!(
+            percent_encode_path("/下载/x.pdf"),
+            "/%E4%B8%8B%E8%BD%BD/x.pdf"
+        );
         assert_eq!(percent_encode_path("/a b"), "/a%20b");
     }
 
@@ -2133,7 +2510,15 @@ mod tests {
         let mut outer = Writer::new();
         outer.message(RESP_MESSAGE, &msg);
         let fr = parse_frame(&outer.into_bytes());
-        assert_eq!(fr.usage, Some(WireUsage { input: 12106, output: 74, cache_read: 11904, cache_write: 0 }));
+        assert_eq!(
+            fr.usage,
+            Some(WireUsage {
+                input: 12106,
+                output: 74,
+                cache_read: 11904,
+                cache_write: 0
+            })
+        );
         // 普通文本帧不能被误判成收尾,否则第一个字出来就把流关了。
         assert_eq!(parse_frame(&delta_frame(RESP_TEXT, "x")).usage, None);
     }
@@ -2150,7 +2535,11 @@ mod tests {
         hb_inner.string(13, "");
         let mut hb = Writer::new();
         hb.message(RESP_MESSAGE, &hb_inner);
-        assert_eq!(parse_frame(&hb.into_bytes()), RespFrame::default(), "心跳不许产出任何东西");
+        assert_eq!(
+            parse_frame(&hb.into_bytes()),
+            RespFrame::default(),
+            "心跳不许产出任何东西"
+        );
 
         // ② 状态帧 1.8.1 也走 field 1,同样不该产出。
         let mut st_inner = Writer::new();
@@ -2174,15 +2563,28 @@ mod tests {
     #[test]
     fn prefill时上下文块挂在最后一条用户轮上() {
         let turns = vec![
-            Turn { text: "问题".into(), is_user: true },
-            Turn { text: "答案是".into(), is_user: false },
+            Turn {
+                text: "问题".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "答案是".into(),
+                is_user: false,
+            },
         ];
         let bytes = build_frame0(
             &turns,
             "sys",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening);
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
         let conv = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION]).unwrap();
         let seen: Vec<&[u8]> = Reader::new(conv)
             .filter_map(|(f, v)| match (f, v) {
@@ -2192,7 +2594,10 @@ mod tests {
             .collect();
         assert_eq!(seen.len(), 2);
         assert!(dig(seen[0], &[TURN_CONTEXT]).is_some(), "必须挂在用户轮");
-        assert!(dig(seen[1], &[TURN_CONTEXT]).is_none(), "助手轮(prefill)不该带上下文块");
+        assert!(
+            dig(seen[1], &[TURN_CONTEXT]).is_none(),
+            "助手轮(prefill)不该带上下文块"
+        );
     }
 
     /// 同一帧里正文与用量并存时,正文**不能**被丢。
@@ -2213,7 +2618,15 @@ mod tests {
         outer.message(RESP_MESSAGE, &msg);
         let fr = parse_frame(&outer.into_bytes());
         assert_eq!(fr.text, "APPLE", "收口帧里的正文必须照样解出来");
-        assert_eq!(fr.usage, Some(WireUsage { input: 10, output: 2, cache_read: 0, cache_write: 0 }));
+        assert_eq!(
+            fr.usage,
+            Some(WireUsage {
+                input: 10,
+                output: 2,
+                cache_read: 0,
+                cache_write: 0
+            })
+        );
     }
 
     #[should_panic(expected = "至少一轮消息")]
@@ -2224,7 +2637,14 @@ mod tests {
             "",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening);
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
     }
 
     #[test]
@@ -2244,7 +2664,10 @@ mod tests {
         );
         let conv = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION]).unwrap();
         let det = dig(conv, &[CONV_TURN, TURN_CONTEXT]).unwrap();
-        assert_eq!(string_at(det, DET_SYSTEM_PROMPT).as_deref(), Some("你是助手"));
+        assert_eq!(
+            string_at(det, DET_SYSTEM_PROMPT).as_deref(),
+            Some("你是助手")
+        );
         // 用户消息里**不能**混进系统提示
         let m = dig(conv, &[CONV_TURN, TURN_MESSAGE]).unwrap();
         assert_eq!(string_at(m, MSG_TEXT).as_deref(), Some("问题"));
@@ -2263,8 +2686,19 @@ mod tests {
             "",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening);
-        let det2 = dig(&b2, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT]).unwrap();
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
+        let det2 = dig(
+            &b2,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT],
+        )
+        .unwrap();
         assert!(string_at(det2, DET_SYSTEM_PROMPT).is_none());
     }
 
@@ -2287,10 +2721,23 @@ mod tests {
             "系统提示",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1, shape, Phase::Opening);
-        let det = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT])
-            .expect("1.2.1.2 必须在场,否则服务端接受请求但永远不生成");
-        assert!(det.is_empty(), "关掉 context_block 时里面应为空,但字段本身要在");
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            shape,
+            Phase::Opening,
+        );
+        let det = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT],
+        )
+        .expect("1.2.1.2 必须在场,否则服务端接受请求但永远不生成");
+        assert!(
+            det.is_empty(),
+            "关掉 context_block 时里面应为空,但字段本身要在"
+        );
     }
 
     /// **首轮 `1.1` 必须是空的**(字段在、长度 0),后续轮才装预算表。
@@ -2299,11 +2746,27 @@ mod tests {
     /// 服务端自己看得见;后续轮上下文在服务端手里,客户端只能报账告诉它各节多大。
     #[test]
     fn 首轮环境块为空后续轮才报账() {
-        let open = f0(&one_user("q"), &Model::new("default"), "c", "UTC", 1, RunShape::default(), Phase::Opening);
+        let open = f0(
+            &one_user("q"),
+            &Model::new("default"),
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
         let env = dig(&open, &[FRAME_BODY, BODY_ENV]).expect("字段本身要在");
         assert!(env.is_empty(), "首轮 1.1 必须是空的,实际 {}B", env.len());
 
-        let cont = f0(&one_user("q"), &Model::new("default"), "c", "UTC", 1, RunShape::default(), Phase::Continuation);
+        let cont = f0(
+            &one_user("q"),
+            &Model::new("default"),
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Continuation,
+        );
         let env = dig(&cont, &[FRAME_BODY, BODY_ENV]).unwrap();
         assert!(!env.is_empty(), "后续轮 1.1 要带预算表");
         assert_eq!(string_at(env, ENV_TIMEZONE).as_deref(), Some("UTC"));
@@ -2316,17 +2779,32 @@ mod tests {
     #[test]
     fn 后续轮只发新消息但上下文声明仍挂轮内() {
         let turns = vec![
-            Turn { text: "第一问".into(), is_user: true },
-            Turn { text: "第一答".into(), is_user: false },
-            Turn { text: "第二问".into(), is_user: true },
+            Turn {
+                text: "第一问".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "第一答".into(),
+                is_user: false,
+            },
+            Turn {
+                text: "第二问".into(),
+                is_user: true,
+            },
         ];
         let bytes = build_frame0(
             &turns,
             "sys",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1,
-                                 RunShape::default(), Phase::Continuation);
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Continuation,
+        );
         let conv = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION]).unwrap();
         let seen: Vec<&[u8]> = Reader::new(conv)
             .filter_map(|(f, v)| match (f, v) {
@@ -2336,7 +2814,11 @@ mod tests {
             .collect();
         assert_eq!(seen.len(), 1, "后续轮只该发一条消息,实际 {}", seen.len());
         let m = dig(seen[0], &[TURN_MESSAGE]).unwrap();
-        assert_eq!(string_at(m, MSG_TEXT).as_deref(), Some("第二问"), "发的必须是最新那条");
+        assert_eq!(
+            string_at(m, MSG_TEXT).as_deref(),
+            Some("第二问"),
+            "发的必须是最新那条"
+        );
         // ⭐ 上下文声明**仍在轮内** 1.2.1.2 —— 这是 2026-08-08 实测出来的唯一可用形态
         // (挪到会话级 1.2.17 会让上游静默挂起,见 PROTOCOL §17)。
         let det = dig(seen[0], &[TURN_CONTEXT]).expect("后续轮轮内必须有 1.2.1.2");
@@ -2353,16 +2835,32 @@ mod tests {
     #[test]
     fn 多轮对话只有最后一轮带上下文块() {
         let turns = vec![
-            Turn { text: "第一问".into(), is_user: true },
-            Turn { text: "第一答".into(), is_user: false },
-            Turn { text: "第二问".into(), is_user: true },
+            Turn {
+                text: "第一问".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "第一答".into(),
+                is_user: false,
+            },
+            Turn {
+                text: "第二问".into(),
+                is_user: true,
+            },
         ];
         let bytes = build_frame0(
             &turns,
             "sys",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening);
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
         let conv = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION]).unwrap();
         let seen: Vec<&[u8]> = Reader::new(conv)
             .filter_map(|(f, v)| match (f, v) {
@@ -2371,7 +2869,10 @@ mod tests {
             })
             .collect();
         assert_eq!(seen.len(), 3);
-        assert!(dig(seen[0], &[TURN_CONTEXT]).is_none(), "前面几轮不该重复上下文块");
+        assert!(
+            dig(seen[0], &[TURN_CONTEXT]).is_none(),
+            "前面几轮不该重复上下文块"
+        );
         assert!(dig(seen[1], &[TURN_CONTEXT]).is_none());
         let det = dig(seen[2], &[TURN_CONTEXT]).expect("最后一轮必须带");
         assert_eq!(string_at(det, DET_SYSTEM_PROMPT).as_deref(), Some("sys"));
@@ -2472,7 +2973,10 @@ mod tests {
         let raw = include_bytes!("../tests/fixtures/asset_echo_real.bin");
         assert!(is_tool_call(raw), "它确实走 exec 通道");
         let w = parse_exec_write(raw).expect("资产写调用必须解得出来");
-        assert_eq!(w.path, "/assets/attach-0-6bd00159-1e01-4924-b8c2-12f28cc81e53.png");
+        assert_eq!(
+            w.path,
+            "/assets/attach-0-6bd00159-1e01-4924-b8c2-12f28cc81e53.png"
+        );
         assert_eq!(w.bytes.len(), 73, "1x1 探针 PNG 的原始字节数");
         assert_eq!(w.id, 0, "实物帧里关联 id 缺省");
         assert_eq!(w.exec_id, "");
@@ -2584,7 +3088,12 @@ mod tests {
         assert!(parse_tool_call(&frame).is_none(), "合帧里没有工具调用");
         assert_eq!(
             parse_frame(&frame).usage,
-            Some(WireUsage { input: 100, output: 5, cache_read: 90, cache_write: 0 }),
+            Some(WireUsage {
+                input: 100,
+                output: 5,
+                cache_read: 90,
+                cache_write: 0
+            }),
             "合帧里的用量绝不能被写调用吞掉"
         );
     }
@@ -2607,13 +3116,19 @@ mod tests {
         for (f, v) in Reader::new(ecm) {
             match (f, v) {
                 (1, PbValue::Varint(n)) => seen_id = Some(n),
-                (15, PbValue::Len(s)) => seen_exec_id = Some(String::from_utf8_lossy(s).to_string()),
+                (15, PbValue::Len(s)) => {
+                    seen_exec_id = Some(String::from_utf8_lossy(s).to_string())
+                }
                 (3, PbValue::Len(s)) => wr = Some(s),
                 _ => {}
             }
         }
         assert_eq!(seen_id, Some(42), "id 必须原样带回(field 1)");
-        assert_eq!(seen_exec_id.as_deref(), Some("exec-1"), "exec_id 在 field 15");
+        assert_eq!(
+            seen_exec_id.as_deref(),
+            Some("exec-1"),
+            "exec_id 在 field 15"
+        );
         // write_result.1 = write_success{1:path, 3:file_size}
         let ws = Reader::new(wr.expect("write_result 在 field 3"))
             .find_map(|(f, v)| match (f, v) {
@@ -2686,7 +3201,11 @@ mod tests {
         }
         assert_eq!(path.as_deref(), Some("/assets/a.png"));
         assert_eq!(size, Some(4));
-        assert_eq!(data.as_deref(), Some(&b"\x89PNG"[..]), "图片字节走 field 5(data)");
+        assert_eq!(
+            data.as_deref(),
+            Some(&b"\x89PNG"[..]),
+            "图片字节走 field 5(data)"
+        );
     }
 
     /// 读调用解析:绝对路径才认领,关联 id 带回。
@@ -2702,16 +3221,19 @@ mod tests {
         let r = parse_exec_read(&top.into_bytes()).expect("读调用必须解得出");
         assert_eq!(r.path, "/assets/attach-0-x.png");
         assert_eq!(r.id, 9);
-        assert!(parse_exec_write(&{
-            let mut args = Writer::new();
-            args.string(1, "/assets/attach-0-x.png");
-            let mut ch = Writer::new();
-            ch.message(EXEC_READ_ARGS, &args);
-            let mut top = Writer::new();
-            top.message(RESP_TOOL_CHANNEL, &ch);
-            top.into_bytes()
-        })
-        .is_none(), "读不是写");
+        assert!(
+            parse_exec_write(&{
+                let mut args = Writer::new();
+                args.string(1, "/assets/attach-0-x.png");
+                let mut ch = Writer::new();
+                ch.message(EXEC_READ_ARGS, &args);
+                let mut top = Writer::new();
+                top.message(RESP_TOOL_CHANNEL, &ch);
+                top.into_bytes()
+            })
+            .is_none(),
+            "读不是写"
+        );
     }
 
     /// ⭐ 数值参数。这是 2026-08-07 那次「grok 无限重试」的直接病因:
@@ -2826,7 +3348,10 @@ mod tests {
         outer.message(RESP_MESSAGE, &msg);
         assert_eq!(
             parse_builtin_call(&outer.into_bytes()),
-            Some(BuiltinCall::Terminal { id: "call-x-0".into(), command: "ls -la".into() })
+            Some(BuiltinCall::Terminal {
+                id: "call-x-0".into(),
+                command: "ls -la".into()
+            })
         );
     }
 
@@ -2848,7 +3373,10 @@ mod tests {
         outer.message(RESP_MESSAGE, &msg);
         assert_eq!(
             parse_builtin_call(&outer.into_bytes()),
-            Some(BuiltinCall::ReadFile { id: "call-y-0".into(), path: "/tmp/a.png".into() })
+            Some(BuiltinCall::ReadFile {
+                id: "call-y-0".into(),
+                path: "/tmp/a.png".into()
+            })
         );
     }
 
@@ -2915,24 +3443,47 @@ mod tests {
             RunShape::default(),
             Phase::Opening,
         );
-        let det = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT]).unwrap();
+        let det = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT],
+        )
+        .unwrap();
         let t = dig(det, &[DET_TOOL]).expect("工具必须落在 1.2.1.2.7");
         // 全名 = <命名空间>-<裸名>,回调时靠这个前缀认领「这是调用方的工具」。
-        assert_eq!(string_at(t, TOOL_FULL_NAME).as_deref(), Some("gwtools-get_weather"));
+        assert_eq!(
+            string_at(t, TOOL_FULL_NAME).as_deref(),
+            Some("gwtools-get_weather")
+        );
         assert_eq!(string_at(t, TOOL_DESC).as_deref(), Some("查天气"));
         assert_eq!(string_at(t, TOOL_NAMESPACE).as_deref(), Some(TOOL_NS));
         assert_eq!(string_at(t, TOOL_BARE_NAME).as_deref(), Some("get_weather"));
-        assert_eq!(string_at(t, TOOL_SCHEMA).as_deref(), Some(r#"{"type":"object"}"#));
+        assert_eq!(
+            string_at(t, TOOL_SCHEMA).as_deref(),
+            Some(r#"{"type":"object"}"#)
+        );
     }
 
     /// 没声明工具时**不能**凭空多出一个空的 `1.2.1.2.7`。
     #[test]
     fn 没有工具时不发空的工具声明() {
         let bytes = build_frame0(
-            &one_user("hi"), "", &[], Media::default(), &Model::new("default"), &[], "c", "UTC", 1,
-            RunShape::default(), Phase::Opening,
+            &one_user("hi"),
+            "",
+            &[],
+            Media::default(),
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
         );
-        let det = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT]).unwrap();
+        let det = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT],
+        )
+        .unwrap();
         assert!(dig(det, &[DET_TOOL]).is_none());
     }
 
@@ -2946,7 +3497,14 @@ mod tests {
             "sys",
             &[],
             Media::default(),
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening);
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
+        );
         let conv = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION]).unwrap();
         assert!(
             dig(conv, &[17]).is_none(),
@@ -2957,10 +3515,20 @@ mod tests {
     /// 无图时 `1.2.1.1.3` 发**空**(与真客户端一致);它不是"恒为空",而是附件容器。
     #[test]
     fn 无图时附件容器为空() {
-        let bytes = f0(&one_user("x"), &Model::new("default"), "c", "UTC", 1, RunShape::default(),
+        let bytes = f0(
+            &one_user("x"),
+            &Model::new("default"),
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
             Phase::Opening,
         );
-        let m = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_MESSAGE]).unwrap();
+        let m = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_MESSAGE],
+        )
+        .unwrap();
         assert_eq!(string_at(m, MSG_ATTACH).as_deref(), Some(""));
     }
 
@@ -2987,11 +3555,26 @@ mod tests {
             height: 1,
         }];
         let bytes = build_frame0(
-            &one_user("这是什么"), "", &[],
-            Media { images: &imgs, docs: &[] },
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening,
+            &one_user("这是什么"),
+            "",
+            &[],
+            Media {
+                images: &imgs,
+                docs: &[],
+            },
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
         );
-        let m = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_MESSAGE]).unwrap();
+        let m = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_MESSAGE],
+        )
+        .unwrap();
         // 注意 `.1`:真包是 1.2.1.1.3 → .1 → 各字段,少这层服务端回 internal。
         let att = dig(m, &[MSG_ATTACH, 1]).expect("图片必须落在 1.2.1.1.3.1");
         assert_eq!(string_at(att, ATT_MIME).as_deref(), Some("image/png"));
@@ -3015,16 +3598,35 @@ mod tests {
             extracted: None,
         }];
         let bytes = build_frame0(
-            &one_user("这个 PDF 讲什么"), "", &[],
-            Media { images: &[], docs: &docs },
-            &Model::new("default"), &[], "c", "UTC", 1, RunShape::default(), Phase::Opening,
+            &one_user("这个 PDF 讲什么"),
+            "",
+            &[],
+            Media {
+                images: &[],
+                docs: &docs,
+            },
+            &Model::new("default"),
+            &[],
+            "c",
+            "UTC",
+            1,
+            RunShape::default(),
+            Phase::Opening,
         );
-        let det = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT]).unwrap();
+        let det = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_CONTEXT],
+        )
+        .unwrap();
         let d = dig(det, &[DET_DOC]).expect("文档必须落在 1.2.1.2.20");
         assert_eq!(string_at(d, DOC_PATH).as_deref(), Some("/tmp/x.pdf"));
         assert_eq!(string_at(d, DOC_CONTENT).as_deref(), Some("%PDF-1.4 内容"));
         // 而消息附件容器必须还是空的。
-        let m = dig(&bytes, &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_MESSAGE]).unwrap();
+        let m = dig(
+            &bytes,
+            &[FRAME_BODY, BODY_CONVERSATION, CONV_TURN, TURN_MESSAGE],
+        )
+        .unwrap();
         assert_eq!(string_at(m, MSG_ATTACH).as_deref(), Some(""));
     }
 
@@ -3100,5 +3702,214 @@ mod tests {
         let e = parse_trailer(r#"{"error":{"weird":123}}"#).unwrap();
         assert!(e.detail.contains("weird"));
         assert!(!e.summary().contains("上游未给出错误详情"));
+    }
+
+    /// `4.2` 内容分节哈希需求检测。
+    ///
+    /// ⚠️ 帧字节**手写十六进制**,不用 `Writer`/常量造 —— lessons §7:逆向出来的
+    /// 协议若拿与解析器同一套常量造帧再解,字段号整套写错也照样绿。
+    /// 结构 `{4: {2: {1: bin[32]}}}`:
+    ///   `22 24`(field4,len36)`12 22`(field2,len34)`0a 20`(field1,len32)+32B
+    #[test]
+    fn 内容分节哈希需求_按实物结构识别() {
+        let h32: Vec<u8> = (0u8..32).collect();
+        let mut frame = vec![0x22, 0x24, 0x12, 0x22, 0x0a, 0x20];
+        frame.extend_from_slice(&h32);
+        assert_eq!(content_hash_echo(&frame), 1);
+
+        // 同一个 field-4 里两条需求。
+        let mut two = vec![0x22, 0x48, 0x12, 0x22, 0x0a, 0x20];
+        two.extend_from_slice(&h32);
+        two.extend_from_slice(&[0x12, 0x22, 0x0a, 0x20]);
+        two.extend_from_slice(&h32);
+        assert_eq!(content_hash_echo(&two), 2);
+
+        // 负面①:`.1` 不是 32 字节 → 不是内容分节哈希。
+        let short = vec![0x22, 0x06, 0x12, 0x04, 0x0a, 0x02, 0xaa, 0xbb];
+        assert_eq!(content_hash_echo(&short), 0);
+        // 负面②:空帧/非 field-4。
+        assert_eq!(content_hash_echo(&[]), 0);
+        assert_eq!(content_hash_echo(&[0x0a, 0x02, 0x01, 0x02]), 0);
+    }
+
+    /// 负面③(**用真实抓包字节**):带顶层 `.3` 描述符的真响应帧里没有内容分节需求。
+    /// 这条是防误报的关键 —— 若 `.3` 被误算成需求,每条正常续轮都会被判成要 CAS 上传。
+    #[test]
+    fn 内容分节哈希需求_真描述符帧不误报() {
+        assert_eq!(
+            content_hash_echo(&crate::run::descriptor_samples::turn1()),
+            0
+        );
+        assert_eq!(
+            content_hash_echo(&crate::run::descriptor_samples::turn2()),
+            0
+        );
+    }
+
+    /// 判决语义:**只有「拿不出来」才是失败**,「被点名」本身不是。
+    ///
+    /// 这条是 2026-08-23 时序实证之后的更正。早先把「出现 `4.2`」当 NO-GO,
+    /// 会把一次健康的 resume(服务端缓存过期→索取→客户端交付)判成方案不可行。
+    #[test]
+    fn wire判决_点名不是失败_拿不出来才是() {
+        // 点名了、也全都交付了(上传腿接上后的正常 resume)→ Ok。
+        let served = WireTurnOutcome {
+            saw_descriptor: true,
+            saw_finish: true,
+            content_chars: 42,
+            demanded: 7,
+            unavailable: 0,
+        };
+        assert_eq!(served.verdict(), WireVerdict::Ok);
+        assert!(!served.should_fallback());
+        assert!(!served.verdict().needs_reflow());
+
+        // 点名 7 个、拿不出 7 个(当前无上传腿的形态)→ 本轮失败 + 作废描述符。
+        let missing = WireTurnOutcome {
+            demanded: 7,
+            unavailable: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            missing.verdict(),
+            WireVerdict::ContentUnavailable {
+                missing: 7,
+                demanded: 7
+            }
+        );
+        assert!(missing.should_fallback());
+        assert!(missing.verdict().needs_reflow());
+
+        // 部分拿不出来也算失败:少一节就是少一段历史。
+        let partial = WireTurnOutcome {
+            saw_finish: true,
+            content_chars: 10,
+            demanded: 7,
+            unavailable: 1,
+            ..Default::default()
+        };
+        assert!(partial.should_fallback(), "缺一节也不能记成功");
+    }
+
+    /// 判决优先级与 NoFinish 的不对称处理。
+    #[test]
+    fn wire判决_优先级与NoFinish不回退() {
+        // 裸态 + 拿不出内容:必须报 ContentUnavailable(它解释裸态成因)。
+        let both = WireTurnOutcome {
+            demanded: 3,
+            unavailable: 3,
+            ..Default::default()
+        };
+        assert!(matches!(
+            both.verdict(),
+            WireVerdict::ContentUnavailable { .. }
+        ));
+
+        // 纯裸态。
+        let barren = WireTurnOutcome::default();
+        assert_eq!(barren.verdict(), WireVerdict::Barren);
+        assert!(barren.should_fallback());
+
+        // 出了字但没收尾:**不**回退本轮(答案有价值),但**要**作废描述符。
+        let nf = WireTurnOutcome {
+            content_chars: 42,
+            ..Default::default()
+        };
+        assert_eq!(nf.verdict(), WireVerdict::NoFinish);
+        assert!(!nf.should_fallback(), "出了字的轮次不该扔掉");
+        assert!(nf.verdict().needs_reflow(), "但它的描述符不可信,必须作废");
+
+        // 干净收尾但没有新 `.3` → NoDescriptor(codex 二轮 #2)。
+        //
+        // 官方每轮尾部都给新描述符(实测 turn1/turn2/turn4 各 3 份),不给就是异常。
+        // 处理不对称:**本轮不回退**(回答是好的,扔掉等于白烧一次额度),
+        // 但**旧描述符必须作废** —— 它已经缺了本轮,留着下轮回放就是静默失忆。
+        let no_desc = WireTurnOutcome {
+            saw_descriptor: false,
+            saw_finish: true,
+            content_chars: 42,
+            ..Default::default()
+        };
+        assert_eq!(no_desc.verdict(), WireVerdict::NoDescriptor);
+        assert!(!no_desc.should_fallback(), "出了字的轮次不该扔掉");
+        assert!(no_desc.verdict().needs_reflow(), "但旧描述符必须作废");
+
+        // 有新描述符 + 干净收尾 + 出字 = 唯一的 Ok。
+        let ok = WireTurnOutcome {
+            saw_descriptor: true,
+            saw_finish: true,
+            content_chars: 42,
+            ..Default::default()
+        };
+        assert_eq!(ok.verdict(), WireVerdict::Ok);
+        assert!(!ok.verdict().needs_reflow());
+    }
+
+    /// 空顶层 `.3` 不算捕获(codex 审查 #4):否则上层判成「有料」→ 静默失忆。
+    #[test]
+    fn 空描述符不算捕获() {
+        // {3: ""} —— 结构合法但零长度。
+        let payload = vec![0x1a, 0x00];
+        assert!(descriptor_field3(&payload).is_none(), "空 .3 必须当没有");
+        // 一帧里先空后非空:取非空那份。
+        let mut mixed = vec![0x1a, 0x00];
+        mixed.extend_from_slice(&[0x1a, 0x03, b'a', b'b', b'c']);
+        assert_eq!(descriptor_field3(&mixed), Some(&b"abc"[..]));
+        // 先非空后空:空的**不得**把非空那份挤掉。
+        let mut mixed2 = vec![0x1a, 0x03, b'a', b'b', b'c'];
+        mixed2.extend_from_slice(&[0x1a, 0x00]);
+        assert_eq!(descriptor_field3(&mixed2), Some(&b"abc"[..]));
+    }
+
+    /// 影子模式①:真实抓包帧(resp-011/013 形态)里解出顶层 `.3` 并数对 ref 个数。
+    /// turn1 = 4 个 blob 引用,turn2 = 6 个(turn1 产生的新 blob 追加进来)。
+    #[test]
+    fn 描述符_真实帧解出field3并数对ref() {
+        let t1 = crate::run::descriptor_samples::turn1();
+        let d1 = descriptor_field3(&t1).expect("turn1 帧必须带顶层 .3");
+        assert_eq!(descriptor_ref_count(d1), 4, "turn1 描述符 = 4 个 blob 引用");
+        // 整帧就是一份 `.3`(抓包实物:顶层只有 field 3)。
+        assert_eq!(d1.len() + (t1.len() - d1.len()), t1.len());
+
+        let t2 = crate::run::descriptor_samples::turn2();
+        let d2 = descriptor_field3(&t2).expect("turn2 帧必须带顶层 .3");
+        assert_eq!(descriptor_ref_count(d2), 6, "turn2 描述符 = 6 个 blob 引用");
+        // turn1 的 4 个 ref 原样排在 turn2 前头(纯追加,顺序不动)——
+        // 这是「描述符 = 累计态」的直接证据,也是将来回放能跨轮的依据。
+        let refs_of = |d: &[u8]| -> Vec<Vec<u8>> {
+            Reader::new(d)
+                .filter(|(f, v)| *f == 1 && matches!(v, PbValue::Len(s) if s.len() == 32))
+                .map(|(_, v)| match v {
+                    PbValue::Len(s) => s.to_vec(),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        let (r1, r2) = (refs_of(d1), refs_of(d2));
+        assert_eq!(
+            &r2[..4],
+            &r1[..],
+            "turn2 的前 4 个 ref 必须就是 turn1 的全部"
+        );
+    }
+
+    /// 影子模式②:顶层不带 field 3 的帧不产生捕获。
+    #[test]
+    fn 描述符_无field3不捕获() {
+        // 真实 turn1 的 resp-012(顶层只有 field 1 的状态帧)。
+        let payload = [0x0a, 0x08, 0x8a, 0x01, 0x05, 0x08, 0x02, 0x10, 0xda, 0x17];
+        assert!(descriptor_field3(&payload).is_none());
+        assert!(descriptor_field3(&[]).is_none());
+    }
+
+    /// 一帧内 `.3` 多次出现时取**最后一份**(尾部状态最新,见函数注释)。
+    #[test]
+    fn 描述符_一帧多份取尾部() {
+        let mut w = Writer::new();
+        w.bytes(3, b"first");
+        w.bytes(1, b"text");
+        w.bytes(3, b"second");
+        let p = w.into_bytes();
+        assert_eq!(descriptor_field3(&p), Some(&b"second"[..]));
     }
 }

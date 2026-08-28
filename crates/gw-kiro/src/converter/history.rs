@@ -578,8 +578,19 @@ pub(super) fn convert_assistant_message(
     //   Q CLI 定义了字段但从不赋值)——这些模型的服务端会话形态就是"历史无思考"。
     //   2026-08-20 用户决策:对齐官方,不回传(嵌入回传是同日循环事故的温床:
     //   嵌进正文 = 推理降格成文体范例,自我放大)。客户端侧 thinking 显示不受影响。
-    let mut thinking: Option<(String, String)> = None; // 最后一个带签名的 thinking 块 (text, sig)
-    let mut redacted: Option<String> = None; // 最后一个 redacted_thinking 块的 data
+    // 【对抗评审 r2 #6】按 content **数组顺序**取最后一段推理,后来者覆盖前者。
+    //
+    // 原实现为 thinking / redacted 各留一个槽位,再无条件优先 redacted(引官方 `oe12`)。
+    // 但 `oe12` 证明的只是官方 Kiro 客户端如何把**一个回合**的推理压进单个
+    // `lastSealedReasoning` 槽位,**不证明它与 Anthropic 的多块消息等价** ——
+    // Anthropic 侧一条 assistant 消息里 thinking 与 redacted_thinking 可表示
+    // **不同的**推理片段。原策略下 `[redacted R1, thinking T2]` 会上传较早的 R1、
+    // 完全忽略较后的 T2。
+    //
+    // Kiro 只有一个 `reasoningContent` 槽位,精确表示不可能 —— 所以必须**明确选择**
+    // 一个有损策略。选"顺序最后一个":离当前轮最近、与官方"后写覆盖"方向一致、
+    // 且不依赖类型优先级这个无依据的假设。
+    let mut last_reasoning: Option<LastReasoning> = None;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -596,14 +607,14 @@ pub(super) fn convert_assistant_message(
                             // 仍可回放,2026-08-19 探针 E2 实测),空文本不是丢弃理由。
                             if let (Some(t), Some(sig)) = (block.thinking, block.signature) {
                                 if !sig.is_empty() {
-                                    thinking = Some((t, sig));
+                                    last_reasoning = Some(LastReasoning::Signed(t, sig));
                                 }
                             }
                         }
                         "redacted_thinking" => {
                             if let Some(d) = block.data {
                                 if !d.is_empty() {
-                                    redacted = Some(d);
+                                    last_reasoning = Some(LastReasoning::Redacted(d));
                                 }
                             }
                         }
@@ -636,7 +647,7 @@ pub(super) fn convert_assistant_message(
     // ⚠️ 前缀稳定性纪律不变: reasoningContent 的挂/摘同样改变历史字节 ——
     // 窗口语义或签名形态的改动会让在途会话下一轮缓存 miss 一次。
     let reasoning = if keep_thinking {
-        build_reasoning_content(thinking.as_ref(), redacted.as_ref(), model_id)
+        build_reasoning_content(last_reasoning.as_ref(), model_id)
     } else {
         None
     };
@@ -670,29 +681,48 @@ pub(super) fn convert_assistant_message(
     })
 }
 
-/// 把客户端历史里的 thinking / redacted_thinking 块翻译成 Kiro 结构化
-/// `reasoningContent`。门控与过滤全部对齐官方客户端(`er5` + `modelSupportsReasoning`):
+/// 历史 assistant 消息里**按 content 顺序的最后一段推理**。
+///
+/// Kiro 的 `assistantResponseMessage` 只有一个 `reasoningContent` 槽位,而 Anthropic 侧
+/// 一条消息可含多个 thinking / redacted_thinking 块(可表示不同片段)→ 必然有损。
+/// 本类型把"选哪一段"这个决策显式化:顺序最后一个胜出(见采集处注释)。
+enum LastReasoning {
+    /// 带非空签名的 `thinking` 块:(text, signature)
+    Signed(String, String),
+    /// `redacted_thinking` 块的密文 `data`
+    Redacted(String),
+}
+
+/// 把历史里那一段推理翻译成 Kiro 结构化 `reasoningContent`。
+/// 门控与过滤对齐官方客户端(`er5` + `modelSupportsReasoning`):
 ///
 /// 1. 当前请求模型无签名代号(= 无原生签名推理能力) → 不上传;
-/// 2. redacted 优先(官方封包逻辑 `oe12`:redactedContent 存在即盖过 text);
+/// 2. 选中哪一段由调用方按 content 顺序决定(见 [`LastReasoning`]),本函数不再做
+///    类型优先级判断 —— 原"redacted 无条件优先"会让 `[redacted, thinking]` 上传较早的
+///    那个(对抗评审 r2 #6);
 /// 3. 签名**原样透传**(2026-08-19 用户决策:下发链路不改写 f6 代号,检测平台角度不关心)。
 ///    f6 读出的代号必须等于当前模型的代号,否则丢弃 —— 覆盖三种情况:
 ///    别的模型签发的(官方:reasoningModelId 不匹配即丢)、历史遗留的改写签名
 ///    (f6=官方名,无法还原即放弃,上游 400 兜底也用不着)、读不出 f6 的畸形签名;
 /// 4. 我方合成的假签名(无原生推理模型的下行兜底产物)重推导识别后丢弃 ——
 ///    上行必过不了验签,发了只会白吃一次 `THINKING_SIGNATURE_INVALID`。
+///
+/// ⚠️ `Redacted` 分支**过不了第 3/4 步的校验** —— 密文不透明、读不出模型标识,
+/// 只能凭"当前模型有推理能力"这一条放行。它的归属正确性由上游验签兜底
+/// (失败 → `THINKING_SIGNATURE_INVALID` → 剥全历史 reasoning 重试一次)。
 fn build_reasoning_content(
-    thinking: Option<&(String, String)>,
-    redacted: Option<&String>,
+    last: Option<&LastReasoning>,
     model_id: &str,
 ) -> Option<ReasoningContent> {
     let codename = super::signature_codename_for(model_id)?;
-    if let Some(data) = redacted {
-        return Some(ReasoningContent::Redacted {
-            redacted_content: data.clone(),
-        });
-    }
-    let (text, sig) = thinking?;
+    let (text, sig) = match last? {
+        LastReasoning::Redacted(data) => {
+            return Some(ReasoningContent::Redacted {
+                redacted_content: data.clone(),
+            })
+        }
+        LastReasoning::Signed(t, s) => (t, s),
+    };
     let issued = crate::signature::read_model_from_signature(sig)?;
     // 合成签名识别用 f6 里的签发名逐字重算(合成时的 model 入参就是当时的客户端请求名)。
     // 必须先于代号比对:opus-4-7 的代号恰好等于官方名,合成签名会误过代号检查。

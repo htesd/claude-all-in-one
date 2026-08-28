@@ -135,7 +135,13 @@ impl UpstreamErrorKind {
                 "服务暂时不可用,请稍后重试"
             }
             UpstreamErrorKind::TemporarilyBlocked => "服务暂时不可用,请稍后重试",
-            UpstreamErrorKind::EmptyResponse => "服务未返回内容,请重试",
+            // 内部定性就是"对该内容的确定性空流(疑 guardrail)"——对外要给用户
+            // 可操作的信息(改内容/换模型),而不是一句看不出所以然的"重试"
+            // (2026-08-24 用户报障:opus-5 被封控时用户只看到裸断流)。覆盖两种
+            // 真实成因:内容安全审核(kiro)+ 不支持的输入(cursor 图片附件)。
+            UpstreamErrorKind::EmptyResponse => {
+                "模型未对该请求产出任何内容:可能是内容触发了上游安全审核,或包含当前通道不支持的输入(如图片附件)。请调整内容或更换模型后重试"
+            }
             // 要人介入。
             UpstreamErrorKind::QuotaExhausted => "服务额度已用尽,请联系管理员",
             UpstreamErrorKind::TokenInvalid => "服务鉴权异常,请联系管理员",

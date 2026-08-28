@@ -96,7 +96,10 @@ fn streams(pdf: &[u8]) -> Vec<Stream<'_>> {
             break;
         };
         let e = s + erel;
-        out.push(Stream { body: &pdf[s..e], flate });
+        out.push(Stream {
+            body: &pdf[s..e],
+            flate,
+        });
         i = e + 9;
     }
     out
@@ -228,8 +231,14 @@ fn read_hex(data: &[u8], mut i: usize) -> (String, usize) {
         }
         i += 1;
     }
-    let bytes: Vec<u8> = nibbles.chunks(2).map(|p| (p[0] << 4) | p.get(1).copied().unwrap_or(0)).collect();
-    (decode_pdf_string(&bytes), i.min(data.len()).saturating_add(1))
+    let bytes: Vec<u8> = nibbles
+        .chunks(2)
+        .map(|p| (p[0] << 4) | p.get(1).copied().unwrap_or(0))
+        .collect();
+    (
+        decode_pdf_string(&bytes),
+        i.min(data.len()).saturating_add(1),
+    )
 }
 
 /// PDF 字符串 → Rust String。
@@ -332,6 +341,10 @@ mod tests {
         e.write_all(&vec![b'A'; 64 * 1024 * 1024]).unwrap();
         let comp = e.finish().unwrap();
         let got = inflate(&comp).expect("截断后仍返回内容");
-        assert!(got.len() <= 16 * 1024 * 1024, "必须被 16MB 上限截住,实际 {}", got.len());
+        assert!(
+            got.len() <= 16 * 1024 * 1024,
+            "必须被 16MB 上限截住,实际 {}",
+            got.len()
+        );
     }
 }

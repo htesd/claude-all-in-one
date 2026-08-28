@@ -22,6 +22,7 @@ pub mod kiro_types;
 pub mod machine_id;
 pub mod models_api;
 pub mod parser;
+pub mod redacted_probe;
 pub mod poison_memo;
 pub mod profiles;
 pub mod resolver;

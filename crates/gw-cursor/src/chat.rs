@@ -73,6 +73,22 @@ pub struct RunCtx {
     pub assets: std::sync::Arc<crate::AssetStore>,
     /// 「上一轮被内建工具截断」的待发纠偏标记。见 [`crate::TruncationNotices`]。
     pub notices: std::sync::Arc<crate::TruncationNotices>,
+    /// 续轮描述符影子表(见 [`crate::DescriptorShadow`])。
+    ///
+    /// 2026-08-23 起**不再是纯观测**:流循环写(干净收尾才提交),出站路径按
+    /// `wire_descriptor_replay` 读来回放。读侧只认同号同模型,见
+    /// [`crate::DescriptorShadow::lookup`]。
+    pub shadow: std::sync::Arc<crate::DescriptorShadow>,
+    /// 本轮 history fps(**减末轮**,与 `ConvRegistry::cli_lookup` 同口径):
+    /// 影子表 **lookup** 用的指纹:本轮请求历史**减末条 user**。IDE 形态为空。
+    pub shadow_fps: Vec<u64>,
+    /// 影子表 **commit** 用的指纹:本轮请求历史**完整**(含末条 user)。
+    /// 两者差一条,混用会让链错位一轮 —— 那正是静默漏轮。
+    pub shadow_fps_full: Vec<u64>,
+    /// 续轮回放描述符(见 [`crate::RunTuning::wire_descriptor_replay`])。
+    pub wire_descriptor_replay: bool,
+    /// 内容分节库:应答服务端 `4.2` 点名(见 [`crate::ContentSections`])。
+    pub sections: std::sync::Arc<crate::ContentSections>,
 }
 
 /// `message_start` 事件。抽出来是因为三条路径都要发它(思考先到 / 正文先到 /
@@ -168,14 +184,13 @@ fn estimate_usage_fallback(
     output_chars: usize,
 ) -> ChatUsage {
     let input_tokens = est_text_tokens(system)
-        + turns
-            .iter()
-            .map(|t| est_text_tokens(&t.text))
-            .sum::<u64>()
+        + turns.iter().map(|t| est_text_tokens(&t.text)).sum::<u64>()
         + tools
             .iter()
             .map(|t| {
-                est_text_tokens(&t.name) + est_text_tokens(&t.description) + est_text_tokens(&t.schema)
+                est_text_tokens(&t.name)
+                    + est_text_tokens(&t.description)
+                    + est_text_tokens(&t.schema)
             })
             .sum::<u64>();
     let output_tokens = (output_chars as u64).div_ceil(4);
@@ -276,8 +291,7 @@ fn extract_text_in_msg(content: &Value, media: Option<(usize, &MediaPlaceholders
                             Value::Array(nested) => {
                                 let mut nb = String::new();
                                 for (ni, n) in nested.iter().enumerate() {
-                                    let nk =
-                                        n.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    let nk = n.get("type").and_then(|t| t.as_str()).unwrap_or("");
                                     let piece = match nk {
                                         "text" => n
                                             .get("text")
@@ -285,9 +299,8 @@ fn extract_text_in_msg(content: &Value, media: Option<(usize, &MediaPlaceholders
                                             .map(str::to_string),
                                         // 占位表里没有 = 该块没被收(非 base64 / 超限 /
                                         // 调用点不带表),沿旧行为不渲染,编号不空洞。
-                                        "image" | "document" => media.and_then(
-                                            |(mi, map)| map.get(&(mi, bi, ni)).cloned(),
-                                        ),
+                                        "image" | "document" => media
+                                            .and_then(|(mi, map)| map.get(&(mi, bi, ni)).cloned()),
                                         _ => None,
                                     };
                                     if let Some(p) = piece {
@@ -654,32 +667,77 @@ fn capability_redirects(tools: &[run::ToolDef]) -> Vec<(&'static str, String)> {
         (
             "跑命令/终端",
             &[
-                "bash", "sh", "zsh", "shell", "terminal", "run_terminal_cmd", "runterminalcmd",
-                "run_command", "runcommand", "execute_command", "executecommand", "exec",
+                "bash",
+                "sh",
+                "zsh",
+                "shell",
+                "terminal",
+                "run_terminal_cmd",
+                "runterminalcmd",
+                "run_command",
+                "runcommand",
+                "execute_command",
+                "executecommand",
+                "exec",
             ],
         ),
         (
             "读文件",
-            &["read", "read_file", "readfile", "view_file", "viewfile", "open_file", "openfile", "cat"],
+            &[
+                "read",
+                "read_file",
+                "readfile",
+                "view_file",
+                "viewfile",
+                "open_file",
+                "openfile",
+                "cat",
+            ],
         ),
         (
             "写/改文件",
             &[
-                "write", "write_file", "writefile", "edit", "edit_file", "editfile", "multiedit",
-                "str_replace_editor", "strreplaceeditor", "apply_patch", "applypatch", "patch",
+                "write",
+                "write_file",
+                "writefile",
+                "edit",
+                "edit_file",
+                "editfile",
+                "multiedit",
+                "str_replace_editor",
+                "strreplaceeditor",
+                "apply_patch",
+                "applypatch",
+                "patch",
             ],
         ),
         (
             "搜代码/找文件",
             &[
-                "grep", "glob", "rg", "ripgrep", "search", "codebase_search", "codebasesearch",
-                "grep_search", "grepsearch", "file_search", "filesearch", "find",
+                "grep",
+                "glob",
+                "rg",
+                "ripgrep",
+                "search",
+                "codebase_search",
+                "codebasesearch",
+                "grep_search",
+                "grepsearch",
+                "file_search",
+                "filesearch",
+                "find",
             ],
         ),
         (
             "查网页",
             &[
-                "websearch", "web_search", "webfetch", "web_fetch", "fetch", "browse", "browser",
+                "websearch",
+                "web_search",
+                "webfetch",
+                "web_fetch",
+                "fetch",
+                "browse",
+                "browser",
             ],
         ),
     ];
@@ -771,7 +829,13 @@ impl BuiltinXlate {
             terminal: find("跑命令/终端", &["command", "cmd", "script"]),
             read_file: find(
                 "读文件",
-                &["file_path", "filePath", "path", "target_file", "absolute_path"],
+                &[
+                    "file_path",
+                    "filePath",
+                    "path",
+                    "target_file",
+                    "absolute_path",
+                ],
             ),
         }
     }
@@ -851,6 +915,22 @@ fn truncation_notice(cap: Option<&str>, tools: &[run::ToolDef]) -> String {
     s
 }
 
+/// 单条消息的逐轮指纹:`sha256(角色标记 + 渲染文本)` 截前 8 字节。
+///
+/// **clidrv 泵在干净收尾后也用它给我方 assistant 输出补指纹**(多路桶精确分层,
+/// 见 `CliConv::append_assistant_fp`)—— 那里算的是「下轮请求历史里那条 assistant
+/// 消息」的指纹,必须与这里逐字节一致,所以两处共用同一函数,口径不可能漂移。
+/// 渲染文本的口径见 `to_turns` / `extract_text_in_msg`(text 块 '\n' 相连,
+/// thinking 不进,tool_use 渲染含参数 JSON 再序列化 —— 后者字节不由我方掌控,
+/// 所以工具轮不补,见调用处注释)。
+pub fn turn_fp(is_user: bool, text: &str) -> u64 {
+    let mut h = Sha256::new();
+    h.update([if is_user { b'u' } else { b'a' }]);
+    h.update(text.as_bytes());
+    let d = h.finalize();
+    u64::from_be_bytes(d[..8].try_into().unwrap())
+}
+
 /// 调用方历史的逐轮指纹(CLI 形态的分叉检测,见 `ConvRegistry::cli_lookup`)。
 ///
 /// 指纹取 `to_turns` 的逐条消息(折叠之前),与 cache_sim 同一稳定语义层:
@@ -858,13 +938,7 @@ fn truncation_notice(cap: Option<&str>, tools: &[run::ToolDef]) -> String {
 pub fn history_fps(body: &Value) -> Vec<u64> {
     to_turns(body)
         .iter()
-        .map(|t| {
-            let mut h = Sha256::new();
-            h.update([if t.is_user { b'u' } else { b'a' }]);
-            h.update(t.text.as_bytes());
-            let d = h.finalize();
-            u64::from_be_bytes(d[..8].try_into().unwrap())
-        })
+        .map(|t| turn_fp(t.is_user, &t.text))
         .collect()
 }
 
@@ -895,6 +969,47 @@ pub(crate) fn latest_user_input(turns: &[Turn]) -> String {
         out.push_str(&t.text);
     }
     out
+}
+
+/// 全历史扫描:是否存在**有序的**「assistant tool_use(P) → 之后的 user tool_result(P)」
+/// 配对。
+///
+/// 用途:多模型编排(生产 2026-08-21 ultra-test 现场)会在我方桥挂起期间,先把
+/// 答案写进共享 transcript、再去别家 provider 跑几轮,最后带着别家的 tool_result
+/// 回来 —— 末条消息的 id 与我方挂起 id 对不上,但挂起 id 在历史里**已被有序应答**。
+/// 这说明客户端已应答过并翻篇,网关应弃槽重铺而不是 400(见 lib.rs 分流处)。
+///
+/// 为什么要求**有序配对**而不是"某个 user 块出现过同 id"(2026-08-21 codex 审查
+/// major#2):后者不证明此前存在对应 assistant tool_use、也不证明结果位于它之后,
+/// 畸形/重排 transcript 可以伪造"已应答"绕过 S1-7 严拒。
+pub(crate) fn history_answers_tool_use(body: &Value, tool_use_id: &str) -> bool {
+    let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let mut use_seen = false;
+    msgs.iter().any(|m| {
+        let role = m.get("role").and_then(|r| r.as_str());
+        let blocks = m.get("content").and_then(|c| c.as_array());
+        match (role, blocks) {
+            (Some("assistant"), Some(bs)) => {
+                if bs.iter().any(|b| {
+                    b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        && b.get("id").and_then(|i| i.as_str()) == Some(tool_use_id)
+                }) {
+                    use_seen = true;
+                }
+                false
+            }
+            (Some("user"), Some(bs)) => {
+                use_seen
+                    && bs.iter().any(|b| {
+                        b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            && b.get("tool_use_id").and_then(|i| i.as_str()) == Some(tool_use_id)
+                    })
+            }
+            _ => false,
+        }
+    })
 }
 
 /// 取「整条都是 tool_result」的最后一条 user 消息:(tool_use_id, 文本) 列表。
@@ -985,8 +1100,12 @@ fn to_turns_with_media(body: &Value, media: Option<&MediaPlaceholders>) -> Vec<T
                         })
                     });
                 turns.push(Turn {
-                    text: if has_media { "(见附件)" } else { "(unsupported content omitted)" }
-                        .to_string(),
+                    text: if has_media {
+                        "(见附件)"
+                    } else {
+                        "(unsupported content omitted)"
+                    }
+                    .to_string(),
                     is_user: role != "assistant",
                 });
                 continue;
@@ -1045,7 +1164,11 @@ fn collect_media_block(
     let mime = src
         .and_then(|s| s.get("media_type"))
         .and_then(|t| t.as_str())
-        .unwrap_or(if kind == "image" { "image/png" } else { "application/pdf" })
+        .unwrap_or(if kind == "image" {
+            "image/png"
+        } else {
+            "application/pdf"
+        })
         .to_string();
     let Some(data) = src.and_then(|s| s.get("data")).and_then(|d| d.as_str()) else {
         return false;
@@ -1062,7 +1185,9 @@ fn collect_media_block(
     };
     if raw.len() > MAX_ONE_ATTACHMENT || *budget + raw.len() > MAX_ALL_ATTACHMENTS {
         tracing::warn!(
-            kind, bytes = raw.len(), budget = *budget,
+            kind,
+            bytes = raw.len(),
+            budget = *budget,
             "cursor: 附件超上限(单个或累计),跳过 —— 无上限时一个大附件能打爆整个 worker"
         );
         return false;
@@ -1070,7 +1195,12 @@ fn collect_media_block(
     *budget += raw.len();
     if kind == "image" {
         let (width, height) = run::image_dims(&raw);
-        images.push(run::ImageAttachment { mime, bytes: raw, width, height });
+        images.push(run::ImageAttachment {
+            mime,
+            bytes: raw,
+            width,
+            height,
+        });
     } else {
         // 文档字段在上游是 proto3 `string`,真客户端把 PDF 当 UTF-8 读、
         // 二进制部分有损替换成 U+FFFD。我方逐字节同构地照做。
@@ -1103,7 +1233,13 @@ fn collect_media_block(
 /// 曾经这里只扫顶层块,tool_result 内嵌的 image 直接 continue 掉;而
 /// extract_text 的注释声称「媒体走 to_media 内联」—— 两边互相推诿,agent 用
 /// Read 工具读的图片就静默消失、日志一条不留(2026-08-13 生产事故)。
-pub(crate) fn to_media(body: &Value) -> (Vec<run::ImageAttachment>, Vec<run::DocAttachment>, MediaPlaceholders) {
+pub(crate) fn to_media(
+    body: &Value,
+) -> (
+    Vec<run::ImageAttachment>,
+    Vec<run::DocAttachment>,
+    MediaPlaceholders,
+) {
     let mut images = Vec::new();
     let mut docs = Vec::new();
     let mut placeholders = MediaPlaceholders::new();
@@ -1125,8 +1261,7 @@ pub(crate) fn to_media(body: &Value) -> (Vec<run::ImageAttachment>, Vec<run::Doc
                     continue;
                 };
                 for (ni, n) in nested.iter().enumerate() {
-                    let is_image =
-                        n.get("type").and_then(|t| t.as_str()) == Some("image");
+                    let is_image = n.get("type").and_then(|t| t.as_str()) == Some("image");
                     if collect_media_block(n, &mut images, &mut docs, &mut budget) {
                         // 占位文本里的编号与 run.rs `ImageAttachment::encode(seq)`
                         // 合成的路径 `attach-{seq}-…` 同源(都是 images 向量下标)。
@@ -1263,7 +1398,10 @@ fn delta_history(turns: &[Turn], task: Option<&str>) -> Vec<Turn> {
         buf.push_str(TOOL_LOOP_NUDGE);
         buf.push_str(task);
     }
-    vec![Turn { text: buf, is_user: true }]
+    vec![Turn {
+        text: buf,
+        is_user: true,
+    }]
 }
 
 /// 工具回路中间轮补的那句提醒(折叠与增量两条路共用,避免两处措辞漂移)。
@@ -1302,7 +1440,10 @@ pub(crate) fn fold_history(turns: &[Turn], task: Option<&str>) -> Vec<Turn> {
     if turns.len() <= 1 && task.is_none() {
         return turns.to_vec();
     }
-    let last = turns.iter().rposition(|t| t.is_user).unwrap_or(turns.len() - 1);
+    let last = turns
+        .iter()
+        .rposition(|t| t.is_user)
+        .unwrap_or(turns.len() - 1);
     let mut buf = String::new();
     if last > 0 {
         buf.push_str("<conversation_history>\n");
@@ -1323,7 +1464,10 @@ pub(crate) fn fold_history(turns: &[Turn], task: Option<&str>) -> Vec<Turn> {
         buf.push_str(TOOL_LOOP_NUDGE);
         buf.push_str(task);
     }
-    vec![Turn { text: buf, is_user: true }]
+    vec![Turn {
+        text: buf,
+        is_user: true,
+    }]
 }
 
 /// 最后一条 user 消息是否**只装 tool_result**(工具回路的中间轮)。
@@ -1465,7 +1609,12 @@ pub fn conversation_uuid(material: &str) -> String {
 ///
 /// ⚠️ 仅在无文件附件(L1)时成立。真要实现 L2 blob 加密时,这把 key 会被用来
 /// 实际加密上传内容,那时必须换成全熵随机并跟随会话状态存起来。
-fn session_key(token: &str, conversation_id: &str, purpose: &str) -> String {
+/// 32 字节哈希的短十六进制(日志用,只取前 8 字节)。
+fn hex32(h: &[u8; 32]) -> String {
+    h[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub(crate) fn session_key(token: &str, conversation_id: &str, purpose: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
     h.update(b"\x00");
@@ -1563,24 +1712,11 @@ fn apply_cli_headers(
     ctx: &RunCtx,
     request_id: &str,
 ) -> reqwest::RequestBuilder {
-    let tp = wire::traceparent();
-    rb.header("connect-protocol-version", "1")
-        .header("connect-accept-encoding", "gzip,br")
-        .header("connect-content-encoding", "gzip")
-        .header("content-type", "application/connect+proto")
-        .header("user-agent", wire::USER_AGENT)
-        .header("authorization", format!("Bearer {}", ctx.token))
-        .header(
-            "x-blob-encryption-key",
-            session_key(&ctx.token, &ctx.conversation_id, "blob"),
-        )
-        .header("x-cursor-client-type", "cli")
-        .header("x-cursor-client-version", crate::cli::CLI_CLIENT_VERSION)
-        .header("x-ghost-mode", "false")
-        .header("x-request-id", request_id)
-        .header("x-original-request-id", request_id)
-        .header("traceparent", &tp)
-        .header("backend-traceparent", &tp)
+    // 头表的唯一来源是 `cli::cli_headers` —— 探针(examples/probe_wire_v2)也走它。
+    // 若两处各自维护一份,探针测出来的形态就不等于生产发出去的形态,结论不可迁移。
+    crate::cli::cli_headers(&ctx.token, &ctx.conversation_id, request_id)
+        .into_iter()
+        .fold(rb, |rb, (k, v)| rb.header(k, v))
 }
 
 /// 发起一次 Cursor Run,返回 Anthropic SSE 事件流。
@@ -1669,10 +1805,41 @@ pub async fn chat_stream(
         && !body_has_tool_blocks(&req.body)
         && raw_turns.last().is_some_and(|t| t.is_user);
 
-    // 服务端已持有本会话历史(Continuation)且增量模式打开 → 只发本轮新消息。
+    // wire v2:续轮的**前提是拿得到描述符**,所以先查影子表,再决定 turns 怎么铺。
+    //
+    // ⚠️ 顺序不能反。`1.2` 只带增量消息、而 `1.1` 里没有描述符 = 服务端手里没有历史、
+    // 我方也没发 → 模型看不到前几轮却照样答(静默失忆)。所以「阶段说 Continuation」
+    // 不足以只发末条,必须**同时**有描述符。没料就降级重铺,代价只是这轮不省钱。
+    //
+    // model 键必须用 `req.model`(Anthropic 侧名),**不是** `model.name`(cursor 侧名,
+    // 如 `default`/`grok-4.6`):提交侧存的就是 `req.model`(见 `stream_to_anthropic`
+    // 的 `model_name` 参数)。两边用不同的名 = lookup 永远 miss,而且是静默的。
+    let cli_descriptor: Option<Vec<u8>> =
+        if cli_mode && ctx.phase.is_continuation() && ctx.wire_descriptor_replay {
+            ctx.shadow.lookup(
+                &ctx.conversation_id,
+                &ctx.account_id,
+                &req.model,
+                &ctx.shadow_fps,
+            )
+        } else {
+            None
+        };
+    let cli_continuation = cli_descriptor.is_some();
+    if cli_mode && ctx.phase.is_continuation() && !cli_continuation {
+        tracing::info!(
+            conversation_id = %ctx.conversation_id,
+            account = %ctx.account_id,
+            model = %req.model,
+            replay_enabled = ctx.wire_descriptor_replay,
+            "cursor Run:阶段是续轮但影子表无描述符,降级重铺(防静默失忆)"
+        );
+    }
+
+    // 服务端已持有本会话历史(Continuation)且拿到了描述符 → 只发本轮新消息。
     // 否则照旧折叠成一条(见 `fold_history` / `delta_history`)。
     let turns = if cli_mode {
-        if ctx.phase.is_continuation() {
+        if cli_continuation {
             // 只发最后一条新消息(gate 已保证它是 user 轮)。
             vec![raw_turns.last().cloned().expect("cli gate 保证非空")]
         } else if raw_turns.len() == 1 {
@@ -1753,7 +1920,10 @@ pub async fn chat_stream(
         None => turns,
     };
 
-    let media = run::Media { images: &images, docs: &docs };
+    let media = run::Media {
+        images: &images,
+        docs: &docs,
+    };
     if turns.is_empty() {
         return Err(UpstreamError::bad_request("cursor: 请求里没有任何消息"));
     }
@@ -1802,27 +1972,21 @@ pub async fn chat_stream(
         // 真 CLI 里这三个值同源(重试时 x-request-id 换新、1.25 与 original 不变;
         // 我方每个网关请求都是新的逻辑尝试,全部同值即可)。
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let opening = ctx.phase.is_opening();
-        // 预算表的 conversation 节 = 历史总字符(本轮新消息不计)。
-        let history_chars: usize = if opening {
-            0
-        } else {
-            raw_turns[..raw_turns.len().saturating_sub(1)]
-                .iter()
-                .map(|t| t.text.chars().count())
-                .sum()
+        // 首轮 / 续轮由「有没有描述符」决定(见上面 cli_descriptor 的注释):
+        // 这个 enum 让「续轮但没有描述符」不可表示。
+        let phase = match cli_descriptor.as_deref() {
+            Some(desc) => crate::cli::CliTurn::Continuation(desc),
+            None => crate::cli::CliTurn::Opening,
         };
+        // ⚠️ 探针阶段写死 lan 的 9 条目录(见 cli_catalog_lan 的生产化告警)。
+        let cli_catalog = crate::cli::cli_catalog_lan();
         let frame0 = crate::cli::build_frame0_cli(
             &turns[0].text,
             &model,
-            &catalog,
+            &cli_catalog,
             &ctx.conversation_id,
             &turn_id,
-            &ctx.timezone,
-            now_ms,
-            opening,
-            (system.chars().count(), history_chars),
-            "file:///",
+            phase,
         );
         let context = crate::cli::build_context_frame_cli(
             &system,
@@ -1893,10 +2057,19 @@ pub async fn chat_stream(
         (frames, apply_headers(client.post(&url), &ctx))
     };
 
+    // wire v2:CLI 形态**只先发帧0**,ENV + 控制帧推迟到会话登记通知之后
+    // (见 [`WireUpload`] 的时序说明)。非 CLI 形态维持一次性灌帧。
+    let mut frames = frames;
+    let wire_deferred: Vec<Vec<u8>> = if cli_mode && ctx.keep_stream_open && frames.len() > 1 {
+        frames.split_off(1)
+    } else {
+        Vec::new()
+    };
+
     // 保持请求流打开时,body 走一个 channel:初始帧先灌进去,发送端在响应读完前
     // 一直不 drop,于是 HTTP/2 的请求流不会 half-close —— 与真 BiDi 客户端一致。
     let (rb, body_keepalive) = if ctx.keep_stream_open {
-        // 容量要装下初始帧全集(CLI 形态 10 帧),否则 try_send 会静默丢帧。
+        // 容量要装下初始帧全集(CLI 形态 13 帧),否则 try_send 会静默丢帧。
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
         for f in frames {
             let _ = tx.try_send(Ok(bytes::Bytes::from(f)));
@@ -1959,15 +2132,101 @@ pub async fn chat_stream(
         usage_fallback,
         sim_cache_read,
         cli_mode,
+        if cli_mode {
+            // 节库:该模型的系统提示节(每模型一份、跨会话稳定)。装不上就是
+            // 「被点名时这一节交不出来」→ 本轮重铺,不影响正确性。
+            ctx.sections.load_model_library(&model.name);
+            Some(WireUpload {
+                deferred: wire_deferred,
+                sections: ctx.sections.clone(),
+            })
+        } else {
+            None
+        },
+        // 描述符只存在于 CLI 形态(IDE 形态没有顶层 `.3`)。**IDE 路径不挂**
+        // (codex 审查 #6):否则生产默认形态也要逐帧扫 `.3`/`4.2`、写 info 日志、
+        // 往影子表堆条目 —— 纯开销,且 IDE 路径的 `shadow_fps` 恒空,血脉判据退化成
+        // 「所有会话挤一个键」。
+        if cli_mode {
+            Some(crate::ShadowFeed {
+                map: ctx.shadow.clone(),
+                account_id: ctx.account_id.clone(),
+                // commit 口径:完整链(含末条 user)。
+                fps: ctx.shadow_fps_full.clone(),
+            })
+        } else {
+            None
+        },
     )))
 }
 
-/// 请求流的「不要关」把手。持有它 = 请求体的 channel 发送端还活着 =
+/// wire v2 的上传腿状态:推迟发送的帧 + 应答 `4.2` 点名用的节库。
+///
+/// ## 为什么帧0 之后要推迟
+///
+/// 2026-08-23 实物时序(三轮一致):帧0 → 服务端 ack `{1:{13:}}` → (turn4:7 个 `4.2`
+/// 点名 → 客户端交 7 个内容槽) → **会话登记通知** → 客户端才发 ENV + 控制帧。
+///
+/// 早先实现把 13 帧一次性灌进 body channel,于是 ENV 抢在内容交换之前。触发器是
+/// **会话登记通知**(不是「内容交换完成」)—— turn4 通知来得晚,是因为服务端要拿到
+/// 内容才能登记会话;turn1/turn2 零点名,通知直接来,ENV 随即发。按通知触发对两种
+/// 情形都成立;若写成「等内容交换」,零点名的会话会等一个永不到来的事件。
+pub(crate) struct WireUpload {
+    /// ENV + 控制帧。等会话登记通知(或兜底期限)后按序发出。
+    pub deferred: Vec<Vec<u8>>,
+    /// 按 hash 供给内容分节。
+    pub sections: std::sync::Arc<crate::ContentSections>,
+}
+
+/// 推迟帧的兜底期限:没等到会话登记通知也要把 ENV 发出去,免得死等。
+const WIRE_DEFERRED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 往请求体通道发一帧的**上限**(codex 终审 #3)。
+///
+/// 裸 `btx.send().await` 会在 HTTP/2 流控停排时无界等待,而响应读取、stall 看门狗、
+/// 下游关闭检测全都在同一个任务里 —— 一次停排就把三件事一起冻住,表现是「号没坏
+/// 但永远 busy」。加上限之后最坏情况是这一帧发失败,由调用方按内容供给失败走判决。
+const WIRE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 带期限地往请求体通道发一帧。`Ok(())` = 发出去了。
+async fn wire_send_frame(btx: &BodyKeepalive, frame: Vec<u8>) -> Result<(), &'static str> {
+    let Some(btx) = btx else {
+        return Err("请求流未保持打开");
+    };
+    match tokio::time::timeout(WIRE_SEND_TIMEOUT, btx.send(Ok(bytes::Bytes::from(frame)))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err("请求流已关"),
+        Err(_) => Err("发送超时(HTTP/2 流控停排?)"),
+    }
+}
+
+/// 把推迟的 ENV + 控制帧按序发出。返回实际发出的帧数。
+///
+/// 抽成函数是因为它有**两个触发点**:收到会话登记通知时,以及独立的兜底期限分支
+/// (见 `select!` 里的 `WIRE_DEFERRED_DEADLINE` 分支)。两处各写一份必然漂移。
+async fn wire_flush_deferred(deferred: &mut Vec<Vec<u8>>, btx: &BodyKeepalive, why: &str) -> usize {
+    if deferred.is_empty() {
+        return 0;
+    }
+    let total = deferred.len();
+    let mut sent = 0usize;
+    for f in std::mem::take(deferred) {
+        if let Err(e) = wire_send_frame(btx, f).await {
+            tracing::warn!(why, sent, total, error = e, "cursor Run:推迟帧发送中断");
+            break;
+        }
+        sent += 1;
+    }
+    tracing::debug!(why, sent, total, "cursor Run:推迟帧(ENV + 控制帧)已发出");
+    sent
+}
+
+/// 请求流的「不要关」把手。/// 请求流的「不要关」把手。持有它 = 请求体的 channel 发送端还活着 =
 /// HTTP/2 请求流不 half-close。读完响应后随任务一起 drop,流才收。
 type BodyKeepalive = Option<tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>;
 
 /// HTTP 状态码 → UpstreamError(仅用于**非** 2xx;流内错误走 trailer 分类)。
-fn classify_http_error(status: u16, body: &str) -> UpstreamError {
+pub(crate) fn classify_http_error(status: u16, body: &str) -> UpstreamError {
     // 非 2xx 时 Connect 也可能把结构化错误放在 body 里,先试着解出来。
     if let Some(t) = run::parse_trailer(body) {
         return trailer_to_error(&t).with_status(status);
@@ -2014,34 +2273,33 @@ fn classify_http_error(status: u16, body: &str) -> UpstreamError {
 ///
 /// 若错判成 `RateLimited`,整个号会被冷却,连不受限的模型一起废掉。
 fn trailer_to_error(e: &run::TrailerError) -> UpstreamError {
-    let kind = if e.debug_error == "ERROR_RATE_LIMITED_CHANGEABLE"
-        || !e.auto_switch_to_model.is_empty()
-    {
-        UpstreamErrorKind::ModelNotAvailable
-    } else if e.debug_error.contains("BAD_MODEL_NAME") {
-        UpstreamErrorKind::BadRequest
-    } else if is_client_integrity_block(e) {
-        // ⚠️ **这一条必须排在下面 `resource_exhausted` 之前。**
-        //
-        // 客户端完整性门(config_version 空/过期、客户端版本过旧)回的**也是**
-        // `resource_exhausted`,文案是 "Update Required"(见 `config.rs` 模块文档)。
-        // 落到下面那个 match 就是 `QuotaExhausted` —— 调度层对它的处置是
-        // **持久禁用、不自愈**。于是一次控制面抖动会杀掉一个额度充足的健康号。
-        //
-        // 判成 `ServerError`:可换号重试(别的号有自己的 config_version),
-        // 计一次可自愈的失败,**不进 quota 禁用**。
-        UpstreamErrorKind::ServerError
-    } else {
-        match e.code.as_str() {
-            "unauthenticated" | "permission_denied" => UpstreamErrorKind::TokenInvalid,
-            "resource_exhausted" => UpstreamErrorKind::QuotaExhausted,
-            "invalid_argument" => UpstreamErrorKind::BadRequest,
-            "unavailable" => UpstreamErrorKind::Overloaded,
-            "deadline_exceeded" => UpstreamErrorKind::Network,
-            "internal" | "unknown" | "data_loss" => UpstreamErrorKind::ServerError,
-            _ => UpstreamErrorKind::Other,
-        }
-    };
+    let kind =
+        if e.debug_error == "ERROR_RATE_LIMITED_CHANGEABLE" || !e.auto_switch_to_model.is_empty() {
+            UpstreamErrorKind::ModelNotAvailable
+        } else if e.debug_error.contains("BAD_MODEL_NAME") {
+            UpstreamErrorKind::BadRequest
+        } else if is_client_integrity_block(e) {
+            // ⚠️ **这一条必须排在下面 `resource_exhausted` 之前。**
+            //
+            // 客户端完整性门(config_version 空/过期、客户端版本过旧)回的**也是**
+            // `resource_exhausted`,文案是 "Update Required"(见 `config.rs` 模块文档)。
+            // 落到下面那个 match 就是 `QuotaExhausted` —— 调度层对它的处置是
+            // **持久禁用、不自愈**。于是一次控制面抖动会杀掉一个额度充足的健康号。
+            //
+            // 判成 `ServerError`:可换号重试(别的号有自己的 config_version),
+            // 计一次可自愈的失败,**不进 quota 禁用**。
+            UpstreamErrorKind::ServerError
+        } else {
+            match e.code.as_str() {
+                "unauthenticated" | "permission_denied" => UpstreamErrorKind::TokenInvalid,
+                "resource_exhausted" => UpstreamErrorKind::QuotaExhausted,
+                "invalid_argument" => UpstreamErrorKind::BadRequest,
+                "unavailable" => UpstreamErrorKind::Overloaded,
+                "deadline_exceeded" => UpstreamErrorKind::Network,
+                "internal" | "unknown" | "data_loss" => UpstreamErrorKind::ServerError,
+                _ => UpstreamErrorKind::Other,
+            }
+        };
     UpstreamError::new(kind, format!("Cursor Run: {}", e.summary()))
 }
 
@@ -2057,7 +2315,11 @@ fn trailer_to_error(e: &run::TrailerError) -> UpstreamError {
 /// 将来真要走请求侧 `field 2` 工具通道回传结果,那里必须用 `ToolCall::id` 的**原值**,
 /// 不能用这里这个。
 fn client_tool_id(raw: &str) -> String {
-    raw.split(['\n', '\r']).next().unwrap_or(raw).trim().to_string()
+    raw.split(['\n', '\r'])
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
 }
 
 /// 这个错误是不是**客户端完整性门**(而不是真的额度问题)。
@@ -2071,9 +2333,15 @@ fn client_tool_id(raw: &str) -> String {
 /// 所以判据宁松勿紧:文案里出现 update/upgrade/version 就当完整性门。
 fn is_client_integrity_block(e: &run::TrailerError) -> bool {
     let hay = format!("{} {} {}", e.debug_error, e.title, e.detail).to_ascii_lowercase();
-    ["update required", "please update", "upgrade", "client version", "out of date"]
-        .iter()
-        .any(|needle| hay.contains(needle))
+    [
+        "update required",
+        "please update",
+        "upgrade",
+        "client version",
+        "out of date",
+    ]
+    .iter()
+    .any(|needle| hay.contains(needle))
 }
 
 /// 本轮失败:通知调用方别把会话记成「服务端已建立」。
@@ -2107,6 +2375,11 @@ fn stream_to_anthropic(
     sim_cache_read: u64,
     // CLI 形态(见 `cli.rs`):响应没有 `1.14` 用量帧,收尾认 `is_turn_commit` 回显。
     cli_mode: bool,
+    // wire v2 上传腿:推迟的 ENV/控制帧 + 应答 `4.2` 点名的节库(见 [`WireUpload`])。
+    upload: Option<WireUpload>,
+    // 续轮描述符影子捕获(纯观测,见 [`crate::DescriptorShadow`]);`None` = 不捕
+    // (测试里不关心影子的老用例)。
+    shadow: Option<crate::ShadowFeed>,
 ) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamItem, UpstreamError>>(32);
 
@@ -2123,6 +2396,10 @@ fn stream_to_anthropic(
         // trailer 里报的 —— 先发 message_start 等于把所有可重试的错误变成不可重试。
         let mut started = false;
         let mut output_chars: usize = 0;
+        // 本轮 assistant 输出的渲染文本,用来算入库链的末节指纹。
+        // 口径必须与 clidrv 的 `append_assistant_fp` 一致(同一个 `turn_fp`):
+        // 正文增量拼接、thinking 不进(它走 `fr.thinking`,本来就不在这里)。
+        let mut assistant_text = String::new();
         // 正文里的非 ASCII 字数:收尾估 output token 时中文不能按 4 字符/token 算
         // (见 est_text_tokens)。
         let mut output_nonascii: usize = 0;
@@ -2140,6 +2417,57 @@ fn stream_to_anthropic(
         // 于是一个「答了一半」的回复会被当成成功收尾:客户拿到残缺答案,
         // 账号健康度和请求日志却毫发无损,没有任何地方看得出来出过事。
         let mut saw_end = false;
+        // ── 影子模式(纯观测)─────────────────────────────────────────────
+        // 本轮捕到的**最后一份**续轮描述符(顶层 `.3` 原始字节 + ref 数),
+        // 只是暂存:流**干净收尾**(trailer / 用量帧 / turn_commit 后排水段排完)
+        // 才提交进影子表。中途捕获的尾部 `.3` 可能装着**未完结**轮次的状态(等工具
+        // 结果的轮、被截断的轮)—— 提交错描述符 = 将来回放时上下文缺一块 =
+        // 模型静默变傻(claude 评审红线)。
+        let mut shadow_staged: Option<(Vec<u8>, usize)> = None;
+        // wire v2:反应式帧序 + 点名应答由 `wirev2::WireDriver` 统一承担
+        // (**探针驱动同一个实现**,见该模块文档:两份实现会让探针结论不可迁移)。
+        // 只在 CLI 形态挂 —— IDE 没有这套内容寻址。
+        let mut wire_driver =
+            upload.map(|u| crate::wirev2::WireDriver::new(u.deferred, u.sections));
+        // wire v2 判据的计数**全在 driver 里**(主段/排水段分离,见
+        // `WireDriver::set_draining`)。这里只留「见过可接受的描述符」这一个本地状态。
+        let mut wire_saw_desc = false;
+        // 排水失败(停滞/读错/解压错)必须**作废已存描述符**(codex 审查 #2):
+        // 只是不提交本轮的话,下一轮 lookup 仍会返回上一轮那份 —— 那份缺了本轮,
+        // 于是只发增量却配一个缺一轮的清单 = 静默失忆。
+        let mut shadow_must_invalidate = false;
+        // 收尾是否「干净可提交」。只在三种干净收尾分支里置位;
+        // 工具调用(轮未完结,上游在等结果)与内建截断都**不**置位;
+        // turn_commit 本身也不置位 —— 它只是排水段的开始(见下)。
+        let mut shadow_committable = false;
+        // turn_commit 之后的**纯排水段**标记(codex 三轮 Finding 1):只继续读帧
+        // 给影子捕尾部 `.3`,其余一律忽略 —— 尾帧不再过完整状态机(usage 不覆写、
+        // 不产 SSE、不动计费),保证「观测零出站变化」。
+        let mut draining = false;
+        // wire v2:**所有失败出口都必经的作废点**(codex 三轮 #3)。
+        //
+        // 早 return 的路径(读流失败 / 错误 trailer / 空回复 / 流断)以前绕过作废,
+        // 于是最典型的失败链——「`4.2` 点名 → 拿不出来 → 上游等内容 → stall/EOF」——
+        // 既拿不到判决也不作废旧描述符,下一轮继续拿同一份清单撞同一面墙。
+        //
+        // 判据故意粗:**只要本轮是失败退出就作废**,不再算判决。失败轮的描述符状态
+        // 本就不可信,多作废一次只是下轮重铺(不省钱),漏作废是静默失忆。
+        let wire_invalidate = |why: &str| {
+            if !cli_mode {
+                return;
+            }
+            if let Some(feed) = &shadow {
+                let dropped = feed.map.invalidate(&conversation_id, &feed.account_id);
+                if dropped > 0 {
+                    tracing::warn!(
+                        conversation_id = %conversation_id,
+                        account = %feed.account_id,
+                        dropped, why,
+                        "cursor Run:本轮失败退出,作废该会话描述符(下轮重铺)"
+                    );
+                }
+            }
+        };
         // 上游要求执行的工具(若有)。收尾时变成一个 `tool_use` 块 + `stop_reason: tool_use`。
         let mut tool_call: Option<run::ToolCall> = None;
         // 内建工具收口发生在「已经出过字」之后 = 本次回答被截断,但仍会按 end_turn 收尾。
@@ -2165,16 +2493,48 @@ fn stream_to_anthropic(
                     return;
                 }
                 chunk = byte_stream.next() => chunk,
+                // ⚠️ **独立的推迟帧兜底期限分支**(codex 终审 #2)。
+                //
+                // 只在「收到响应帧时」检查这个期限是不够的:ack 之后上游若静默,根本
+                // 没有帧来触发检查,ENV 就一路拖到 90s stall 闸才被发现 —— 而 ENV 迟发
+                // 本身可能就是上游不出字的原因,那就成了自己造的死锁。
+                _ = tokio::time::sleep_until(
+                    wire_driver.as_ref().map(|d| d.deferred_deadline())
+                        .unwrap_or_else(|| std::time::Instant::now() + STALL_TIMEOUT)
+                        .into()
+                ), if wire_driver.as_ref().is_some_and(|d| d.has_deferred()) => {
+                    if let Some(d) = wire_driver.as_mut() {
+                        d.flush_deferred(body_keepalive.as_ref(), "兜底期限").await;
+                    }
+                    last_progress = std::time::Instant::now();
+                    continue;
+                }
                 _ = tokio::time::sleep_until(
                     (last_progress + STALL_TIMEOUT).into()
                 ) => {
+                    // 排水段的停滞**不是错误**:轮次在 turn_commit 已经成功,
+                    // 只是影子失去「干净收尾」资格(不提交),轮次照常收尾。
+                    if draining {
+                        tracing::debug!(
+                            secs = STALL_TIMEOUT.as_secs(),
+                            "cursor Run:turn_commit 后尾流停滞,放弃影子提交并作废旧描述符(轮次照常成功)"
+                        );
+                        shadow_must_invalidate = true;
+                        break 'outer;
+                    }
                     tracing::warn!(
                         secs = STALL_TIMEOUT.as_secs(),
                         started,
-                        "cursor Run:上游只发心跳、无任何进展,按空回复收口"
+                        "cursor Run:上游只发心跳、无任何进展,按上游错误收口"
                     );
+                    // 停滞是**瞬态服务故障**(可重试),不是内容级拒答 —— 不能用
+                    // EmptyResponse(它对内容是确定性的、对外映射 400 止重试,
+                    // 见 upstream_status)。ServerError:非流式 → 502 可重试;流式
+                    // 窥探 10s 超时早已提交 200,客户端拿到流内 api_error SSE
+                    // (语义同为"服务端问题、可重试",只是形态不同)。
+                    // (2026-08-24 codex 审查:两者混用会把瞬态停滞误表述成客户请求有错。)
                     trailer_err = Some(UpstreamError::new(
-                        UpstreamErrorKind::EmptyResponse,
+                        UpstreamErrorKind::ServerError,
                         format!(
                             "Cursor Run {}s 内只有心跳、没有任何文本或用量帧",
                             STALL_TIMEOUT.as_secs()
@@ -2183,10 +2543,24 @@ fn stream_to_anthropic(
                     break 'outer;
                 }
             };
-            let Some(chunk) = next else { break 'outer };
+            let Some(chunk) = next else {
+                // 流自然结束:排水段排到这里 = 干净收尾,影子可提交(尾部 .3 已暂存)。
+                if draining {
+                    shadow_committable = true;
+                }
+                break 'outer;
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
+                    // 排水段读失败同理:轮次已成功,只放弃影子,绝不让已成功的
+                    // 轮次变红(见 turn_commit 分支的排水段注释)。
+                    if draining {
+                        shadow_must_invalidate = true;
+                        tracing::debug!(error = %e, "cursor Run:turn_commit 后尾流读失败,放弃影子提交并作废旧描述符(轮次照常成功)");
+                        break 'outer;
+                    }
+                    wire_invalidate("读取流失败");
                     fail(&outcome);
                     let _ = tx
                         .send(Err(UpstreamError::network(format!(
@@ -2203,6 +2577,11 @@ fn stream_to_anthropic(
                 let payload = match wire::frame_payload(flag, &raw) {
                     Ok(p) => p,
                     Err(e) => {
+                        if draining {
+                            shadow_must_invalidate = true;
+                            tracing::debug!(error = %e, "cursor Run:turn_commit 后尾帧解压失败,放弃影子提交并作废旧描述符(轮次照常成功)");
+                            break 'outer;
+                        }
                         trailer_err = Some(UpstreamError::new(
                             UpstreamErrorKind::ServerError,
                             format!("Cursor 帧解压失败(flag={flag:#04x}): {e}"),
@@ -2212,12 +2591,25 @@ fn stream_to_anthropic(
                 };
 
                 if flag & 0x02 != 0 {
+                    // 排水段排到 trailer = 干净收尾,提交影子;trailer 内容不再
+                    // 解析 —— 轮次在 turn_commit 已成功,错误 trailer 也改不了它。
+                    if draining {
+                        if run::parse_trailer(&String::from_utf8_lossy(&payload)).is_some() {
+                            tracing::debug!(
+                                "cursor Run:turn_commit 后尾部出现错误 trailer,忽略(轮次照常成功)"
+                            );
+                        }
+                        saw_end = true;
+                        shadow_committable = true;
+                        break 'outer;
+                    }
                     let text = String::from_utf8_lossy(&payload);
                     if let Some(t) = run::parse_trailer(&text) {
                         trailer_err = Some(trailer_to_error(&t));
                     }
                     // 干净的 end-stream trailer 也是正常收尾 —— 与用量帧同级。
                     saw_end = true;
+                    shadow_committable = true;
                     break 'outer;
                 }
 
@@ -2235,6 +2627,81 @@ fn stream_to_anthropic(
                     "cursor Run 响应帧"
                 );
 
+                // 影子捕获:响应帧顶层带 `.3` 就暂存(一帧多份取尾部,见
+                // `run::descriptor_field3`)。**只观测,绝不动出站**;日志照打,
+                // 但此时一律「未收尾不入库」—— 提交点在循环外的干净收尾处。
+                // ── wire v2:存回显 / 应答点名 / 按登记通知发推迟帧 ───────────
+                //
+                // 三件事都在 `WireDriver::on_frame` 里,**与探针共用同一份实现**。
+                // 只在 CLI 形态挂 driver(IDE 没有这套内容寻址,见 driver 的构造处)。
+                if let Some(d) = wire_driver.as_mut() {
+                    let eff = d.on_frame(&payload, body_keepalive.as_ref()).await;
+                    // 主段/排水段的隔离已收进 driver(见 `WireDriver::set_draining`),
+                    // 这里不再自己加计数 —— 探针读同一份 getter,两边自动同源。
+                    if eff.demanded > 0 {
+                        tracing::warn!(
+                            conversation_id = %conversation_id,
+                            demanded = eff.demanded,
+                            unavailable = eff.unavailable,
+                            draining,
+                            counted = !draining,
+                            "cursor Run:上游点名要内容分节(field-4 `4.2`)"
+                        );
+                    }
+                    if eff.demanded > 0 || eff.sections_stored > 0 || eff.deferred_sent > 0 {
+                        last_progress = std::time::Instant::now();
+                    }
+                }
+
+                // ⚠️ **描述符只在 turn_commit 同帧或之后才作数**(codex 终审 #1)。
+                //
+                // commit 之前收到的 `.3` 是**中间态**:它装的是一个还没完结的轮次的
+                // 状态。旧写法把本轮任意时刻的 `.3` 都记有效,于是「只在 commit 前收到
+                // 中间态 `.3`、commit 后正常 EOF」这条路径上,`NoDescriptor` 不触发、
+                // 中间态描述符被提交到新指纹链,下一轮精确匹配成功后回放一个缺一轮的
+                // 状态 —— 精确匹配挡不住它,因为链是对的、内容是错的。
+                //
+                // 中间态照常打日志(观测有价值),但不进 staged、不置 wire_saw_desc。
+                let commit_frame = run::is_turn_commit(&payload);
+                let desc_acceptable = crate::wirev2::descriptor_acceptable(draining, commit_frame);
+                if let (Some(feed), Some(d3)) = (&shadow, run::descriptor_field3(&payload)) {
+                    let refs = run::descriptor_ref_count(d3);
+                    let fp = crate::fnv1a64(d3);
+                    let changed = shadow_staged
+                        .as_ref()
+                        .map(|(prev, _)| crate::fnv1a64(prev) != fp);
+                    tracing::info!(
+                        conversation_id = %conversation_id,
+                        account = %feed.account_id,
+                        model = %model,
+                        refs,
+                        bytes = d3.len(),
+                        fp = %format!("{fp:016x}"),
+                        changed = ?changed,
+                        acceptable = desc_acceptable,
+                        "cursor Run:捕到续轮描述符(顶层 .3)"
+                    );
+                    if desc_acceptable {
+                        wire_saw_desc = true;
+                        shadow_staged = Some((d3.to_vec(), refs));
+                    } else {
+                        tracing::debug!(
+                            "cursor Run:该 `.3` 在 turn_commit 之前 = 未完结轮次的中间态,不作数"
+                        );
+                    }
+                }
+
+                // ── 纯排水段(codex 三轮 Finding 1)───────────────────────────
+                // turn_commit 之后的尾帧**只**给影子捕 `.3`(上面已捕),其余一律
+                // 忽略:usage(1.14)不得覆写 `upstream_usage`、不产任何
+                // SSE/StreamItem、不改任何计费与客户端可见输出。改动前 CLI 形态
+                // 在 turn_commit 就收尾,这些尾帧本来不会被处理 —— 排水段是纯
+                // 观测附加段,它的存在不得改变轮次的任何外部表现。
+                if draining {
+                    last_progress = std::time::Instant::now();
+                    continue;
+                }
+
                 // ⚠️ **用量必须最后判。** 「一帧只装一样东西」只是对抓包的观察,
                 // protobuf 层没有任何东西阻止上游把最后一个正文增量和用量并进同一帧。
                 // 先判用量就 break 的话,那一帧里的正文被静默丢掉,而客户还是收到
@@ -2243,9 +2710,7 @@ fn stream_to_anthropic(
                 let text = fr.text;
                 // 未透传的思考**不算进展**:否则会一边丢 `1.4`、一边续命 last_progress,
                 // 拖到 gw-app 的 300s 静默硬上限才报错(见 client_wants_thinking 注释)。
-                if !text.is_empty()
-                    || usage.is_some()
-                    || (want_thinking && !fr.thinking.is_empty())
+                if !text.is_empty() || usage.is_some() || (want_thinking && !fr.thinking.is_empty())
                 {
                     last_progress = std::time::Instant::now();
                 }
@@ -2257,7 +2722,11 @@ fn stream_to_anthropic(
                 // 不发时思考照旧丢掉(绝不能混进正文,见 run::RespFrame)。
                 if want_thinking && !fr.thinking.is_empty() {
                     if !started {
-                        if tx.send(Ok(StreamItem::Sse(message_start(&msg_id, &model)))).await.is_err() {
+                        if tx
+                            .send(Ok(StreamItem::Sse(message_start(&msg_id, &model))))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         started = true;
@@ -2297,9 +2766,14 @@ fn stream_to_anthropic(
 
                 if !text.is_empty() {
                     output_chars += text.chars().count();
+                    assistant_text.push_str(&text);
                     output_nonascii += text.chars().filter(|c| !c.is_ascii()).count();
                     if !started {
-                        if tx.send(Ok(StreamItem::Sse(message_start(&msg_id, &model)))).await.is_err() {
+                        if tx
+                            .send(Ok(StreamItem::Sse(message_start(&msg_id, &model))))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         started = true;
@@ -2344,15 +2818,23 @@ fn stream_to_anthropic(
                     continue;
                 }
 
-                // CLI 形态**没有 `1.14` 用量帧**:收尾信号是「本轮已提交」回显
-                // (见 run::is_turn_commit)。不认它,每轮都要等满看门狗才收口。
-                if cli_mode && run::is_turn_commit(&payload) {
+                // CLI 形态的「本轮已提交」回显(见 run::is_turn_commit):轮次到此
+                // **已经成功**(saw_end),客户端结果已定。但它**不是流尾** ——
+                // 2026-08-23 官方抓包实证帧序为 turn_commit → .3 → .3(ref 更多) →
+                // 小尾帧 → 流结束。所以从此进入**纯排水段**(draining):继续读帧
+                // 只为影子捕尾部 `.3`,尾帧不再过状态机(见上方排水段注释)。
+                // 排水段的任何失败(停滞/读错/解压错)都只放弃影子提交,
+                // 绝不影响这个已经成功的轮次。
+                if cli_mode && commit_frame {
+                    if let Some(d) = wire_driver.as_mut() {
+                        d.set_draining();
+                    }
                     // 合帧防御:同帧若有用量先收下(目前 CLI 实测没有,留这条不亏)。
                     if let Some(wu) = usage {
                         upstream_usage = Some(usage_from_upstream(wu));
                     }
                     saw_end = true;
-                    break 'outer;
+                    draining = true;
                 }
 
                 // 工具调用:上游在等客户端执行工具并回帧。
@@ -2389,7 +2871,10 @@ fn stream_to_anthropic(
                                         );
                                     }
                                     let ack = wire::frame(&run::encode_write_success(
-                                        w.id, &w.exec_id, &w.path, w.bytes.len(),
+                                        w.id,
+                                        &w.exec_id,
+                                        &w.path,
+                                        w.bytes.len(),
                                     ));
                                     // 回执是协议关键帧:try_send 丢了会退化成 90s 死等,
                                     // 所以**等容量**而不是丢;只有真发出去才算已处理。
@@ -2485,8 +2970,7 @@ fn stream_to_anthropic(
                                 tool_call = Some(tc);
                                 // 同帧用量同样要收(与外部工具臂同一条合帧原则)。
                                 if let Some(wu) = usage {
-                                    upstream_usage =
-                                        Some(usage_from_upstream(wu));
+                                    upstream_usage = Some(usage_from_upstream(wu));
                                 }
                                 // 与外部工具臂同款:正常的 tool_use 收尾,不是截断。
                                 saw_end = true;
@@ -2549,12 +3033,14 @@ fn stream_to_anthropic(
                 if let Some(wu) = usage {
                     upstream_usage = Some(usage_from_upstream(wu));
                     saw_end = true;
+                    shadow_committable = true;
                     break 'outer;
                 }
             }
         }
 
         if let Some(err) = trailer_err {
+            wire_invalidate("错误 trailer");
             fail(&outcome);
             let _ = tx.send(Err(err)).await;
             return;
@@ -2566,8 +3052,11 @@ fn stream_to_anthropic(
         // 有工具调用时,「一个字都没出」是**正常**的:模型可以直接决定调工具而不先说话。
         // 那时也必须补一个 message_start,否则后面的块没有依附。
         if !started && tool_call.is_some() {
-            let _ = tx.send(Ok(StreamItem::Sse(message_start(&msg_id, &model)))).await;
+            let _ = tx
+                .send(Ok(StreamItem::Sse(message_start(&msg_id, &model))))
+                .await;
         } else if !started {
+            wire_invalidate("空回复(一个字都没出)");
             fail(&outcome);
             let _ = tx
                 .send(Err(UpstreamError::new(
@@ -2581,6 +3070,7 @@ fn stream_to_anthropic(
         // 出过字、但流是**断掉**的而不是收尾的 —— 报截断,不许伪装成 end_turn。
         // 首包已经发出去了,gw-app 换不了号,但至少让这次请求在日志里是红的。
         if !saw_end {
+            wire_invalidate("流断而非收尾");
             fail(&outcome);
             let _ = tx
                 .send(Err(UpstreamError::new(
@@ -2589,6 +3079,127 @@ fn stream_to_anthropic(
                 )))
                 .await;
             return;
+        }
+
+        // 影子提交:**只有干净收尾才走到这里**(trailer_err / !saw_end 已在上面
+        // return;工具调用与内建截断分支不置 shadow_committable)。「同号/换号」
+        // 「同模型/换模型」是评估描述符回放可行性的核心统计 —— 账号轮转决定
+        // 描述符的有效寿命。
+        // ── wire v2 判决(见 `run::WireTurnOutcome`)────────────────────────────
+        //
+        // 这里 `saw_end` 必为真(中断/错误 trailer 已在上面 return)。能在这里翻船的
+        // 是「收尾了、甚至出了字,但服务端点名了我方拿不出来的内容分节」——
+        // 那种轮次的回答**可能是基于缺历史生成的**,记成功等于把错答案留给客户,
+        // 并且把一份指向不可用内容的描述符留给下一轮。
+        // ⚠️ **判决只在 CLI 形态执行**(codex 终审 #6)。IDE 形态没有描述符,
+        // 无条件跑判决会让每个成功轮都算出 `NoDescriptor` 并打一条 WARN ——
+        // 那是给生产默认路径凭空加噪声,而且会误导排查。
+        let wire_verdict = if !cli_mode {
+            run::WireVerdict::Ok
+        } else {
+            run::WireTurnOutcome {
+                saw_descriptor: wire_saw_desc,
+                saw_finish: saw_end,
+                content_chars: output_chars,
+                demanded: wire_driver.as_ref().map_or(0, |d| d.demanded()),
+                unavailable: wire_driver.as_ref().map_or(0, |d| d.unavailable()),
+            }
+            .verdict()
+        };
+        if wire_verdict != run::WireVerdict::Ok {
+            tracing::warn!(
+                conversation_id = %conversation_id,
+                verdict = ?wire_verdict,
+                saw_descriptor = wire_saw_desc,
+                output_chars,
+                demanded = wire_driver.as_ref().map_or(0, |d| d.demanded()),
+                unavailable = wire_driver.as_ref().map_or(0, |d| d.unavailable()),
+                "cursor Run:wire 判决非 Ok"
+            );
+        }
+
+        // 描述符作废:三种情形合流 —— ① 排水失败(旧条目缺本轮,codex #2);
+        // ② 判决要求回退;③ 本轮拿不出内容分节。作废后下一轮走首轮形态重铺。
+        let must_invalidate = shadow_must_invalidate || wire_verdict.needs_reflow();
+        if must_invalidate {
+            if let Some(feed) = &shadow {
+                let dropped = feed.map.invalidate(&conversation_id, &feed.account_id);
+                tracing::warn!(
+                    conversation_id = %conversation_id,
+                    account = %feed.account_id,
+                    dropped,
+                    drain_failed = shadow_must_invalidate,
+                    verdict = ?wire_verdict,
+                    "cursor Run:作废该会话描述符,下轮重铺"
+                );
+            }
+            shadow_staged = None;
+        }
+
+        // ⭐ **判决要真正作用于本轮**(codex 审查 #3)。
+        //
+        // 早先这里只作废下一轮的料就继续走 message_stop + h(true) —— 那让「基于缺
+        // 历史生成的答案」被记成成功轮:ConvRegistry 会 confirm、客户拿到错答案、
+        // 而我们以为一切正常。回退必须体现为**本轮失败**,让上层按既有语义重试
+        // (重试时描述符已作废 → 走 Opening 全量重铺)。
+        if wire_verdict.should_fallback() {
+            fail(&outcome);
+            let _ = tx
+                .send(Err(UpstreamError::new(
+                    UpstreamErrorKind::ServerError,
+                    match wire_verdict {
+                        run::WireVerdict::ContentUnavailable { missing, demanded } => format!(
+                            "Cursor Run:上游点名 {demanded} 个内容分节,我方拿不出 {missing} 个\
+                             (描述符清单指向未持有的内容,已作废,下轮重铺)"
+                        ),
+                        _ => {
+                            format!("Cursor Run:上游接受请求但未产出内容(已输出 {output_chars} 字)")
+                        }
+                    },
+                )))
+                .await;
+            return;
+        }
+
+        if shadow_committable {
+            if let (Some(feed), Some((desc, refs))) = (&shadow, shadow_staged.take()) {
+                // 本轮 assistant 输出指纹。**工具轮不算**:它的渲染含参数 JSON 的
+                // 调用方再序列化,字节不由我方掌控(键序/空白都可能变),算出来的
+                // 指纹下一轮对不上,反而制造假分叉 —— 与 clidrv 同一条红线。
+                // 缺指纹的条目 lookup 会硬性拒绝,所以宁缺勿错。
+                let assistant_fp = if tool_call.is_some() {
+                    None
+                } else {
+                    // 空正文(纯 thinking 等)沿用 `to_turns` 的占位串口径。
+                    let text = if assistant_text.is_empty() {
+                        "(unsupported content omitted)"
+                    } else {
+                        assistant_text.as_str()
+                    };
+                    Some(turn_fp(false, text))
+                };
+                let c = feed.map.commit(
+                    &conversation_id,
+                    &feed.account_id,
+                    &model,
+                    &feed.fps,
+                    assistant_fp,
+                    &desc,
+                    refs,
+                );
+                tracing::info!(
+                    conversation_id = %conversation_id,
+                    account = %feed.account_id,
+                    model = %model,
+                    refs,
+                    bytes = desc.len(),
+                    fp = %format!("{:016x}", c.fp),
+                    changed = ?c.changed,
+                    account_shift = ?c.same_account.map(|b| if b { "同号" } else { "换号" }),
+                    model_shift = ?c.same_model.map(|b| if b { "同模型" } else { "换模型" }),
+                    "cursor Run:流干净收尾,续轮描述符已入影子表"
+                );
+            }
         }
 
         // 上游自报优先,但「input=0 且 cache=0」的用量帧**不可信** —— 请求体显然
@@ -2608,10 +3219,10 @@ fn stream_to_anthropic(
                 // output = 正文出字(ASCII/4 + 非 ASCII/1.5)+ 工具参数(纯 tool_use
                 // 轮的产出大头是参数 JSON)。上游若给了 output(哪怕 input/cache
                 // 置零),它比估算准,用它的。
-                let text_tokens = ((output_chars - output_nonascii) as u64).div_ceil(4)
-                    + output_nonascii as u64;
-                u.output_tokens = text_tokens
-                    + tool_call.as_ref().map(tool_call_tokens).unwrap_or(0);
+                let text_tokens =
+                    ((output_chars - output_nonascii) as u64).div_ceil(4) + output_nonascii as u64;
+                u.output_tokens =
+                    text_tokens + tool_call.as_ref().map(tool_call_tokens).unwrap_or(0);
                 if let Some(up) = &zeroed {
                     if up.output_tokens > 0 {
                         u.output_tokens = up.output_tokens;
@@ -2665,8 +3276,11 @@ fn stream_to_anthropic(
             // 参数值已经是解好的 JSON(数字仍是数字、对象仍是对象)。
             // 早先这里是 `Value::String(v.clone())` —— 把一切都变成字符串,
             // `{"limit": 200}` 会发成 `{"limit": "200"}`,schema 写 number 的工具直接拒。
-            let input: serde_json::Map<String, Value> =
-                tc.args.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let input: serde_json::Map<String, Value> = tc
+                .args
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             let _ = tx
                 .send(Ok(StreamItem::Sse(SseEvent::new(
                     "content_block_start",
@@ -2839,7 +3453,9 @@ mod tests {
     /// 动态噪声的判据必须精确到「整条就是这个」:带正文的消息不能被误丢。
     #[test]
     fn 分流器_动态噪声判据不放宽() {
-        assert!(is_dynamic_system_noise("<total_tokens>123 tokens left</total_tokens>"));
+        assert!(is_dynamic_system_noise(
+            "<total_tokens>123 tokens left</total_tokens>"
+        ));
         assert!(is_dynamic_system_noise(
             "\n  <total_tokens>123 tokens left</total_tokens>  \n"
         ));
@@ -2862,15 +3478,33 @@ mod tests {
     #[test]
     fn 本轮输入取整段而非末条() {
         let one = vec![
-            Turn { text: "甲".into(), is_user: true },
-            Turn { text: "乙".into(), is_user: false },
-            Turn { text: "丙".into(), is_user: true },
+            Turn {
+                text: "甲".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "乙".into(),
+                is_user: false,
+            },
+            Turn {
+                text: "丙".into(),
+                is_user: true,
+            },
         ];
         assert_eq!(latest_user_input(&one), "丙", "正常形态 = last()");
         let two = vec![
-            Turn { text: "乙".into(), is_user: false },
-            Turn { text: "丙".into(), is_user: true },
-            Turn { text: "<system_context>\n未知注入\n</system_context>".into(), is_user: true },
+            Turn {
+                text: "乙".into(),
+                is_user: false,
+            },
+            Turn {
+                text: "丙".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "<system_context>\n未知注入\n</system_context>".into(),
+                is_user: true,
+            },
         ];
         assert_eq!(
             latest_user_input(&two),
@@ -2878,7 +3512,10 @@ mod tests {
             "未知注入落在尾巴上时,用户的话仍在 prompt 里"
         );
         // 全是 user(首轮)→ 整条都是本轮输入。
-        let fresh = vec![Turn { text: "甲".into(), is_user: true }];
+        let fresh = vec![Turn {
+            text: "甲".into(),
+            is_user: true,
+        }];
         assert_eq!(latest_user_input(&fresh), "甲");
         assert_eq!(latest_user_input(&[]), "");
     }
@@ -2946,9 +3583,18 @@ mod tests {
     #[test]
     fn 增量历史只发本轮_不重传历史() {
         let turns = vec![
-            Turn { text: "第一个问题".into(), is_user: true },
-            Turn { text: "第一个回答".into(), is_user: false },
-            Turn { text: "第二个问题".into(), is_user: true },
+            Turn {
+                text: "第一个问题".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "第一个回答".into(),
+                is_user: false,
+            },
+            Turn {
+                text: "第二个问题".into(),
+                is_user: true,
+            },
         ];
         let out = delta_history(&turns, None);
         assert_eq!(out.len(), 1);
@@ -2968,10 +3614,22 @@ mod tests {
     #[test]
     fn 增量历史保留尾随的_prefill() {
         let turns = vec![
-            Turn { text: "历史问题".into(), is_user: true },
-            Turn { text: "历史回答".into(), is_user: false },
-            Turn { text: "本轮问题".into(), is_user: true },
-            Turn { text: "答案是".into(), is_user: false },
+            Turn {
+                text: "历史问题".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "历史回答".into(),
+                is_user: false,
+            },
+            Turn {
+                text: "本轮问题".into(),
+                is_user: true,
+            },
+            Turn {
+                text: "答案是".into(),
+                is_user: false,
+            },
         ];
         let out = delta_history(&turns, None);
         assert_eq!(out[0].text, "本轮问题\n\n答案是");
@@ -2982,9 +3640,10 @@ mod tests {
     /// 与历史在谁手里无关)。
     #[test]
     fn 增量历史照样补工具回路提醒() {
-        let turns = vec![
-            Turn { text: "[工具返回]42".into(), is_user: true },
-        ];
+        let turns = vec![Turn {
+            text: "[工具返回]42".into(),
+            is_user: true,
+        }];
         let d = delta_history(&turns, Some("帮我算一下"));
         let f = fold_history(&turns, Some("帮我算一下"));
         assert!(d[0].text.contains("不要重复调用已经返回结果的工具"));
@@ -2997,7 +3656,10 @@ mod tests {
     /// 而空请求上游只回心跳。
     #[test]
     fn 没有_user_轮时退回折叠而不是返回空() {
-        let turns = vec![Turn { text: "只有助手".into(), is_user: false }];
+        let turns = vec![Turn {
+            text: "只有助手".into(),
+            is_user: false,
+        }];
         let out = delta_history(&turns, None);
         assert!(!out.is_empty());
         assert!(out[0].text.contains("只有助手"));
@@ -3033,11 +3695,17 @@ mod tests {
         };
         let k1 = affinity_key_from_body(&body("ea527")).expect("要能派生出键");
         let k2 = affinity_key_from_body(&body("b91f0")).expect("要能派生出键");
-        assert_eq!(k1, k2, "同一会话两轮的键必须相同,否则钉扎/续写/缓存三件事一起废");
+        assert_eq!(
+            k1, k2,
+            "同一会话两轮的键必须相同,否则钉扎/续写/缓存三件事一起废"
+        );
 
         // 顺带确认:发给上游的 system 里不能再留着那行随机数(它会毒化 prefix cache)。
         let sys = extract_system(&body("ea527"));
-        assert!(!sys.contains("x-anthropic-billing-header"), "指纹行不该进上游报文");
+        assert!(
+            !sys.contains("x-anthropic-billing-header"),
+            "指纹行不该进上游报文"
+        );
         assert!(sys.contains("You are Claude Code"), "正文必须保留");
 
         // 反向:换了真正的会话内容(system 正文或开场白)仍必须换键。
@@ -3066,6 +3734,11 @@ mod tests {
             keep_stream_open: true,
             assets: std::sync::Arc::new(crate::AssetStore::default()),
             notices: std::sync::Arc::new(crate::TruncationNotices::default()),
+            shadow: std::sync::Arc::new(crate::DescriptorShadow::default()),
+            shadow_fps: Vec::new(),
+            shadow_fps_full: Vec::new(),
+            wire_descriptor_replay: true,
+            sections: std::sync::Arc::new(crate::ContentSections::default()),
         }
     }
 
@@ -3088,9 +3761,15 @@ mod tests {
                  "content":[{"type":"text","text":"gamma\ndelta\n"}]}]}
           ]
         });
-        assert!(last_user_is_tool_result_only(&body), "这一轮应被认成工具回路中间轮");
+        assert!(
+            last_user_is_tool_result_only(&body),
+            "这一轮应被认成工具回路中间轮"
+        );
         let task = latest_real_user_request(&body);
-        assert_eq!(task.as_deref(), Some("读一下 data.txt 然后告诉我里面有什么"));
+        assert_eq!(
+            task.as_deref(),
+            Some("读一下 data.txt 然后告诉我里面有什么")
+        );
 
         let turns = fold_history(&to_turns(&body), task.as_deref());
         assert_eq!(turns.len(), 1);
@@ -3369,8 +4048,14 @@ mod tests {
         // 两组 traceparent 独立随机,且 **flags 不同**(抓包实物 -00 / -01)
         assert_ne!(get("traceparent"), get("backend-traceparent"));
         assert!(get("traceparent").unwrap().starts_with("00-"));
-        assert!(get("traceparent").unwrap().ends_with("-00"), "traceparent 未采样");
-        assert!(get("backend-traceparent").unwrap().ends_with("-01"), "backend 已采样");
+        assert!(
+            get("traceparent").unwrap().ends_with("-00"),
+            "traceparent 未采样"
+        );
+        assert!(
+            get("backend-traceparent").unwrap().ends_with("-01"),
+            "backend 已采样"
+        );
     }
 
     #[test]
@@ -3401,7 +4086,10 @@ mod tests {
         };
         assert_eq!(mk("unauthenticated", ""), UpstreamErrorKind::TokenInvalid);
         assert_eq!(mk("permission_denied", ""), UpstreamErrorKind::TokenInvalid);
-        assert_eq!(mk("resource_exhausted", ""), UpstreamErrorKind::QuotaExhausted);
+        assert_eq!(
+            mk("resource_exhausted", ""),
+            UpstreamErrorKind::QuotaExhausted
+        );
         assert_eq!(mk("invalid_argument", ""), UpstreamErrorKind::BadRequest);
         assert_eq!(mk("unavailable", ""), UpstreamErrorKind::Overloaded);
         assert_eq!(mk("internal", ""), UpstreamErrorKind::ServerError);
@@ -3463,8 +4151,10 @@ mod tests {
             std::sync::Arc::new(crate::TruncationNotices::default()),
             BuiltinXlate::default(),
             ChatUsage::default(),
-            0, // 本用例不关心模拟缓存,
+            0,     // 本用例不关心模拟缓存,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3488,7 +4178,10 @@ mod tests {
 
         // ② 资产进了内存库,路径与实物帧一致。
         let stored = assets
-            .get("conv-test", "/assets/attach-0-6bd00159-1e01-4924-b8c2-12f28cc81e53.png")
+            .get(
+                "conv-test",
+                "/assets/attach-0-6bd00159-1e01-4924-b8c2-12f28cc81e53.png",
+            )
             .expect("资产必须已存进内存库");
         assert_eq!(stored.len(), 73);
         assert!(stored.starts_with(b"\x89PNG"), "存的是原图字节");
@@ -3537,7 +4230,7 @@ mod tests {
         ];
         let tools = [run::ToolDef {
             name: "Edit".into(),
-            description: "edit a file".into(), // 11
+            description: "edit a file".into(),      // 11
             schema: "{\"type\":\"object\"}".into(), // 16
         }];
         // system 24 + conv 140 + tools (4+11+16=31) = 195 chars → 49 tok
@@ -3588,7 +4281,12 @@ mod tests {
             let mut sys = extract_system(body);
             let tools = to_tools(body);
             sys.push_str(&builtin_tool_guard(&tools));
-            crate::cache_sim::fingerprints_from_context(&sys, &tools, &to_turns(body), est_text_tokens)
+            crate::cache_sim::fingerprints_from_context(
+                &sys,
+                &tools,
+                &to_turns(body),
+                est_text_tokens,
+            )
         };
         let store = crate::cache_sim::CacheSimStore::new();
         let t0 = std::time::Instant::now();
@@ -3600,7 +4298,12 @@ mod tests {
         assert!(store.commit_at(key, "claude-fable-5", fps1, t0, gen1));
 
         let fps2 = fps_of(&body2);
-        let (r2, _) = store.peek_at(key, "claude-fable-5", &fps2, t0 + std::time::Duration::from_secs(30));
+        let (r2, _) = store.peek_at(
+            key,
+            "claude-fable-5",
+            &fps2,
+            t0 + std::time::Duration::from_secs(30),
+        );
         // 第二轮应命中:system + 第一轮 user 消息(逻辑前缀)。
         let expect_min = r1.total_tokens; // 第一轮全部被第二轮包含为前缀
         assert!(
@@ -3648,10 +4351,8 @@ mod tests {
     #[tokio::test]
     async fn 上游零用量帧回落请求体粗估() {
         let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // "红"
-        // {1:{14:{1:0,2:7,3:0}}} —— input/cache 置零、output=7
-        let usage_payload: &[u8] = &[
-            0x0a, 0x08, 0x72, 0x06, 0x08, 0x00, 0x10, 0x07, 0x18, 0x00,
-        ];
+                                                                                     // {1:{14:{1:0,2:7,3:0}}} —— input/cache 置零、output=7
+        let usage_payload: &[u8] = &[0x0a, 0x08, 0x72, 0x06, 0x08, 0x00, 0x10, 0x07, 0x18, 0x00];
         let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
             Ok(bytes::Bytes::from(wire::frame(&text_payload))),
             Ok(bytes::Bytes::from(wire::frame(usage_payload))),
@@ -3672,8 +4373,10 @@ mod tests {
                 output_tokens: 1,
                 ..Default::default()
             },
-            400, // 模拟缓存命中,
+            400,   // 模拟缓存命中,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3698,10 +4401,8 @@ mod tests {
     #[tokio::test]
     async fn 模拟缓存封顶输入总量() {
         let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // "红"
-        // {1:{14:{1:100,2:5,3:0}}} —— input=100, cached=0
-        let usage_payload: &[u8] = &[
-            0x0a, 0x08, 0x72, 0x06, 0x08, 0x64, 0x10, 0x05, 0x18, 0x00,
-        ];
+                                                                                     // {1:{14:{1:100,2:5,3:0}}} —— input=100, cached=0
+        let usage_payload: &[u8] = &[0x0a, 0x08, 0x72, 0x06, 0x08, 0x64, 0x10, 0x05, 0x18, 0x00];
         let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
             Ok(bytes::Bytes::from(wire::frame(&text_payload))),
             Ok(bytes::Bytes::from(wire::frame(usage_payload))),
@@ -3720,6 +4421,8 @@ mod tests {
             ChatUsage::default(),
             99999, // 模拟命中远超上游 input,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3739,7 +4442,7 @@ mod tests {
     #[tokio::test]
     async fn 上游用量同步写入真实缓存字段() {
         let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // "红"
-        // {1:{14:{1:1000,2:5,3:900}}}
+                                                                                     // {1:{14:{1:1000,2:5,3:900}}}
         let usage_payload: &[u8] = &[
             0x0a, 0x0a, 0x72, 0x08, 0x08, 0xe8, 0x07, 0x10, 0x05, 0x18, 0x84, 0x07,
         ];
@@ -3762,8 +4465,10 @@ mod tests {
                 input_tokens: 1,
                 ..Default::default()
             }, // fallback 不应被用到
-            5000, // 模拟值再大也不许盖过上游真实命中,
+            5000,  // 模拟值再大也不许盖过上游真实命中,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3835,6 +4540,46 @@ mod tests {
         assert_eq!(last_tool_results(&tail_ai), None);
     }
 
+    #[test]
+    fn history_answers_tool_use_全历史扫描() {
+        // 多模型编排现场形态:我方 toolu_a 在中间轮已被应答,末条是别家的 call-* 结果。
+        let body = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_a", "name": "webfetch", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_a", "content": "我方答案"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call-x-1", "name": "webfetch", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-x-1", "content": "别家答案"}]},
+        ]});
+        assert!(
+            history_answers_tool_use(&body, "toolu_a"),
+            "中间轮已应答 → true"
+        );
+        assert!(history_answers_tool_use(&body, "call-x-1"), "末条应答也认");
+        assert!(
+            !history_answers_tool_use(&body, "toolu_不存在的"),
+            "无此 id → false"
+        );
+        // assistant 消息里的同名块不算(tool_use 不是 tool_result)。
+        assert!(
+            !history_answers_tool_use(&body, "webfetch"),
+            "工具名不是 id"
+        );
+        // 只有 tool_use、没人应答 → false(真错配/重放场景,维持严拒)。
+        let unanswered = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_a", "name": "webfetch", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-y", "content": "别家的"}]},
+        ]});
+        assert!(!history_answers_tool_use(&unanswered, "toolu_a"));
+        // 乱序伪造(codex 审查 major#2):结果在 tool_use **之前** → 不算已应答。
+        let reordered = json!({"messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_a", "content": "抢先的答案"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_a", "name": "webfetch", "input": {}}]},
+        ]});
+        assert!(
+            !history_answers_tool_use(&reordered, "toolu_a"),
+            "结果先于调用 → false"
+        );
+    }
+
     /// 造一帧思考增量 `1.4.1`(与 run 单测同形,避免依赖私有 helper)。
     fn thinking_wire(text: &str) -> Vec<u8> {
         use crate::protobuf::Writer;
@@ -3854,7 +4599,9 @@ mod tests {
         // 透传后必须先有 message_start,客户端才算有首字。
         let usage_payload = [0x0au8, 0x08, 0x72, 0x06, 0x08, 0x64, 0x10, 0x05, 0x18, 0x5a];
         let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
-            Ok(bytes::Bytes::from(wire::frame(&thinking_wire("规划马里奥关卡")))),
+            Ok(bytes::Bytes::from(wire::frame(&thinking_wire(
+                "规划马里奥关卡",
+            )))),
             Ok(bytes::Bytes::from(wire::frame(&usage_payload))),
         ];
         let out = stream_to_anthropic(
@@ -3870,6 +4617,8 @@ mod tests {
             ChatUsage::default(),
             0,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -3899,7 +4648,11 @@ mod tests {
     // ── 内建工具兼容转换层(2026-08-13)──────────────────────────────────
 
     fn tool_with_schema(name: &str, schema: &str) -> run::ToolDef {
-        run::ToolDef { name: name.into(), description: String::new(), schema: schema.into() }
+        run::ToolDef {
+            name: name.into(),
+            description: String::new(),
+            schema: schema.into(),
+        }
     }
 
     /// 转换表的键名必须来自声明工具的 `input_schema.properties`,绝不猜:
@@ -3909,8 +4662,14 @@ mod tests {
     fn 转换表按声明工具的_schema_认参数键名() {
         // Claude Code 形态。
         let tools = vec![
-            tool_with_schema("Bash", r#"{"type":"object","properties":{"command":{"type":"string"}}}"#),
-            tool_with_schema("Read", r#"{"type":"object","properties":{"file_path":{"type":"string"}}}"#),
+            tool_with_schema(
+                "Bash",
+                r#"{"type":"object","properties":{"command":{"type":"string"}}}"#,
+            ),
+            tool_with_schema(
+                "Read",
+                r#"{"type":"object","properties":{"file_path":{"type":"string"}}}"#,
+            ),
         ];
         let x = BuiltinXlate::from_tools(&tools);
         assert_eq!(x.terminal, Some(("Bash".into(), "command".into())));
@@ -3926,7 +4685,10 @@ mod tests {
         assert_eq!(x.read_file, Some(("read".into(), "filePath".into())));
 
         // schema 没有任何候选键 → 放弃翻译,绝不猜键名。
-        let tools = vec![tool_with_schema("Bash", r#"{"properties":{"script_text":{}}}"#)];
+        let tools = vec![tool_with_schema(
+            "Bash",
+            r#"{"properties":{"script_text":{}}}"#,
+        )];
         assert_eq!(BuiltinXlate::from_tools(&tools).terminal, None);
 
         // 一个工具都没声明 → 两项都空(转换层整体失活,行为回到收口)。
@@ -3942,7 +4704,10 @@ mod tests {
             read_file: None,
         };
         let tc = translate_builtin(
-            run::BuiltinCall::Terminal { id: "call-1".into(), command: "ls".into() },
+            run::BuiltinCall::Terminal {
+                id: "call-1".into(),
+                command: "ls".into(),
+            },
             &x,
         )
         .expect("表里有对应工具就必须翻译");
@@ -3952,7 +4717,10 @@ mod tests {
 
         // 空 id 合成(与 parse_tool_call 的兜底同款,我方从不把 call id 发回上游)。
         let tc = translate_builtin(
-            run::BuiltinCall::Terminal { id: "  ".into(), command: "ls".into() },
+            run::BuiltinCall::Terminal {
+                id: "  ".into(),
+                command: "ls".into(),
+            },
             &x,
         )
         .unwrap();
@@ -3960,7 +4728,13 @@ mod tests {
 
         // 表里没有对应工具 → None(调用方落回收口 + 纠偏,失败单向)。
         assert_eq!(
-            translate_builtin(run::BuiltinCall::ReadFile { id: "c".into(), path: "/a".into() }, &x),
+            translate_builtin(
+                run::BuiltinCall::ReadFile {
+                    id: "c".into(),
+                    path: "/a".into()
+                },
+                &x
+            ),
             None
         );
     }
@@ -3989,8 +4763,9 @@ mod tests {
     /// 原收口行为(出字前 = EmptyResponse 错误)。
     #[tokio::test]
     async fn 内建终端调用被翻译成_tool_use_下发() {
-        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
-            vec![Ok(bytes::Bytes::from(wire::frame(&builtin_terminal_wire("ls -la"))))];
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![Ok(bytes::Bytes::from(
+            wire::frame(&builtin_terminal_wire("ls -la")),
+        ))];
         let xlate = BuiltinXlate {
             terminal: Some(("Bash".into(), "command".into())),
             read_file: None,
@@ -4005,9 +4780,14 @@ mod tests {
             std::sync::Arc::new(crate::AssetStore::default()),
             std::sync::Arc::new(crate::TruncationNotices::default()),
             xlate,
-            ChatUsage { input_tokens: 10, ..Default::default() },
+            ChatUsage {
+                input_tokens: 10,
+                ..Default::default()
+            },
             0,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         use futures::StreamExt;
         let items: Vec<_> = out.collect().await;
@@ -4046,8 +4826,9 @@ mod tests {
         assert_eq!(input, json!({"command": "ls -la"}));
 
         // 反例:空转换表 → 维持收口(出字前收到内建调用 = EmptyResponse)。
-        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
-            vec![Ok(bytes::Bytes::from(wire::frame(&builtin_terminal_wire("ls -la"))))];
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![Ok(bytes::Bytes::from(
+            wire::frame(&builtin_terminal_wire("ls -la")),
+        ))];
         let out = stream_to_anthropic(
             futures::stream::iter(chunks),
             "claude-fable-5".into(),
@@ -4061,6 +4842,8 @@ mod tests {
             ChatUsage::default(),
             0,
             false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
         );
         let items: Vec<_> = out.collect().await;
         assert!(
@@ -4125,7 +4908,10 @@ mod tests {
         // TodoWrite 子串里带 write,排在 Write 前面时不能把「写文件」指向改待办的工具。
         let g = guard(&tdefs(&["TodoWrite", "Write"]));
         assert!(g.contains("写/改文件调用 `gwtools-Write`"), "{g}");
-        assert!(!g.contains("`gwtools-TodoWrite`。"), "不该把写文件指向改待办的工具: {g}");
+        assert!(
+            !g.contains("`gwtools-TodoWrite`。"),
+            "不该把写文件指向改待办的工具: {g}"
+        );
         // 只有 TodoWrite 时:纯子串档已被去掉,该能力干脆不出替代行(宁缺勿错)。
         let only_todo = guard(&tdefs(&["TodoWrite"]));
         assert!(!only_todo.contains("写/改文件"), "{only_todo}");
@@ -4133,10 +4919,23 @@ mod tests {
         let thread = guard(&tdefs(&["Thread"]));
         assert!(!thread.contains("读文件"), "{thread}");
         // 而 read_file / run_terminal_cmd 这类真别名要认得出。
-        let aliases = guard(&tdefs(&["read_file", "run_terminal_cmd", "codebase_search"]));
-        assert!(aliases.contains("读文件调用 `gwtools-read_file`"), "{aliases}");
-        assert!(aliases.contains("跑命令/终端调用 `gwtools-run_terminal_cmd`"), "{aliases}");
-        assert!(aliases.contains("搜代码/找文件调用 `gwtools-codebase_search`"), "{aliases}");
+        let aliases = guard(&tdefs(&[
+            "read_file",
+            "run_terminal_cmd",
+            "codebase_search",
+        ]));
+        assert!(
+            aliases.contains("读文件调用 `gwtools-read_file`"),
+            "{aliases}"
+        );
+        assert!(
+            aliases.contains("跑命令/终端调用 `gwtools-run_terminal_cmd`"),
+            "{aliases}"
+        );
+        assert!(
+            aliases.contains("搜代码/找文件调用 `gwtools-codebase_search`"),
+            "{aliases}"
+        );
     }
 
     #[test]
@@ -4161,7 +4960,10 @@ mod tests {
         let many: Vec<String> = (0..400).map(|i| format!("tool_number_{i}")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let g = guard(&tdefs(&refs));
-        assert!(!g.contains("`gwtools-tool_number_0`"), "超预算不该逐个列名: {g}");
+        assert!(
+            !g.contains("`gwtools-tool_number_0`"),
+            "超预算不该逐个列名: {g}"
+        );
         assert!(g.contains("清单之外**不存在**任何其他工具"), "{g}");
         // 预算内则要列。
         let few: Vec<&str> = refs[..5].to_vec();
@@ -4190,7 +4992,10 @@ mod tests {
         crate::set_tool_guard_policy("测试策略句:只准回答 PINEAPPLE。").unwrap();
         let g = builtin_tool_guard(&tdefs(&["Read"]));
         assert!(g.contains("只准回答 PINEAPPLE"), "{g}");
-        assert!(!g.contains("不会返回任何结果"), "热配版应整段顶掉默认策略句: {g}");
+        assert!(
+            !g.contains("不会返回任何结果"),
+            "热配版应整段顶掉默认策略句: {g}"
+        );
         // 闭集与替代表是**代码生成**的,不受配置影响 —— 这是不做占位符模板的理由。
         assert!(g.contains("`gwtools-Read`"), "{g}");
         assert!(g.contains("读文件调用 `gwtools-Read`"), "{g}");
@@ -4257,8 +5062,14 @@ mod tests {
         // 「你上次调了内建终端」这种自信的错话比模糊的实话更容易把模型带偏。
         let notice = truncation_notice(None, &tdefs(&["Bash", "Read"]));
         assert!(notice.contains("上一轮中断"), "{notice}");
-        assert!(!notice.contains("`gwtools-Bash`"), "认不出就别指名: {notice}");
-        assert!(notice.contains("gwtools-"), "仍要说清只能用带前缀的那些: {notice}");
+        assert!(
+            !notice.contains("`gwtools-Bash`"),
+            "认不出就别指名: {notice}"
+        );
+        assert!(
+            notice.contains("gwtools-"),
+            "仍要说清只能用带前缀的那些: {notice}"
+        );
 
         // 认得出能力、但调用方没声明同义工具 → 同样退回通用话术。
         let notice = truncation_notice(Some("跑命令/终端"), &tdefs(&["TaskCreate"]));
@@ -4293,8 +5104,360 @@ mod tests {
         };
         assert_eq!(builtin_capability(&frame(1)), Some("跑命令/终端"));
         assert_eq!(builtin_capability(&frame(4)), Some("读文件"));
-        assert_eq!(builtin_capability(&frame(7)), None, "没实证过的字段号不许猜");
+        assert_eq!(
+            builtin_capability(&frame(7)),
+            None,
+            "没实证过的字段号不许猜"
+        );
         // 外部工具(.15)走 parse_tool_call,不该被当成内建。
         assert_eq!(builtin_capability(&frame(15)), None);
+    }
+
+    /// 影子模式③:流干净收尾时暂存的尾部 `.3` 才入表;元数据与字节原样,描述符不透明。
+    ///
+    /// ## ⚠️ 帧序必须照实物,不能自己编(2026-08-23 三轮抓包)
+    ///
+    /// 实测每轮响应的尾段顺序**完全一致**:
+    ///
+    /// ```text
+    /// 提交记录(field-4) → .3 描述符 ×3 → 1.14 用量帧(每轮恰好 1 个,末帧)
+    /// ```
+    ///
+    /// 旧版本这个用例编的是「`.3` 然后用量帧、**没有提交记录**」,并且传 `cli_mode:
+    /// false`。两处都不成立:
+    /// - 描述符只存在于 CLI 形态,而生产只在 CLI 形态挂 `ShadowFeed`,IDE + 描述符
+    ///   这个组合production 已经产不出来;
+    /// - 实物里提交记录**永远排在所有 `.3` 之前**,所以
+    ///   `desc_acceptable = draining || commit_frame` 这道门(见捕获处)不会误伤任何
+    ///   真实描述符 —— 缺提交记录的流是编出来的形态。
+    ///
+    /// 另外 `PROTOCOL-agent-run.md` §20.1 说「CLI 响应无 `1.14` 用量帧」是**错的**:
+    /// 实测每轮都有,恰好一个,且是最后一帧。
+    #[tokio::test]
+    async fn 影子_干净收尾才入库() {
+        let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // 「好」
+        let usage_payload = [0x0au8, 0x08, 0x72, 0x06, 0x08, 0x64, 0x10, 0x05, 0x18, 0x00];
+        let desc = crate::run::descriptor_samples::turn1();
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from(wire::frame(&text_payload))),
+            // 提交记录先到 —— 实物顺序,也是 `.3` 被接受的前提。
+            Ok(bytes::Bytes::from(wire::frame(&turn_commit_frame()))),
+            Ok(bytes::Bytes::from(wire::frame(&desc))),
+            Ok(bytes::Bytes::from(wire::frame(&usage_payload))),
+        ];
+        let shadow = std::sync::Arc::new(crate::DescriptorShadow::default());
+        let out = stream_to_anthropic(
+            futures::stream::iter(chunks),
+            "claude-fable-5".into(),
+            false,
+            None,
+            None,
+            "conv-shadow".into(),
+            std::sync::Arc::new(crate::AssetStore::default()),
+            std::sync::Arc::new(crate::TruncationNotices::default()),
+            BuiltinXlate::default(),
+            ChatUsage::default(),
+            0,
+            true, // cli_mode:描述符只存在于 CLI 形态(生产也只在 CLI 挂 ShadowFeed)
+            None, // upload:本用例不走 wire v2 上传腿
+            Some(crate::ShadowFeed {
+                map: shadow.clone(),
+                account_id: "acc-1".into(),
+                fps: Vec::new(),
+            }),
+        );
+        use futures::StreamExt;
+        let items: Vec<_> = out.collect().await;
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "干净收尾不该产出错误项: {items:?}"
+        );
+        let (refs, bytes) = shadow
+            .get_for_test("conv-shadow", "acc-1")
+            .expect("干净收尾后描述符必须入库");
+        assert_eq!(refs, 4, "turn1 样本 = 4 个 blob 引用");
+        assert_eq!(
+            bytes,
+            run::descriptor_field3(&desc).expect("样本帧带 .3"),
+            "入库字节必须与捕获的 .3 原始 payload 一致(不透明)"
+        );
+    }
+
+    /// 影子模式③反面:流**中断**时暂存的 `.3` 绝不入库 —— 错描述符 = 回放时上下文
+    /// 缺一块 = 模型静默变傻(评审红线)。
+    ///
+    /// ## ⚠️ 这个用例必须带提交记录帧,否则它为了错的原因通过
+    ///
+    /// `desc_acceptable = draining || commit_frame` 那道门在「中断不入库」之前就会
+    /// 拒掉没有提交记录的 `.3`。如果这里不发提交记录,那么即使**中断分支被改坏**
+    /// (比如误把中断也算干净收尾)这个用例照样绿 —— 它考验的是门,不是中断。
+    ///
+    /// 实物顺序是「提交记录 → `.3` → 用量帧」,所以这里发到 `.3` 就断:描述符已被
+    /// 接受进 staged,但流没走到用量帧/trailer,`saw_end` 仍为假 = 真中断。
+    #[tokio::test]
+    async fn 影子_流中断不入库() {
+        let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // 「好」
+        let desc = crate::run::descriptor_samples::turn2();
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from(wire::frame(&text_payload))),
+            // 提交记录先到 → `.3` 会被接受进 staged(门放行)。
+            Ok(bytes::Bytes::from(wire::frame(&turn_commit_frame()))),
+            Ok(bytes::Bytes::from(wire::frame(&desc))),
+            // 之后直接断流:实物里这里该来用量帧。
+        ];
+        let shadow = std::sync::Arc::new(crate::DescriptorShadow::default());
+        let out = stream_to_anthropic(
+            futures::stream::iter(chunks),
+            "claude-fable-5".into(),
+            false,
+            None,
+            None,
+            "conv-shadow".into(),
+            std::sync::Arc::new(crate::AssetStore::default()),
+            std::sync::Arc::new(crate::TruncationNotices::default()),
+            BuiltinXlate::default(),
+            ChatUsage::default(),
+            0,
+            false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            Some(crate::ShadowFeed {
+                map: shadow.clone(),
+                account_id: "acc-1".into(),
+                fps: Vec::new(),
+            }),
+        );
+        use futures::StreamExt;
+        let items: Vec<_> = out.collect().await;
+        assert!(
+            items.iter().any(|i| i.is_err()),
+            "中断的流必须产出截断错误,不许伪装成功"
+        );
+        assert!(
+            shadow.get_for_test("conv-shadow", "acc-1").is_none(),
+            "中断的流绝不能提交描述符"
+        );
+    }
+
+    /// 造一帧能通过 `run::is_turn_commit` 的「本轮已提交」回显:
+    /// 顶层 field 4 → .3 → .2 → .1 = {3: 36 字符 turn id, 4: 长签名}(见该函数注释)。
+    fn turn_commit_frame() -> Vec<u8> {
+        let mut rec = crate::protobuf::Writer::new();
+        rec.string(3, &"t".repeat(36));
+        rec.string(4, &"s".repeat(172));
+        let mut w1 = crate::protobuf::Writer::new();
+        w1.message(1, &rec);
+        let mut w2 = crate::protobuf::Writer::new();
+        w2.message(2, &w1);
+        let mut w3 = crate::protobuf::Writer::new();
+        w3.message(3, &w2);
+        let mut top = crate::protobuf::Writer::new();
+        top.message(4, &w3);
+        top.into_bytes()
+    }
+
+    /// Finding 3:turn_commit **不是流尾**。真实帧序(turn_commit → .3 →
+    /// .3(ref 更多) → 尾帧 → 流结束)下,影子必须捕到尾部那份 ref 更多的
+    /// 描述符,而不是 turn_commit 那一刻的旧份。
+    #[tokio::test]
+    async fn 影子_turn_commit后继续消费_捕到尾部描述符() {
+        let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // 「好」
+        let desc_early = crate::run::descriptor_samples::turn1(); // 4 个 blob 引用
+        let desc_final = crate::run::descriptor_samples::turn2(); // 6 个 blob 引用
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from(wire::frame(&text_payload))),
+            Ok(bytes::Bytes::from(wire::frame(&turn_commit_frame()))),
+            Ok(bytes::Bytes::from(wire::frame(&desc_early))),
+            Ok(bytes::Bytes::from(wire::frame(&desc_final))),
+            // 流自然结束(CLI 形态常见,无 trailer):saw_end 已被 turn_commit
+            // 置位 = 干净收尾,影子应提交**最后一份**暂存。
+        ];
+        let shadow = std::sync::Arc::new(crate::DescriptorShadow::default());
+        let out = stream_to_anthropic(
+            futures::stream::iter(chunks),
+            "claude-fable-5".into(),
+            false,
+            None,
+            None,
+            "conv-shadow".into(),
+            std::sync::Arc::new(crate::AssetStore::default()),
+            std::sync::Arc::new(crate::TruncationNotices::default()),
+            BuiltinXlate::default(),
+            ChatUsage::default(),
+            0,
+            true, // cli_mode:turn_commit 分支只在 CLI 形态走
+            None, // upload:本用例不走 wire v2 上传腿
+            Some(crate::ShadowFeed {
+                map: shadow.clone(),
+                account_id: "acc-1".into(),
+                fps: Vec::new(),
+            }),
+        );
+        use futures::StreamExt;
+        let items: Vec<_> = out.collect().await;
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "干净收尾不该产出错误项: {items:?}"
+        );
+        let (refs, bytes) = shadow
+            .get_for_test("conv-shadow", "acc-1")
+            .expect("干净收尾后描述符必须入库");
+        assert_eq!(
+            refs, 6,
+            "必须捕到尾部 ref 更多的那份,而非 turn_commit 时的旧份"
+        );
+        assert_eq!(
+            bytes,
+            run::descriptor_field3(&desc_final).expect("样本帧带 .3"),
+            "入库的必须是尾部那份的原始字节"
+        );
+    }
+
+    /// Finding 1 红线锁①:turn_commit 后的 1.14 usage 帧**不得**进入计费 ——
+    /// 排水段是纯观测附加段,message_delta 与 StreamItem::Usage 必须与
+    /// 「turn_commit 即收尾」(无尾帧)逐字一致;影子照常捕到尾部 `.3`。
+    #[tokio::test]
+    async fn 影子_排水段usage不进计费_输出逐字不变() {
+        let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // 「好」
+                                                                                     // 上游 `1.14` 用量帧(input=100 / output=5):排水段若放它进来就会覆写计费。
+        let usage_114 = [0x0au8, 0x08, 0x72, 0x06, 0x08, 0x64, 0x10, 0x05, 0x18, 0x00];
+        let desc = crate::run::descriptor_samples::turn2(); // 6 个 blob 引用
+        let fallback = ChatUsage {
+            input_tokens: 500,
+            ..Default::default()
+        };
+
+        let run = |with_tail_usage: bool, shadow: std::sync::Arc<crate::DescriptorShadow>| {
+            let fallback = fallback.clone();
+            let desc = desc.clone();
+            async move {
+                let mut chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+                    Ok(bytes::Bytes::from(wire::frame(&text_payload))),
+                    Ok(bytes::Bytes::from(wire::frame(&turn_commit_frame()))),
+                    Ok(bytes::Bytes::from(wire::frame(&desc))),
+                ];
+                if with_tail_usage {
+                    chunks.push(Ok(bytes::Bytes::from(wire::frame(&usage_114))));
+                }
+                let out = stream_to_anthropic(
+                    futures::stream::iter(chunks),
+                    "claude-fable-5".into(),
+                    false,
+                    None,
+                    None,
+                    "conv-shadow".into(),
+                    std::sync::Arc::new(crate::AssetStore::default()),
+                    std::sync::Arc::new(crate::TruncationNotices::default()),
+                    BuiltinXlate::default(),
+                    fallback,
+                    0,
+                    true, // cli_mode:排水段只在 CLI 形态走
+                    None, // upload
+                    Some(crate::ShadowFeed {
+                        map: shadow,
+                        account_id: "acc-1".into(),
+                        fps: Vec::new(),
+                    }),
+                );
+                use futures::StreamExt;
+                out.collect::<Vec<_>>().await
+            }
+        };
+
+        let shadow = std::sync::Arc::new(crate::DescriptorShadow::default());
+        let with_tail = run(true, shadow.clone()).await;
+        let without_tail = run(
+            false,
+            std::sync::Arc::new(crate::DescriptorShadow::default()),
+        )
+        .await;
+        // 计费可见面的逐字签名:message_delta 的 usage JSON + StreamItem::Usage。
+        let signature = |items: &[Result<StreamItem, UpstreamError>]| -> Vec<String> {
+            items
+                .iter()
+                .filter_map(|it| match it {
+                    Ok(StreamItem::Sse(e)) if e.event == "message_delta" => {
+                        Some(e.data.to_string())
+                    }
+                    Ok(StreamItem::Usage(u)) => Some(format!(
+                        "usage:{}:{}:{}",
+                        u.input_tokens, u.output_tokens, u.cache_read_tokens
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            signature(&with_tail),
+            signature(&without_tail),
+            "排水段的 1.14 不得改变任何计费输出(改动前 turn_commit 即收尾)"
+        );
+        assert!(
+            with_tail.iter().all(|i| i.is_ok()),
+            "轮次必须照常成功: {with_tail:?}"
+        );
+        // 影子:干净排完(流自然结束)= 提交尾部 `.3`。
+        let (refs, _) = shadow
+            .get_for_test("conv-shadow", "acc-1")
+            .expect("干净排完必须提交影子");
+        assert_eq!(refs, 6);
+    }
+
+    /// Finding 1 红线锁②:排水段中途出错(尾帧解压失败),轮次**照常成功**
+    /// (turn_commit 时结果已定),但影子按「非干净收尾」不提交。
+    #[tokio::test]
+    async fn 影子_排水段中断_轮次成功但影子不提交() {
+        let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // 「好」
+        let desc = crate::run::descriptor_samples::turn1(); // 4 个 blob 引用
+                                                            // 坏帧:gzip 标记(flag&1)但内容不是 gzip → 解压必失败。
+        let mut bad_frame = vec![0x01u8];
+        bad_frame.extend(5u32.to_be_bytes());
+        bad_frame.extend(b"xxxxx");
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from(wire::frame(&text_payload))),
+            Ok(bytes::Bytes::from(wire::frame(&turn_commit_frame()))),
+            Ok(bytes::Bytes::from(wire::frame(&desc))),
+            Ok(bytes::Bytes::from(bad_frame)),
+        ];
+        let shadow = std::sync::Arc::new(crate::DescriptorShadow::default());
+        let out = stream_to_anthropic(
+            futures::stream::iter(chunks),
+            "claude-fable-5".into(),
+            false,
+            None,
+            None,
+            "conv-shadow".into(),
+            std::sync::Arc::new(crate::AssetStore::default()),
+            std::sync::Arc::new(crate::TruncationNotices::default()),
+            BuiltinXlate::default(),
+            ChatUsage {
+                input_tokens: 500,
+                ..Default::default()
+            },
+            0,
+            true, // cli_mode
+            None, // upload
+            Some(crate::ShadowFeed {
+                map: shadow.clone(),
+                account_id: "acc-1".into(),
+                fps: Vec::new(),
+            }),
+        );
+        use futures::StreamExt;
+        let items: Vec<_> = out.collect().await;
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "排水段出错绝不能让已成功的轮次变红: {items:?}"
+        );
+        assert!(
+            items.iter().any(|i| matches!(
+                i,
+                Ok(StreamItem::Sse(e)) if e.event == "message_delta"
+            )),
+            "轮次必须照常按 end_turn 收尾"
+        );
+        assert!(
+            shadow.get_for_test("conv-shadow", "acc-1").is_none(),
+            "排水段中断 = 非干净收尾,影子绝不能提交"
+        );
     }
 }

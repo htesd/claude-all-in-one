@@ -242,9 +242,10 @@ fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
         "" => Ok(serde_json::Value::Null),
         "cli" => Ok(serde_json::json!("cli")),
         "wire" => Ok(serde_json::json!("wire")),
+        "inference" => Ok(serde_json::json!("inference")),
         other => Err(format!(
             "未知驱动形态 {other:?};只接受 \"cli\"(默认,子进程驱动 cursor-agent)、\
-             \"wire\"(退回线协议)或 \"\"(清除,回默认)"
+             \"wire\"(退回线协议)、\"inference\"(InferenceService 直连)或 \"\"(清除,回默认)"
         )),
     }
 }

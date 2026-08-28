@@ -1594,6 +1594,49 @@ fn test_synthesized_signature_dropped_before_upstream() {
 }
 
 #[test]
+fn test_mixed_reasoning_blocks_pick_last_in_content_order() {
+    // 【对抗评审 r2 #6】Kiro 只有一个 reasoningContent 槽位 → 必然有损。
+    // 策略已明确为「按 content 数组顺序取最后一段」,不再按类型优先级。
+    // 原实现无条件优先 redacted,会让 [redacted R1, thinking T2] 上传较早的 R1。
+    let mut m = HashMap::new();
+
+    // 顺序 A:redacted 在前、signed thinking 在后 → 应取**后面的 thinking**。
+    let msg_a = crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "redacted_thinking", "data": "UjE="},
+            {"type": "thinking", "thinking": "T2", "signature": REAL_SIG_QUINCE},
+            {"type": "text", "text": "答"}
+        ]),
+    };
+    let a = convert_assistant_message(&msg_a, &mut m, true, "claude-opus-4.8").unwrap();
+    match &a.assistant_response_message.reasoning_content {
+        Some(ReasoningContent::ReasoningText { reasoning_text }) => {
+            assert_eq!(reasoning_text.text, "T2", "应取顺序上更靠后的 thinking");
+            assert_eq!(reasoning_text.signature, REAL_SIG_QUINCE);
+        }
+        other => panic!("[redacted, thinking] 应取后者,实际 {other:?}"),
+    }
+
+    // 顺序 B:signed thinking 在前、redacted 在后 → 应取**后面的 redacted**。
+    let msg_b = crate::anthropic_types::Message {
+        role: "assistant".to_string(),
+        content: serde_json::json!([
+            {"type": "thinking", "thinking": "T1", "signature": REAL_SIG_QUINCE},
+            {"type": "redacted_thinking", "data": "UjI="},
+            {"type": "text", "text": "答"}
+        ]),
+    };
+    let b = convert_assistant_message(&msg_b, &mut m, true, "claude-opus-4.8").unwrap();
+    match &b.assistant_response_message.reasoning_content {
+        Some(ReasoningContent::Redacted { redacted_content }) => {
+            assert_eq!(redacted_content, "UjI=", "应取顺序上更靠后的 redacted");
+        }
+        other => panic!("[thinking, redacted] 应取后者,实际 {other:?}"),
+    }
+}
+
+#[test]
 fn test_redacted_thinking_maps_to_redacted_content() {
     // Anthropic redacted_thinking 块 → {redactedContent: <base64>},优先于 text 形态。
     let mut m = HashMap::new();

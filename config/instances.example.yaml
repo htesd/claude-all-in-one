@@ -11,14 +11,14 @@ workers:
     listen: "127.0.0.1:9000"
     egress:
       mode: local_ip
-      address: "203.0.113.10"   # 主 IP
+      address: "203.0.113.10"      # 示例主 IP（RFC 5737）
     account_group: "G0"
 
   - instance: 1
     listen: "127.0.0.1:9001"
     egress:
       mode: local_ip
-      address: "203.0.113.11"     # 第二 IP(灰度)
+      address: "203.0.113.11"      # 示例第二 IP（RFC 5737）
     account_group: "G1"
     # 或走外部固定 IP 代理池:
     # egress:

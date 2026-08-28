@@ -36,7 +36,10 @@ pub async fn fetch_config_version(
         // unary:裸 proto,非 connect+proto(那是流式带信封)。
         .header("content-type", "application/proto")
         .header("user-agent", "connect-es/1.6.1")
-        .header("x-cursor-checksum", wire::checksum(machine_id, mac_machine_id))
+        .header(
+            "x-cursor-checksum",
+            wire::checksum(machine_id, mac_machine_id),
+        )
         .header("x-cursor-client-version", wire::CLIENT_VERSION)
         .header("x-cursor-client-commit", wire::CLIENT_COMMIT)
         // ⚠️ 这里是 `ide`,而推理请求(chat.rs)发的是 `glass` —— **不是笔误**,
@@ -71,7 +74,10 @@ pub async fn fetch_config_version(
             format!(
                 "Cursor GetServerConfig {}: {}",
                 status.as_u16(),
-                String::from_utf8_lossy(&bytes).chars().take(200).collect::<String>()
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             ),
         ));
     }
@@ -106,7 +112,10 @@ mod tests {
         w.string(1, "ignore");
         w.string(6, "cfg-abc-123");
         w.uint(7, 2);
-        assert_eq!(parse_config_version(&w.into_bytes()).as_deref(), Some("cfg-abc-123"));
+        assert_eq!(
+            parse_config_version(&w.into_bytes()).as_deref(),
+            Some("cfg-abc-123")
+        );
     }
 
     #[test]

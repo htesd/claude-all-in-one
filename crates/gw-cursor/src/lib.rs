@@ -31,20 +31,27 @@
 
 pub mod auth;
 pub mod cache_sim;
-pub mod login;
 mod chat;
 pub mod cli;
 mod clidrv;
 mod config;
+pub mod inference;
+pub mod login;
 pub mod mcpbridge;
 mod models;
 mod pdf;
-mod protobuf;
+pub mod protobuf;
 pub mod run;
 pub mod usage;
 pub mod wire;
+/// wire v2 反应式帧序驱动(生产与探针共用,见模块文档)。
+pub mod wirev2;
 
 // 模型目录热追加(worker 30s 设置环回写;见 models::set_extra_models)。
+/// 模型目录:帧0 的 `1.14` 用它(08-23 实物是 9 条带参条目,两种轮次都发)。
+/// 导出是给外部 harness 用的 —— 探针必须发**与生产同一份**目录,
+/// 否则测出来的形态不等于生产发出去的形态。
+pub use models::catalog;
 pub use models::set_extra_models;
 
 /// 内建工具护栏的**策略句**默认值(见 [`chat`] 里 `builtin_tool_guard` 的模块文档)。
@@ -157,8 +164,7 @@ pub fn set_cli_notice(text: &str) -> Result<(), String> {
 ///
 /// 存 `Arc<str>` 而不是 `String`:读侧(每个请求都读)拿快照后**立刻放锁**,
 /// 绝不在拼几 KB 长提示的过程里持着锁。
-static TOOL_GUARD_POLICY: std::sync::RwLock<Option<Arc<str>>> =
-    std::sync::RwLock::new(None);
+static TOOL_GUARD_POLICY: std::sync::RwLock<Option<Arc<str>>> = std::sync::RwLock::new(None);
 
 /// 当前生效的护栏策略句。
 pub fn tool_guard_policy() -> Arc<str> {
@@ -210,7 +216,10 @@ mod cli_notice_tests {
         let d = super::DEFAULT_CURSOR_CLI_NOTICE;
         assert!(d.contains("gwtools"), "要指明真正的执行通道: {d}");
         assert!(d.contains("用户自己的机器"), "要说清工具跑在哪一侧: {d}");
-        assert!(d.contains("不要让用户去切换模式"), "必须堵掉「请切 Agent 模式」: {d}");
+        assert!(
+            d.contains("不要让用户去切换模式"),
+            "必须堵掉「请切 Agent 模式」: {d}"
+        );
         assert!(d.contains("本地沙箱"), "要限定只读限制的作用域: {d}");
     }
 
@@ -220,13 +229,19 @@ mod cli_notice_tests {
     #[test]
     fn 默认文案必须教怎么查工具且给全名示范() {
         let d = super::DEFAULT_CURSOR_CLI_NOTICE;
-        assert!(d.contains("GetMcpTools"), "必须指明先调 GetMcpTools 拿清单: {d}");
+        assert!(
+            d.contains("GetMcpTools"),
+            "必须指明先调 GetMcpTools 拿清单: {d}"
+        );
         assert!(
             d.contains("初始函数表") || d.contains("函数表里"),
             "必须说明工具不在初始函数表里(否则模型判定网关说谎): {d}"
         );
         assert!(d.contains("完整名字"), "必须要求用带前缀的完整工具名: {d}");
-        assert!(d.contains("mcp__gwtools__"), "要给一个可照抄的全名示例: {d}");
+        assert!(
+            d.contains("mcp__gwtools__"),
+            "要给一个可照抄的全名示例: {d}"
+        );
         assert!(d.contains("截断"), "要讲清短名调用的后果(静默截断): {d}");
     }
 
@@ -261,13 +276,21 @@ mod cli_notice_tests {
         super::set_cli_notice("").unwrap();
         assert_eq!(&*super::cli_notice(), super::DEFAULT_CURSOR_CLI_NOTICE);
         super::set_cli_notice("   ").unwrap();
-        assert_eq!(&*super::cli_notice(), super::DEFAULT_CURSOR_CLI_NOTICE, "全空白也回默认");
+        assert_eq!(
+            &*super::cli_notice(),
+            super::DEFAULT_CURSOR_CLI_NOTICE,
+            "全空白也回默认"
+        );
 
         super::set_cli_notice("自定义说明 ALPHA").unwrap();
         assert_eq!(&*super::cli_notice(), "自定义说明 ALPHA");
         let err = super::set_cli_notice(&"啊".repeat(4000)).expect_err("过长必须被拒");
         assert!(err.contains("过长"), "{err}");
-        assert_eq!(&*super::cli_notice(), "自定义说明 ALPHA", "校验失败保留上一份");
+        assert_eq!(
+            &*super::cli_notice(),
+            "自定义说明 ALPHA",
+            "校验失败保留上一份"
+        );
     }
 }
 
@@ -280,7 +303,10 @@ pub fn tool_guard_rev() -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(tool_guard_policy().as_bytes());
-    h.finalize()[..4].iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 use std::collections::HashMap;
@@ -395,6 +421,18 @@ pub struct RunTuning {
     pub keep_stream_open: bool,
     /// 请求形态:IDE(3.14.27)还是 CLI(cursor-agent 2026.08.11)。见 [`cli::Profile`]。
     pub profile: cli::Profile,
+    /// 续轮把上一轮捕到的描述符原样回放进 `1.1`(wire v2 主路,仅 CLI 形态有意义)。
+    ///
+    /// 真 CLI 就是这么干的,所以 [`RunTuning::faithful`] 里是 `true`。
+    ///
+    /// ⚠️ **关掉它不是「另一种热续方案」**(codex 审查 #5)。本地构造 `1.1` 那条支
+    /// 已经删除(08-23 实物证明客户端从不自己构造续轮 `1.1`),所以关掉后
+    /// `lookup` 恒为 `None` → 每轮都走 Opening 全量重铺。也就是说这个开关比的是
+    /// **「描述符增量」vs「CLI 形态全量重铺」**,不是两种增量方案。
+    ///
+    /// 「描述符路线比内联热续省不省」那个问题的对照臂是 **clidrv**(子进程驱动,
+    /// 热续 49–60%),不是本开关的任何一档。
+    pub wire_descriptor_replay: bool,
 }
 
 impl Default for RunTuning {
@@ -415,6 +453,7 @@ impl RunTuning {
             context_frames: true,
             keep_stream_open: true,
             profile: cli::Profile::from_env(),
+            wire_descriptor_replay: true,
         }
     }
 }
@@ -452,12 +491,26 @@ pub struct CursorProvider {
     assets: Arc<AssetStore>,
     /// 「上一轮被内建工具截断」的待发纠偏标记(见 [`TruncationNotices`])。
     notices: Arc<TruncationNotices>,
+    /// 续轮描述符影子表(见 [`DescriptorShadow`])。
+    shadow: Arc<DescriptorShadow>,
+    /// 内容分节库(应答服务端 `4.2` 点名,见 [`ContentSections`])。
+    sections: Arc<ContentSections>,
     /// CLI 驱动(子进程包裹 cursor-agent,见 [`clidrv`])的配置与会话表。
     cli_cfg: clidrv::CliDriverConfig,
     cli_convs: Arc<clidrv::CliConversations>,
     /// CLI 子进程自刷新的 token 捕获表(CLI 回写 auth.json → 这里 →
     /// worker 周期任务经 `poll_token_updates` 取走 CAS 落库)。
     cli_token_updates: clidrv::TokenUpdates,
+    /// 每会话(conversation_id)一把分流锁:把「① 挂起接续/弃槽判定 → ② lookup
+    /// → start_conv 完成注册(insert 在其内部)」的**整个事务**按会话串行化。
+    ///
+    /// 没有它的竞态(2026-08-21 codex 复审 r3 blocker):A 取走挂起槽后、摘表前,
+    /// 并发请求 B 观察到「旧条目在、pending=None」→ lookup 命中 Resume(旧 sid)
+    /// → 与 A 的 Fresh 并发双开;盲替换的 insert 让后写者赢,后续请求可能再次
+    /// 进入已被弃置的 session。值用 Weak:锁对象随最后一个持有者回收;
+    /// 失效条目由 `cli_lock_for` 机会主义清理(阈值摊销,防长进程慢漏)。
+    /// 锁序只此一条:本锁 → `SPAWN_GATE`(start_conv 内),无反向路径。
+    cli_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 /// 会话在**服务端**是否已经建立,以及建在哪个号上。
@@ -637,6 +690,529 @@ impl AssetStore {
     }
 }
 
+/// FNV-1a 64 内容指纹(与分叉 digest 同族常量):影子日志里做「距上一份是否变化」
+/// 的前缀对比,不把整份字节打进日志。
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// 内容分节库:`sha256(bytes) -> bytes`,用来应答服务端的 `4.2` 内容点名。
+///
+/// ## 为什么需要它(2026-08-23 抓包 + store.db 复核)
+///
+/// 描述符不是不透明状态,是一张**内容寻址清单**(`.1` 装消息节哈希、`.8` 装轮次提交
+/// 记录哈希)。服务端的内容缓存过期后会逐条点名索取(field-4 `4.2`,一帧一个哈希),
+/// 客户端必须按 hash 交出原字节。官方 CLI 就是靠
+/// `~/.cursor/chats/<project>/<session>/store.db` 的 `blobs(id TEXT PRIMARY KEY, data BLOB)`
+/// 应答的 —— 实测 **70/70 条 `id == sha256(data)`**,四个会话无一例外。
+///
+/// 我方四个供给来源(都已验证可得):
+/// 1. **系统提示节**:每模型一份、跨会话稳定(Composer 2025B `83ccb7a5…`、
+///    Grok 4.6 4343B `83ec1496…`)。它**不在 ENV 帧里**,是客户端自持的,
+///    所以要从官方 store.db 收割成节库文件,见 [`ContentSections::load_model_library`]。
+/// 2. **工具/rules 等节**:我方自己构造,构造时算 hash 存进来即可。
+/// 3. **消息节**:我方持有的历史。
+/// 4. **轮次提交记录节**:从响应的 field-4 收到(带 182B 服务端签名,只能原样留存)。
+///
+/// 内容寻址天然全局去重(同一份系统提示节被所有会话引用),所以这里**不按会话分片**,
+/// 一张全局表 + 总量上限就够。
+#[derive(Default, Debug)]
+pub struct ContentSections {
+    inner: Mutex<HashMap<[u8; 32], SectionEntry>>,
+}
+
+#[derive(Debug)]
+struct SectionEntry {
+    data: Vec<u8>,
+    /// 常驻项(节库里的系统提示节)不参与淘汰 —— 它被每份描述符引用,
+    /// 淘汰掉就等于把续轮能力丢了,而它总量很小(每模型几 KB)。
+    pinned: bool,
+    at: Instant,
+}
+
+/// 非常驻节的总量上限。消息节随会话增长,要有闸。
+const SECTIONS_CAP: usize = 8192;
+
+impl ContentSections {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], SectionEntry>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 算 hash 并存入,返回该节的 hash。已存在则只刷新时间戳(内容寻址,同 hash 同内容)。
+    pub fn insert(&self, data: &[u8]) -> [u8; 32] {
+        self.insert_inner(data, false)
+    }
+
+    /// 存入常驻节(节库项,不参与淘汰)。
+    pub fn insert_pinned(&self, data: &[u8]) -> [u8; 32] {
+        self.insert_inner(data, true)
+    }
+
+    fn insert_inner(&self, data: &[u8], pinned: bool) -> [u8; 32] {
+        let h = Self::hash(data);
+        let mut map = self.map();
+        match map.get_mut(&h) {
+            Some(e) => {
+                e.at = Instant::now();
+                e.pinned |= pinned;
+            }
+            None => {
+                map.insert(
+                    h,
+                    SectionEntry {
+                        data: data.to_vec(),
+                        pinned,
+                        at: Instant::now(),
+                    },
+                );
+            }
+        }
+        Self::enforce_cap(&mut map);
+        h
+    }
+
+    /// 按 hash 取内容。取不到 = 我方交不出这一节 = 本轮必须重铺。
+    pub fn get(&self, h: &[u8; 32]) -> Option<Vec<u8>> {
+        let mut map = self.map();
+        let e = map.get_mut(h)?;
+        e.at = Instant::now();
+        Some(e.data.clone())
+    }
+
+    pub fn hash(data: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::digest(data);
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&d);
+        h
+    }
+
+    fn enforce_cap(map: &mut HashMap<[u8; 32], SectionEntry>) {
+        let n = map.values().filter(|e| !e.pinned).count();
+        if n <= SECTIONS_CAP {
+            return;
+        }
+        let mut drop_n = n - SECTIONS_CAP;
+        while drop_n > 0 {
+            let Some(oldest) = map
+                .iter()
+                .filter(|(_, e)| !e.pinned)
+                .min_by_key(|(_, e)| e.at)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            map.remove(&oldest);
+            drop_n -= 1;
+        }
+    }
+
+    /// 表内节数(常驻, 非常驻)。
+    pub fn len(&self) -> (usize, usize) {
+        let map = self.map();
+        let p = map.values().filter(|e| e.pinned).count();
+        (p, map.len() - p)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map().is_empty()
+    }
+}
+
+/// 内置系统提示节库(逐字节从官方 CLI 的 `store.db` 提取)。
+///
+/// 形状 `{ key: { sha256, json } }`。`json` 是**字符串**,用的时候必须按 UTF-8 字节
+/// 处理 —— grok 那节是 4339 字符 / **4343 字节**(含多字节字符),按字符数截取就会
+/// 算出错的 hash,那节从此永远交不出去。
+///
+/// 刷新走独立工具(harvest),不在运行期读 `~/.cursor`:生产机上没有那个目录,
+/// 而节库必须随二进制一起可用。
+const SECTION_LIBRARY: &str = include_str!("../sections/system-prompt-sections.json");
+
+/// 模型名 → 节库 key。
+///
+/// **只映射有证据的**,认不出的模型返回 `None`(宁可这一节交不出去→重铺,
+/// 也不拿另一个模型的系统提示节冒充 —— 那会让 hash 对不上,等于白存)。
+///
+/// - `default` = Auto 的线上名,路由到 Composer。证据:08-23 抓包会话 `3d9e9788`
+///   的帧0 `.9` = `{1:'default'}`,其系统节正是 `83ccb7a5…`(Composer 2025B)。
+/// - `grok-4.6`:节正文自称 "powered by Cursor Grok 4.6",会话 `bf51854b`/`f39ae02f`。
+fn section_key_for_model(model: &str) -> Option<&'static str> {
+    match model {
+        "default" => Some("_composer_claude"),
+        "grok-4.6" => Some("grok-4.6"),
+        _ => None,
+    }
+}
+
+impl ContentSections {
+    /// 把该模型的系统提示节装进表(常驻)。返回是否装上。
+    ///
+    /// 装入前**校验 sha256 与节库声明一致**:节库是人工导出的文件,一旦被改动
+    /// (哪怕只是编辑器改了行尾)hash 就变,而错的字节比没有更糟 —— 它会让我方
+    /// 以为能应答,实际交出去的内容服务端不认。
+    pub fn load_model_library(&self, model: &str) -> bool {
+        let Some(key) = section_key_for_model(model) else {
+            tracing::debug!(
+                model,
+                "cursor 节库:该模型没有已知的系统提示节,续轮被点名时只能重铺"
+            );
+            return false;
+        };
+        let lib: serde_json::Value = match serde_json::from_str(SECTION_LIBRARY) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "cursor 节库 JSON 解析失败");
+                return false;
+            }
+        };
+        let Some(entry) = lib.get(key) else {
+            tracing::error!(key, "cursor 节库缺该 key");
+            return false;
+        };
+        let Some(text) = entry.get("json").and_then(|v| v.as_str()) else {
+            tracing::error!(key, "cursor 节库该 key 缺 json 字段");
+            return false;
+        };
+        // ⚠️ UTF-8 字节,不是字符。
+        let bytes = text.as_bytes();
+        let want = entry
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let got = Self::hash(bytes);
+        let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+        if got_hex != want {
+            tracing::error!(
+                key, want, got = %got_hex, bytes = bytes.len(),
+                "cursor 节库 sha256 不符 —— 拒绝装入(错字节比没有更糟)"
+            );
+            return false;
+        }
+        self.insert_pinned(bytes);
+        tracing::info!(model, key, bytes = bytes.len(), hash = %&got_hex[..12], "cursor 节库:系统提示节已装入");
+        true
+    }
+}
+
+/// 续轮描述符影子表(2026-08-23 影子模式,**纯观测**)。
+///
+/// 背景:官方客户端的跨轮状态 = 服务端在 Run 响应尾部把「续轮描述符」(顶层 `.3`)
+/// 当不透明字节回声给客户端,客户端下轮原样回放(见 `run::descriptor_field3`)。
+/// 唯一的消费者是日志 —— **绝不参与任何出站请求**。回放是下一阶段的事:
+/// 等影子数据回答「同一条会话跨轮是否同号/同模型、描述符怎么变」再拍板。
+///
+/// 结构 = conversation_id → **一桶**血脉条目(codex 三轮 Finding 2 后重做):
+/// 同一 conv 可因内容碰撞并存多条血脉,(conv, account) 键既挡不住同号血脉
+/// 互覆,又会把「这号以前出现过吗」误当「相邻轮换没换号」。血脉判据与
+/// [`clidrv::CliConversations::lookup`] 同族:**条目 fps 是当前请求 history fps
+/// 的前缀**,同号池内最长优先(同长取最近),同号没有才看全桶 —— 全桶最长
+/// 若异号就是「换号」;并行血脉 fps 不同,永不互染。TTL 取 [`CONV_TTL`]。
+#[derive(Default, Debug)]
+pub(crate) struct DescriptorShadow {
+    inner: Mutex<HashMap<String, Vec<ShadowEntry>>>,
+}
+
+#[derive(Debug)]
+struct ShadowEntry {
+    account_id: String,
+    model: String,
+    /// **完整前序指纹链** = 提交那一轮的请求历史(含本轮 user)+ 本轮 assistant 输出。
+    ///
+    /// 也就是「下一轮请求的历史(减末条 user)应该长什么样」。lookup 要求与它
+    /// **精确相等**,见 [`DescriptorShadow::lookup`]。
+    fps: Vec<u64>,
+    /// 本轮 assistant 输出的指纹(`chat::turn_fp(false, 渲染文本)`)。
+    ///
+    /// `None` = 这一轮没能算出输出指纹(失败轮 / 工具轮)。**这样的条目永不匹配** ——
+    /// 它的链是残的,拿它回放等于漏掉本轮的回答。
+    assistant_fp: Option<u64>,
+    /// 尾部 `.3` 的原始字节(不透明,永不解析修改)。
+    desc: Vec<u8>,
+    /// `.1` 32B blob 引用个数(捕获时数好,读侧不再解)。
+    #[allow(dead_code)] // 目前是测试与将来回放阶段才读;入库即日志打完
+    refs: usize,
+    at: Instant,
+}
+
+/// 单桶血脉上限(参照 [`clidrv`] 的 BUCKET_CAP):超了按最旧提交淘汰。
+const SHADOW_BUCKET_CAP: usize = 8;
+
+/// **全表条目总量上限**(codex 审查 #6)。原先只有单桶上限与 TTL:桶数无界,
+/// 高并发多会话下条目量只受 TTL 约束,而每份描述符是 500B~数 KB 的 `Vec<u8>` ——
+/// 一万条活跃会话就是几十 MB 常驻。超限按最旧提交全表淘汰。
+const SHADOW_TOTAL_CAP: usize = 4096;
+
+/// 一次提交的对比结果(供日志):与**同血脉最新一份**相比。
+pub(crate) struct ShadowCommit {
+    /// 内容指纹(变化对比的前缀来源)。
+    pub fp: u64,
+    /// 字节是否变化(与同血脉命中条目比)。`None` = 新血脉首份(无可比)。
+    pub changed: Option<bool>,
+    /// 相邻轮是否同号:同号池有前缀命中 → 同号;同号没有但全桶最长前缀
+    /// 异号 → 换号;新血脉 → `None`。
+    pub same_account: Option<bool>,
+    /// 是否同模型(与同血脉命中条目比)。`None` = 新血脉首份。
+    pub same_model: Option<bool>,
+}
+
+/// 流循环侧的影子捕获句柄:影子表 + 本轮的账号 id 与 history fps
+/// (血脉判据,减末轮口径与 lookup 一致)。捆成一个参数传进
+/// `stream_to_anthropic`,测试不关心的路径给 `None`。
+pub(crate) struct ShadowFeed {
+    pub map: std::sync::Arc<DescriptorShadow>,
+    pub account_id: String,
+    /// 本轮请求历史的**完整**逐轮指纹(含末条 user)。提交时链 = 它 ++ [assistant_fp]。
+    /// 注意与 lookup 用的那份(减末条)不是同一个值,见 `DescriptorShadow::commit`。
+    pub fps: Vec<u64>,
+}
+
+impl DescriptorShadow {
+    /// 锁:毒化即恢复(同 [`ConvRegistry`] 的理由:纯观测缓存,不能变成 panic 点)。
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<ShadowEntry>>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 干净收尾时提交本轮尾部 `.3`,并把这条血脉的指纹链推进一轮。
+    ///
+    /// `request_fps` = 本轮请求历史的逐轮指纹(**含本轮 user**,与 `chat::history_fps`
+    /// 同口径);`assistant_fp` = 本轮我方 assistant 输出的指纹
+    /// (`chat::turn_fp(false, 渲染文本)`,与 clidrv 的 `append_assistant_fp` 共用函数
+    /// 以保证口径不漂移)。入库的链 = `request_fps ++ [assistant_fp]`,正是
+    /// 「下一轮请求历史(减末条 user)应该长什么样」。
+    ///
+    /// 入库策略:找到**精确前序**(链 == `request_fps` 去掉末条)就**替换它**
+    /// (同一条血脉每轮只留最新一条,与 clidrv 桶「每轮接替旧槽」同义);
+    /// 找不到就追加(新血脉 / 并行分支互不覆盖)。桶满按最旧提交淘汰。
+    ///
+    /// 调用方(见 chat.rs 捕获处)保证只在流**干净收尾**时走到这里 —— 中途捕获的
+    /// `.3` 可能装着未完结轮次的状态,提交错描述符 = 回放时上下文缺一块 = 模型静默变傻。
+    pub(crate) fn commit(
+        &self,
+        conv: &str,
+        account_id: &str,
+        model: &str,
+        request_fps: &[u64],
+        assistant_fp: Option<u64>,
+        desc: &[u8],
+        refs: usize,
+    ) -> ShadowCommit {
+        let fp = fnv1a64(desc);
+        // 本轮入库的完整链。assistant_fp 缺失时链是残的 —— 照样入库(留痕),
+        // 但 lookup 会硬性拒绝它,见 ShadowEntry::assistant_fp。
+        let mut chain = request_fps.to_vec();
+        if let Some(a) = assistant_fp {
+            chain.push(a);
+        }
+        // 精确前序 = 本轮请求历史去掉末条 user。
+        let predecessor = &request_fps[..request_fps.len().saturating_sub(1)];
+
+        let mut map = self.map();
+        // 顺手全表清过期:过期条目摘除,空桶摘键(同 AssetStore 的摊销式清扫)。
+        map.retain(|_, bucket| {
+            bucket.retain(|e| e.at.elapsed() < CONV_TTL);
+            !bucket.is_empty()
+        });
+        let bucket = map.entry(conv.to_string()).or_default();
+        let hit = bucket
+            .iter()
+            .position(|e| e.account_id == account_id && e.fps == predecessor);
+        let out = match hit {
+            Some(i) => {
+                let e = &bucket[i];
+                ShadowCommit {
+                    fp,
+                    changed: Some(e.desc != desc),
+                    same_account: Some(true),
+                    same_model: Some(e.model == model),
+                }
+            }
+            None => ShadowCommit {
+                fp,
+                changed: None,
+                same_account: None,
+                same_model: None,
+            },
+        };
+        match hit {
+            // 同血脉推进:接替旧槽。
+            Some(i) => {
+                let e = &mut bucket[i];
+                e.model = model.to_string();
+                e.fps = chain;
+                e.assistant_fp = assistant_fp;
+                e.desc = desc.to_vec();
+                e.refs = refs;
+                e.at = Instant::now();
+            }
+            // 新血脉 / 并行分支:追加。
+            None => {
+                while bucket.len() >= SHADOW_BUCKET_CAP {
+                    let idx = bucket
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, e)| e.at)
+                        .map(|(i, _)| i)
+                        .expect("桶非空必有最旧者");
+                    bucket.remove(idx);
+                }
+                bucket.push(ShadowEntry {
+                    account_id: account_id.to_string(),
+                    model: model.to_string(),
+                    fps: chain,
+                    assistant_fp,
+                    desc: desc.to_vec(),
+                    refs,
+                    at: Instant::now(),
+                });
+            }
+        }
+        Self::enforce_total_cap(&mut map);
+        out
+    }
+
+    fn enforce_total_cap(map: &mut HashMap<String, Vec<ShadowEntry>>) {
+        let mut total: usize = map.values().map(|b| b.len()).sum();
+        while total > SHADOW_TOTAL_CAP {
+            // 找全表最旧的那条。表被 TTL 与本闸压着,线性扫可接受。
+            let Some((key, idx)) = map
+                .iter()
+                .filter_map(|(k, b)| {
+                    b.iter()
+                        .enumerate()
+                        .min_by_key(|(_, e)| e.at)
+                        .map(|(i, e)| (k.clone(), i, e.at))
+                })
+                .min_by_key(|(_, _, at)| *at)
+                .map(|(k, i, _)| (k, i))
+            else {
+                break;
+            };
+            if let Some(b) = map.get_mut(&key) {
+                b.remove(idx);
+                if b.is_empty() {
+                    map.remove(&key);
+                }
+            }
+            total -= 1;
+        }
+    }
+
+    /// 作废该会话在该账号下的全部描述符条目,返回摘掉的条数。
+    ///
+    /// 用在「服务端要求补传内容分节」之后:那说明我方回放的描述符指向的内容
+    /// 服务端手里没有,留着它下一轮会再撞一次同样的墙,而每次撞墙都可能是一次
+    /// 裸态(累计 3 次/60s 就让这个号冷却)。作废后下一轮走首轮形态重铺 ——
+    /// 代价是这条会话不再省钱,但正确性回到已知可用的那条路上。
+    ///
+    /// 只摘同号的:同一条 conv 上别的账号的血脉与本次失败无关(描述符是
+    /// per-account 的服务端状态)。
+    pub(crate) fn invalidate(&self, conv: &str, account_id: &str) -> usize {
+        let mut map = self.map();
+        let Some(bucket) = map.get_mut(conv) else {
+            return 0;
+        };
+        let before = bucket.len();
+        bucket.retain(|e| e.account_id != account_id);
+        let dropped = before - bucket.len();
+        if bucket.is_empty() {
+            map.remove(conv);
+        }
+        dropped
+    }
+
+    /// 回放读侧:取本轮该走的续轮描述符(直接就是请求 `1.1` 的原样字节)。
+    ///
+    /// `history_fps` = 本轮请求历史**减末条 user** 的逐轮指纹。返回 `None` = 没料,
+    /// 调用方走首轮形态全量重铺。
+    ///
+    /// ## ⭐ 为什么这里比 clidrv 严:要求**精确相等**,不接受前缀
+    ///
+    /// clidrv 的 `CliConversations::lookup` 容忍「条目链是请求历史的严格前缀」——
+    /// 落后几轮的条目照样 Resume。那对它是安全的:CLI **子进程自己持有真实历史**,
+    /// 续上一个落后的进程不会丢轮。
+    ///
+    /// 描述符没有这条腿。条目链是严格前缀,意味着存在这份描述符不覆盖的轮次;
+    /// 而续轮请求 `1.2` 只带本轮增量消息 —— 服务端按这张缺轮的清单取上下文,
+    /// 模型看不到中间那几轮却照样回答,**没有任何错误信号**。所以判据必须是
+    /// 链 == `history_fps` 精确相等,落后一条就重铺。
+    ///
+    /// 其余语义照搬 clidrv(同一套桶,不另发明规则):
+    /// - **歧义即 Fresh**:多条精确相等的条目(并行分支撞上同一段历史)绝不瞎挑;
+    /// - **跨号即 Fresh**:命中在别的账号上就重铺,不回退同号的短祖先
+    ///   (那会静默丢中间轮);描述符本身也是 per-account 的服务端状态。
+    /// - **换模型即 Fresh**:预算表带着上下文上限(实测 `.5.2` = 256000),
+    ///   跨模型回放等于拿 A 模型的上下文账本给 B 用。
+    /// - **链残即不匹配**:`assistant_fp` 为 `None` 的条目(失败轮/工具轮)硬性跳过。
+    pub(crate) fn lookup(
+        &self,
+        conv: &str,
+        account_id: &str,
+        model: &str,
+        history_fps: &[u64],
+    ) -> Option<Vec<u8>> {
+        let mut map = self.map();
+        let bucket = map.get_mut(conv)?;
+        // 读侧也顺手清过期(与 commit 同一摊销式清扫)。
+        bucket.retain(|e| e.at.elapsed() < CONV_TTL);
+
+        // 全桶扫描:先按「链精确相等」筛,再看账号/模型 —— 顺序重要。
+        // 先筛账号会把「精确命中在别号」误判成「本号无命中」,那就退化成
+        // 「回退同号短祖先」= clidrv 明确拒绝的那种静默丢轮。
+        let exact: Vec<&ShadowEntry> = bucket
+            .iter()
+            .filter(|e| e.assistant_fp.is_some() && e.fps == history_fps)
+            .collect();
+        match exact.len() {
+            0 => None,
+            1 => {
+                let e = exact[0];
+                if e.account_id != account_id {
+                    tracing::info!(
+                        conversation_id = conv,
+                        bucket_len = bucket.len(),
+                        "cursor wire:精确前序在别号(账号轮转),不回退短祖先,重铺"
+                    );
+                    return None;
+                }
+                if e.model != model {
+                    tracing::info!(
+                        conversation_id = conv,
+                        stored = %e.model,
+                        want = model,
+                        "cursor wire:精确前序换了模型,重铺"
+                    );
+                    return None;
+                }
+                Some(e.desc.clone())
+            }
+            n => {
+                tracing::info!(
+                    conversation_id = conv,
+                    tied = n,
+                    bucket_len = bucket.len(),
+                    "cursor wire:多条精确前序(并行分支同历史),歧义不挑,重铺"
+                );
+                None
+            }
+        }
+    }
+
+    /// 测试用:读出该会话某账号**最近提交**的条目(ref 个数 + 字节)。
+    #[cfg(test)]
+    pub(crate) fn get_for_test(&self, conv: &str, account_id: &str) -> Option<(usize, Vec<u8>)> {
+        self.map().get(conv).and_then(|bucket| {
+            bucket
+                .iter()
+                .filter(|e| e.account_id == account_id)
+                .max_by_key(|e| e.at)
+                .map(|e| (e.refs, e.desc.clone()))
+        })
+    }
+}
+
 /// 「上一轮被内建工具截断」的待发纠偏标记,按 conversation 存。
 ///
 /// ## 为什么不挂在 [`ConvRegistry`] 上
@@ -745,7 +1321,12 @@ impl ConvRegistry {
     ///
     /// 判定不变式与 `phase_for` 相同:任何不确定都当 Opening(Fresh/Diverged),
     /// 宁可重铺不错续。
-    fn cli_lookup(&self, conversation_id: &str, account_id: &str, history_fps: &[u64]) -> CliLookup {
+    fn cli_lookup(
+        &self,
+        conversation_id: &str,
+        account_id: &str,
+        history_fps: &[u64],
+    ) -> CliLookup {
         if !self.stateful {
             return CliLookup::Fresh;
         }
@@ -805,10 +1386,30 @@ impl CursorProvider {
             conversations: Arc::new(ConvRegistry::from_env()),
             assets: Arc::new(AssetStore::default()),
             notices: Arc::new(TruncationNotices::default()),
+            shadow: Arc::new(DescriptorShadow::default()),
+            sections: Arc::new(ContentSections::default()),
             cli_cfg: clidrv::CliDriverConfig::from_env(),
             cli_convs: Arc::new(clidrv::CliConversations::default()),
             cli_token_updates: clidrv::TokenUpdates::default(),
+            cli_locks: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 取某会话的分流锁(没有就建;Weak 存储,锁对象随最后一个持有者回收)。
+    fn cli_lock_for(&self, conversation_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut m = self.cli_locks.lock().unwrap_or_else(|p| p.into_inner());
+        // 机会主义 GC(2026-08-21 codex 复审 r4 major):失效 Weak(锁对象已回收)
+        // 本身不会消失,唯一 conversation_id 无界 → 长进程会按历史会话总数慢漏。
+        // 持表锁时顺带清;阈值只是摊销,不是正确性条件。
+        if m.len() > 256 {
+            m.retain(|_, w| w.strong_count() > 0);
+        }
+        if let Some(l) = m.get(conversation_id).and_then(|w| w.upgrade()) {
+            return l;
+        }
+        let l = Arc::new(tokio::sync::Mutex::new(()));
+        m.insert(conversation_id.to_string(), Arc::downgrade(&l));
+        l
     }
 
     /// 覆盖请求形状(协议试错用;生产别调)。
@@ -853,10 +1454,7 @@ impl CursorProvider {
         // poison 用 into_inner 恢复:这把锁只护一张纯缓存,毒化不代表数据不可用,
         // 而 unwrap 会让此后每个请求都 panic(对齐 gw-dario 的写法)。
         {
-            let cache = self
-                .proxy_clients
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let cache = self.proxy_clients.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(c) = cache.get(url) {
                 return Ok(c.clone());
             }
@@ -874,7 +1472,10 @@ impl CursorProvider {
                     "cursor 账号的出口代理无法构造,拒绝使用该号(绝不回退默认出口): {e}");
                 Err(UpstreamError::new(
                     UpstreamErrorKind::BadRequest,
-                    format!("cursor 账号 {} 的出口代理配置非法,拒绝发包(回退默认出口=关联封号风险)", account.account_id),
+                    format!(
+                        "cursor 账号 {} 的出口代理配置非法,拒绝发包(回退默认出口=关联封号风险)",
+                        account.account_id
+                    ),
                 ))
             }
         }
@@ -1018,10 +1619,7 @@ impl CursorProvider {
     }
 
     fn cached_config_version(&self, key: &str) -> CacheLook {
-        let map = self
-            .config_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let map = self.config_cache.lock().unwrap_or_else(|p| p.into_inner());
         let Some(e) = map.get(key) else {
             return CacheLook::Miss;
         };
@@ -1055,12 +1653,7 @@ fn config_cache_key(account: &Account, token: &str, machine_id: &str) -> String 
     h.update(b"\x00");
     h.update(machine_id.as_bytes());
     h.update(b"\x00");
-    h.update(
-        account
-            .extra_str("proxy")
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    h.update(account.extra_str("proxy").unwrap_or_default().as_bytes());
     let d = h.finalize();
     // 前 8 字节够区分了,键不必长。
     let mut fp = String::with_capacity(16);
@@ -1106,7 +1699,10 @@ impl Provider for CursorProvider {
     /// caio-cache-billing-and-hot-settings 记的两处静默失败之一)。
     fn apply_hot_settings(&self, settings: &serde_json::Value) {
         let mut b = crate::cache_sim::billing();
-        if let Some(v) = settings.get("cache_read_multiplier").and_then(|v| v.as_f64()) {
+        if let Some(v) = settings
+            .get("cache_read_multiplier")
+            .and_then(|v| v.as_f64())
+        {
             b.read_multiplier = v;
         }
         if let Some(v) = settings.get("cache_cap_ratio").and_then(|v| v.as_f64()) {
@@ -1217,14 +1813,26 @@ impl Provider for CursorProvider {
         // 环境变量 `CURSOR_DRIVER=wire` 整个 worker 退出。历史值 `"cli"` 仍然合法(等于默认)。
         let account_driver = Self::opt_str(&ctx.account, "driver");
         let env_driver = std::env::var("CURSOR_DRIVER").ok();
-        let wire_opt_out = account_driver.as_deref() == Some("wire")
-            || env_driver.as_deref() == Some("wire");
+        // 生效驱动:环境变量是 worker 级强制开关(回滚时不必逐号改库),设了就压过
+        // 账号字段;没设才看账号级灰度(codex 复审 major#13:两条都要有否决权)。
+        let effective_driver = env_driver.as_deref().or(account_driver.as_deref());
+        // 第三条路径:InferenceService.Stream 直连(2026-08-26,见 inference.rs 模块文档)。
+        // 纯 H1 + connect 流式,无进程校验,服务端前缀缓存真实回表。
+        let inference_driver = effective_driver == Some("inference");
+        let wire_opt_out = effective_driver == Some("wire");
         // `cli_eligible` 仍是硬前提:assistant 结尾(prefill)这类形态 CLI 接不了,回线协议。
         let cli_driver = !wire_opt_out && chat::cli_eligible(&req.body);
 
         let machine_id = Self::machine_id_of(&ctx.account, &token);
         let mac_machine_id = Self::mac_machine_id_of(&ctx.account, &token);
         let client = self.client_for(&ctx.account)?;
+
+        // ── InferenceService 直连(driver=inference)──────────────────────────
+        // 不需要 config_version / 会话注册表 / CLI 工作区,进出国度全在 inference.rs。
+        // 形态门控 inference_eligible:prefill/document/URL 图片回退 cli/wire。
+        if inference_driver && inference::inference_eligible(&req.body) {
+            return inference::chat_stream(&client, &ctx.account, &token, req, ctx).await;
+        }
 
         // CLI 形态/CLI 驱动都不需要 config_version(头表里没有这条)—— 省掉
         // GetServerConfig 握手(单次 5–6s),也顺带绕开「取不到就失败」的冷启动面。
@@ -1296,13 +1904,13 @@ impl Provider for CursorProvider {
                 sys
             };
             let refresh = Self::opt_str(&ctx.account, "refresh_token");
-            let (home, ws) = clidrv::prepare_home(
+            // 账号级 HOME(auth.json / permissions / 降权);工作区按 CLI 会话分,
+            // 要等 lookup 知道用哪个 ws_id 再备(见下面的 `prepare_ws`)。
+            let home = clidrv::prepare_home(
                 &self.cli_cfg,
                 &ctx.account.account_id,
-                &conversation_id, // 工作区每会话一份(AGENTS.md 装的是本次请求的 system)
                 &token,
                 refresh.as_deref(),
-                &system,
                 &self.cli_token_updates,
             )?;
 
@@ -1340,23 +1948,162 @@ impl Provider for CursorProvider {
                 })
             };
 
+            // 每会话分流锁(见 `cli_locks` 字段文档):① 弃槽判定 → ② lookup →
+            // start_conv 注册完成,整个事务串行。guard 一直活到 start_conv 返回
+            // (insert 在其内部完成),之后本分支只剩拼 stream,无共享状态。
+            let _dispatch_lock = self.cli_lock_for(&conversation_id);
+            let _dispatch = _dispatch_lock.lock().await;
+
+            // 弃槽重铺标记:一旦本请求注销了旧桥调用,② 必须**跳过 lookup 强制
+            // Fresh**。有分流锁后同会话请求不可能再在"取槽→摘表"窗口里插队,
+            // 这层是防御纵深(锁被日后重构掉时,语义仍然成立)。
+            let mut force_fresh = false;
+            // 「截至上一轮」的历史指纹(去掉末轮):① 的 pending 路由与 ② 的 lookup
+            // 共用同一份前缀口径 —— 条目 fps 存的是调用方历史,比的是前缀。
+            let history = &fps[..fps.len().saturating_sub(1)];
             // ① 调用方带 tool_result 回来:优先接续挂起的桥调用(按 tool_use_id
             //    键控消费,错配显式报错 —— 静默喂错结果是语义损坏)。
             if let Some(results) = chat::last_tool_results(&req.body) {
-                if let Some(conv) = self.cli_convs.get(&conversation_id) {
-                    if conv.has_pending() {
-                        *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
-                        return clidrv::resume_conv(conv, results, sim_req);
+                let result_ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+                let pick = self.cli_convs.find_pending(
+                    &conversation_id,
+                    &ctx.account.account_id,
+                    history,
+                    &result_ids,
+                );
+                // 歧义(Finding 2):多条血脉都挂着桥调用且按带回 id 也无法唯一
+                // 路由 —— 瞎挑会把旧会话的结果喂进新会话的 CLI。不落 pending
+                // 接续,落回 ② 重铺(安全方向),但必须可数。
+                //
+                // ⚠️ 必须同时 force_fresh(codex 复审 Finding 1):只打日志的话,
+                // ② 的普通 lookup 仍可能把前缀最长的**仍挂起**血脉唯一选中
+                // Resume —— 原泵还在等桥结果,新进程以同一 SID 启动 =
+                // 同一上游 session 并发写。与弃槽重铺同一语义:绝不 Resume。
+                if let clidrv::PendingPick::Ambiguous {
+                    bucket_len,
+                    candidates,
+                } = &pick
+                {
+                    tracing::warn!(
+                        conversation_id = %conversation_id,
+                        account = %ctx.account.account_id,
+                        bucket_len,
+                        candidates,
+                        "cursor-cli:多条血脉都有挂起桥调用且无法按带回 id 唯一路由,不落 pending 接续,强制 Fresh 重铺"
+                    );
+                    force_fresh = true;
+                }
+                if let clidrv::PendingPick::One(conv) = pick {
+                    if let Some(pid) = conv.pending_id() {
+                        // 多模型编排插队(生产 2026-08-21 ultra-test 现场):客户端在
+                        // 我方桥挂起期间先把答案写进共享 transcript,再去别家 provider
+                        // 跑了几轮(call-<uuid>-N 形态的 tool_use),最后带着别家的
+                        // tool_result 回来 —— 末条结果与我方挂起 id 对不上,但挂起 id
+                        // 在历史里**已被有序应答** = 客户端已应答并翻篇。
+                        //
+                        // 处置(2026-08-21 codex 审查后重做,三个原子性缺一不可):
+                        // 1. **CAS 取槽**:按证明过的 id 取,取不到 = 并发请求已推进槽位
+                        //    (可能消费 P 又挂出 Q)→ 报错让客户端重试,绝不继续开会话;
+                        // 2. **显式注销泵**(`BridgeAnswer::Abandon`):泵 break → 杀整组
+                        //    CLI —— responder drop 达不到这个效果(泵会把错误写回 CLI
+                        //    继续跑,旧 CLI 会和新会话并发写同一条上游 session);
+                        // 3. **摘掉注册表同一份条目**:否则 ② 的 lookup 会因旧指纹仍是
+                        //    前缀而命中 Resume,把别家结果当增量送进旧 session 而非
+                        //    全量 Fresh 重铺。
+                        // ⚠️ S1-7 不削弱:错配结果依然永远不进 CLI;历史里没有该 id 的
+                        // 有序配对(真错配/重放注入)时维持原样显式拒绝。
+                        let brought_match = results.iter().any(|(rid, _)| *rid == pid);
+                        let stale =
+                            !brought_match && chat::history_answers_tool_use(&req.body, &pid);
+                        // 弃血脉挂起(2026-08-24 生产事故,zcode 连续 400 现场):
+                        // 上一轮请求**吞槽后客户端秒断**,泵继续跑、把新 tool_use
+                        // 流进死连接 —— 客户端历史里根本没有这个 id,"带正确结果
+                        // 重试"对它不成立,错配 400 会一直拒到 PENDING_TTL(≤280s)
+                        // 清槽。delivered=false(本阶段没被完整 drain)= 弃血脉挂起,
+                        // 同样弃槽重铺;delivered=true 的错配才维持 400。
+                        //
+                        // ⚠️ delivered=false 是"本阶段未被完整消费",不是"客户端已
+                        // 断流"(慢读的活客户端同样是 false);该分支的代价上界是一次
+                        // 无辜重铺,错配结果照样不进任何 CLI —— 失败方向安全。
+                        let abandoned = !brought_match && conv.pending_undelivered(&pid);
+                        let mut to_resume = !stale && !abandoned;
+                        if stale || abandoned {
+                            // 弃血脉分支把"未送达"校验折进取槽 CAS
+                            // (take_pending_for_if_undelivered):判定与取槽之间
+                            // drain 可能刚标记送达 —— 那时回退已送达错配语义
+                            // (to_resume → 错配 400),绝不误杀已送达的槽。
+                            let taken = if stale {
+                                conv.take_pending_for(&pid)
+                            } else {
+                                conv.take_pending_for_if_undelivered(&pid)
+                            };
+                            match taken {
+                                Some(slot) => {
+                                    if stale {
+                                        tracing::warn!(
+                                            account = %ctx.account.account_id,
+                                            pending = %pid,
+                                            "cursor-cli:挂起的桥调用已在历史中被有序应答(多模型编排插队),弃槽重铺"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            account = %ctx.account.account_id,
+                                            pending = %pid,
+                                            "cursor-cli:挂起的桥调用所在阶段未被完整消费(弃血脉/断流),弃槽重铺"
+                                        );
+                                    }
+                                    slot.abandon();
+                                    // 卫生措施:摘掉旧条目,防**别的**请求再 resume
+                                    // 被杀掉的 session;返回值无所谓 —— 本请求自己的
+                                    // Fresh 由 force_fresh 保证(见上)。
+                                    self.cli_convs.remove_if_same(&conversation_id, &conv);
+                                    force_fresh = true;
+                                    // 落回 ②:强制 Fresh → 全量折叠重铺。
+                                }
+                                None if abandoned
+                                    && !stale
+                                    && conv.pending_id().as_deref() == Some(pid.as_str()) =>
+                                {
+                                    // TOCTOU 出口:判定→取槽之间 drain 标记了送达,
+                                    // 槽还是原来那个 —— 按已送达错配处理(resume →
+                                    // 400),不启动第二个 CLI、不丢会话。
+                                    to_resume = true;
+                                }
+                                None => {
+                                    // 并发请求在两步之间推进了槽位:不启动第二个 CLI。
+                                    return Err(UpstreamError::bad_request_visible(
+                                        "cursor-cli: 会话正被另一请求推进,请带最新历史重试"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        if to_resume {
+                            // 续用命中条目的工作区(同一条 CLI 会话同一份 ws):
+                            // 每轮刷新 .last 与 AGENTS.md —— system 可能轮间变化,
+                            // .last 不刷活会话目录会被 GC 误收(语义同旧 prepare_home)。
+                            clidrv::prepare_ws(
+                                &self.cli_cfg,
+                                &ctx.account.account_id,
+                                &conv.ws_id,
+                                &system,
+                            )?;
+                            // fps 不在入口写:错 id 会先污染指纹、废掉正确重试
+                            // (Finding 2)—— resume_conv 在槽校验成功后才写。
+                            return clidrv::resume_conv(conv, results, fps, sim_req);
+                        }
                     }
                 }
-                // 没有挂起的桥调用(重启/超时):落回重铺,文本里带着工具结果。
+                // 没有挂起的桥调用(重启/超时/弃槽/歧义):落回重铺,文本里带着工具结果。
             }
 
-            // ② 常规:新开一个 CLI 进程(Fresh 或 --resume)。
-            let history = &fps[..fps.len().saturating_sub(1)];
-            let lookup = self
-                .cli_convs
-                .lookup(&conversation_id, &ctx.account.account_id, history);
+            // ② 常规:新开一个 CLI 进程(Fresh 或 --resume)。弃槽重铺强制 Fresh。
+            let lookup = if force_fresh {
+                clidrv::CliLookup::Fresh
+            } else {
+                self.cli_convs
+                    .lookup(&conversation_id, &ctx.account.account_id, history)
+            };
             let mut prompt = match &lookup {
                 // 本轮新增的**整段**,不是末条消息 —— 理由见 `latest_user_input`。
                 clidrv::CliLookup::Resume(_) => chat::latest_user_input(&raw_turns),
@@ -1369,6 +2116,25 @@ impl Provider for CursorProvider {
                 }
                 clidrv::CliLookup::Fresh => chat::latest_user_input(&raw_turns),
             };
+
+            // 工作区**每 CLI 会话一份**:Resume 沿用命中条目的 ws_id(同一条 CLI
+            // 会话同一份);Fresh 新生成。按 conversation_id 分是错的 —— 桶内并行
+            // 血脉会互相覆盖 AGENTS.md(2026-08-17 事故的复发形态,见 prepare_ws)。
+            let (resume_sid, ws_id, supersede) = match lookup {
+                clidrv::CliLookup::Resume(entry) => {
+                    (entry.session_id(), entry.ws_id.clone(), Some(entry))
+                }
+                clidrv::CliLookup::Fresh => {
+                    // `_noconv` 特例:派生不出 conversation_id 时维持共享兜底目录。
+                    let ws_id = if conversation_id.is_empty() {
+                        String::new()
+                    } else {
+                        uuid::Uuid::new_v4().to_string()
+                    };
+                    (None, ws_id, None)
+                }
+            };
+            let ws = clidrv::prepare_ws(&self.cli_cfg, &ctx.account.account_id, &ws_id, &system)?;
 
             // 附件:图片落盘 + 提示词带路径(ask 模式只读工具能读图);
             // 文档(PDF)抽文本层内联(与线协议形态同一话术)。
@@ -1406,11 +2172,7 @@ impl Provider for CursorProvider {
                 prompt = format!("{pre}{prompt}");
             }
 
-            let resume_sid = match &lookup {
-                clidrv::CliLookup::Resume(sid) => Some(sid.clone()),
-                _ => None,
-            };
-            let stream = clidrv::start_conv(
+            let (stream, _conv) = clidrv::start_conv(
                 &self.cli_cfg,
                 &self.cli_convs,
                 &conversation_id,
@@ -1419,23 +2181,27 @@ impl Provider for CursorProvider {
                 Self::opt_str(&ctx.account, "proxy").as_deref(),
                 &home,
                 &ws,
+                &ws_id,
                 &cli_model,
                 &prompt,
                 // 新会话的 input 基准要含 system(它经 AGENTS.md 落盘,CLI 每轮重读,
                 // 上游照样计费)。续会话不用它 —— `sim_total` 的口径本来就含 system。
                 &system,
                 resume_sid,
+                supersede,
+                // 全量历史指纹随插入落条目(Finding 4a),不再先插空再回写。
+                fps,
                 &tools,
                 &req.model,
                 self.cli_token_updates.clone(),
                 sim_req,
             )
             .await?;
-            // 登记调用方指纹(供下一轮分叉校验)。失败轮的矫正靠调用方重试时
-            // 前缀不一致自然触发重铺,代价只是多铺一次。
-            if let Some(conv) = self.cli_convs.get(&conversation_id) {
-                *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
-            }
+            // 指纹登记分两段,这里**都没有**:调用方历史那段已随 start_conv 的
+            // insert 落进新条目(Finding 4a);本轮我方 assistant 输出那段由泵在
+            // 干净收尾时追加(Finding 3a,见 `CliConv::append_assistant_fp` ——
+            // 它只能在响应真正产出后做,这里流还没开始)。失败轮没有追加,
+            // 矫正靠调用方重试时前缀不一致自然触发重铺,代价只是多铺一次。
             return Ok(stream);
         }
 
@@ -1491,6 +2257,12 @@ impl Provider for CursorProvider {
                 keep_stream_open: self.tuning.keep_stream_open,
                 assets: self.assets.clone(),
                 notices: self.notices.clone(),
+                shadow: self.shadow.clone(),
+                sections: self.sections.clone(),
+                // 影子血脉判据:与上面 cli_lookup 同一份指纹、同一个减末轮口径。
+                shadow_fps: cli_fps[..cli_fps.len().saturating_sub(1)].to_vec(),
+                shadow_fps_full: cli_fps.clone(),
+                wire_descriptor_replay: self.tuning.wire_descriptor_replay,
             },
             req,
             // 只在**成功收尾**后才登记会话已建立。失败时清掉,下次从首轮重铺 ——
@@ -1512,7 +2284,12 @@ impl Provider for CursorProvider {
 
     /// CLI 子进程自刷新捕获(见 [`clidrv`]):一次性取空上报表,worker 周期任务
     /// 负责 CAS 落库。CLI 是号库凭据的第二个写者,不捕获 = 旧 rt 作废后号砖。
-    fn poll_token_updates(&self) -> Vec<(String, std::collections::BTreeMap<String, serde_json::Value>)> {
+    fn poll_token_updates(
+        &self,
+    ) -> Vec<(
+        String,
+        std::collections::BTreeMap<String, serde_json::Value>,
+    )> {
         std::mem::take(
             &mut *self
                 .cli_token_updates
@@ -1702,18 +2479,30 @@ mod tests {
         let s = p.account_schema();
         let has = |n: &str| s.iter().any(|f| f.name == n);
         assert!(s.iter().any(|f| f.name == "access_token" && f.required));
-        for f in ["refresh_token", "machine_id", "mac_machine_id", "timezone", "proxy"] {
+        for f in [
+            "refresh_token",
+            "machine_id",
+            "mac_machine_id",
+            "timezone",
+            "proxy",
+        ] {
             assert!(has(f), "schema 缺字段 {f}");
         }
         // 凭据必须是 Password 类型,别在后台明文回显
         for f in ["access_token", "refresh_token"] {
             let spec = s.iter().find(|x| x.name == f).unwrap();
-            assert!(matches!(spec.field_type, FieldType::Password), "{f} 应为 Password");
+            assert!(
+                matches!(spec.field_type, FieldType::Password),
+                "{f} 应为 Password"
+            );
         }
         // 模型白名单已定稿落地(2026-08-13):字段名 model_allowlist,
         // 缺失/null=不限、空表/类型错=全禁,匹配器在 gw-core。旧键名 `models`
         // 从未有账号配过,不留兼容 —— schema 里绝不能再出现旧键。
-        assert!(has("model_allowlist"), "白名单字段该进 schema 了(语义已定稿)");
+        assert!(
+            has("model_allowlist"),
+            "白名单字段该进 schema 了(语义已定稿)"
+        );
         assert!(!has("models"), "旧键名不许复活");
     }
 
@@ -1778,6 +2567,120 @@ mod tests {
     fn validate_account_checks_token() {
         let p = CursorProvider::new(CursorConfig::default());
         assert!(p.validate_account(&acct(&[])).is_err());
-        assert!(p.validate_account(&acct(&[("access_token", "tok")])).is_ok());
+        assert!(p
+            .validate_account(&acct(&[("access_token", "tok")]))
+            .is_ok());
+    }
+
+    /// ⭐ **严格前缀不得匹配** —— 这条是本表比 clidrv 严的全部理由。
+    ///
+    /// clidrv 容忍落后条目(CLI 子进程自己持有真实历史,续上不丢轮);描述符没有
+    /// 这条腿:条目链是请求历史的严格前缀 = 存在这份清单不覆盖的轮次,而续轮只发
+    /// 增量消息 → 模型看不到中间轮却照样答,**没有任何错误信号**。
+    #[test]
+    fn 影子表_严格前缀不匹配() {
+        let s = DescriptorShadow::default();
+        // turn1:请求历史 [u1],输出 a1 → 链 [u1, a1]。
+        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-1", 4);
+        // 正:下一轮的历史正是 [u1, a1]。
+        assert_eq!(
+            s.lookup("conv", "A", "m1", &[1, 11]).as_deref(),
+            Some(&b"desc-1"[..])
+        );
+        // 负:链是历史的严格前缀(中间又过了一轮 u2/a2)→ 必须重铺。
+        assert!(
+            s.lookup("conv", "A", "m1", &[1, 11, 2, 22]).is_none(),
+            "落后一轮的描述符绝不能回放"
+        );
+        // 负:历史比链短(调用方截了历史)→ 也不匹配。
+        assert!(s.lookup("conv", "A", "m1", &[1]).is_none());
+        // 负:同长但内容不同(分叉)。
+        assert!(s.lookup("conv", "A", "m1", &[1, 99]).is_none());
+    }
+
+    /// 两轮推进:commit 找到精确前任就**替换**,不累积条目。
+    #[test]
+    fn 影子表_两轮推进替换前任() {
+        let s = DescriptorShadow::default();
+        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-1", 4);
+        // turn2:请求历史 [u1,a1,u2],前任 = [u1,a1] → 替换。
+        let c = s.commit("conv", "A", "m1", &[1, 11, 2], Some(22), b"desc-2", 6);
+        assert_eq!(c.same_account, Some(true), "找到精确前任");
+        assert_eq!(c.changed, Some(true));
+        // 旧链已不存在。
+        assert!(
+            s.lookup("conv", "A", "m1", &[1, 11]).is_none(),
+            "旧链应被接替"
+        );
+        // 新链可用。
+        assert_eq!(
+            s.lookup("conv", "A", "m1", &[1, 11, 2, 22]).as_deref(),
+            Some(&b"desc-2"[..])
+        );
+    }
+
+    /// 并列精确前序(并行分支撞上同一段历史)→ 歧义不挑,重铺。
+    #[test]
+    fn 影子表_并列前序歧义不挑() {
+        // 两次 commit 的前任都是 `[]`(request_fps 只有一条),所以第二次找不到前任 →
+        // 追加。于是同 conv 下两条条目的链都是 [1, 11] = 真并列。
+        let s2 = DescriptorShadow::default();
+        s2.commit("conv", "A", "m1", &[1], Some(11), b"desc-x", 1);
+        s2.commit("conv", "A", "m1", &[1], Some(11), b"desc-y", 1);
+        // 第二次 commit 的前任 = [] ,与第一条链 [1,11] 不等 → 追加,于是两条链都是 [1,11]。
+        assert!(
+            s2.lookup("conv", "A", "m1", &[1, 11]).is_none(),
+            "两条精确前序并列时绝不瞎挑"
+        );
+    }
+
+    /// 跨号 / 换模型不回放(描述符是 per-account 的服务端状态;预算表随模型)。
+    #[test]
+    fn 影子表_跨号与换模型不回放() {
+        let s = DescriptorShadow::default();
+        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-A", 4);
+        assert!(
+            s.lookup("conv", "B", "m1", &[1, 11]).is_none(),
+            "跨号必须重铺"
+        );
+        assert!(
+            s.lookup("conv", "A", "m2", &[1, 11]).is_none(),
+            "换模型必须重铺"
+        );
+        assert!(s.lookup("other", "A", "m1", &[1, 11]).is_none(), "别的会话");
+        // 同号同模型仍可用(证明上面三条不是被别的原因挡掉的)。
+        assert!(s.lookup("conv", "A", "m1", &[1, 11]).is_some());
+    }
+
+    /// 缺 assistant_fp 的条目(失败轮 / 工具轮)**硬性不匹配**:它的链是残的。
+    #[test]
+    fn 影子表_缺assistant_fp硬性不匹配() {
+        let s = DescriptorShadow::default();
+        s.commit("conv", "A", "m1", &[1], None, b"desc-partial", 4);
+        // 链只有 [1](没追 assistant),按链相等去查也不给。
+        assert!(
+            s.lookup("conv", "A", "m1", &[1]).is_none(),
+            "链残的条目即使链相等也不得回放"
+        );
+    }
+
+    /// 作废只摘同号,别号血脉不受影响。
+    #[test]
+    fn 影子表_作废只摘同号() {
+        let s = DescriptorShadow::default();
+        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-A", 1);
+        s.commit("conv", "B", "m1", &[2], Some(22), b"desc-B", 1);
+        assert_eq!(s.invalidate("conv", "A"), 1);
+        assert!(
+            s.lookup("conv", "A", "m1", &[1, 11]).is_none(),
+            "A 的已作废"
+        );
+        assert!(
+            s.lookup("conv", "B", "m1", &[2, 22]).is_some(),
+            "B 的不受影响"
+        );
+        // 幂等。
+        assert_eq!(s.invalidate("conv", "A"), 0);
+        assert_eq!(s.invalidate("nope", "A"), 0);
     }
 }

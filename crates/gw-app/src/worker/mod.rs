@@ -2752,19 +2752,7 @@ async fn handle_chat(
         {
             Ok(l) => l,
             Err(e) => {
-                // 穷尽 match(**不要改回二分 if**):新增变体时编译器会强制在这里做出
-                // 显式决策,而不是默默落进 503 —— GroupEmpty 与 NoModelSupport 的
-                // 状态码差异(可重试 vs 不可重试)正是靠这里区分的。
-                let code = match e {
-                    // 客户侧可解(换模型/升级订阅),重试无用 → 400。
-                    scheduler::AcquireError::NoModelSupport => StatusCode::BAD_REQUEST,
-                    // 池子/分组的配置或运行时状态,稍后可恢复 → 503。
-                    scheduler::AcquireError::GroupEmpty
-                    | scheduler::AcquireError::AllDisabled
-                    | scheduler::AcquireError::AllBusy
-                    | scheduler::AcquireError::AllRpmLimited
-                    | scheduler::AcquireError::Empty => StatusCode::SERVICE_UNAVAILABLE,
-                };
+                let code = acquire_error_status(&e);
                 // 内部原因(哪一档耗尽 / 组里压根没成员)只进日志:它描述的是账号池形态,
                 // 对客户既没用又泄底。客户端只拿到"换模型"还是"稍后重试"。
                 tracing::warn!(
@@ -3082,6 +3070,65 @@ async fn handle_chat(
     }
 }
 
+/// 终态首包前失败的统一出口(零产出/上游拒答/web search 回环失败):
+/// 可选上报 + 失败请求日志 + 释放 lease + 对外错误响应,四处口径一致。
+///
+/// - `report_failure=true`:与主 handler「chat 失败」分支及流内 Err 分支同口径
+///   (report_failure_with_gen);账号健康隔离纪律由 scheduler 按 kind 自担
+///   (BadRequest/ModelNotAvailable/Overloaded 不扣健康,见 spares_account_health)。
+/// - `report_failure=false`:零产出流,刻意**既不报成功也不报失败**(旧路径
+///   StreamCtx::Drop 会 report_success_observed(false) 顺带清 429 连击,这里保守不动)。
+#[allow(clippy::too_many_arguments)]
+fn fail_pre_first_byte(
+    st: &Arc<WorkerState>,
+    lease: scheduler::AccountLease,
+    req: &ChatRequest,
+    client_key: &str,
+    account: &Arc<Account>,
+    started_at: std::time::Instant,
+    wire: Wire,
+    e: &gw_core::error::UpstreamError,
+    // 窥探缓冲里抢救出的 Usage(若有)。失败请求上游已产出的 token 该计还得计
+    // (口径同 StreamCtx::drop 的 #130 块,account_ok=false)。
+    usage: Option<ChatUsage>,
+    report_failure: bool,
+) -> axum::response::Response {
+    if report_failure {
+        st.scheduler
+            .report_failure_with_gen(lease.account_id(), e.kind, lease.suspend_gen);
+    }
+    if let (Some(sink), Some(u)) = (st.usage_sink.clone(), usage.clone()) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let guard = st.pending_writes.enter();
+            let account_id = account.account_id.clone();
+            let model = req.model.clone();
+            let client_key = client_key.to_string();
+            handle.spawn(async move {
+                let _guard = guard;
+                finalize_usage(Some(&sink), &account_id, &model, &client_key, Some(&u), false)
+                    .await;
+            });
+        }
+    }
+    spawn_request_log_blocking(
+        st,
+        req.clone(),
+        Some(account.clone()),
+        client_key.to_string(),
+        req.stream,
+        false,
+        Some(upstream_status(e.kind).as_u16() as i64),
+        Some(format!("{:?}", e.kind)),
+        Some(started_at.elapsed().as_millis() as i64),
+        None,
+        usage,
+        ResponseLog::None,
+        st.provider.family(),
+    );
+    drop(lease);
+    upstream_error_response_wire(wire, e)
+}
+
 /// `Overloaded` 的同号退避梯度(毫秒)。长度即重试次数上限。
 ///
 /// 只覆盖"上游容量秒级抖动"这一种场景,故总等待封顶约 3s——再长客户端体感就不如直接
@@ -3245,16 +3292,32 @@ mod error_shape_tests {
     fn error_type_agrees_with_status_code() {
         assert_eq!(anthropic_error_type(K::BadRequest), "invalid_request_error");
         assert_eq!(anthropic_error_type(K::ModelNotAvailable), "invalid_request_error");
+        // 确定性空流 → 400 → invalid_request_error(止住重试,见 upstream_status 注释)。
+        assert_eq!(anthropic_error_type(K::EmptyResponse), "invalid_request_error");
         assert_eq!(anthropic_error_type(K::Overloaded), "overloaded_error");
         // 选号失败那条路自己算状态码,走 error_type_for_status
         assert_eq!(error_type_for_status(StatusCode::SERVICE_UNAVAILABLE), "overloaded_error");
+        assert_eq!(error_type_for_status(StatusCode::TOO_MANY_REQUESTS), "rate_limit_error");
         assert_eq!(error_type_for_status(StatusCode::BAD_REQUEST), "invalid_request_error");
         assert_eq!(error_type_for_status(StatusCode::BAD_GATEWAY), "api_error");
         // 502 那一大类:api_error(而不是 authentication_error —— 那会让客户以为
         // 是自己的 key 有问题,而坏的是我们的上游账号)。
-        for k in [K::TokenInvalid, K::EmptyResponse, K::Network, K::QuotaExhausted] {
+        for k in [K::TokenInvalid, K::Network, K::QuotaExhausted] {
             assert_eq!(anthropic_error_type(k), "api_error", "{k:?}");
         }
+    }
+
+    /// 选号失败映射(2026-08-24 用户报障驱动):忙 = 429,没号 = 503,模型不可解 = 400。
+    /// 改映射必须过这关 —— 429/503 语义不同(客户端退避 vs 等运维),不许再揉在一起。
+    #[test]
+    fn acquire_error_status_忙429_没号503_模型400() {
+        use scheduler::AcquireError as A;
+        assert_eq!(acquire_error_status(&A::AllBusy), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(acquire_error_status(&A::AllRpmLimited), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(acquire_error_status(&A::AllDisabled), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(acquire_error_status(&A::Empty), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(acquire_error_status(&A::GroupEmpty), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(acquire_error_status(&A::NoModelSupport), StatusCode::BAD_REQUEST);
     }
 
     /// 上游自己发来的 error 载荷若没带 type,也要补上。
@@ -3273,11 +3336,41 @@ mod error_shape_tests {
     }
 }
 
+/// 上游流内 error 事件的 type → 内部 kind(窥探期首内容即 error 时用)。
+/// 只映射重试语义明确的三个;其余归 `Other`(502,保守可重试)。payload 本身是
+/// 上游原文,只进日志 —— 对外文案走 kind 的 client_message,脱敏纪律不变。
+fn sse_error_event_kind(ev: &SseEvent) -> UpstreamErrorKind {
+    match ev.data.pointer("/error/type").and_then(|t| t.as_str()) {
+        Some("rate_limit_error") => UpstreamErrorKind::RateLimited,
+        Some("overloaded_error") => UpstreamErrorKind::Overloaded,
+        Some("invalid_request_error") => UpstreamErrorKind::BadRequest,
+        _ => UpstreamErrorKind::Other,
+    }
+}
+
+/// 窥探缓冲里的最后一份 Usage(dario 在 EOF/出错前刻意先产 Usage,
+/// gw-dario chat.rs:526;Fail/Empty 分支不重放缓冲,不单独取出就会漏计费)。
+fn buffered_usage(
+    buffered: &[Result<StreamItem, gw_core::error::UpstreamError>],
+) -> Option<ChatUsage> {
+    buffered.iter().rev().find_map(|it| match it {
+        Ok(StreamItem::Usage(u)) => Some(u.clone()),
+        _ => None,
+    })
+}
+
 fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
     match kind {
         UpstreamErrorKind::BadRequest | UpstreamErrorKind::ModelNotAvailable => {
             StatusCode::BAD_REQUEST
         }
+        // 确定性内容级空流(疑 guardrail / 不支持的输入):内部语义本就"不换号、
+        // 重试同一内容无意义",502 只会诱发网关/客户端的自动重试风暴(放大 error
+        // 招封号,见 error.rs EmptyResponse 注释)。400 止住重试、把文案直接亮给
+        // 用户(2026-08-24 用户报障:opus-5 封控只收到裸断流)。
+        // ⚠️ 与之正交的瞬态停滞(cursor Run 90s 只有心跳)已在源头改挂 ServerError
+        // (gw-cursor chat.rs STALL_TIMEOUT 分支),不会冒到这条 arm 被误标成 400。
+        UpstreamErrorKind::EmptyResponse => StatusCode::BAD_REQUEST,
         UpstreamErrorKind::Overloaded => overloaded_status(),
         _ => StatusCode::BAD_GATEWAY,
     }
@@ -3309,6 +3402,30 @@ fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
 ///   key 或请求有问题)
 fn anthropic_error_type(kind: UpstreamErrorKind) -> &'static str {
     error_type_for_status(upstream_status(kind))
+}
+
+/// 选号失败原因 → 对外状态码。
+///
+/// 独立成函数的理由:① 映射本身可单测(下次有人改回去编译器+测试一起拦);
+/// ② 穷尽 match(**不要改回二分 if**):新增变体时编译器强制在这里做出显式决策,
+/// 而不是默默落进 503 —— GroupEmpty 与 NoModelSupport 的差异正是靠这里区分的。
+fn acquire_error_status(e: &scheduler::AcquireError) -> StatusCode {
+    match e {
+        // 客户侧可解(换模型/升级订阅),重试无用 → 400。
+        scheduler::AcquireError::NoModelSupport => StatusCode::BAD_REQUEST,
+        // 容量类但**稍后自行恢复**:并发满 / RPM 窗口 → 429
+        // (`rate_limit_error`,SDK/new-api 的标准退避重试信号;
+        // 2026-08-24 用户报障:503 经网关转成 502,用户完全看不出是"忙",
+        // 而 429 是所有客户端都认识的"稍后再来"。已验 new-api 侧:默认仅
+        // 401 触发渠道禁用(status_code_ranges.go),429 与 503 一样走普通重试)。
+        scheduler::AcquireError::AllBusy | scheduler::AcquireError::AllRpmLimited => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        // 池子/分组的配置或运行时状态(没号/全禁),与"忙"语义不同 → 503。
+        scheduler::AcquireError::AllDisabled
+        | scheduler::AcquireError::GroupEmpty
+        | scheduler::AcquireError::Empty => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 /// 状态码 → Anthropic `error.type`。
@@ -3765,10 +3882,11 @@ async fn finish_web_search_response(
         }
         Err(e) => {
             tracing::warn!(account = %account_id, kind = ?e.kind, "web search 回环失败: {e}");
-            st.scheduler
-                .report_failure_with_gen(&account_id, e.kind, lease.suspend_gen);
-            drop(lease);
-            upstream_error_response_wire(wire, &e)
+            // 统一出口:上报 + 失败请求日志(原先此分支漏记,失败在日志里不可见)
+            // + 释放 lease + 对外错误响应(2026-08-24 codex 审查 major#3)。
+            // websearch 的零产出**已烧过上游搜索回环**,按失败上报(report=true)——
+            // 与普通流的零事件窥探分支(report=false)不同是有意的:那条没烧上游。
+            fail_pre_first_byte(&st, lease, req, client_key, &account, started_at, wire, &e, None, true)
         }
     }
 }
@@ -3785,7 +3903,7 @@ async fn finish_response(
     wire: Wire,
 ) -> axum::response::Response {
     if req.stream {
-        // 流式:返回惰性 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库 usage+请求日志)。
+        // 流式:首项窥探后返回 SSE 响应,收尾走 StreamCtx::Drop(同步上报 + detach 落库 usage+请求日志)。
         stream_response(
             st,
             lease,
@@ -3796,6 +3914,7 @@ async fn finish_response(
             started_at,
             wire,
         )
+        .await
     } else {
         // 非流式:此处即时抽干流、折叠成单个 Messages JSON。
         collect_response(
@@ -4020,6 +4139,15 @@ const STREAM_IDLE_KEEPALIVE: std::time::Duration = std::time::Duration::from_sec
 /// "慢还是死"——这是不额外消耗上游配额就能拿到该答案的唯一途径。
 const STREAM_IDLE_ABORT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// 流式响应的**首项窥探**超时(2026-08-24 用户报障:拒答/空流只能看到 200 裸断)。
+///
+/// 上游拒答(疑 guardrail)/零产出错误的形态是"首项即 Err 或零项流",且来得很快
+/// (生产实测 2-6s);而 grok 隐藏推理的首个内容要 20-60s。10s 足以干净切开:
+/// 窗口内拿到 Err/None → 直接回真实错误状态与文案;超时 → 判定为慢首 token,
+/// 回退现有 200 + keepalive 行为(零回归)。取值若需调整,按上游漂移再改,
+/// 宁可保守(大)不可冒进(小)——小了会把长思考误判成"快路径"而毫无意义。
+const PEEK_FIRST_ITEM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 当前开着的内容块种类(带块索引)。保活帧必须**贴合当前块类型**:Anthropic SSE 里
 /// 往 tool_use 块塞 text_delta 是非法的,客户端解析器会错乱。只跟踪这三种能安全附加
 /// 零增量的块;其余(如 redacted_thinking,它没有增量形态)一律视为"无可附着的块"。
@@ -4161,16 +4289,106 @@ fn wire_event(f: WireFrame) -> Event {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stream_response(
+#[allow(clippy::too_many_arguments)]
+async fn stream_response(
     st: Arc<WorkerState>,
     lease: scheduler::AccountLease,
-    stream: gw_core::provider::ChatStream,
+    mut stream: gw_core::provider::ChatStream,
     req: ChatRequest,
     client_key: String,
     account: Arc<Account>,
     started_at: std::time::Instant,
     wire: Wire,
 ) -> axum::response::Response {
+    // 首项窥探(2026-08-24 用户报障):上游拒答(疑 guardrail)/空流的形态是"前导帧
+    // 之后 Err 或流尽",老路同步返回 200 SSE,客户端只看到裸断(Claude Code 只会说
+    // "check any proxy")。在响应头定稿前窥探:窗口内压前导帧,Err/流尽 → 回真实
+    // 错误状态+文案;内容帧/超时 → 缓冲拼回流首,后续逐字节不变。router 等 worker
+    // 响应头再转发(router/mod.rs:634),状态如实穿透,无需改 router。
+    //
+    // ⚠️ 不能见到任意 Ok 首项就提交(codex 审查 blocker):kiro 空响应会**先急发
+    // message_start**、确认零内容后才发 Err(EmptyResponse)(gw-kiro chat.rs:885/1175);
+    // dario 的零 SSE 流也会先产内部 Usage(gw-dario chat.rs:536)。所以窗口内要把
+    // **前导帧**(message_start / Usage / UpstreamCut)压进缓冲继续窥探,直到:
+    // ① Err → 按首包前失败回显真实状态;② 流尽 → 零产出按 EmptyResponse 回显;
+    // ③ 内容帧(其余一切 SSE)→ 缓冲原样拼回流首,后续路径逐字节不变;
+    // ④ 超时(长思考慢首 token)→ 同样拼回,回退现有 200 + keepalive 行为。
+    enum Verdict {
+        /// 提交 200:见到内容帧(缓冲含它)或窥探超时。
+        Commit,
+        /// 窗口内拿到上游硬错误。
+        Fail(gw_core::error::UpstreamError),
+        /// 窗口内流尽:零产出。
+        Empty,
+    }
+    let deadline = tokio::time::Instant::now() + PEEK_FIRST_ITEM_TIMEOUT;
+    let mut buffered: Vec<Result<StreamItem, gw_core::error::UpstreamError>> = Vec::new();
+    let verdict = loop {
+        // `stream.next()` 取消安全(元素只在 Poll::Ready 时取走),超时丢弃 future
+        // 不会吞掉任何事件 —— 超时的 Commit 只是把缓冲拼回首位,零丢失。
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Err(e))) => break Verdict::Fail(e),
+            Ok(Some(Ok(item))) => {
+                match &item {
+                    // dario 会把上游 error 帧包成 Ok(Sse)(gw-dario chat.rs:510):
+                    // 首内容就是 error 时 Commit 成 200 会把拒答藏回流内,按上游
+                    // 硬错误处理(2026-08-24 codex 复审 blocker#1)。
+                    StreamItem::Sse(ev) if ev.event == "error" => {
+                        let kind = sse_error_event_kind(ev);
+                        break Verdict::Fail(gw_core::error::UpstreamError::new(
+                            kind,
+                            format!("上游流内 error 事件(窥探期): {}", ev.data),
+                        ));
+                    }
+                    // 内容帧(除 message_start/ping 外的 SSE)才提交 200。
+                    // ping 是保活帧,不证明内容;message_start 见上方 blocker 注释。
+                    StreamItem::Sse(ev) if ev.event != "message_start" && ev.event != "ping" => {
+                        buffered.push(Ok(item));
+                        break Verdict::Commit;
+                    }
+                    // 前导帧(message_start / ping / Usage / UpstreamCut):压缓冲继续窥探。
+                    _ => buffered.push(Ok(item)),
+                }
+            }
+            Ok(None) => break Verdict::Empty,
+            Err(_) => break Verdict::Commit,
+        }
+    };
+    let stream: gw_core::provider::ChatStream = match verdict {
+        Verdict::Commit => Box::pin(futures::stream::iter(buffered).chain(stream)),
+        Verdict::Fail(e) => {
+            // 首项(或前导后)即上游错误 = 首包前失败:与主 handler「chat 失败」分支
+            // 同口径(report_failure + 失败请求日志 + 对外错误状态),只是把 200 空流
+            // 换成真实状态码。不另起换号重试:与今天流内 Err 分支的行为一致。
+            tracing::warn!(
+                account = %lease.account_id(),
+                kind = ?e.kind,
+                "流在零产出阶段即上游错误,按首包前失败回显: {e}"
+            );
+            let usage = buffered_usage(&buffered);
+            return fail_pre_first_byte(
+                &st, lease, &req, &client_key, &account, started_at, wire, &e, usage, true,
+            );
+        }
+        Verdict::Empty => {
+            // 零产出流:**既不报成功也不报失败**(比旧口径保守 —— 旧路径
+            // StreamCtx::Drop 会 report_success_observed(false) 顺带清 429 连击,
+            // 此处刻意不动账号健康状态),但客户端必须拿到明确错误而非 200 空流。
+            let e = gw_core::error::UpstreamError::new(
+                UpstreamErrorKind::EmptyResponse,
+                "上游空响应(零事件流)".to_string(),
+            );
+            tracing::warn!(
+                account = %lease.account_id(),
+                "流零内容结束(缓冲仅前导帧),按 EmptyResponse 回显"
+            );
+            let usage = buffered_usage(&buffered);
+            return fail_pre_first_byte(
+                &st, lease, &req, &client_key, &account, started_at, wire, &e, usage, false,
+            );
+        }
+    };
+
     /// unfold 累积态:lease 持有到流结束;reported 防重复上报;last_usage 缓存终结用量。
     struct StreamCtx {
         st: Arc<WorkerState>,
@@ -5509,8 +5727,10 @@ mod tests {
         // 既有映射一个都不能变。
         assert_eq!(upstream_status(K::BadRequest), StatusCode::BAD_REQUEST);
         assert_eq!(upstream_status(K::ModelNotAvailable), StatusCode::BAD_REQUEST);
+        // 确定性内容级空流 → 400(止住重试风暴,文案亮给用户;见 upstream_status 注释)。
+        assert_eq!(upstream_status(K::EmptyResponse), StatusCode::BAD_REQUEST);
         for k in [K::ServerError, K::Network, K::RateLimited, K::QuotaExhausted,
-                  K::TokenInvalid, K::TemporarilyBlocked, K::EmptyResponse, K::Other] {
+                  K::TokenInvalid, K::TemporarilyBlocked, K::Other] {
             assert_eq!(upstream_status(k), StatusCode::BAD_GATEWAY, "{k:?} 应保持 502");
         }
     }
@@ -6063,7 +6283,8 @@ mod tests {
             Arc::new(acct(&[])),
             std::time::Instant::now(),
             Wire::Anthropic,
-        );
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body = String::from_utf8_lossy(&bytes).to_string();
@@ -6084,7 +6305,8 @@ mod tests {
             Arc::new(acct(&[])),
             std::time::Instant::now(),
             Wire::Anthropic,
-        );
+        )
+        .await;
         let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         assert!(st.scheduler.is_draining("a"), "窗口内两次 cut 应进软冷却");
         let snap = st.scheduler.status_snapshot();
@@ -6257,7 +6479,8 @@ mod tests {
             Arc::new(acct(&[])),
             std::time::Instant::now(),
             Wire::OpenAiChat { include_usage: true },
-        );
+        )
+        .await;
         let body = sse_body(resp).await;
         // ChatCompletions 不写 event 行 —— 写了会让只认 data: 的解析器丢帧。
         assert!(!body.contains("event: "), "chat 线缆不该有 event 行:\n{body}");
@@ -6287,7 +6510,8 @@ mod tests {
             Arc::new(acct(&[])),
             std::time::Instant::now(),
             Wire::OpenAiResponses,
-        );
+        )
+        .await;
         let body = sse_body(resp).await;
         // Responses 每帧都必须带 event 名,客户端按它分发。
         assert!(body.contains("event: response.created"));
@@ -6295,6 +6519,194 @@ mod tests {
         assert!(body.contains("event: response.completed"));
         assert!(!body.contains("[DONE]"), "Responses 没有 [DONE] 这个概念");
         assert!(!body.contains("message_stop"));
+    }
+
+    /// 首项窥探(2026-08-24 用户报障):流首项即上游错误 → 直接回真实错误状态+文案,
+    /// 不再是 200 空流(Claude Code 只会说 "check any proxy")。
+    #[tokio::test]
+    async fn 首项即错误_窥探后回真实错误状态() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            chat_stream(vec![Err(UpstreamError::new(
+                UpstreamErrorKind::EmptyResponse,
+                "上游空响应(零内容产出)".to_string(),
+            ))]),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::Anthropic,
+        )
+        .await;
+        // EmptyResponse → 400(止住对同一被拒内容的重试风暴),文案含可操作提示。
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = sse_body(resp).await;
+        assert!(body.contains("invalid_request_error"), "{body}");
+        assert!(body.contains("安全审核"), "文案必须点出疑 guardrail: {body}");
+        assert!(!body.contains("零内容产出"), "内部原文不外泄: {body}");
+    }
+
+    /// 零项流(上游零事件结束)→ 按 EmptyResponse 回显 400,而非 200 空 SSE。
+    #[tokio::test]
+    async fn 零项流_窥探后按空响应回显() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            chat_stream(vec![]),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::Anthropic,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = sse_body(resp).await;
+        assert!(body.contains("invalid_request_error"), "{body}");
+    }
+
+    /// 前导帧不证明有内容:kiro 空响应的真实形态是 message_start 急发**之后**才 Err
+    /// (gw-kiro chat.rs:885/1175)——窥探必须压过前导帧,不能被 message_start 骗提交
+    /// (2026-08-24 codex 审查 blocker)。
+    #[tokio::test]
+    async fn 前导message_start后错误_仍按首包前失败回显() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            chat_stream(vec![
+                Ok(StreamItem::Sse(SseEvent::new(
+                    "message_start",
+                    serde_json::json!({"message":{"model":"grok-4.5","usage":{"input_tokens":7}}}),
+                ))),
+                Err(UpstreamError::new(
+                    UpstreamErrorKind::EmptyResponse,
+                    "上游空响应(零内容产出)".to_string(),
+                )),
+            ]),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::Anthropic,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = sse_body(resp).await;
+        assert!(body.contains("invalid_request_error"), "{body}");
+        assert!(body.contains("安全审核"), "{body}");
+    }
+
+    /// Usage 也是前导(dario 零 SSE 流会先产内部 Usage,gw-dario chat.rs:536):
+    /// [Usage, 流尽] → 按 EmptyResponse 400。
+    #[tokio::test]
+    async fn 前导usage后流尽_按空响应回显() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            chat_stream(vec![Ok(StreamItem::Usage(ChatUsage {
+                input_tokens: 7,
+                output_tokens: 0,
+                ..Default::default()
+            }))]),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::Anthropic,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// 正常流:message_start/Usage 只是前导,内容帧到来才提交 200;缓冲拼回后事件
+    /// 顺序与原文逐字节一致(message_start 不得丢/不得重复,Usage 不丢给收尾计费)。
+    #[tokio::test]
+    async fn 正常流_前导缓冲拼回_顺序不变() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        // 前导帧里夹一份 Usage(dario 形态),验证它随缓冲拼回不丢、且不误触发 Commit。
+        let mut items = vec![
+            Ok(StreamItem::Sse(SseEvent::new(
+                "message_start",
+                serde_json::json!({"message":{"model":"grok-4.5","usage":{"input_tokens":7}}}),
+            ))),
+            Ok(StreamItem::Usage(ChatUsage {
+                input_tokens: 7,
+                output_tokens: 0,
+                ..Default::default()
+            })),
+        ];
+        // 拼上正文段(复用现成 fixture 的内容部分,跳过它自己的 message_start)。
+        let mut rest: Vec<_> = {
+            let mut buf = Vec::new();
+            let mut s = text_reply_stream();
+            while let Some(it) = s.next().await {
+                buf.push(it);
+            }
+            buf.drain(1..).collect()
+        };
+        items.append(&mut rest);
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            chat_stream(items),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::Anthropic,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = sse_body(resp).await;
+        assert_eq!(
+            body.matches("message_start").count(),
+            1,
+            "message_start 恰好一次,不得丢也不得重复: {body}"
+        );
+        assert!(body.contains("message_stop"));
+    }
+
+    /// dario 形态:上游 error 帧被包成 Ok(Sse)(gw-dario chat.rs:510)——窥探期首内容
+    /// 即 error 时不得 Commit 成 200,按 kind 回真实状态(2026-08-24 codex blocker#1)。
+    #[tokio::test]
+    async fn 窥探期error事件_按kind回真实状态() {
+        let st = wire_state();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            chat_stream(vec![
+                Ok(StreamItem::Sse(SseEvent::new(
+                    "message_start",
+                    serde_json::json!({"message":{"model":"m","usage":{"input_tokens":3}}}),
+                ))),
+                Ok(StreamItem::Sse(SseEvent::new(
+                    "error",
+                    serde_json::json!({"type":"error","error":{"type":"rate_limit_error","message":"上游原文"}}),
+                ))),
+            ]),
+            req_model_m(),
+            String::new(),
+            Arc::new(acct(&[])),
+            std::time::Instant::now(),
+            Wire::Anthropic,
+        )
+        .await;
+        // rate_limit_error → RateLimited → 502(可重试),绝不是 200。
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = sse_body(resp).await;
+        assert!(body.contains("请求过于频繁"), "{body}");
+        assert!(!body.contains("上游原文"), "上游原文不外泄: {body}");
     }
 
     #[tokio::test]

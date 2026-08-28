@@ -545,11 +545,32 @@ pub async fn run_loop(
             }
             Err(e) => {
                 return Err(UpstreamError::new(
-                    UpstreamErrorKind::ServerError,
+                    // 零事件集 = 上游零产出(拒答/空流),归一成 EmptyResponse,与
+                    // worker 侧 P2/P3 的对外语义一致(400 + guardrail 提示文案);
+                    // 其它折叠失败仍按 ServerError。
+                    if events.is_empty() {
+                        UpstreamErrorKind::EmptyResponse
+                    } else {
+                        UpstreamErrorKind::ServerError
+                    },
                     format!("web search 回环折叠失败: {e}"),
                 ));
             }
         };
+        // 零内容语义与窥探对齐(2026-08-24 codex 复审 major#3):fold 只要有
+        // message_start 就成功(gw-core fold.rs),[message_start, Usage] 零内容流
+        // 会被合成 content:[] 的 200 成功;普通流式路径里它被窥探判 Empty(400)。
+        if round == 1
+            && msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|c| c.is_empty())
+        {
+            return Err(UpstreamError::new(
+                UpstreamErrorKind::EmptyResponse,
+                "web search 首轮零产出(仅前导帧,无内容块)".to_string(),
+            ));
+        }
         if msg_id.is_empty() {
             if let Some(id) = msg.get("id").and_then(Value::as_str) {
                 msg_id = id.to_string();

@@ -3,7 +3,11 @@
 //! 真实金标准(test-cred-free.json 实测 generateAssistantResponse 200):
 //! 响应 `application/vnd.amazon.eventstream`,frame 序列:
 //! - `assistantResponseEvent` `{"content":"...","modelId":"..."}` — 文本(可多帧增量)
-//! - `reasoningContentEvent` `{"text":..,"signature":..}` — Opus 原生 thinking 独立通道
+//! - `reasoningContentEvent` — Opus 原生 thinking 独立通道。payload 是 Smithy
+//!   `ReasoningContent` **union**:常见一支 `{"text":..,"signature":..}`,另一支带
+//!   `redactedContent`(安全遮蔽的加密推理;拆包 1.0.369 客户端确实从响应读
+//!   `reasoningRedactedContent`)。**我方目前只实现前一支下行**,后一支仅抓样存证
+//!   (见 [`crate::redacted_probe`]),其 signature 被显式丢弃以免污染归属。
 //! - `tokenUsageEvent` `{"uncachedInputTokens":..,"cacheReadInputTokens":..,..}` — 精确计量
 //! - `contextUsageEvent` `{"contextUsagePercentage":..}` — 上下文占比(tokenUsage 缺席时回退)
 //! - `meteringEvent` `{"unit":"credit","usage":..}` — credit 计费(v53 已不用于缓存反推)
@@ -419,9 +423,12 @@ struct BlockTracker {
     text_index: Option<usize>,
     /// 是否见过原生 reasoning(见过后正文绕过任何 inline 解析,直接 text_delta)。
     native_reasoning_seen: bool,
-    /// 关闭 thinking 块时透传的签名(已重写 f6→官方名;上游无签名则 None)。
+    /// 关闭 thinking 块时透传的签名(**原样透传上游字节,不改写 f6**;上游无签名则 None
+    /// → 走 `synthesize_signature` 合成)。2026-08-19 起停止改写:签名要随客户端历史回传
+    /// 上行验签,改写过的会吃 400 THINKING_SIGNATURE_INVALID。
     reasoning_signature: Option<String>,
-    /// 客户端请求的官方模型名(签名重写/合成用)。
+    /// 客户端请求的官方模型名。**仅** `synthesize_signature` 用(上游无签名时的兜底);
+    /// 真签名已不再按它改写 f6。
     model: String,
     /// 累积的 thinking 文本(上游无签名时用于合成签名;native 与 inline 共用)。
     thinking_text: String,
@@ -502,6 +509,13 @@ impl BlockTracker {
         self.emit_signature = v;
     }
 
+    /// 当前是否有 thinking 块开着。**仅供 redacted 抓样记录上下文**
+    /// (对抗评审 r2 #5:样本要能回答"明文与 redacted 是否共存、谁先谁后")——
+    /// redacted 帧到达时若已有块开着,说明二者共存于同一段推理。
+    fn reasoning_block_open(&self) -> bool {
+        self.reasoning_active
+    }
+
     /// 处理 reasoningContentEvent:捕获签名 + 逐片发 thinking_delta。
     fn on_reasoning(&mut self, text: &str, signature: Option<&str>) -> Vec<SseEvent> {
         // 1) 先捕获签名(上游在 thinking 流最后一帧单独下发 {"signature":...},无 text)。
@@ -509,7 +523,10 @@ impl BlockTracker {
         //    回传上行做结构化 reasoningContent 回放,上游验签只认原代号,改写过的
         //    签名会吃 400 THINKING_SIGNATURE_INVALID(探针实测)。f6 代号泄漏给
         //    第三方检测平台的风险,用户已明确不关心(用户体验优先)。
-        //    历史上的改写签名由 converter 在回传时反写兼容(见 history.rs)。
+        //    历史遗留的改写签名(本次改动之前下发的,f6=官方名)在回传时按「代号不匹配」
+        //    **丢弃**,不做反写 —— 反写方案已评估否决:改写是破坏性覆盖(原 f6 字节不复存在),
+        //    反写只能照代号表重建,而重写用的是**客户端请求名**、与上游实际服务模型不恒等,
+        //    猜错即 400。宁可丢一轮推理。见 history.rs::build_reasoning_content。
         if let Some(sig) = signature {
             if !sig.is_empty() {
                 self.reasoning_signature = Some(sig.to_string());
@@ -611,7 +628,7 @@ impl BlockTracker {
 
     /// 关闭开着的 thinking 块(若有):发 signature_delta + content_block_stop。
     /// 时序铁律:stopped 块不能再 delta,故 signature 必须在 stop 前。
-    /// native 与 inline 路径共用:有真签名(已重写)用之,否则按累积 thinking 文本合成。
+    /// native 与 inline 路径共用:有真签名则**原样透传**,否则按累积 thinking 文本合成。
     fn close_reasoning_if_open(&mut self) -> Vec<SseEvent> {
         if !self.reasoning_active {
             return Vec::new();
@@ -619,7 +636,8 @@ impl BlockTracker {
         let mut events = Vec::new();
         if let Some(idx) = self.thinking_index {
             // emit_signature 关时:thinking 块照常闭合(content_block_stop),但**不发**
-            // signature_delta。Kiro 合成/重写签名是 Kiro 专用、对真 Anthropic/Bedrock 验签非法,
+            // signature_delta。Kiro **合成**签名是 Kiro 专用、对真 Anthropic/Bedrock 验签非法,
+            // (真签名自 2026-08-19 起原样透传、跨平台本就可验;此处风险只剩合成签名)
             // 多上游反代里跨通道漂移会被拒 THINKING_SIGNATURE_INVALID(见 converter::thinking_signature_enabled)。
             if self.emit_signature {
                 let signature = match &self.reasoning_signature {
@@ -874,6 +892,8 @@ fn async_stream_like(
         // 真 Anthropic/Bedrock 通道被拒)。每请求读一次,设置面板改后下个请求即生效。
         tracker.set_emit_signature(crate::converter::thinking_signature_enabled());
         let mut decoder = EventStreamDecoder::new();
+        // 本响应内已抓样的 redacted 帧序号(对抗评审 r2 #5:样本要能回答"顺序与共存")。
+        let mut reasoning_seq: u32 = 0;
         // 显式 stop_reason(model_context_window_exceeded / max_tokens)。None = 收尾按
         // tool_use > end_turn 优先级推导(🔵 kiro.rs stream.rs get_stop_reason)。
         let mut stop_reason: Option<String> = None;
@@ -977,6 +997,37 @@ fn async_stream_like(
                                 if let Ok(v) = frame.payload_as_json::<serde_json::Value>() {
                                     let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                     let sig = v.get("signature").and_then(|s| s.as_str());
+                                    // 抓样(2026-08-20,对抗评审 #1 + 用户决策"先监视不处理"):
+                                    // `redactedContent` 是 `ReasoningContent` union 的一支,
+                                    // **搭在本事件 payload 里**、不需要独立事件类型 —— 拆包
+                                    // 1.0.369 的客户端确实从响应读 `reasoningRedactedContent`
+                                    // (见 `oe12` / `withReasoningContent` 第 4 参)。
+                                    // 我方**尚未实现该支下行**(Anthropic 文档只给非流式块形状,
+                                    // 未描述 SSE 形状,猜错=发畸形流),所以这里只存证不处理:
+                                    // 本段推理仍会被下方 `on_reasoning` 在 text 为空处丢弃。
+                                    // 详见 crate::redacted_probe 的模块文档。
+                                    let has_redacted =
+                                        crate::redacted_probe::payload_has_redacted(&v);
+                                    if has_redacted {
+                                        crate::redacted_probe::capture(
+                                            &v,
+                                            &model,
+                                            reasoning_seq,
+                                            tracker.reasoning_block_open(),
+                                        );
+                                        reasoning_seq += 1;
+                                    }
+                                    // 【对抗评审 r2 #1 High】redacted 帧的 `signature` **绝不能**
+                                    // 进 tracker。`on_reasoning` 在 `text.is_empty()` **之前**就捕获
+                                    // 签名,所以序列
+                                    //   thinking A → signature A → redacted R + signature R
+                                    // 会让 R 的签名覆盖 A,收尾下发「thinking A + signature R」——
+                                    // 这不是丢一段推理,是**制造错误的密文归属**:客户端把它写进历史,
+                                    // 下一轮上行验签失败 → 400 THINKING_SIGNATURE_INVALID → 剥全部
+                                    // 历史 reasoning 重试。比缺失严重得多。
+                                    // 「只观测不处理」必须**真的**零副作用:text 照常透传(若有),
+                                    // 但签名按 None 处理。
+                                    let sig = if has_redacted { None } else { sig };
                                     for ev in tracker.on_reasoning(text, sig) {
                                         if tx.send(Ok(StreamItem::Sse(ev))).await.is_err() {
                                             return;
@@ -1153,8 +1204,16 @@ fn async_stream_like(
         let output_tokens = tracker.output_tokens.min(i32::MAX as i64) as i32;
         // report_total 优先级:tokenUsage 真值 > contextUsage 估算 > 模拟器 sim_total 兜底。
         let final_input_tokens = report_total.unwrap_or(sim_total).max(0);
-        // 零输出保护:本轮无产出则不计缓存(用户没拿到东西不该为缓存付费)。
-        let zero_output = output_tokens <= 0;
+        // 零产出保护:本轮没交付任何实质内容(正文/工具调用/思考)则不计缓存
+        // (用户没拿到东西不该为缓存付费)。
+        //
+        // ⚠️ 判据必须是 `produced_any_content()` 而不是 `output_tokens <= 0`:
+        // 裸工具调用(空参数 `{}` 的 tool_use)output_tokens 恰为 0,但用户实实在在
+        // 收到了 tool_use 并据此执行 —— 旧判据会把整轮的缓存折扣误清。
+        // (2026-08-24 生产实测:agentbridge 轮询循环里 get_messages({}) 每轮 327k
+        // 输入被全价计费,panel 显示"无缓存命中",而上游明明有缓存。)
+        // 真正的零事件空流自有 EmptyResponse 兜底(400,见零产出窥探)。
+        let zero_output = !tracker.produced_any_content();
         let cache_read = if zero_output {
             0
         } else {
@@ -1342,6 +1401,58 @@ mod tests {
         let evs = t.on_text("hello");
         assert_eq!(evs[0].data["index"], 0);
         assert_eq!(evs[0].data["content_block"]["type"], "text");
+    }
+
+    /// 【对抗评审 r2 #1 High】redacted 帧的签名**绝不能**覆盖合法 thinking 的签名。
+    ///
+    /// 真实序列:`thinking A → signature A → redacted R + signature R`。
+    /// `on_reasoning` 在 `text.is_empty()` **之前**捕获签名,所以若把 R 的签名喂进来,
+    /// 收尾会下发「thinking A + signature R」—— 制造错误的密文归属,客户端写进历史后
+    /// 下一轮上行验签失败 → 400 → 剥全历史 reasoning 重试。比丢一段推理严重得多。
+    /// 调用点(`async_stream_like` 的 reasoningContentEvent 分支)据 `payload_has_redacted`
+    /// 把该帧的 sig 置 None,本测试锁住"置 None 后归属正确"。
+    #[test]
+    fn redacted_frame_signature_must_not_overwrite_thinking_signature() {
+        const SIG_A: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.on_reasoning("thinking A", None); // 开块 + 发 delta
+        t.on_reasoning("", Some(SIG_A)); // 签名帧(无 text)
+        // redacted 帧:调用点已把 sig 置 None,text 仍照常透传(此例为空)。
+        t.on_reasoning("", None);
+        let close = t.close_reasoning_if_open();
+        let sig = close
+            .iter()
+            .find(|e| tag(e) == "content_block_delta:signature_delta")
+            .expect("应有 signature_delta")
+            .data["delta"]["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(sig, SIG_A, "必须仍是 thinking A 自己的签名");
+    }
+
+    /// 反证:证明上面那条抑制是**承重**的 —— 若把 redacted 帧的签名喂进 tracker,
+    /// 归属确实会被污染。这条测试存在的意义是:有人日后"简化"掉调用点的
+    /// `let sig = if has_redacted { None } else { sig };` 时,能立刻看到代价。
+    #[test]
+    fn unsuppressed_redacted_signature_would_corrupt_attribution() {
+        const SIG_A: &str = "Ev4BCmMIDhABGAIqQDLCxOcAxIGpEWzaBVN/7Rhnn7KPNqmlN3pQgWXeogdRhOlKAvxTylSWauMzkhf1NcylYW38yAUC463X+Bvj1YMyDWNsYXVkZS1xdWluY2U4AEIIdGhpbmtpbmcSDJZPrLrFRh2MFQgTIRoMLunMMbV2gAt9AB3FIjAfpHy8DkJKmF8LaQs9OEJhpMGgRwQvd6qHoPV5Rz2jXdeuhTBoQnCIMS44GqTamasqSZscuKHM930rQ31rcriqFj3AzLv8RnxlyFiu/fdDdt9YiFKtO38Cy4iqw35ZEKQr9J0/Mkru/S451tutqRClvGDgnIrJ2N0D3dcYAQ==";
+        const SIG_R: &str = "cmVkYWN0ZWQtc2lnbmF0dXJlLW5vdC1vdXJz";
+        let mut t = BlockTracker::new("claude-opus-4-8".to_string(), false);
+        t.on_reasoning("thinking A", None);
+        t.on_reasoning("", Some(SIG_A));
+        t.on_reasoning("", Some(SIG_R)); // ← 未抑制:模拟 bug
+        let close = t.close_reasoning_if_open();
+        let sig = close
+            .iter()
+            .find(|e| tag(e) == "content_block_delta:signature_delta")
+            .expect("应有 signature_delta")
+            .data["delta"]["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(sig, SIG_R, "未抑制时确实会被覆盖 —— 这就是必须抑制的理由");
+        assert_ne!(sig, SIG_A);
     }
 
     #[test]

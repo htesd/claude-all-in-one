@@ -252,7 +252,10 @@ mod tests {
 
     #[test]
     fn reads_exp_from_jwt_payload() {
-        assert_eq!(token_expires_at(&jwt_with_exp(1_800_000_000)), Some(1_800_000_000));
+        assert_eq!(
+            token_expires_at(&jwt_with_exp(1_800_000_000)),
+            Some(1_800_000_000)
+        );
         assert_eq!(token_expires_at("garbage"), None);
         assert_eq!(token_expires_at("a.b.c"), None);
         assert_eq!(token_expires_at(""), None);

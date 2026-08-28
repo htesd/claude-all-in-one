@@ -126,8 +126,14 @@ pub async fn get_on_demand(
     account: &Account,
     api_host: &str,
 ) -> Result<OnDemandQuota, UpstreamError> {
-    let text =
-        dashboard_call(client, account, api_host, "GetHardLimit", &serde_json::json!({})).await?;
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "GetHardLimit",
+        &serde_json::json!({}),
+    )
+    .await?;
     parse_hard_limit(&text)
 }
 
@@ -193,10 +199,7 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
         )
     })?;
     let plan = v.plan_usage.ok_or_else(|| {
-        UpstreamError::new(
-            UpstreamErrorKind::Other,
-            "Cursor 用量响应缺少 planUsage",
-        )
+        UpstreamError::new(UpstreamErrorKind::Other, "Cursor 用量响应缺少 planUsage")
     })?;
 
     // ## 三种形态,不是两种
@@ -218,8 +221,16 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
     let free_plan = plan.included_spend.is_none() && plan.limit.is_none();
     // 官方单位美分 → 美元。剩余优先用服务端 remaining,缺则 limit - includedSpend。
     // FREE 档没有套餐额度,三个数都是 0(不是"未知":免费号的套餐内额度确实是 0)。
-    let used = if free_plan { 0.0 } else { cents_to_usd(plan.included_spend.ok_or_else(missing)?) };
-    let limit = if free_plan { 0.0 } else { cents_to_usd(plan.limit.ok_or_else(missing)?) };
+    let used = if free_plan {
+        0.0
+    } else {
+        cents_to_usd(plan.included_spend.ok_or_else(missing)?)
+    };
+    let limit = if free_plan {
+        0.0
+    } else {
+        cents_to_usd(plan.limit.ok_or_else(missing)?)
+    };
     let remaining = match plan.remaining {
         Some(r) => cents_to_usd(r),
         None => limit - used,
@@ -228,13 +239,20 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
     // 档位:判据就是上面那个形态差异(有套餐额度 = 付费)。**不去猜具体档位名** ——
     // GetMe 里没有会员字段(实测只有 authId/email/country/isEnterpriseUser 之类),
     // 上游也没有别的只读端点给档位名,所以只报能证实的二分。
-    q.plan_tier = Some(if free_plan { "FREE".into() } else { "PAID".into() });
+    q.plan_tier = Some(if free_plan {
+        "FREE".into()
+    } else {
+        "PAID".into()
+    });
     // from_used_limit 重算 remaining;若服务端给了 remaining(含超额负值语义外的口径),
     // 以服务端为准,避免和 includedSpend/limit 舍入不一致。
     q.remaining = remaining;
     if limit > 0.0 {
         q.percent_used = used / limit * 100.0;
-    } else if let Some(p) = plan.total_percent_used.filter(|p| p.is_finite() && *p >= 0.0) {
+    } else if let Some(p) = plan
+        .total_percent_used
+        .filter(|p| p.is_finite() && *p >= 0.0)
+    {
         q.percent_used = p;
     }
     q.currency = Some("USD".into());
@@ -248,10 +266,18 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
     let mut windows = Vec::new();
     let valid = |p: &f64| p.is_finite() && *p >= 0.0;
     if let Some(p) = plan.auto_percent_used.filter(valid) {
-        windows.push(QuotaWindow { label: "auto".into(), percent_used: p, reset_at: None });
+        windows.push(QuotaWindow {
+            label: "auto".into(),
+            percent_used: p,
+            reset_at: None,
+        });
     }
     if let Some(p) = plan.api_percent_used.filter(valid) {
-        windows.push(QuotaWindow { label: "api".into(), percent_used: p, reset_at: None });
+        windows.push(QuotaWindow {
+            label: "api".into(),
+            percent_used: p,
+            reset_at: None,
+        });
     }
     q.windows = windows;
     // 超额已用/上限(美分 → 美元)。`spendLimitUsage` 在未开启超额时只有 limitType,
@@ -267,7 +293,9 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
         Some(OnDemandQuota {
             // 能给出超额额度/用量,说明超额是开着的。
             enabled: true,
-            limit: limit.filter(|l| *l > 0 && *l < UNLIMITED_SENTINEL).map(cents_to_usd),
+            limit: limit
+                .filter(|l| *l > 0 && *l < UNLIMITED_SENTINEL)
+                .map(cents_to_usd),
             used: cents_to_usd(used),
             unlimited: limit.is_some_and(|l| l >= UNLIMITED_SENTINEL),
         })
@@ -293,11 +321,7 @@ where
     }
     match Option::<Num>::deserialize(d)? {
         Some(Num::I(i)) => Ok(Some(i)),
-        Some(Num::S(s)) => s
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(Num::S(s)) => s.trim().parse().map(Some).map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
@@ -359,7 +383,10 @@ impl SpendLimitUsage {
         if let Some(u) = self.individual_used.or(self.overall_used) {
             return u;
         }
-        match (self.limit_cents(), self.individual_remaining.or(self.overall_remaining)) {
+        match (
+            self.limit_cents(),
+            self.individual_remaining.or(self.overall_remaining),
+        ) {
             // 差值可能因上游舍入为负,clamp 到 0:超额「已用」不存在负数语义。
             (Some(l), Some(r)) => (l - r).max(0),
             _ => 0,
@@ -410,7 +437,11 @@ mod tests {
         let q = parse_period_usage(body).expect("应解析");
         assert!((q.used - 232.22).abs() < 1e-9, "used={}", q.used);
         assert!((q.limit - 400.0).abs() < 1e-9, "limit={}", q.limit);
-        assert!((q.remaining - 167.78).abs() < 1e-9, "remaining={}", q.remaining);
+        assert!(
+            (q.remaining - 167.78).abs() < 1e-9,
+            "remaining={}",
+            q.remaining
+        );
         assert!(q.percent_used > 50.0 && q.percent_used < 60.0);
         assert!(
             q.currency.as_deref().is_some_and(|c| c.contains("USD")),
@@ -457,7 +488,11 @@ mod tests {
         let q = parse_period_usage(body).expect("字符串数字应解析");
         assert!((q.used - 232.22).abs() < 1e-9, "used={}", q.used);
         assert!((q.limit - 400.0).abs() < 1e-9, "limit={}", q.limit);
-        assert!((q.remaining - 167.78).abs() < 1e-9, "remaining={}", q.remaining);
+        assert!(
+            (q.remaining - 167.78).abs() < 1e-9,
+            "remaining={}",
+            q.remaining
+        );
     }
 
     /// **只缺一个**金额字段 = 上游改了字段/账号状态诡异 → 报错,绝不显示成零额度。
@@ -494,9 +529,17 @@ mod tests {
         assert_eq!(q.used, 0.0);
         assert_eq!(q.limit, 0.0);
         // 百分比仍要有:limit=0 时走上游给的 totalPercentUsed。
-        assert!((q.percent_used - 50.0).abs() < 1e-9, "percent={}", q.percent_used);
+        assert!(
+            (q.percent_used - 50.0).abs() < 1e-9,
+            "percent={}",
+            q.percent_used
+        );
         // 两条桶利用率照常承载 —— auto 桶 100% 正是 composer 不可用的直接证据。
-        let auto = q.windows.iter().find(|w| w.label == "auto").expect("应有 auto 窗口");
+        let auto = q
+            .windows
+            .iter()
+            .find(|w| w.label == "auto")
+            .expect("应有 auto 窗口");
         assert!((auto.percent_used - 100.0).abs() < 1e-9);
     }
 

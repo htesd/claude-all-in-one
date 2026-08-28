@@ -21,14 +21,29 @@ async fn main() {
     let mut got = None;
     for i in 1..=login::POLL_MAX_ATTEMPTS {
         match login::poll_once(&client, &flow).await {
-            Ok(PollOutcome::Done { access_token, refresh_token, auth_id }) => {
+            Ok(PollOutcome::Done {
+                access_token,
+                refresh_token,
+                auth_id,
+            }) => {
                 println!("\n✅ 登录成功（第 {i} 次轮询）");
-                println!("   access_token : {} 字符，前缀 {}…", access_token.len(), &access_token[..access_token.len().min(12)]);
-                println!("   refresh_token: {} 字符，前缀 {}…", refresh_token.len(), &refresh_token[..refresh_token.len().min(12)]);
+                println!(
+                    "   access_token : {} 字符，前缀 {}…",
+                    access_token.len(),
+                    &access_token[..access_token.len().min(12)]
+                );
+                println!(
+                    "   refresh_token: {} 字符，前缀 {}…",
+                    refresh_token.len(),
+                    &refresh_token[..refresh_token.len().min(12)]
+                );
                 println!("   两者相同     : {}", access_token == refresh_token);
                 println!("   auth_id      : {}", auth_id.as_deref().unwrap_or("(无)"));
                 if let Some(exp) = gw_cursor::auth::token_expires_at(&access_token) {
-                    println!("   有效期至     : {}", gw_cursor::auth::format_unix_utc(exp));
+                    println!(
+                        "   有效期至     : {}",
+                        gw_cursor::auth::format_unix_utc(exp)
+                    );
                 }
                 got = Some(access_token);
                 break;

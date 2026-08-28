@@ -881,17 +881,20 @@ impl AcquireError {
     /// 等于把渠道形态告诉客户),只进日志;客户端看这一份。
     ///
     /// 与 [`gw_core::error::UpstreamErrorKind::client_message`] 同口径:只区分
-    /// 「客户能做什么」——换模型(400) vs 等一等(503)。
+    /// 「客户能做什么」——换模型(400) vs 等一等(429 忙 / 503 没号)。
     pub fn client_message(&self) -> &'static str {
         match self {
             // 400:客户侧可解 —— 换个模型就行。
             AcquireError::NoModelSupport => "当前模型不可用,请更换模型后重试",
-            // 503:我方容量/配置态,客户只能等。
-            AcquireError::AllDisabled
-            | AcquireError::AllBusy
-            | AcquireError::AllRpmLimited
-            | AcquireError::Empty
-            | AcquireError::GroupEmpty => "服务暂时不可用,请稍后重试",
+            // 429:容量类、稍后自行恢复 —— 明说"忙",与 503 的"没号"分开
+            // (2026-08-24 用户报障:502 让用户完全看不出是并发满)。
+            AcquireError::AllBusy | AcquireError::AllRpmLimited => {
+                "当前请求量较大,请稍后重试"
+            }
+            // 503:我方配置/运行态(无账号/全禁用),客户只能等运维。
+            AcquireError::AllDisabled | AcquireError::Empty | AcquireError::GroupEmpty => {
+                "服务暂时不可用,请稍后重试"
+            }
         }
     }
 }

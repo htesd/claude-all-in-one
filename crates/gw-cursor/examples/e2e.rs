@@ -26,11 +26,9 @@ fn read_kv(db: &str, key: &str) -> Option<String> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .ok()?;
-    conn.query_row(
-        "SELECT value FROM ItemTable WHERE key=?1",
-        [key],
-        |row| row.get::<_, String>(0),
-    )
+    conn.query_row("SELECT value FROM ItemTable WHERE key=?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
     .ok()
 }
 
@@ -96,7 +94,9 @@ async fn main() {
     // CURSOR_MID_MODE=service 退回旧的 serviceMachineId 派生路径(仅对照实验)。
     // CURSOR_CONFIG_VERSION 可显式指定(调试用),否则留空让 provider 现取。
     let ide_mode = std::env::var("CURSOR_MID_MODE").as_deref() != Ok("service");
-    let explicit_cfg = std::env::var("CURSOR_CONFIG_VERSION").ok().filter(|s| !s.is_empty());
+    let explicit_cfg = std::env::var("CURSOR_CONFIG_VERSION")
+        .ok()
+        .filter(|s| !s.is_empty());
     // 磁盘缓存值仅用于观测比对(不再喂给 provider)。
     let _disk_cfg = read_config_version(&db);
     let (machine_id, mac_machine_id) = if ide_mode {
@@ -105,15 +105,33 @@ async fn main() {
             read_storage_json(&home, "telemetry.macMachineId").unwrap_or_default(),
         )
     } else {
-        (read_kv(&db, "storage.serviceMachineId").unwrap_or_default(), String::new())
+        (
+            read_kv(&db, "storage.serviceMachineId").unwrap_or_default(),
+            String::new(),
+        )
     };
     eprintln!(
         "token len={} mode={} machineId={} macMachineId={} configVersion={}",
         token.len(),
-        if ide_mode { "ide(真身份)" } else { "service(对照)" },
-        if machine_id.is_empty() { "(派生)".into() } else { mask(&machine_id) },
-        if mac_machine_id.is_empty() { "(无)".into() } else { mask(&mac_machine_id) },
-        match &explicit_cfg { Some(c) => format!("显式 {}", mask(c)), None => "(provider 现取 GetServerConfig)".into() },
+        if ide_mode {
+            "ide(真身份)"
+        } else {
+            "service(对照)"
+        },
+        if machine_id.is_empty() {
+            "(派生)".into()
+        } else {
+            mask(&machine_id)
+        },
+        if mac_machine_id.is_empty() {
+            "(无)".into()
+        } else {
+            mask(&mac_machine_id)
+        },
+        match &explicit_cfg {
+            Some(c) => format!("显式 {}", mask(c)),
+            None => "(provider 现取 GetServerConfig)".into(),
+        },
     );
 
     let mut extra = BTreeMap::new();
@@ -125,7 +143,10 @@ async fn main() {
         extra.insert("machine_id".to_string(), serde_json::json!(machine_id));
     }
     if !mac_machine_id.is_empty() {
-        extra.insert("mac_machine_id".to_string(), serde_json::json!(mac_machine_id));
+        extra.insert(
+            "mac_machine_id".to_string(),
+            serde_json::json!(mac_machine_id),
+        );
     }
     if let Some(cfg) = explicit_cfg {
         extra.insert("config_version".to_string(), serde_json::json!(cfg));
@@ -148,7 +169,11 @@ async fn main() {
     // 两次 `cargo run` 是两个进程,注册表各自为空,永远只会是 Opening。
     let prompts: Vec<String> = {
         let a: Vec<String> = std::env::args().skip(1).collect();
-        if a.is_empty() { vec![prompt.clone()] } else { a }
+        if a.is_empty() {
+            vec![prompt.clone()]
+        } else {
+            a
+        }
     };
 
     // 协议试错开关(默认 = 完整模拟真客户端)。用于对着真上游二分「哪些字段/帧必需」。
@@ -172,23 +197,40 @@ async fn main() {
         keep_stream_open: on("CURSOR_HALF_CLOSE"),
         // CURSOR_PROFILE=cli 走 2026-08-16 抓包的 CLI 形态(服务端持史,见 cli.rs)。
         profile: gw_cursor::cli::Profile::from_env(),
+        // CURSOR_NO_REPLAY=1 关掉续轮描述符回放。
+        //
+        // ⚠️ 这**不是**「另一种热续方案」:本地构造 `1.1` 那条支已按 08-23 实物删除
+        // (客户端从不自己构造续轮 `1.1`),所以关掉后 lookup 恒 None → 每轮 Opening
+        // 全量重铺。也就是说它比的是**「描述符增量」vs「CLI 形态全量重铺」**。
+        // 「描述符路线比内联热续省不省」那个问题的对照臂是 **clidrv**(49–60%),
+        // 不是本开关的任何一档。
+        wire_descriptor_replay: on("CURSOR_NO_REPLAY"),
     };
     eprintln!("tuning={tuning:?}");
     let provider = CursorProvider::new(CursorConfig::default()).with_tuning(tuning);
     // CURSOR_E2E_CONV 固定 conversation_id;不设则新会话。
-    let conversation_id = std::env::var("CURSOR_E2E_CONV")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    let conversation_id =
+        std::env::var("CURSOR_E2E_CONV").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     eprintln!("conversation_id={conversation_id}");
 
     // CURSOR_E2E_HISTORY=1:把所有参数当成**一个请求里的多轮历史**(user/assistant 交替),
     // 用来验「Anthropic 式的无状态重放上游认不认」。默认是连续多轮(每个参数一次请求)。
     let replay_history = std::env::var("CURSOR_E2E_HISTORY").as_deref() == Ok("1");
     let rounds: Vec<Vec<serde_json::Value>> = if replay_history {
-        vec![prompts.iter().enumerate().map(|(i, t)| serde_json::json!({
-            "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": t
-        })).collect()]
+        vec![prompts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                serde_json::json!({
+                    "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": t
+                })
+            })
+            .collect()]
     } else {
-        prompts.iter().map(|p| vec![serde_json::json!({"role":"user","content":p})]).collect()
+        prompts
+            .iter()
+            .map(|p| vec![serde_json::json!({"role":"user","content":p})])
+            .collect()
     };
 
     // 与真实 Anthropic 客户端一致:每轮**重放全量历史**(上一轮 user+assistant 进 messages)。
@@ -219,7 +261,11 @@ async fn main() {
         let with_tools = std::env::var("CURSOR_E2E_TOOLS").as_deref() == Ok("1");
         let mut auto_follow = with_tools;
         loop {
-            eprintln!("\n════════ 第 {} 轮(累计 {} 条消息)════════", i + 1, history.len());
+            eprintln!(
+                "\n════════ 第 {} 轮(累计 {} 条消息)════════",
+                i + 1,
+                history.len()
+            );
             let mut body = serde_json::json!({
                 "model": model,
                 "stream": true,
@@ -270,16 +316,27 @@ async fn main() {
                             && ev.data["content_block"]["type"] == "tool_use"
                         {
                             tool_uses.push((
-                                ev.data["content_block"]["id"].as_str().unwrap_or("").to_string(),
-                                ev.data["content_block"]["name"].as_str().unwrap_or("").to_string(),
+                                ev.data["content_block"]["id"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string(),
+                                ev.data["content_block"]["name"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string(),
                                 String::new(),
                             ));
                         } else if ev.event == "message_delta" {
-                            stop_reason = ev.data["delta"]["stop_reason"].as_str().unwrap_or("").to_string();
+                            stop_reason = ev.data["delta"]["stop_reason"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
                             eprintln!("\n[stop_reason={stop_reason}]");
                         }
                     }
-                    Ok(StreamItem::Usage(u)) => eprintln!("[usage output_tokens={}]", u.output_tokens),
+                    Ok(StreamItem::Usage(u)) => {
+                        eprintln!("[usage output_tokens={}]", u.output_tokens)
+                    }
                     Ok(StreamItem::UpstreamCut) => {}
                     Err(e) => {
                         eprintln!("\n流错误: {e:?}");
@@ -287,7 +344,11 @@ async fn main() {
                     }
                 }
             }
-            eprintln!("---- 第 {} 轮回复 {} 字符 ----", i + 1, full.chars().count());
+            eprintln!(
+                "---- 第 {} 轮回复 {} 字符 ----",
+                i + 1,
+                full.chars().count()
+            );
 
             if auto_follow && stop_reason == "tool_use" && !tool_uses.is_empty() {
                 // 组装 assistant tool_use 块 + user tool_result 块,自动再续一轮。

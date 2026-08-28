@@ -28,7 +28,7 @@
 **多进程方案的优势**(你的直觉正确):
 - 进程 = 隔离边界。一个 worker 绑一个出口 IP(通过 `local_address` 或独立代理),**进程内所有请求天然同 IP**,不需要 per-request 绑定。
 - 一个 worker 崩,只影响它那组号,其他 worker 不受影响。
-- 契合双 IPv4 灰度:worker-A 绑 `203.0.113.10`,worker-B 绑 `203.0.113.11`,各跑各的。
+- 契合双 IPv4 灰度:worker-A 绑 `203.0.113.10`,worker-B 绑 `203.0.113.11`,各跑各的（均为 RFC 5737 示例地址）。
 - 未来"一 IP 一组号"防关联:加 IP/代理就是加 worker,水平扩展。
 
 ### 1.2 进程拓扑
@@ -75,7 +75,7 @@
 vultr 单机:
   router   进程  绑 203.0.113.10:8990  (对外,nginx/直接暴露)
   worker-0 进程  出口 203.0.113.10      账号 1-12
-  worker-1 进程  出口 203.0.113.11        账号 13-24
+  worker-1 进程  出口 203.0.113.11      账号 13-24
 ```
 
 由 systemd 或 docker-compose 起 3 个进程(1 router + 2 worker),同一个二进制 + 不同 `--mode/--instance`。灰度期:旧 kiro.rs 继续在主 IP:38990 服务,新 worker-1 绑第二 IP 试跑,互不干扰。
@@ -330,4 +330,3 @@ cache:
 - usage 跨进程汇总:每 worker 写本地后台汇总,还是都写同一 SQLite?(Phase 4 定)
 - admin 面板:router 统一展示全 worker 状态,还是每 worker 自己一个?(倾向 router 聚合)
 - 账号分组策略:手动配 vs 按某规则自动均分到 worker?(先手动)
-

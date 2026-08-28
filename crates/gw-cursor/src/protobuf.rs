@@ -71,6 +71,15 @@ impl Writer {
         self.write_varint(v);
     }
 
+    /// 写一个 float 字段(wt=5,fixed32 小端)。InferenceModelConfig 的
+    /// temperature/top_p 是它 —— 注意不是 double:官方 proto 里这两个是
+    /// float32(T:2=FLOAT),曾误编码成 double(wt=1)被上游拒:
+    /// "parse binary: illegal tag"(解析器按 float32 读,多读 4 字节即脱同步)。
+    pub fn float(&mut self, field: u32, v: f32) {
+        self.write_tag(field, 5);
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
     /// 写一个 double 字段(wt=1)。`google.protobuf.Value.number_value` 用它。
     #[allow(dead_code)] // 目前只有测试造帧用;回传工具结果(请求侧 field 2)时会用到
     pub fn double(&mut self, field: u32, v: f64) {
@@ -109,11 +118,23 @@ impl Value<'_> {
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// 中途遇畸形/截断。`is_done` 必须连它一起看:截断的 varint 会把 pos
+    /// 停在末尾附近,「pos 到尾」不等于「完整解析」。
+    malformed: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            malformed: false,
+        }
+    }
+
+    /// 是否完整消费了整个缓冲(响应侧协议漂移观测用)。
+    pub fn is_done(&self) -> bool {
+        !self.malformed && self.pos >= self.buf.len()
     }
 
     fn read_varint(&mut self) -> Option<u64> {
@@ -141,10 +162,13 @@ impl<'a> Iterator for Reader<'a> {
         if self.pos >= self.buf.len() {
             return None;
         }
-        let key = self.read_varint()?;
+        let Some(key) = self.read_varint() else {
+            self.malformed = true;
+            return None;
+        };
         let field = (key >> 3) as u32;
         let wire_type = (key & 7) as u32;
-        match wire_type {
+        let item = (|| match wire_type {
             0 => {
                 let v = self.read_varint()?;
                 Some((field, Value::Varint(v)))
@@ -180,7 +204,11 @@ impl<'a> Iterator for Reader<'a> {
                 Some((field, Value::Fixed64(b)))
             }
             _ => None,
+        })();
+        if item.is_none() {
+            self.malformed = true;
         }
+        item
     }
 }
 
@@ -244,7 +272,11 @@ mod tests {
         let got: Vec<_> = Reader::new(&bytes).collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, 2);
-        assert_eq!(got[0].1.as_f64(), Some(200.0), "丢了 fixed64 的字节 = 数值参数解成空");
+        assert_eq!(
+            got[0].1.as_f64(),
+            Some(200.0),
+            "丢了 fixed64 的字节 = 数值参数解成空"
+        );
     }
 
     #[test]
@@ -253,10 +285,7 @@ mod tests {
         w.double(2, -1.5);
         let b = w.into_bytes();
         assert_eq!(b[0], 0x11, "tag 必须是 field 2 / wt 1");
-        assert_eq!(
-            Reader::new(&b).next().unwrap().1.as_f64(),
-            Some(-1.5)
-        );
+        assert_eq!(Reader::new(&b).next().unwrap().1.as_f64(), Some(-1.5));
     }
 
     #[test]

@@ -82,11 +82,19 @@ fn base_catalog() -> Vec<Model> {
         ),
         Model::with_params(
             "claude-sonnet-5",
-            &[("thinking", "true"), ("context", "300k"), ("effort", "high")],
+            &[
+                ("thinking", "true"),
+                ("context", "300k"),
+                ("effort", "high"),
+            ],
         ),
         Model::with_params(
             "claude-fable-5",
-            &[("thinking", "true"), ("context", "300k"), ("effort", "high")],
+            &[
+                ("thinking", "true"),
+                ("context", "300k"),
+                ("effort", "high"),
+            ],
         ),
         // ── claude 4.x 系 ──
         Model::with_params(
@@ -109,12 +117,20 @@ fn base_catalog() -> Vec<Model> {
         ),
         Model::with_params(
             "claude-opus-4-6",
-            &[("thinking", "true"), ("context", "200k"), ("effort", "high")],
+            &[
+                ("thinking", "true"),
+                ("context", "200k"),
+                ("effort", "high"),
+            ],
         ),
         Model::with_params("claude-opus-4-5", &[("thinking", "true")]),
         Model::with_params(
             "claude-sonnet-4-6",
-            &[("thinking", "true"), ("context", "200k"), ("effort", "high")],
+            &[
+                ("thinking", "true"),
+                ("context", "200k"),
+                ("effort", "high"),
+            ],
         ),
         Model::with_params(
             "claude-sonnet-4-5",
@@ -128,30 +144,47 @@ fn base_catalog() -> Vec<Model> {
         // ── gpt 系 ──
         Model::with_params(
             "gpt-5.6-sol",
-            &[("context", "272k"), ("reasoning", "medium"), ("fast", "false")],
+            &[
+                ("context", "272k"),
+                ("reasoning", "medium"),
+                ("fast", "false"),
+            ],
         ),
         Model::with_params(
             "gpt-5.6-terra",
-            &[("context", "272k"), ("reasoning", "medium"), ("fast", "false")],
+            &[
+                ("context", "272k"),
+                ("reasoning", "medium"),
+                ("fast", "false"),
+            ],
         ),
         Model::with_params(
             "gpt-5.6-luna",
-            &[("context", "272k"), ("reasoning", "medium"), ("fast", "false")],
+            &[
+                ("context", "272k"),
+                ("reasoning", "medium"),
+                ("fast", "false"),
+            ],
         ),
         Model::with_params(
             "gpt-5.5",
-            &[("context", "272k"), ("reasoning", "medium"), ("fast", "false")],
+            &[
+                ("context", "272k"),
+                ("reasoning", "medium"),
+                ("fast", "false"),
+            ],
         ),
         Model::with_params(
             "gpt-5.4",
-            &[("context", "272k"), ("reasoning", "medium"), ("fast", "false")],
+            &[
+                ("context", "272k"),
+                ("reasoning", "medium"),
+                ("fast", "false"),
+            ],
         ),
         Model::with_params("gpt-5.4-mini", &[("reasoning", "medium")]),
         Model::with_params("gpt-5.4-nano", &[("reasoning", "medium")]),
-        Model::with_params(
-            "gpt-5.3-codex",
-            &[("reasoning", "high"), ("fast", "false")],
-        ),
+        Model::with_params("gpt-5.3-codex", &[("reasoning", "high"), ("fast", "false")]),
         Model::with_params("gpt-5.2", &[("reasoning", "medium"), ("fast", "false")]),
         Model::with_params("gpt-5.1", &[("reasoning", "medium")]),
         Model::new("gpt-5-mini"),
@@ -197,7 +230,8 @@ pub fn resolve_cursor_model(name: &str) -> Option<String> {
     // Anthropic 日期后缀(claude-sonnet-4-5-20250929):剥掉 `-YYYYMMDD` 再查一次目录 ——
     // 目录已有 claude-sonnet-4-5 这类真身,剥缀命中就该用真身,而不是落到下面的
     // 按族归并被静默升到 5 系(审查 r1 中危)。剥缀后仍不中的才走族归一。
-    if let Some(base) = n.rsplit_once('-')
+    if let Some(base) = n
+        .rsplit_once('-')
         .filter(|(_, suf)| suf.len() == 8 && suf.bytes().all(|b| b.is_ascii_digit()))
         .map(|(base, _)| base)
     {
@@ -464,13 +498,28 @@ mod tests {
     #[test]
     fn dated_suffix_matches_catalog_base_before_family_fallback() {
         // Anthropic 日期后缀:剥掉 -YYYYMMDD 命中目录真身,不被静默升到 5 系(审查 r1 中危)。
-        assert_eq!(to_cursor_model("claude-sonnet-4-5-20250929"), "claude-sonnet-4-5");
-        assert_eq!(to_cursor_model("claude-opus-4-6-20260101"), "claude-opus-4-6");
-        assert_eq!(to_cursor_model("claude-haiku-4-5-20251001"), "claude-haiku-4-5");
+        assert_eq!(
+            to_cursor_model("claude-sonnet-4-5-20250929"),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(
+            to_cursor_model("claude-opus-4-6-20260101"),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            to_cursor_model("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5"
+        );
         // 剥缀也不中的才族归一。
-        assert_eq!(to_cursor_model("claude-sonnet-9-9-20990101"), "claude-sonnet-5");
+        assert_eq!(
+            to_cursor_model("claude-sonnet-9-9-20990101"),
+            "claude-sonnet-5"
+        );
         // 非 8 位数字后缀不剥(避免误伤正常名字)。
-        assert_eq!(to_cursor_model("claude-sonnet-4-5-thinking"), "claude-sonnet-5");
+        assert_eq!(
+            to_cursor_model("claude-sonnet-4-5-thinking"),
+            "claude-sonnet-5"
+        );
     }
 
     #[test]
@@ -481,7 +530,10 @@ mod tests {
         assert_eq!(resolve_cursor_model("").as_deref(), Some(DEFAULT_MODEL));
         assert_eq!(resolve_cursor_model("   ").as_deref(), Some(DEFAULT_MODEL));
         // 已知家族的**有意**降级不是未知:目录外 gemini 交服务端路由。
-        assert_eq!(resolve_cursor_model("gemini-9.9-ultra").as_deref(), Some(DEFAULT_MODEL));
+        assert_eq!(
+            resolve_cursor_model("gemini-9.9-ultra").as_deref(),
+            Some(DEFAULT_MODEL)
+        );
         // 兼容包装(展示/估算类调用用)维持旧回退。
         assert_eq!(to_cursor_model("totally-unknown"), DEFAULT_MODEL);
         assert_eq!(to_cursor_model(""), DEFAULT_MODEL);
@@ -505,27 +557,46 @@ mod tests {
         let on = serde_json::json!({"type":"enabled"});
         let off = serde_json::json!({"type":"disabled"});
         let get = |m: &Model, k: &str| {
-            m.params.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+            m.params
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
         };
 
         let mut m = model_by_name("claude-sonnet-5");
         apply_thinking_pref(&mut m, Some(&off));
-        assert_eq!(get(&m, "thinking").as_deref(), Some("false"), "客户不要推理就别发 true");
+        assert_eq!(
+            get(&m, "thinking").as_deref(),
+            Some("false"),
+            "客户不要推理就别发 true"
+        );
 
         // ⭐ 没提 thinking 的请求(绝大多数流量)**必须保持目录默认**。
         // 这个参数的实际作用未验证(A/B 实测 true/false 都不产生 `1.4` 帧),
         // 拿主流量去改一个作用未知的旋钮是赌博。
         let mut m = model_by_name("claude-sonnet-5");
         apply_thinking_pref(&mut m, None);
-        assert_eq!(get(&m, "thinking").as_deref(), Some("true"), "没提就别动抓包实物的值");
+        assert_eq!(
+            get(&m, "thinking").as_deref(),
+            Some("true"),
+            "没提就别动抓包实物的值"
+        );
         let mut m = model_by_name("claude-sonnet-5");
         apply_thinking_pref(&mut m, Some(&serde_json::json!({"type":"weird"})));
-        assert_eq!(get(&m, "thinking").as_deref(), Some("true"), "不认识的取值也别动");
+        assert_eq!(
+            get(&m, "thinking").as_deref(),
+            Some("true"),
+            "不认识的取值也别动"
+        );
 
         let mut m = model_by_name("claude-sonnet-5");
         apply_thinking_pref(&mut m, Some(&on));
         assert_eq!(get(&m, "thinking").as_deref(), Some("true"));
-        assert_eq!(get(&m, "effort").as_deref(), Some("high"), "没给预算保留目录默认");
+        assert_eq!(
+            get(&m, "effort").as_deref(),
+            Some("high"),
+            "没给预算保留目录默认"
+        );
 
         // adaptive(Claude Code)必须显式开 true,不能掉进「不认识就不动」后碰巧依赖默认。
         let mut m = model_by_name("claude-fable-5");
@@ -544,11 +615,24 @@ mod tests {
 
     #[test]
     fn budget_tokens_maps_to_effort_tiers() {
-        let get = |m: &Model| m.params.iter().find(|(k, _)| k == "effort").map(|(_, v)| v.clone());
-        for (budget, want) in [(1024u64, "low"), (2000, "low"), (8000, "medium"), (32000, "high")] {
+        let get = |m: &Model| {
+            m.params
+                .iter()
+                .find(|(k, _)| k == "effort")
+                .map(|(_, v)| v.clone())
+        };
+        for (budget, want) in [
+            (1024u64, "low"),
+            (2000, "low"),
+            (8000, "medium"),
+            (32000, "high"),
+        ] {
             let mut m = model_by_name("claude-opus-5");
-            apply_thinking_pref(&mut m, Some(&serde_json::json!({
-                "type":"enabled","budget_tokens":budget})));
+            apply_thinking_pref(
+                &mut m,
+                Some(&serde_json::json!({
+                "type":"enabled","budget_tokens":budget})),
+            );
             assert_eq!(get(&m).as_deref(), Some(want), "budget={budget}");
         }
     }
@@ -559,10 +643,16 @@ mod tests {
         for name in ["composer-2.5", "gpt-5.6-sol", "default"] {
             let before = model_by_name(name).params.len();
             let mut m = model_by_name(name);
-            apply_thinking_pref(&mut m, Some(&serde_json::json!({
-                "type":"enabled","budget_tokens":32000})));
+            apply_thinking_pref(
+                &mut m,
+                Some(&serde_json::json!({
+                "type":"enabled","budget_tokens":32000})),
+            );
             assert_eq!(m.params.len(), before, "{name} 的参数数量不该变");
-            assert!(!m.params.iter().any(|(k, _)| k == "thinking"), "{name} 不该凭空多出 thinking");
+            assert!(
+                !m.params.iter().any(|(k, _)| k == "thinking"),
+                "{name} 不该凭空多出 thinking"
+            );
         }
     }
 
@@ -643,7 +733,10 @@ mod tests {
         assert!(list().iter().any(|m| m.id == "grok-4.7"));
 
         drop(_cleanup);
-        assert!(!catalog().iter().any(|m| m.name == "grok-4.7"), "清空后要回纯内置目录");
+        assert!(
+            !catalog().iter().any(|m| m.name == "grok-4.7"),
+            "清空后要回纯内置目录"
+        );
     }
 
     #[test]
@@ -697,10 +790,22 @@ mod tests {
         // ⚠️ 与旧语义相反(旧版把空串/空数组当「未配 = 不限」)。写侧拒绝这些
         // 形态,能出现只可能是手改 DB/YAML —— 运维写空值的本意多半是「全禁」,
         // 当成「全放」是要出事的(gpt-5.6-sol 评审定稿,交接规格第 4 条)。
-        assert!(!account_supports(&acct_models(serde_json::json!("")), "claude-opus-5"));
-        assert!(!account_supports(&acct_models(serde_json::json!("  , ;")), "claude-opus-5"));
-        assert!(!account_supports(&acct_models(serde_json::json!([])), "claude-opus-5"));
-        assert!(!account_supports(&acct_models(serde_json::json!(42)), "claude-opus-5"));
+        assert!(!account_supports(
+            &acct_models(serde_json::json!("")),
+            "claude-opus-5"
+        ));
+        assert!(!account_supports(
+            &acct_models(serde_json::json!("  , ;")),
+            "claude-opus-5"
+        ));
+        assert!(!account_supports(
+            &acct_models(serde_json::json!([])),
+            "claude-opus-5"
+        ));
+        assert!(!account_supports(
+            &acct_models(serde_json::json!(42)),
+            "claude-opus-5"
+        ));
     }
 
     #[test]
@@ -720,8 +825,14 @@ mod tests {
         // 少了 resolve_cursor_model 这一步,`claude-4.5-sonnet` 会被字面比对挡掉。
         let a = acct_models(serde_json::json!("claude-*"));
         assert!(account_supports(&a, "claude-sonnet-4-5-20250929"));
-        assert!(account_supports(&a, "claude-4.5-sonnet"), "旧点分名归一到 claude-sonnet-5");
-        assert!(account_supports(&a, "claude-opus-9-9"), "族归一到 claude-opus-5");
+        assert!(
+            account_supports(&a, "claude-4.5-sonnet"),
+            "旧点分名归一到 claude-sonnet-5"
+        );
+        assert!(
+            account_supports(&a, "claude-opus-9-9"),
+            "族归一到 claude-opus-5"
+        );
         assert!(!account_supports(&a, "grok-4.5"));
 
         // 未知名字 resolve 不出 → 受限号 fail-closed:白名单含 default 也不放行 ——

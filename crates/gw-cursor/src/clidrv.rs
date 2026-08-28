@@ -13,10 +13,12 @@
 //! - **安全闸**:`--mode ask`(read-only)且**绝不**加 `--force`。注意 ask 模式
 //!   仍允许**只读 shell**(ls/cat 会真跑)—— 部署侧用**每账号独立 uid** + 700
 //!   HOME 隔离:别号的 CLI 连目录都进不来,auth.json 互不可读(见 `account_uid`)。
-//! - 调用方 system 提示写进**每会话**工作区(`<home>/ws/<conversation_id>/`)的
-//!   `AGENTS.md`(CLI 原生 rules 位置)。**每号一份是错的**:AGENTS.md 装的是调用方
-//!   本次请求的 system,同号并发的两个会话会互相覆盖它,还会让甲客户的提示被乙客户的
-//!   CLI 读到(2026-08-17 线上实测,见 [`prepare_home`])。
+//! - 调用方 system 提示写进**每 CLI 会话一份**工作区(`<home>/ws/<ws_id>/`,`ws_id`
+//!   建会话时生成)的 `AGENTS.md`(CLI 原生 rules 位置)。**每号一份是错的**:AGENTS.md
+//!   装的是调用方本次请求的 system,同号并发的两个会话会互相覆盖它,还会让甲客户的提示
+//!   被乙客户的 CLI 读到(2026-08-17 线上实测,见 [`prepare_ws`])。按 conversation_id
+//!   分也是错的:同一 conversation_id 的桶内可并存多条并行 CLI 会话(内容碰撞,见
+//!   [`CliConversations`]),它们共用一份 AGENTS.md 同样是互相覆盖。
 //! - **工具桥**(调用方声明了 tools 时):每号 HOME 写死 `.cursor/mcp.json` +
 //!   `permissions.json`(`{"mcpAllowlist":["gwtools:*"]}`,格式挖自 CLI bundle 的
 //!   `shouldBlockMcp`/`matchesMcpPattern`,必须带冒号)。桥是本网关二进制的
@@ -231,7 +233,10 @@ impl TokenUpdate {
     /// 转 accounts.extra 增量字段(键与 refresh_auth 回写口径一致)。
     pub fn to_delta(&self) -> BTreeMap<String, Value> {
         let mut d = BTreeMap::new();
-        d.insert("access_token".to_string(), Value::String(self.access_token.clone()));
+        d.insert(
+            "access_token".to_string(),
+            Value::String(self.access_token.clone()),
+        );
         if let Some(rt) = &self.refresh_token {
             d.insert("refresh_token".to_string(), Value::String(rt.clone()));
         }
@@ -254,17 +259,14 @@ fn report_token_update(
     refresh: Option<&str>,
     exp: Option<i64>,
 ) {
-    updates
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            account_id.to_string(),
-            TokenUpdate {
-                access_token: access.to_string(),
-                refresh_token: refresh.map(str::to_string),
-                expires_at: exp.map(crate::auth::format_unix_utc),
-            },
-        );
+    updates.lock().unwrap_or_else(|p| p.into_inner()).insert(
+        account_id.to_string(),
+        TokenUpdate {
+            access_token: access.to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: exp.map(crate::auth::format_unix_utc),
+        },
+    );
     tracing::info!(account = %account_id, "cursor-cli:捕获到 CLI 自刷新轮换的 token,待落库");
 }
 
@@ -280,7 +282,11 @@ fn read_auth_creds(path: &Path) -> Option<(String, Option<String>)> {
 }
 
 /// 原子写 auth.json(tmp + rename,0600)。
-fn write_auth_json(home: &Path, access_token: &str, refresh_token: Option<&str>) -> std::io::Result<()> {
+fn write_auth_json(
+    home: &Path,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> std::io::Result<()> {
     let rt = refresh_token.unwrap_or(access_token);
     let body = json!({"accessToken": access_token, "refreshToken": rt});
     let tmp = home.join(".config/cursor/.auth.json.tmp");
@@ -357,29 +363,16 @@ fn gc_workspaces(ws_root: &Path, keep: &Path) {
     }
 }
 
+/// 账号级 HOME 准备:目录、auth.json 对账、MCP 白名单、降权。**不碰工作区** ——
+/// 工作区按 CLI 会话分(ws_id),要等 lookup 之后才知道用哪份,见 [`prepare_ws`]。
 pub fn prepare_home(
     cfg: &CliDriverConfig,
     account_id: &str,
-    conversation_id: &str,
     access_token: &str,
     refresh_token: Option<&str>,
-    system: &str,
     updates: &TokenUpdates,
-) -> Result<(PathBuf, PathBuf), UpstreamError> {
+) -> Result<PathBuf, UpstreamError> {
     let home = cfg.base_dir.join(account_id);
-    let ws_root = home.join("ws");
-    // 工作区**每会话一份**。早先是每号一份(`home/ws`),而 AGENTS.md 装的是**调用方本次
-    // 请求的 system 提示** —— 同一个号上并发的两个会话会互相覆盖这个文件:
-    // 2026-08-17 线上实测,一个无工具的角色扮演会话把它覆成「你没有任何工具可用」+ 人设,
-    // 而同号另一个带 46 个工具的 Claude Code 会话的 CLI 读到的就是那份,模型的 thinking 里
-    // 写着「gwtools 未直接列入 MCP 列表」。除了功能错乱,这还是**跨会话的提示串味**:
-    // 甲客户的 system 提示躺在乙客户的 CLI 工作区里。
-    // 目录名用 conversation_id(已是 UUID 形态,见 chat::conversation_uuid,不含路径分隔符)。
-    let ws = if conversation_id.is_empty() {
-        ws_root.join("_noconv")
-    } else {
-        ws_root.join(conversation_id)
-    };
     let io = |what: &str, e: std::io::Error| {
         UpstreamError::new(
             UpstreamErrorKind::Other,
@@ -388,18 +381,6 @@ pub fn prepare_home(
     };
     std::fs::create_dir_all(home.join(".config/cursor")).map_err(|e| io("创建 home", e))?;
     std::fs::create_dir_all(home.join(".cursor")).map_err(|e| io("创建 .cursor", e))?;
-    std::fs::create_dir_all(ws.join("assets")).map_err(|e| io("创建工作区", e))?;
-
-    // 迁移:旧版把 AGENTS.md 直接写在 `home/ws` 下,而那正是新工作区的**父目录** ——
-    // Cursor 会往上层找 rules,留着它等于把串味问题原地保留。见到就删。
-    let legacy_agents = ws_root.join("AGENTS.md");
-    if legacy_agents.is_file() {
-        let _ = std::fs::remove_file(&legacy_agents);
-        tracing::info!(account = %account_id, "cursor-cli:清掉旧的每号共享 AGENTS.md(已改每会话)");
-    }
-    // 活跃标记 + 过期目录回收(判据见 gc_workspaces)。
-    let _ = std::fs::write(ws.join(".last"), now_secs().to_string());
-    gc_workspaces(&ws_root, &ws);
 
     let auth_file = home.join(".config/cursor/auth.json");
     if auth_file.exists() {
@@ -437,17 +418,11 @@ pub fn prepare_home(
         std::fs::write(&perms, perms_body).map_err(|e| io("写 permissions.json", e))?;
     }
 
-    if !system.is_empty() {
-        let agents = ws.join("AGENTS.md");
-        if std::fs::read_to_string(&agents).unwrap_or_default() != system {
-            std::fs::write(&agents, system).map_err(|e| io("写 AGENTS.md", e))?;
-        }
-    }
-
     // 降权隔离:CLI 子进程以**每账号独立 uid** 运行(见 start_conv / account_uid),
     // HOME 归它且 700 —— 别号的 CLI(不同 uid)连目录都进不来,auth.json 互不可读。
     // /app/data 等敏感目录对这些 uid 同样不可读(部署要求 data/ 700、control.db 600)。
     // 非 root 环境(本机开发)chown 会失败,忽略即可。
+    // 注意:此时尚不知道本轮用哪份工作区,新建 ws 的属主由 [`prepare_ws`] 自己补。
     #[cfg(unix)]
     {
         let uid = account_uid(account_id);
@@ -459,7 +434,74 @@ pub fn prepare_home(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
     }
-    Ok((home, ws))
+    Ok(home)
+}
+
+/// 工作区级准备:**每 CLI 会话一份**(`<home>/ws/<ws_id>/`),在 lookup 之后调用
+/// —— Resume 用命中条目的 ws_id(同一条 CLI 会话续用同一目录),Fresh 用新生成的。
+///
+/// 为什么按 ws_id 而不是 conversation_id 分:同一 conversation_id 的会话桶里可并存
+/// 多条并行 CLI 会话(内容碰撞:侧链、固定开场模板、重试,见 [`CliConversations`]),
+/// 它们共用 `ws/<conversation_id>/` 就会互相覆盖 AGENTS.md —— 正是 2026-08-17
+/// 修掉的跨会话提示串味(当时按号分:无工具的角色扮演会话把它覆成「你没有任何工具
+/// 可用」+ 人设,同号带 46 个工具的 Claude Code 会话的 CLI 读到的就是那份,模型的
+/// thinking 里写着「gwtools 未直接列入 MCP 列表」)。
+///
+/// `ws_id` 为空(`_noconv` 特例:派生不出 conversation_id 的请求)维持共享兜底目录
+/// `ws/_noconv`,与旧版行为一致。
+pub fn prepare_ws(
+    cfg: &CliDriverConfig,
+    account_id: &str,
+    ws_id: &str,
+    system: &str,
+) -> Result<PathBuf, UpstreamError> {
+    let home = cfg.base_dir.join(account_id);
+    let ws_root = home.join("ws");
+    let ws = if ws_id.is_empty() {
+        ws_root.join("_noconv")
+    } else {
+        // ws_id 是建会话时生成的 UUID(见 lib.rs 分流),不含路径分隔符。
+        ws_root.join(ws_id)
+    };
+    let io = |what: &str, e: std::io::Error| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("cursor-cli: {what}失败: {e}"),
+        )
+    };
+    std::fs::create_dir_all(ws.join("assets")).map_err(|e| io("创建工作区", e))?;
+
+    // 迁移:旧版把 AGENTS.md 直接写在 `home/ws` 下,而那正是新工作区的**父目录** ——
+    // Cursor 会往上层找 rules,留着它等于把串味问题原地保留。见到就删。
+    let legacy_agents = ws_root.join("AGENTS.md");
+    if legacy_agents.is_file() {
+        let _ = std::fs::remove_file(&legacy_agents);
+        tracing::info!(account = %account_id, "cursor-cli:清掉旧的每号共享 AGENTS.md(已改每会话)");
+    }
+    // 活跃标记 + 过期目录回收(判据见 gc_workspaces)。每轮都刷:续轮 system 可能
+    // 变化,AGENTS.md 要跟着重写;.last 不刷的话活会话的目录会被 GC 误收。
+    let _ = std::fs::write(ws.join(".last"), now_secs().to_string());
+    gc_workspaces(&ws_root, &ws);
+
+    if !system.is_empty() {
+        let agents = ws.join("AGENTS.md");
+        if std::fs::read_to_string(&agents).unwrap_or_default() != system {
+            std::fs::write(&agents, system).map_err(|e| io("写 AGENTS.md", e))?;
+        }
+    }
+
+    // 本目录可能刚由 worker(root)创建,prepare_home 的整家 chown 先于它跑过,
+    // 这里把自己这份补成账号 uid —— 否则降权后的 CLI 连自己的工作区都写不进。
+    #[cfg(unix)]
+    {
+        let uid = account_uid(account_id);
+        let _ = std::process::Command::new("chown")
+            .arg("-R")
+            .arg(format!("{uid}:{uid}"))
+            .arg(&ws)
+            .status();
+    }
+    Ok(ws)
 }
 
 /// 对外模型名 → CLI 模型名(`--model` 参数)。
@@ -586,7 +628,11 @@ fn is_root() -> bool {
 enum OutItem {
     Item(Result<StreamItem, UpstreamError>),
     /// 阶段结束:drain 流收到它就收尾(本次 Anthropic 响应完结)。
-    End,
+    /// 携带本阶段的 tool_use_id(**仅** `finish_tool_use`;`finish_done`/`finish_error`
+    /// 为 None)—— drain 按它**键控**标记送达:同一条 `conv.out` 可被先后两次响应
+    /// 的 drain 并发消费(见 resume_conv),无条件标记会把「上一阶段的 End」错记到
+    /// 本阶段刚挂出的槽上(2026-08-24 claude 复审竞态 1)。
+    End(Option<String>),
     /// **内部心跳**:泵确认 CLI 活着(60s 窗口内有任何原始活动)时按 15s 间隔推入。
     /// drain 收到只重置 idle 计时、**不产生任何 SSE 输出**(不上线缆,客户端零感知;
     /// 也骗不过 gw-app 的 300s 总闸)。存在的唯一理由:把「CLI 有原始活动」与「模型有
@@ -610,7 +656,10 @@ impl OutQueue {
         })
     }
     fn push(&self, item: OutItem) {
-        self.q.lock().unwrap_or_else(|p| p.into_inner()).push_back(item);
+        self.q
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(item);
         self.notify.notify_one();
     }
     async fn pop(&self) -> OutItem {
@@ -707,8 +756,24 @@ impl SimRequest {
     }
 }
 
+/// 桥应答(调用方 → 泵)的三态。
+///
+/// `Abandon` 是网关**主动注销**的显式信号(弃槽重铺,见 lib.rs 分流):不能用
+/// responder drop 代替 —— 2026-08-21 codex 审查实证,drop 只会走到"发送端丢失"
+/// 臂,而那条臂历史上是把错误写回 CLI **继续跑**(不 break、不杀进程),
+/// 旧 CLI 会和新会话并发写同一条上游 session。
+enum BridgeAnswer {
+    /// 调用方带回的 tool_result 文本 + 下一阶段的模拟槽。
+    Answer(String, Option<SimSlot>),
+    /// 调用方显式报错(当前无人构造,保留给"客户端拒绝执行工具"类路径)。
+    #[allow(dead_code)]
+    Error(String, Option<SimSlot>),
+    /// 网关注销:调用方已在历史里应答过并翻篇(多模型编排插队),泵立即收尾。
+    Abandon,
+}
+
 /// 待调用方应答的桥调用。
-struct PendingSlot {
+pub struct PendingSlot {
     /// 给调用方的 tool_use.id —— 消费槽位时**按它键控**(防错配/重放注入)。
     tool_use_id: String,
     /// 把结果**和下一阶段的模拟槽**一起还给泵任务。
@@ -719,12 +784,35 @@ struct PendingSlot {
     /// 于是 A 的账单用到 B 的命中数、甚至 A 的 commit 提交了 B 的指纹
     /// (对抗评审 high#2:代际 CAS 只保护表的一致性,保护不了"谁的账单用了谁的槽")。
     /// 顺着这条通道传,槽的所有权就跟着"哪一轮把结果喂回来"走,结构上不可能错配。
-    responder: oneshot::Sender<(Result<String, String>, Option<SimSlot>)>,
+    responder: oneshot::Sender<BridgeAnswer>,
+    /// 本阶段的 tool_use 是否**真正送达**了调用方:挂槽时 false,drain 侧把本阶段
+    /// 队列 pop 到 `OutItem::End(Some(id))` 且 id 相符时置 true(FIFO:End 被取走 ⇒
+    /// 含 tool_use 在内的全部 SSE 已被响应流消费)。
+    ///
+    /// 用途(2026-08-24 生产事故):客户端在**上一轮吞槽后秒断**,泵继续跑、把新
+    /// tool_use 流进死连接 —— 客户端历史里永远没有它。之后带别的 tool_result 回来
+    /// 若按错配 400,客户端被要求"带正确结果重试"一个它从未见过的 id,会话卡死
+    /// 直至 PENDING_TTL 清槽(≤280s)。delivered=false 的错配 = 弃血脉挂起,分流应
+    /// 弃槽重铺而非 400;delivered=true 的错配维持 400(S1-7 不动)。
+    delivered: bool,
+}
+
+impl PendingSlot {
+    /// 显式注销(弃槽):通知泵立即收尾(break → 循环外 kill_procs 杀整组)。
+    /// send 失败 = 接收端已随 PENDING_TTL 超时被 drop —— 但那条路径已改为**超时即
+    /// 清槽 + break**,泵正在收尾、循环外 kill_procs 兜底,所以失败同样安全。
+    pub fn abandon(self) {
+        let _ = self.responder.send(BridgeAnswer::Abandon);
+    }
 }
 
 /// 一条存活中的 CLI 会话(可能正挂在桥调用上)。
 pub struct CliConv {
     pub account_id: String,
+    /// 本会话的工作区 id(`<home>/ws/<ws_id>/`):建会话时生成,续轮经 lookup
+    /// 命中沿用。**不能**用 conversation_id 当目录 —— 桶内并行血脉会互相覆盖
+    /// AGENTS.md(见 [`prepare_ws`])。
+    pub ws_id: String,
     /// CLI 的 session_id(pump 拿到 init 事件后填)。
     cli_session_id: Mutex<Option<String>>,
     /// 调用方历史逐轮指纹(分叉检测,同线协议形态)。
@@ -754,8 +842,64 @@ impl CliConv {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+    #[allow(dead_code)] // 测试与分流旧路径用;新分流走 pending_id + CAS
     pub fn has_pending(&self) -> bool {
-        self.pending.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+    /// 挂起槽的 tool_use_id(分流处据此查"历史里是否已应答")。
+    pub fn pending_id(&self) -> Option<String> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|s| s.tool_use_id.clone())
+    }
+    /// drain 侧 pop 到 `OutItem::End(Some(id))` 时调用:**仅当**当前挂起 id 相符才
+    /// 标记送达。键控的原因:同一条 `conv.out` 可被两次响应的 drain 并发消费,
+    /// 上一阶段残留的 End 不得错标本阶段刚挂出的槽(见 OutItem::End 注释)。
+    /// End(None)/无挂起槽 → no-op。
+    pub fn mark_pending_delivered_for(&self, expected: &str) {
+        let mut p = self.pending.lock().unwrap_or_else(|po| po.into_inner());
+        if let Some(s) = p.as_mut() {
+            if s.tool_use_id == expected {
+                s.delivered = true;
+            }
+        }
+    }
+    /// 当前挂起 id == `expected` 且**未被完整消费**?(分流判"弃血脉挂起"用,见
+    /// PendingSlot::delivered 注释)。无挂起 / id 不同 → false(走不到弃槽分支)。
+    ///
+    /// ⚠️ 措辞注意:false 不等于"客户端已断流" —— 慢读的活客户端(hyper 背压,
+    /// body 还没被 poll 到 End)同样是未消费。它只是"本阶段没被 drain 完"的判据。
+    pub fn pending_undelivered(&self, expected: &str) -> bool {
+        let p = self.pending.lock().unwrap_or_else(|po| po.into_inner());
+        matches!(p.as_ref(), Some(s) if s.tool_use_id == expected && !s.delivered)
+    }
+    /// CAS 取槽(弃血脉专用):**仅当**挂起 id == `expected` 且仍未被标记送达才取走。
+    /// 把"判未送达 → 取槽"折进同一把锁,消掉两者之间 drain 恰好标记送达、误杀
+    /// 一个已送达槽的 TOCTOU(2026-08-24 claude 复审)。
+    pub fn take_pending_for_if_undelivered(&self, expected: &str) -> Option<PendingSlot> {
+        let mut p = self.pending.lock().unwrap_or_else(|po| po.into_inner());
+        match p.as_ref() {
+            Some(s) if s.tool_use_id == expected && !s.delivered => p.take(),
+            _ => None,
+        }
+    }
+    /// 原子 CAS 取槽:**仅当**当前挂起 id == `expected` 才取走返回,否则原样不动。
+    ///
+    /// 弃槽分流必须"先证明 stale(pending_id + 历史配对)、后按证明过的 id 原子取"
+    /// 两步 —— 不能证明完无条件 take:并发请求可能在两步之间正常消费了 P、泵又挂出
+    /// 新调用 Q,无条件 take 会错杀 Q(2026-08-21 codex 审查 major#1)。CAS 失败的
+    /// 调用方不得继续开会话(见 lib.rs 分流的冲突报错)。
+    pub fn take_pending_for(&self, expected: &str) -> Option<PendingSlot> {
+        let mut p = self.pending.lock().unwrap_or_else(|po| po.into_inner());
+        match p.as_ref() {
+            Some(s) if s.tool_use_id == expected => p.take(),
+            _ => None,
+        }
     }
     /// 消费待应答槽:**仅当** `results` 里有与挂起 tool_use_id 匹配的结果。
     ///
@@ -802,6 +946,43 @@ impl CliConv {
     fn fresh(&self) -> bool {
         self.at.lock().unwrap_or_else(|p| p.into_inner()).elapsed() < SESSION_TTL
     }
+    /// 已登记指纹条数(lookup 选"最长前缀"的排序键)。
+    fn fps_len(&self) -> usize {
+        self.fps.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+    /// 触碰时间是否晚于 `other`(同长指纹并列时取最近触碰的)。
+    fn touched_after(&self, other: &CliConv) -> bool {
+        *self.at.lock().unwrap_or_else(|p| p.into_inner())
+            > *other.at.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// 干净收尾后,把**本轮我方 assistant 输出的指纹**追加进 fps
+    /// (多路桶的精确分层,codex 审查 Finding 3a)。
+    ///
+    /// 为什么需要:条目 fps 此前只装调用方历史,完全相同开场的两条会话首轮都是
+    /// `[u1]`,turn2 各带不同 assistant 历史回来时无法区分,lookup 只能瞎选 →
+    /// 续错 SID。追加各自的 assistant 输出指纹后,turn2 的历史 `[u1, a1, u2]`
+    /// 就只对自己那条是前缀。
+    ///
+    /// 口径红线:指纹必须与 `chat::history_fps` 对「下轮请求历史里那条 assistant
+    /// 消息」的计算结果**逐字节一致**,所以直接复用 [`crate::chat::turn_fp`],
+    /// 渲染文本 = 各 text 块 `'\n'` 相连(见 [`SsePhase::assistant_rendered_text`],
+    /// thinking 块不进 —— 与 `extract_text_in_msg` 丢弃 thinking 的口径一致)。
+    /// **tool_use 轮不追加**:其渲染含参数 JSON 的调用方再序列化,字节不由我方
+    /// 掌控(键序/空白都可能变)。工具轮本来也走不到这里 —— 泵里发 tool_use 的
+    /// 阶段必然以桥挂起收场,干净收尾的末阶段必无 tool_use。
+    ///
+    /// 安全方向:指纹一旦对不上,代价是下轮误判分叉退 Fresh 重铺(贵但安全),
+    /// 绝不会把对话续进错的会话 —— 所以宁缺勿错。
+    fn append_assistant_fp(&self, rendered_text: &str) {
+        // 空正文(纯 thinking 等非文本块)= `to_turns` 的占位串口径。
+        let text = if rendered_text.is_empty() {
+            "(unsupported content omitted)"
+        } else {
+            rendered_text
+        };
+        let fp = crate::chat::turn_fp(false, text);
+        self.fps.lock().unwrap_or_else(|p| p.into_inner()).push(fp);
+    }
     /// 杀掉这条会话的**整个进程组**(CLI 主进程 + 它自己拉起的 node 帮工)。
     ///
     /// ⚠️ 这个函数以前是**空壳**(`fn kill_procs(&self) {}`,注释写着"所有权在 pump 里,
@@ -839,75 +1020,279 @@ impl CliConv {
     }
 }
 
-/// 会话表:我方 conversation_id → CLI 会话。
+/// 同一 conversation_id 桶内容纳的 CLI 会话条数上限。桶存在的意义是让**内容碰撞**
+/// 的并行血脉共存(见 [`CliConversations`]),实测并行血脉是个位数;真打满说明
+/// 碰撞异常,先看 insert 埋点的桶分布再调。超了按最近触碰(`at`)淘汰最旧的。
+const BUCKET_CAP: usize = 8;
+
+/// 会话表:我方 conversation_id → **一桶** CLI 会话。
+///
+/// 为什么是多路桶而不是单条目:conversation_id 由内容派生(system + 首条 user 消息
+/// 的哈希),任何开场相同的请求都碰撞到同一个键 —— 侧链(session_title)、固定开场
+/// 模板、重试都躲不开。单条目时代 `insert` 是破坏性替换:侧链(stored=2)顶掉主会话
+/// (stored=83),主会话下轮判分叉重铺再顶回侧链,互相驱逐(生产 24h 实测 stored 序列
+/// 1→15→54→2→83→79→2→83→2→87,resumed=true 仅 14.7%)。
+///
+/// 桶内共存 + lookup 前缀挑选:**前缀匹配本身就是血脉判据**,不需要任何"什么是侧链"
+/// 的内容识别 —— 前缀对不上的条目原样保留,它们可能是别的并行血脉,不归本轮管。
 #[derive(Default)]
 pub struct CliConversations {
-    inner: Mutex<HashMap<String, Arc<CliConv>>>,
+    inner: Mutex<HashMap<String, Vec<Arc<CliConv>>>>,
 }
 
 /// 本轮的会话开法。
 pub enum CliLookup {
     Fresh,
-    Resume(String),
+    /// 前缀命中:命中的条目本身。调用方从它读 session_id / ws_id;start_conv
+    /// 插入新条目后据它摘掉桶内被接替的旧槽(同一条血脉每轮只留最新一条)。
+    Resume(Arc<CliConv>),
+}
+
+/// 带 tool_result 回来的路由判定(codex 审查 Finding 2 后重做)。
+pub enum PendingPick {
+    /// 唯一候选:按现有语义继续(stale 判定 / CAS / 弃槽一概不动)。
+    One(Arc<CliConv>),
+    /// 无候选:落回重铺(现状语义)。
+    None,
+    /// 歧义(多候选且按带回的 tool_use_id 也无法唯一确定):**绝不瞎挑** ——
+    /// 旧会话的合法结果送进新会话的 CLI,是静默的跨血脉污染。
+    Ambiguous {
+        bucket_len: usize,
+        candidates: usize,
+    },
 }
 
 impl CliConversations {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<CliConv>>> {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<Arc<CliConv>>>> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    pub fn get(&self, conv: &str) -> Option<Arc<CliConv>> {
-        self.map().get(conv).cloned()
+    /// 弃槽/接续判定用:桶内找「该接续这次 tool_result」的条目。
+    ///
+    /// 候选 = **同号 && 活着 && entry.fps 是调用方 history 前缀 && 有挂起桥调用**。
+    /// 三条筛子缺一不可(Finding 2):不看账号会操作别号启动的 CLI;不看历史前缀
+    /// 会把分叉血脉的挂起当成自己的;多条候选时不按带回的 `result_ids` 优选,
+    /// 旧会话的合法结果就会被送进新会话。仍不唯一 → [`PendingPick::Ambiguous`],
+    /// 调用方落回重铺(安全方向)并打 warn。
+    pub fn find_pending(
+        &self,
+        conv: &str,
+        account_id: &str,
+        history_fps: &[u64],
+        result_ids: &[&str],
+    ) -> PendingPick {
+        let map = self.map();
+        let Some(bucket) = map.get(conv) else {
+            return PendingPick::None;
+        };
+        let cands: Vec<Arc<CliConv>> = bucket
+            .iter()
+            .filter(|e| e.account_id == account_id && e.fresh())
+            .filter(|e| e.pending_id().is_some())
+            .filter(|e| {
+                let fps = e.fps.lock().unwrap_or_else(|p| p.into_inner());
+                fps.len() <= history_fps.len() && fps.iter().zip(history_fps).all(|(a, b)| a == b)
+            })
+            .cloned()
+            .collect();
+        match cands.len() {
+            0 => PendingPick::None,
+            // 单候选:保持现有语义,挂起 id 是否在 results 里由调用方的
+            // stale 判定处理(多模型编排插队的弃槽路径,一概不动)。
+            1 => PendingPick::One(cands.into_iter().next().expect("len==1 必有元素")),
+            _ => {
+                // 多候选:优先「挂起 id 在本次带回的 results 里」的那条。
+                let matched: Vec<&Arc<CliConv>> = cands
+                    .iter()
+                    .filter(|e| {
+                        e.pending_id()
+                            .is_some_and(|pid| result_ids.contains(&pid.as_str()))
+                    })
+                    .collect();
+                if matched.len() == 1 {
+                    PendingPick::One((*matched[0]).clone())
+                } else {
+                    PendingPick::Ambiguous {
+                        bucket_len: bucket.len(),
+                        candidates: cands.len(),
+                    }
+                }
+            }
+        }
     }
 
-    pub fn insert(&self, conv: &str, entry: Arc<CliConv>) {
+    /// `new_lineage`:这条插入是不是**新血脉**(Fresh 开的新会话),还是同血脉
+    /// 接替(start_conv 摘旧插新)。碰撞分布埋点只在新血脉让桶 ≥2 时打 ——
+    /// 接替路径每轮都会让碰撞桶瞬时回到 ≥2,不区分就是每轮刷屏(Finding 4b)。
+    pub fn insert(&self, conv: &str, entry: Arc<CliConv>, new_lineage: bool) {
         let mut map = self.map();
-        map.insert(conv.to_string(), entry);
-        map.retain(|_, e| e.fresh());
+        // 顺手全表清扫:过期(!fresh)条目摘除,空桶摘键(旧版 retain 语义,桶化)。
+        map.retain(|_, bucket| {
+            bucket.retain(|e| e.fresh());
+            !bucket.is_empty()
+        });
+        let bucket = map.entry(conv.to_string()).or_default();
+        bucket.push(entry);
+        if new_lineage && bucket.len() >= 2 {
+            // 埋点(影子模式前置):新血脉与既有血脉并存 = 内容碰撞实录。
+            // 上线后按 bucket_len / fps 长度分布定 [`BUCKET_CAP`] 是否合理。
+            // fps_lens 取自**插入时已带全量指纹**的条目(Finding 4a),
+            // 不再出现恒 0 的新血脉。
+            tracing::info!(
+                conversation_id = conv,
+                bucket_len = bucket.len(),
+                fps_lens = ?bucket
+                    .iter()
+                    .map(|e| e.fps.lock().unwrap_or_else(|p| p.into_inner()).len())
+                    .collect::<Vec<_>>(),
+                "cursor-cli:同一 conversation_id 并存多条 CLI 会话(内容碰撞)"
+            );
+        }
+        while bucket.len() > BUCKET_CAP {
+            // 淘汰最久未触碰的。不杀进程:泵持有自己的 Arc,kill_on_drop 兜底,
+            // 与旧版 retain 清过期条目不杀进程的语义一致。
+            let idx = bucket
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| *e.at.lock().unwrap_or_else(|p| p.into_inner()))
+                .map(|(i, _)| i)
+                .expect("桶非空必有最旧者");
+            bucket.remove(idx);
+        }
     }
 
     #[allow(dead_code)] // 预留:后台清理任务用
     pub fn remove(&self, conv: &str) {
-        if let Some(e) = self.map().remove(conv) {
-            e.kill_procs();
+        if let Some(bucket) = self.map().remove(conv) {
+            for e in bucket {
+                e.kill_procs();
+            }
         }
     }
 
+    /// 仅当桶内仍有**同一份**会话对象时摘除(弃槽重铺 / start_conv 接替旧槽用):
+    /// 防并发下摘掉后来者刚重插的新会话。不杀进程 —— CLI 归泵管,弃槽已通过
+    /// [`PendingSlot::abandon`] 显式通知泵收尾;接替场景的旧 CLI 已随上轮泵结束退出。
+    pub fn remove_if_same(&self, conv: &str, entry: &Arc<CliConv>) -> bool {
+        let mut map = self.map();
+        let Some(bucket) = map.get_mut(conv) else {
+            return false;
+        };
+        let Some(idx) = bucket.iter().position(|e| Arc::ptr_eq(e, entry)) else {
+            return false;
+        };
+        bucket.remove(idx);
+        if bucket.is_empty() {
+            map.remove(conv);
+        }
+        true
+    }
+
     /// 判定本轮怎么开会话(指纹前缀校验,语义同线协议形态)。
+    ///
+    /// **全桶(不限账号)先找最长前缀长度 L**(codex 审查 Finding 1):先按当前
+    /// 账号过滤的话,A→B→A 轮转时 A 的旧短条目仍前缀命中 → Resume 只发增量 →
+    /// B 处理的中间轮上游从没见过,静默丢上下文。长度 == L 的条目:
+    /// - 唯一且同号 → Resume;
+    /// - 唯一但**异号** → Fresh(不许退回同号短祖先 —— 那正是 Finding 1 的形态);
+    /// - **多条同长** → Fresh(Finding 3b:完全相同开场的会话无法区分时,
+    ///   以前按最近触碰静默挑一条 = 可能续错 SID;歧义宁可重铺不许猜,且打日志
+    ///   让它可数)。
+    ///
+    /// **无一命中不驱逐任何条目** —— 前缀对不上的可能是别的并行血脉
+    /// (见结构体文档),只是本轮不归它们。
     pub fn lookup(&self, conv: &str, account_id: &str, history_fps: &[u64]) -> CliLookup {
         let map = self.map();
-        match map.get(conv) {
-            Some(e) if e.account_id == account_id && e.fresh() => {
-                let fps = e.fps.lock().unwrap_or_else(|p| p.into_inner());
-                let prefix_ok = fps.len() <= history_fps.len()
-                    && fps.iter().zip(history_fps).all(|(a, b)| a == b);
-                if prefix_ok {
-                    let sid = e.session_id();
-                    drop(fps);
-                    match sid {
-                        Some(sid) => CliLookup::Resume(sid),
-                        None => CliLookup::Fresh,
+        let Some(bucket) = map.get(conv) else {
+            return CliLookup::Fresh;
+        };
+        let mut best_len = 0usize;
+        let mut best: Vec<Arc<CliConv>> = Vec::new(); // 长度 == L 的条目(并列全留)
+                                                      // 分叉埋点沿用:同号活候选的 fps 长度列表 + 其中最长者(stored 口径)。
+        let mut cand_fps_lens = Vec::new();
+        let mut best_same_acct: Option<Arc<CliConv>> = None;
+        for e in bucket.iter().filter(|e| e.fresh()) {
+            let fps = e.fps.lock().unwrap_or_else(|p| p.into_inner());
+            if e.account_id == account_id {
+                cand_fps_lens.push(fps.len());
+                let better = match &best_same_acct {
+                    None => true,
+                    Some(b) => {
+                        fps.len() > b.fps_len() || (fps.len() == b.fps_len() && e.touched_after(b))
                     }
-                } else {
-                    let first_diff = fps
-                        .iter()
-                        .zip(history_fps)
-                        .position(|(a, b)| a != b)
-                        .map(|p| p as i64)
-                        .unwrap_or(-1);
-                    tracing::info!(
-                        conversation_id = conv,
-                        stored = fps.len(),
-                        incoming = history_fps.len(),
-                        first_diff,
-                        "cursor-cli:调用方历史分叉,新会话重铺"
-                    );
-                    drop(fps);
-                    CliLookup::Fresh
+                };
+                if better {
+                    best_same_acct = Some(e.clone());
                 }
             }
-            _ => CliLookup::Fresh,
+            let prefix_ok =
+                fps.len() <= history_fps.len() && fps.iter().zip(history_fps).all(|(a, b)| a == b);
+            if prefix_ok {
+                match fps.len().cmp(&best_len) {
+                    std::cmp::Ordering::Greater => {
+                        best_len = fps.len();
+                        best.clear();
+                        best.push(e.clone());
+                    }
+                    std::cmp::Ordering::Equal => best.push(e.clone()),
+                    std::cmp::Ordering::Less => {}
+                }
+            }
         }
+        match best.len() {
+            1 => {
+                let e = &best[0];
+                if e.account_id == account_id {
+                    return match e.session_id() {
+                        Some(_) => CliLookup::Resume(e.clone()),
+                        // 命中但 CLI 还没给 session_id(init 未到):按新会话来,不算分叉。
+                        None => CliLookup::Fresh,
+                    };
+                }
+                // 最长前缀在**别号**(A→B→A 的 B):退回同号短祖先会静默丢中间轮,
+                // Fresh 全量重铺 —— 调用方历史一文不少,代价只是多铺一次。
+                tracing::info!(
+                    conversation_id = conv,
+                    best_len,
+                    bucket_len = bucket.len(),
+                    "cursor-cli:最长前缀会话在别号(账号轮转),不回退同号短祖先,新会话重铺"
+                );
+                return CliLookup::Fresh;
+            }
+            0 => {} // 无一前缀匹配:落下面分叉日志(语义照旧)。
+            n => {
+                tracing::info!(
+                    conversation_id = conv,
+                    best_len,
+                    tied = n,
+                    bucket_len = bucket.len(),
+                    "cursor-cli:多条会话同为最长前缀(歧义),不猜,新会话重铺"
+                );
+                return CliLookup::Fresh;
+            }
+        }
+        if let Some(best) = best_same_acct {
+            // 桶里有同号活条目但无一前缀匹配 = 调用方历史相对**所有**并行血脉都分叉了。
+            // stored/first_diff 取最佳候选(指纹最长、并列取最近触碰)的,与旧单条目版同口径;
+            // bucket_len 与各候选指纹长度用于上线后量化碰撞严重度。
+            let fps = best.fps.lock().unwrap_or_else(|p| p.into_inner());
+            let first_diff = fps
+                .iter()
+                .zip(history_fps)
+                .position(|(a, b)| a != b)
+                .map(|p| p as i64)
+                .unwrap_or(-1);
+            tracing::info!(
+                conversation_id = conv,
+                stored = fps.len(),
+                incoming = history_fps.len(),
+                first_diff,
+                bucket_len = bucket.len(),
+                cand_fps_lens = ?cand_fps_lens,
+                "cursor-cli:调用方历史分叉,新会话重铺"
+            );
+        }
+        CliLookup::Fresh
     }
 }
 
@@ -986,6 +1371,11 @@ struct SsePhase {
     /// 调用方仍然每轮带全量历史,`sim_total` 照旧是整段 —— 但上游那边被丢弃的
     /// 前缀永远不会回来。累加式只跟"我方实际喂过什么"走,重铺后自动归零重算。
     ctx_base: u64,
+    /// 本阶段流出的**正文 text 块**原文,按块分开存(收尾追加 assistant 指纹用,
+    /// 见 [`CliConv::append_assistant_fp`]。调用方下轮历史里这条 assistant 消息的
+    /// 渲染 = 各 text 块 `'\n'` 相连(chat::extract_text_in_msg 的口径),所以必须
+    /// 按块存 —— 拼成一整条会在多块时与调用方渲染差一个换行,指纹必错。
+    text_blocks: Vec<String>,
 }
 
 impl SsePhase {
@@ -1000,7 +1390,14 @@ impl SsePhase {
             in_tally,
             sim_cache_read: sim.map(|s| s.cache_read).unwrap_or(0),
             ctx_base,
+            text_blocks: Vec::new(),
         }
+    }
+
+    /// 本阶段 assistant 正文的渲染形态(各 text 块 `'\n'` 相连),与调用方下轮
+    /// 历史经 `chat::history_fps` 计算时走的 `extract_text_in_msg` 同口径。
+    fn assistant_rendered_text(&self) -> String {
+        self.text_blocks.join("\n")
     }
 
     /// 本阶段自估 `input` 的基准 = 上游会话已有量 + 本轮喂进去的新增量。
@@ -1120,6 +1517,15 @@ impl SsePhase {
             )))));
             self.open = Some((self.next_idx, kind));
             self.next_idx += 1;
+            // 新开的 text 块单独成条(渲染口径见 `assistant_rendered_text`)。
+            if !is_thinking {
+                self.text_blocks.push(String::new());
+            }
+        }
+        if !is_thinking {
+            if let Some(last) = self.text_blocks.last_mut() {
+                last.push_str(text);
+            }
         }
         if let Some((idx, _)) = self.open {
             let delta = if is_thinking {
@@ -1185,7 +1591,7 @@ impl SsePhase {
             json!({"type":"message_stop"}),
         )))));
         out.push(OutItem::Item(Ok(StreamItem::Usage(usage))));
-        out.push(OutItem::End);
+        out.push(OutItem::End(Some(tool_use_id.to_string())));
         billed
     }
 
@@ -1204,7 +1610,7 @@ impl SsePhase {
             json!({"type":"message_stop"}),
         )))));
         out.push(OutItem::Item(Ok(StreamItem::Usage(usage.clone()))));
-        out.push(OutItem::End);
+        out.push(OutItem::End(None));
     }
 
     fn finish_error(&mut self, out: &OutQueue, err: UpstreamError) {
@@ -1212,7 +1618,7 @@ impl SsePhase {
             self.close_block(out);
         }
         out.push(OutItem::Item(Err(err)));
-        out.push(OutItem::End);
+        out.push(OutItem::End(None));
     }
 }
 
@@ -1355,7 +1761,11 @@ fn fallback_cache_from_sim(usage: &mut ChatUsage, sim_cache_read: u64) -> Option
     // 用 cap 收口:与 `cache_sim::reported_cache_read` 的 `cap_ratio` 同源同语义
     // (「杜绝假到全命中」),保证客户侧输入恒留 `1 − cap` 的余量,不再出现整轮 0.1×。
     let cap = crate::cache_sim::billing().cap_ratio;
-    let cap = if cap.is_finite() { cap.clamp(0.0, 1.0) } else { crate::cache_sim::DEFAULT_CACHE_CAP_RATIO };
+    let cap = if cap.is_finite() {
+        cap.clamp(0.0, 1.0)
+    } else {
+        crate::cache_sim::DEFAULT_CACHE_CAP_RATIO
+    };
     // `floor` 不能 `round`:`round` 在小 input 上会把上限抬回 input 本身
     // (input 10、cap 0.95 → 9.5 → 10),余量归零,等于没夹。
     let ceiling = (usage.input_tokens as f64 * cap).floor() as u64;
@@ -1368,24 +1778,46 @@ fn fallback_cache_from_sim(usage: &mut ChatUsage, sim_cache_read: u64) -> Option
 }
 
 /// drain 一条响应流(到 End 为止)。
-fn drain_stream(out: Arc<OutQueue>) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
-    drain_stream_with_idle(out, DRAIN_IDLE_TIMEOUT)
+///
+/// `conv` 用于**送达标记**:pop 到 `OutItem::End(Some(id))` 说明该阶段全部 SSE
+/// (含 tool_use)已被响应流真正取走 → `mark_pending_delivered_for(id)`(键控,
+/// 残留旧 End 不误标)。客户端中途断开时 axum 直接 drop 掉流,End 永不被 pop,
+/// 挂起槽保持"未送达" —— 分流据此区分「真错配(已送达,维持 400)」与「弃血脉
+/// 挂起(未送达,弃槽重铺)」(2026-08-24 生产事故)。注意未送达 ≠ 已断流:慢读的
+/// 活客户端(hyper 背压)同样是未送达,它只是"本阶段未被完整消费"的判据。
+fn drain_stream(
+    out: Arc<OutQueue>,
+    conv: Arc<CliConv>,
+) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
+    drain_stream_with_idle(out, Some(conv), DRAIN_IDLE_TIMEOUT)
 }
 
-/// [`drain_stream`] 的显式传参本体(idle 超时可注入,便于测试)。
+/// [`drain_stream`] 的显式传参本体(idle 超时可注入,便于测试;conv 传 None 即
+/// 不做送达标记 —— 测试与无会话场景用)。
 ///
 /// `Heartbeat` 的处理:只重置 idle 计时继续等,**不产生任何 SSE 输出** ——
 /// 它不上线缆、客户端零感知,也骗不过 gw-app 的 300s 总闸(那是刻意的兜底)。
 /// 心跳停止(CLI 真死透,泵不再确认活动)后,idle 死闸照旧收尸。
-fn drain_stream_with_idle(out: Arc<OutQueue>, idle: Duration) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
+fn drain_stream_with_idle(
+    out: Arc<OutQueue>,
+    conv: Option<Arc<CliConv>>,
+    idle: Duration,
+) -> impl futures::Stream<Item = Result<StreamItem, UpstreamError>> + Send {
     // 状态是 `Option`:超时那一下要**先发一条错误、再终止**,不能继续 pop ——
     // 否则下一次 poll 又等 90s,变成每 90s 吐一条错误的死循环。
-    futures::stream::unfold(Some(out), move |st| async move {
-        let out = st?;
+    futures::stream::unfold(Some((out, conv)), move |st| async move {
+        let (out, conv) = st?;
         loop {
             match tokio::time::timeout(idle, out.pop()).await {
-                Ok(OutItem::Item(it)) => break Some((it, Some(out))),
-                Ok(OutItem::End) => break None,
+                Ok(OutItem::Item(it)) => break Some((it, Some((out, conv)))),
+                Ok(OutItem::End(id)) => {
+                    // 阶段被完整 drain ⇒ 该 tool_use 已随响应流取走 ⇒ **按 id 键控**
+                    // 标记送达(残留的旧阶段 End 不会误标本阶段的槽)。
+                    if let (Some(c), Some(id)) = (&conv, &id) {
+                        c.mark_pending_delivered_for(id);
+                    }
+                    break None;
+                }
                 // 泵确认 CLI 活着:重置 idle 计时(继续下一轮 pop),不产出任何 item。
                 Ok(OutItem::Heartbeat) => continue,
                 Err(_) => {
@@ -1436,8 +1868,12 @@ async fn pump(mut a: PumpArgs) {
     let out = a.conv.out.clone();
     // 本阶段的模拟槽:泵独占。阶段切换时换成 resume 送来的那个(见 PendingSlot)。
     let mut sim: Option<SimSlot> = a.sim.take();
-    let mut phase =
-        SsePhase::with_input(&a.echo_model, a.first_in_tally, sim.as_ref(), a.first_ctx_base);
+    let mut phase = SsePhase::with_input(
+        &a.echo_model,
+        a.first_in_tally,
+        sim.as_ref(),
+        a.first_ctx_base,
+    );
     let mut state = NdjsonState::default();
     // 阶段计时器:**每阶段独立**——桥挂起结束、新阶段开始时重置(见下方 call 分支)。
     // 千万别改成全程不重置:挂起期间墙钟照走而 tick 停转,resume 后 tick 补发会把
@@ -1481,6 +1917,10 @@ async fn pump(mut a: PumpArgs) {
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // 泵→CLI 首行输出的耗时(与 start_conv 的分段计时拼成完整冷启动画像)。
+    let t_pump = Instant::now();
+    let mut first_line_logged = false;
+
     // 结果:Ok(()) 正常完结;Err 进 finish_error。
     let outcome: Result<(), UpstreamError> = 'outer: loop {
         tokio::select! {
@@ -1493,6 +1933,14 @@ async fn pump(mut a: PumpArgs) {
                 // 任何原始行都算活动(不管解析成什么事件):心跳保活只关心「CLI 死没死」,
                 // 不关心「模型有没有语义输出」——两个信号必须分开。
                 last_activity = Instant::now();
+                if !first_line_logged {
+                    first_line_logged = true;
+                    tracing::info!(
+                        account = %a.conv.account_id,
+                        ms = t_pump.elapsed().as_millis() as u64,
+                        "cursor-cli:泵→CLI 首行输出(冷启动末段)"
+                    );
+                }
                 // 逆向排障:原始 NDJSON 落盘(仅设了 CURSOR_CLI_DUMP_NDJSON 时)。
                 if let Ok(f) = std::env::var("CURSOR_CLI_DUMP_NDJSON") {
                     use std::io::Write as _;
@@ -1538,13 +1986,21 @@ async fn pump(mut a: PumpArgs) {
                 // 就能带着 tool_result 回来(`finish_tool_use` 只是入队、不等于送达),
                 // 而那条路会经 responder 送来**下一轮**的槽。先取后挂,本阶段要提交的
                 // 东西就已经在局部变量里,不可能被后来者换掉。
+                //
+                // 这个顺序同时也是 delivered 判据的前提(2026-08-24 claude 复审):
+                // 挂 pending 必须**严格早于** `finish_tool_use` 推 End,否则存在
+                // 「End 先被 pop、槽还没挂上 → 永远等不到键控标记 → 误判未送达 →
+                // 削弱 S1-7」的窗口。重排这段代码时两条不变量一起保。
                 let this_sim = sim.take();
 
-                let (tx_slot, rx_slot) =
-                    oneshot::channel::<(Result<String, String>, Option<SimSlot>)>();
+                let (tx_slot, rx_slot) = oneshot::channel::<BridgeAnswer>();
                 {
                     let mut p = a.conv.pending.lock().unwrap_or_else(|p| p.into_inner());
-                    *p = Some(PendingSlot { tool_use_id: tool_use_id.clone(), responder: tx_slot });
+                    *p = Some(PendingSlot {
+                        tool_use_id: tool_use_id.clone(),
+                        responder: tx_slot,
+                        delivered: false,
+                    });
                 }
                 // 本阶段报给调用方的 input 累进会话账本:末轮据此补差(见 `true_up_input`)。
                 // `Relaxed` 足够:同会话的阶段是串行推进的,这里只需要最终可见的总和。
@@ -1569,17 +2025,43 @@ async fn pump(mut a: PumpArgs) {
                 // 挂起等调用方结果(带 TTL)。连同**下一阶段的模拟槽**一起收下。
                 let res = tokio::time::timeout(PENDING_TTL, rx_slot).await;
                 let (reply, next_sim) = match res {
-                    Ok(Ok((Ok(text), s))) => (json!({"result": text}), s),
-                    Ok(Ok((Err(err), s))) => (json!({"error": err}), s),
-                    Ok(Err(_)) => (json!({"error": "网关注销了这次调用"}), None),
-                    Err(_) => (
-                        json!({"error": format!("等待调用方 tool_result 超时({}s)", PENDING_TTL.as_secs())}),
-                        None,
-                    ),
+                    Ok(Ok(BridgeAnswer::Answer(text, s))) => (json!({"result": text}), s),
+                    Ok(Ok(BridgeAnswer::Error(err, s))) => (json!({"error": err}), s),
+                    // 显式注销(弃槽重铺):调用方已在历史里应答并翻篇,CLI 等的
+                    // 东西永远不会再来 —— 立即收尾,循环外 kill_procs 杀整组。
+                    Ok(Ok(BridgeAnswer::Abandon)) => break 'outer Err(UpstreamError::new(
+                        UpstreamErrorKind::Other,
+                        "cursor-cli: 调用方已在历史里应答并翻篇,桥调用被网关注销".to_string(),
+                    )),
+                    // 发送端丢失(未应答先 drop):历史上这条臂把错误写回 CLI **继续跑**
+                    // —— 那是错配结果污染上游 session 的通道(2026-08-21 codex 审查
+                    // blocker)。发送端都没了,跑完也无人收,继续只会白烧额度,同按注销收尾。
+                    Ok(Err(_)) => break 'outer Err(UpstreamError::new(
+                        UpstreamErrorKind::Other,
+                        "cursor-cli: 桥调用应答通道异常关闭".to_string(),
+                    )),
+                    // PENDING_TTL 超时:接收端已随 timeout 被 drop,槽里只剩一个
+                    // 发不出去的 sender。必须**原子清槽 + 收尾**,两件事缺一不可
+                    // (2026-08-21 codex 复审 blocker#1):
+                    // - 不清槽:后续 stale 判定仍能 CAS 取到它,abandon 的 send 必然
+                    //   失败(接收端死了)却被忽略 → 旧泵继续跑,新 Fresh 与旧 CLI
+                    //   双写同一上游 session;
+                    // - 不 break:挂起前那个响应早已交付完结,超时后的 CLI 输出没有
+                    //   任何消费者,继续只会白烧额度;续会话请求本就有
+                    //   「无挂起 → 落回 ② lookup」的正路(见 lib.rs 分流)。
+                    Err(_) => {
+                        a.conv.pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+                        break 'outer Err(UpstreamError::new(
+                            UpstreamErrorKind::Other,
+                            format!(
+                                "cursor-cli: 等待调用方 tool_result 超时({}s),清槽收尾",
+                                PENDING_TTL.as_secs()
+                            ),
+                        ))
+                    }
                 };
                 // 新阶段开始 = 重置阶段计时:挂起等 reply 的墙钟(最坏 PENDING_TTL)
                 // **不计入**下一阶段(2026-08-18 误杀事故的修复点,见 CLI_TIMEOUT 注释)。
-                // PENDING_TTL 超时路径同样走到这里:旧阶段已终结,重置无害。
                 started = Instant::now();
                 // 新阶段(下一个 Anthropic 响应)重新开始计数。**在拿到 reply 之后**才重建
                 // —— 喂回 CLI 的这段文本就是下一阶段的输入,要计进它的 in_tally。
@@ -1685,7 +2167,10 @@ async fn pump(mut a: PumpArgs) {
             let (ok, mut usage, upstream_raw_cache) = match &state.result {
                 Some(r) if r.get("subtype").and_then(|s| s.as_str()) == Some("success") => {
                     let u = r.get("usage").cloned().unwrap_or_default();
-                    let raw = u.get("cacheReadTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let raw = u
+                        .get("cacheReadTokens")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
                     (true, usage_from_result(&u), raw)
                 }
                 other => {
@@ -1757,9 +2242,10 @@ async fn pump(mut a: PumpArgs) {
                 // 只动**计费列**:`real_cache_read_tokens` 保持 0(对账列只认上游自报,
                 // 模拟值是计费策略、不是事实断言)。夹到 input 之内保住
                 // `input ≥ cache_read` 不变式。
-                if let Some(fallback) =
-                    fallback_cache_from_sim(&mut usage, sim.as_ref().map(|s| s.cache_read).unwrap_or(0))
-                {
+                if let Some(fallback) = fallback_cache_from_sim(
+                    &mut usage,
+                    sim.as_ref().map(|s| s.cache_read).unwrap_or(0),
+                ) {
                     tracing::info!(
                         account = %a.conv.account_id,
                         upstream_raw_cache,
@@ -1809,12 +2295,21 @@ async fn pump(mut a: PumpArgs) {
                 if let Some(s) = sim.take() {
                     s.commit();
                 }
+                // 多路桶精确分层(Finding 3a):把本轮 assistant 输出的指纹追加进
+                // 条目 fps —— 判据与 sim commit 同源(这个响应已交付,调用方下轮
+                // 历史里会有这条 assistant 消息)。末阶段必无 tool_use(发 tool_use
+                // 的阶段以桥挂起收场,走不到这里),所以这里必然是可安全追加的
+                // 纯文本轮;口径红线见 [`CliConv::append_assistant_fp`]。
+                a.conv.append_assistant_fp(&phase.assistant_rendered_text());
                 phase.finish_done(&out, &usage);
             } else {
-                phase.finish_error(&out, UpstreamError::new(
-                    UpstreamErrorKind::Other,
-                    "cursor-cli 未成功收尾(无 success result)".to_string(),
-                ));
+                phase.finish_error(
+                    &out,
+                    UpstreamError::new(
+                        UpstreamErrorKind::Other,
+                        "cursor-cli 未成功收尾(无 success result)".to_string(),
+                    ),
+                );
             }
         }
         Err(e) => phase.finish_error(&out, e),
@@ -1838,7 +2333,7 @@ async fn pump(mut a: PumpArgs) {
 /// - **新开会话(含重铺)**:调用方照旧带全量历史,但我方只把最后一段用户输入喂了上去
 ///   —— 那段历史上游根本没有,拿 `sim_total` 当基准会超收(标定里那条 **26.6 倍**
 ///   离群正是这种轮次)。基准 = 我方实际喂进去的 `system + tools + prompt`。
-///   ⚠️ **system 必须计**:它经 AGENTS.md 落盘([`prepare_home`]),CLI 每轮重读,
+///   ⚠️ **system 必须计**:它经 AGENTS.md 落盘([`prepare_ws`]),CLI 每轮重读,
 ///   上游照样按它计费。2026-08-18 受控实测(新会话、空 system、两个小工具):
 ///   我方自估首轮 48,同一进程退出时上游真值 **16,821** —— 差的 16.5k 是每请求的
 ///   固定地板(AGENTS.md + Cursor 注入的服务端 system),计上 system 补掉我方能算的那半。
@@ -1864,7 +2359,9 @@ fn first_phase_basis(
     (0, tally)
 }
 
-/// 开一条新的 CLI 会话(新 spawn;`lookup` 决定带不带 --resume),返回首阶段响应流。
+/// 开一条新的 CLI 会话(新 spawn;`lookup` 决定带不带 --resume),返回首阶段响应流
+/// 和刚注册进桶的新条目(调用方直接往它回写本轮指纹,别再按键摸 —— 桶里同键
+/// 可能并排着别的血脉,`get` 语义已经拆掉了)。
 #[allow(clippy::too_many_arguments)]
 pub async fn start_conv(
     cfg: &CliDriverConfig,
@@ -1876,31 +2373,46 @@ pub async fn start_conv(
     proxy: Option<&str>,
     home: &Path,
     ws: &Path,
+    // 本会话的工作区 id(落进新条目,续轮 lookup 命中后沿用同一份)。
+    ws_id: &str,
     cli_model: &str,
     prompt: &str,
-    // 调用方 system 提示(已经由 `prepare_home` 落进工作区 AGENTS.md)。
+    // 调用方 system 提示(已经由 `prepare_ws` 落进工作区 AGENTS.md)。
     // 只用于**新会话**的 input 基准:CLI 每轮都会重读 AGENTS.md,上游照样按它计费,
     // 漏算就是我方贴钱。续会话不用它 —— `SimSlot::sim_total` 的口径本来就含 system。
     system: &str,
     resume_sid: Option<String>,
+    // lookup 命中的旧条目(Resume 时):新条目插入前按指针把它从桶里摘除 ——
+    // 同一条血脉每轮只留最新一条,桶深度才真实等于并行血脉数(埋点的口径)。
+    supersede: Option<Arc<CliConv>>,
+    // 调用方本轮的**全量历史指纹**:条目插入时就带上(Finding 4a)——
+    // 空 fps 插入 + 事后回写会让碰撞埋点的 fps_lens 恒 0,也把「完全相同开场」
+    // 的歧义窗口从几毫秒拉长到一次 spawn。之后的 assistant 输出指纹由泵在
+    // 干净收尾时追加(见 [`CliConv::append_assistant_fp`])。
+    initial_fps: Vec<u64>,
     tools: &[crate::run::ToolDef],
     echo_model: &str,
     updates: TokenUpdates,
     // 本轮的模拟缓存材料(未 peek)。None = 不模拟,自估轮 cache_read 退回 0。
     sim: Option<SimRequest>,
-) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+) -> Result<(gw_core::provider::ChatStream, Arc<CliConv>), UpstreamError> {
     // 同号 spawn 串行化:mcp.json 是每号一份的静态路径,桥 socket 每请求一条,
     // 等桥连上(或确认无工具)后再放行下一个,避免后一个请求改写 mcp.json 被
     // 前一个 CLI 读到。窗口 ~1s。用 tokio 锁:要跨 await 持有。
     static SPAWN_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let t0 = Instant::now();
     let _gate = SPAWN_GATE.lock().await;
+    let t_gate = t0.elapsed();
 
     let io = |what: &str, e: std::io::Error| {
-        UpstreamError::new(UpstreamErrorKind::Other, format!("cursor-cli: {what}失败: {e}"))
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("cursor-cli: {what}失败: {e}"),
+        )
     };
 
     // 工具桥:mcp.json + tools 文件 + unix socket 监听。**桥进程由 CLI 经
-    // mcp.json 自己拉起**(stdio 是 MCP 的生命线),网关只监听回连 —— 
+    // mcp.json 自己拉起**(stdio 是 MCP 的生命线),网关只监听回连 ——
     // 第一版自己抢跑了一个桥,把唯一一次 accept 用掉,CLI 拉起的桥反而连不上。
     let mut listener = None;
     if !tools.is_empty() {
@@ -1928,10 +2440,12 @@ pub async fn start_conv(
                 "args": ["--mode", "cursor-mcp-bridge",
                          "--sock", sock_path.to_string_lossy(),
                          "--tools", tools_path.to_string_lossy()],
-            }}}).to_string(),
+            }}})
+            .to_string(),
         )
         .map_err(|e| io("写 mcp.json", e))?;
-        let l = tokio::net::UnixListener::bind(&sock_path).map_err(|e| io("绑 bridge socket", e))?;
+        let l =
+            tokio::net::UnixListener::bind(&sock_path).map_err(|e| io("绑 bridge socket", e))?;
         // 桥以本账号的 uid 回连:socket 0600 + 属主=该 uid,别号的 CLI(不同 uid)
         // 连不上 —— 共享 nobody 时这里曾是 0666,任何被注入的 CLI 都能往别人的
         // 桥里注结果(对抗审查共识 S0-2)。bridge/ 还在 700 的 HOME 里,路径本身
@@ -1947,6 +2461,11 @@ pub async fn start_conv(
                 .status();
         }
         listener = Some(l);
+    } else {
+        // 无工具请求:清掉每号 home 里可能残留的 mcp.json(上一个**带工具**的请求
+        // 写的)。不清的话本轮 CLI 会照它拉起桥进程去连一个早已不存在的 socket,
+        // 白付一遍 MCP server 启动开销(正是冷启动想省的那部分)。
+        let _ = std::fs::remove_file(home.join(".cursor/mcp.json"));
     }
 
     let mut cmd = Command::new(&cfg.bin);
@@ -1989,7 +2508,14 @@ pub async fn start_conv(
     // 所以它走的是认环境变量的 HTTP 客户端,`NODE_USE_ENV_PROXY` 不需要(加了也不变)。
     if let Some(p) = proxy.map(str::trim).filter(|p| !p.is_empty()) {
         // 大小写两套都给:不同库只认其中一套(curl 系认小写,多数 Node/Python 库认大写)。
-        for k in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"] {
+        for k in [
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "all_proxy",
+        ] {
             cmd.env(k, p);
         }
         // 本地回环别走代理,否则 MCP 桥那条 unix/loopback 通路会被绕进代理。
@@ -2017,6 +2543,7 @@ pub async fn start_conv(
             format!("cursor-cli: 启动 {} 失败: {e}", cfg.bin.display()),
         )
     })?;
+    let t_spawned = t0.elapsed();
     // 记下进程组(= 子进程 pid,因为上面 process_group(0) 让它自成组),
     // 下面建 CliConv 时填进去 —— kill_procs 靠它才有的可杀(会话淘汰与泵收尾两处都用)。
     let cli_pgid = cli.id();
@@ -2035,27 +2562,50 @@ pub async fn start_conv(
     let sock = match listener {
         Some(l) => match tokio::time::timeout(Duration::from_secs(10), l.accept()).await {
             Ok(Ok((s, _))) => Some(s),
-            _ => return Err(UpstreamError::new(
-                UpstreamErrorKind::Other,
-                "cursor-cli 桥 10s 内未回连(MCP server 启动失败?)".to_string(),
-            )),
+            _ => {
+                return Err(UpstreamError::new(
+                    UpstreamErrorKind::Other,
+                    "cursor-cli 桥 10s 内未回连(MCP server 启动失败?)".to_string(),
+                ))
+            }
         },
         None => None,
     };
+    // 分段计时(2026-08-21 冷启动优化基线):gate = 同号 spawn 串行锁;
+    // to_spawn = 桥准备 + 命令构造 + 进程拉起;to_ready = 桥回连等待(无工具时 ≈ to_spawn)。
+    // 首行输出计时在泵里,两段拼起来就是"网关内冷启动"全貌。
+    tracing::info!(
+        account = %account_id,
+        gate_ms = t_gate.as_millis() as u64,
+        to_spawn_ms = t_spawned.as_millis() as u64,
+        to_ready_ms = t0.elapsed().as_millis() as u64,
+        tools = tools.len(),
+        resumed,
+        "cursor-cli:CLI 已起(分段计时)"
+    );
 
     // peek 尽量靠后:离 commit 越近,代际被别人推进的窗口越小。
     let sim = sim.map(SimRequest::peek);
     let conv = Arc::new(CliConv {
         account_id: account_id.to_string(),
+        ws_id: ws_id.to_string(),
         cli_session_id: Mutex::new(resume_sid),
-        fps: Mutex::new(Vec::new()),
+        fps: Mutex::new(initial_fps),
         out: OutQueue::new(),
         pending: Mutex::new(None),
         pgid: Mutex::new(cli_pgid),
         at: Mutex::new(Instant::now()),
         billed_input: std::sync::atomic::AtomicU64::new(0),
     });
-    convs.insert(conv_key, conv.clone());
+    // 接替同血脉旧槽(它的 CLI 已随上轮泵结束退出):**先摘旧再插新**。
+    // `new_lineage` = 本次是不是新血脉(Fresh):接替路径(有 supersede)不算 ——
+    // 碰撞桶里每轮正常续轮都摘旧插新,把它当碰撞打埋点就是每轮刷屏(Finding 4b)。
+    let new_lineage = supersede.is_none();
+    if let Some(old) = supersede {
+        // 按指针摘,摘不到(并发下已被别人动过)也无所谓 —— 新槽马上进桶。
+        convs.remove_if_same(conv_key, &old);
+    }
+    convs.insert(conv_key, conv.clone(), new_lineage);
     let out = conv.out.clone();
     // 开泵时的已知 token:以 auth.json 现状为准(prepare_home 对账后文件可能比
     // 号库还新);读不到就退号库 token。pump 据此探测 CLI 中途的轮换。
@@ -2075,7 +2625,7 @@ pub async fn start_conv(
     );
     // 子进程所有权交给 pump:pump 结束(Done/出错/超时)即 drop,kill_on_drop 收尾。
     tokio::spawn(pump(PumpArgs {
-        conv,
+        conv: conv.clone(),
         cli,
         sock,
         echo_model: echo_model.to_string(),
@@ -2086,7 +2636,7 @@ pub async fn start_conv(
         first_ctx_base,
         sim,
     }));
-    Ok(Box::pin(drain_stream(out)))
+    Ok((Box::pin(drain_stream(out, conv.clone())), conv))
 }
 
 /// 喂回桥调用结果(调用方带 tool_result 的下一轮请求),返回继续输出的响应流。
@@ -2094,25 +2644,38 @@ pub async fn start_conv(
 /// `results` = 本轮带回的 (tool_use_id, 文本) 列表。消费槽位**按 id 键控**:
 /// 没有匹配项就显式报错且保留槽位 —— 把别的轮次/别的会话的 tool_result 喂进
 /// CLI 是静默语义损坏,比报错严重得多。
+///
+/// `fps` = 本轮调用方全量历史指纹,**在槽校验成功之后、唤醒泵之前**才写进条目
+/// (codex 复审 Finding 2):先在入口写的话,带错 id 的请求被拒、槽保留,但条目
+/// fps 已被污染 —— 客户端带正确结果重试时,find_pending 的前缀筛选被这条错误
+/// 指纹卡掉 → 无辜 Fresh 重铺、旧泵干等到超时。紧随拿槽之后写:同会话请求由
+/// dispatch 锁串行,拿槽到写之间没有第二个写者,不引入新竞态;「校验 + 消费
+/// 同一把锁」的原子性由 [`CliConv::take_pending_matching`] 保持,不动。
 pub fn resume_conv(
     conv: Arc<CliConv>,
     results: Vec<(String, String)>,
+    fps: Vec<u64>,
     sim: Option<SimRequest>,
 ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
     conv.touch();
     // 先校验、**后 peek**:错配的 tool_result 根本不算一次有效轮次,让它先把模拟
     // 状态读出来只会白白拉长 peek→commit 的竞态窗口(对抗评审 high#3)。
     let (slot, text) = conv.take_pending_matching(&results)?;
+    // S1-7 不动:错配在上面已显式拒绝、槽保留、fps 一字未写 ——
+    // 带正确结果的重试照常能命中这条血脉(见函数注释 Finding 2)。
+    *conv.fps.lock().unwrap_or_else(|p| p.into_inner()) = fps;
     // 槽随结果一起走通道交给泵 —— 不落会话共享字段,所以并发请求不会互相覆盖,
     // 也不存在"装槽晚于唤醒"的竞态(两者现在是同一次 send,原子)。
     let sim = sim.map(SimRequest::peek);
-    slot.responder.send((Ok(text), sim)).map_err(|_| {
-        UpstreamError::new(
-            UpstreamErrorKind::Other,
-            "cursor-cli: 泵任务已退出,桥调用无法送达".to_string(),
-        )
-    })?;
-    Ok(Box::pin(drain_stream(conv.out.clone())))
+    slot.responder
+        .send(BridgeAnswer::Answer(text, sim))
+        .map_err(|_| {
+            UpstreamError::new(
+                UpstreamErrorKind::Other,
+                "cursor-cli: 泵任务已退出,桥调用无法送达".to_string(),
+            )
+        })?;
+    Ok(Box::pin(drain_stream(conv.out.clone(), conv.clone())))
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────────
@@ -2273,7 +2836,11 @@ mod tests {
         let mut u = usage_from_result(&json!({
             "inputTokens": 6779, "outputTokens": 35, "cacheReadTokens": 6016
         }));
-        assert_eq!(fallback_cache_from_sim(&mut u, 99999), None, "有真值就不该回落");
+        assert_eq!(
+            fallback_cache_from_sim(&mut u, 99999),
+            None,
+            "有真值就不该回落"
+        );
         assert_eq!(u.cache_read_tokens, 6016);
 
         // ② 模拟值超过 input → 夹到 **input × cap**(默认 0.9),不是 input 本身。
@@ -2288,7 +2855,10 @@ mod tests {
         let expect = (1000.0 * cap).floor() as u64;
         assert_eq!(fallback_cache_from_sim(&mut u2, 40000), Some(expect));
         assert_eq!(u2.cache_read_tokens, expect, "必须夹到 input × cap");
-        assert!(u2.cache_read_tokens < u2.input_tokens, "客户侧输入必须留余量");
+        assert!(
+            u2.cache_read_tokens < u2.input_tokens,
+            "客户侧输入必须留余量"
+        );
 
         // ③ 模拟值为 0 → 无事发生。
         let mut u3 = usage_from_result(&json!({
@@ -2310,7 +2880,11 @@ mod tests {
     #[test]
     fn 自估轮的input基准是会话已有量加本轮新增量() {
         let mut t = TokenTally::default();
-        t.push("本轮新增的输入文本,长度要够让命中值有意义".repeat(50).as_str());
+        t.push(
+            "本轮新增的输入文本,长度要够让命中值有意义"
+                .repeat(50)
+                .as_str(),
+        );
         let fresh = t.tokens();
         assert!(fresh > 100, "新增量要够大,否则夹限会掩盖基准差异: {fresh}");
 
@@ -2319,8 +2893,7 @@ mod tests {
         let basis = ctx_base + fresh;
         // 模拟器按完整上下文算命中,取一个落在基准之内的值。
         let slot = test_slot(basis / 2, basis);
-        let u =
-            SsePhase::with_input("grok-4.6", t, Some(&slot), ctx_base).estimated_usage();
+        let u = SsePhase::with_input("grok-4.6", t, Some(&slot), ctx_base).estimated_usage();
         assert_eq!(
             u.input_tokens, basis,
             "input 必须是 ctx_base + 本轮新增,只报新增会低估几个数量级"
@@ -2394,7 +2967,10 @@ mod tests {
         // sim_total 是调用方全量历史(很大),但上游根本没收到它。
         let slot = test_slot(fresh * 5, fresh * 27);
         let u = SsePhase::with_input("grok-4.6", t, Some(&slot), 0).estimated_usage();
-        assert_eq!(u.input_tokens, fresh, "新开会话的基准只能是我方实际喂进去的量");
+        assert_eq!(
+            u.input_tokens, fresh,
+            "新开会话的基准只能是我方实际喂进去的量"
+        );
         let cap = crate::cache_sim::billing().cap_ratio;
         assert_eq!(
             u.cache_read_tokens,
@@ -2412,7 +2988,11 @@ mod tests {
     #[test]
     fn 模拟命中超过本轮输入时夹到cap而非全额() {
         let mut t = TokenTally::default();
-        t.push("一条不长的 tool_result,但要够长以免取整吃掉余量".repeat(20).as_str());
+        t.push(
+            "一条不长的 tool_result,但要够长以免取整吃掉余量"
+                .repeat(20)
+                .as_str(),
+        );
         let fresh = t.tokens();
         assert!(fresh > 50, "基准要够大才看得出 cap 余量: {fresh}");
 
@@ -2423,7 +3003,10 @@ mod tests {
         let cap = crate::cache_sim::billing().cap_ratio;
         let expect = (fresh as f64 * cap).floor() as u64;
         assert_eq!(u.cache_read_tokens, expect, "命中必须夹到 基准 × cap");
-        assert!(u.cache_read_tokens < fresh, "绝不能等于基准(那就是整轮 0.1×)");
+        assert!(
+            u.cache_read_tokens < fresh,
+            "绝不能等于基准(那就是整轮 0.1×)"
+        );
 
         let wire = crate::chat::delta_usage_json_pub(&u);
         let uncached = wire.get("input_tokens").and_then(|v| v.as_u64()).unwrap();
@@ -2442,7 +3025,11 @@ mod tests {
         // 模拟器"几乎全命中"(99.98%)的极端输入,过夹限后必须留出余量。
         let total = 172_687u64;
         let raw_hit = 172_626u64;
-        let b = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.95, floor_ratio: 0.75 };
+        let b = CacheBilling {
+            read_multiplier: 1.8,
+            cap_ratio: 0.95,
+            floor_ratio: 0.75,
+        };
         let reported = reported_cache_read(total, raw_hit, total, b);
         assert!(
             reported <= (total as f64 * 0.95).round() as u64,
@@ -2455,7 +3042,11 @@ mod tests {
         );
         // 冷启动(0 命中)时 floor 仍会给出下限,但绝不超过 cap。
         let cold = reported_cache_read(total, 0, total, b);
-        assert_eq!(cold, (total as f64 * 0.75).round() as u64, "0 命中时按 floor 报");
+        assert_eq!(
+            cold,
+            (total as f64 * 0.75).round() as u64,
+            "0 命中时按 floor 报"
+        );
         // total=0 不 panic。
         assert_eq!(reported_cache_read(0, 0, 0, b), 0);
     }
@@ -2493,7 +3084,11 @@ mod tests {
     #[test]
     fn 单轮turn补差不改真值() {
         let truth = 16_664u64;
-        assert_eq!(true_up_input(truth, 0, 5_000), truth, "没有已报量时原样保留真总量");
+        assert_eq!(
+            true_up_input(truth, 0, 5_000),
+            truth,
+            "没有已报量时原样保留真总量"
+        );
     }
 
     /// `result.usage.inputTokens` 是**未命中量**,必须把 cacheRead + cacheWrite 加回来。
@@ -2511,14 +3106,23 @@ mod tests {
             "inputTokens": 4504, "outputTokens": 34,
             "cacheReadTokens": 12160, "cacheWriteTokens": 0
         }));
-        assert_eq!(u.input_tokens, 16664, "总量 = 未命中 + 命中读 + 命中写(线缆 field 1)");
+        assert_eq!(
+            u.input_tokens, 16664,
+            "总量 = 未命中 + 命中读 + 命中写(线缆 field 1)"
+        );
         assert_eq!(u.cache_read_tokens, 12160);
-        assert_eq!(u.real_cache_read_tokens, 12160, "上游自报是真实命中,要进对账列");
+        assert_eq!(
+            u.real_cache_read_tokens, 12160,
+            "上游自报是真实命中,要进对账列"
+        );
         assert_eq!(u.cache_creation_tokens, 0);
 
         // 线缆侧减一次 → 客户看到的未命中正好还原成 CLI 报的那个数。
         let wire = crate::chat::delta_usage_json_pub(&u);
-        assert_eq!(wire.get("input_tokens").and_then(|v| v.as_u64()), Some(4504));
+        assert_eq!(
+            wire.get("input_tokens").and_then(|v| v.as_u64()),
+            Some(4504)
+        );
         assert_eq!(
             wire.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
             Some(12160)
@@ -2552,7 +3156,10 @@ mod tests {
             "inputTokens": 72811, "outputTokens": 3940, "cacheReadTokens": 366720
         }));
         assert_eq!(u.input_tokens, 439531, "72811 + 366720 = 总量");
-        assert_eq!(u.cache_read_tokens, 366720, "命中照收,不得因为大于未命中量就丢");
+        assert_eq!(
+            u.cache_read_tokens, 366720,
+            "命中照收,不得因为大于未命中量就丢"
+        );
         assert_eq!(u.real_cache_read_tokens, 366720);
 
         let wire = crate::chat::delta_usage_json_pub(&u);
@@ -2581,7 +3188,11 @@ mod tests {
         // 字段缺失也不能 panic,按 0 处理。
         let empty = usage_from_result(&json!({}));
         assert_eq!(
-            (empty.input_tokens, empty.output_tokens, empty.cache_read_tokens),
+            (
+                empty.input_tokens,
+                empty.output_tokens,
+                empty.cache_read_tokens
+            ),
             (0, 0, 0)
         );
     }
@@ -2650,6 +3261,7 @@ mod tests {
 
         let conv = CliConv {
             account_id: "acc".into(),
+            ws_id: "w".into(),
             cli_session_id: Mutex::new(None),
             fps: Mutex::new(Vec::new()),
             out: OutQueue::new(),
@@ -2703,8 +3315,8 @@ mod tests {
     /// 造一枚只带 exp 的假 JWT(测试用,不验签)。
     fn fake_jwt(exp: i64) -> String {
         use base64::Engine;
-        let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"exp":{exp}}}"#));
+        let body =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         format!("h.{body}.s")
     }
 
@@ -2742,10 +3354,10 @@ mod tests {
         let old = fake_jwt(1_000_000);
         let new = fake_jwt(2_000_000);
         // 号库 token 旧;文件里是 CLI 轮换后的新 token。
-        prepare_home(&cfg, "acc", "conv-a", &old, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", &old, None, &updates).unwrap();
         write_auth_json(&base.join("acc"), &new, Some("rt-new")).unwrap();
 
-        prepare_home(&cfg, "acc", "conv-a", &old, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", &old, None, &updates).unwrap();
 
         let captured = updates.lock().unwrap().get("acc").cloned();
         let captured = captured.expect("文件更新必须产生捕获");
@@ -2763,51 +3375,73 @@ mod tests {
         let updates = TokenUpdates::default();
         let old = fake_jwt(1_000_000);
         let new = fake_jwt(2_000_000);
-        prepare_home(&cfg, "acc", "conv-a", &old, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", &old, None, &updates).unwrap();
 
         // gw-app 侧刷新过(号库 exp 更新)→ 文件应被覆写跟上。
-        prepare_home(&cfg, "acc", "conv-a", &new, Some("rt-new"), "", &updates).unwrap();
+        prepare_home(&cfg, "acc", &new, Some("rt-new"), &updates).unwrap();
 
         let (at, rt) = read_auth_creds(&base.join("acc/.config/cursor/auth.json")).unwrap();
         assert_eq!(at, new);
         assert_eq!(rt.as_deref(), Some("rt-new"));
-        assert!(updates.lock().unwrap().is_empty(), "号库更新不是轮换,不该上报");
+        assert!(
+            updates.lock().unwrap().is_empty(),
+            "号库更新不是轮换,不该上报"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **2026-08-17 跨会话提示串味的回归锁**:同号两个会话的 AGENTS.md 必须各是各的。
     /// 每号一份时,无工具的角色扮演会话会把它覆成「你没有任何工具可用」,同号那个带
-    /// 46 个工具的 Claude Code 会话的 CLI 就读到了那份。
+    /// 46 个工具的 Claude Code 会话的 CLI 就读到了那份。工作区按 ws_id(每条 CLI 会话
+    /// 一份)分 —— 同一 conversation_id 的并行血脉也各是各的目录。
     #[test]
-    fn prepare_home_工作区每会话一份_互不覆盖() {
+    fn prepare_ws_工作区每cli会话一份_互不覆盖() {
         let (cfg, base) = test_cfg("perconv");
-        let updates = TokenUpdates::default();
         let tok = fake_jwt(1_500_000);
-        let (_, ws_a) = prepare_home(&cfg, "acc", "conv-a", &tok, None, "甲会话的 system", &updates).unwrap();
-        let (_, ws_b) = prepare_home(&cfg, "acc", "conv-b", &tok, None, "乙会话的 system", &updates).unwrap();
-        assert_ne!(ws_a, ws_b, "两个会话必须是两个目录");
-        assert_eq!(std::fs::read_to_string(ws_a.join("AGENTS.md")).unwrap(), "甲会话的 system");
-        assert_eq!(std::fs::read_to_string(ws_b.join("AGENTS.md")).unwrap(), "乙会话的 system");
+        prepare_home(&cfg, "acc", &tok, None, &TokenUpdates::default()).unwrap();
+        let ws_a = prepare_ws(&cfg, "acc", "ws-a", "甲会话的 system").unwrap();
+        let ws_b = prepare_ws(&cfg, "acc", "ws-b", "乙会话的 system").unwrap();
+        assert_ne!(ws_a, ws_b, "两条 CLI 会话必须是两个目录");
+        assert_eq!(ws_a, base.join("acc/ws/ws-a"), "目录名就是 ws_id");
+        assert_eq!(ws_b, base.join("acc/ws/ws-b"));
+        assert_eq!(
+            std::fs::read_to_string(ws_a.join("AGENTS.md")).unwrap(),
+            "甲会话的 system"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws_b.join("AGENTS.md")).unwrap(),
+            "乙会话的 system"
+        );
         // 附件也各自隔离(编号 attach-N 是每请求重排的,共用目录会互相盖图)。
         assert!(ws_a.join("assets").is_dir() && ws_b.join("assets").is_dir());
-        // 会话 id 为空时有确定的兜底目录,不会退回共享父目录。
-        let (_, ws_n) = prepare_home(&cfg, "acc", "", &tok, None, "x", &updates).unwrap();
+        // ws_id 为空(_noconv 特例)时有确定的兜底目录,不会退回共享父目录。
+        let ws_n = prepare_ws(&cfg, "acc", "", "x").unwrap();
         assert_eq!(ws_n, base.join("acc/ws/_noconv"));
+        // 续轮重刷:同一份 ws 的 AGENTS.md 跟着本轮 system 改写。
+        let ws_a2 = prepare_ws(&cfg, "acc", "ws-a", "甲会话改过的 system").unwrap();
+        assert_eq!(ws_a2, ws_a, "同一 ws_id 必须落回同一目录");
+        assert_eq!(
+            std::fs::read_to_string(ws_a.join("AGENTS.md")).unwrap(),
+            "甲会话改过的 system"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 迁移:旧版把 AGENTS.md 写在 `ws/` 下,而那是新工作区的**父目录** ——
     /// Cursor 会往上层找 rules,留着等于串味原地保留。必须删掉。
     #[test]
-    fn prepare_home_清掉旧的每号共享agents() {
+    fn prepare_ws_清掉旧的每号共享agents() {
         let (cfg, base) = test_cfg("legacy");
-        let updates = TokenUpdates::default();
         let tok = fake_jwt(1_500_000);
+        prepare_home(&cfg, "acc", &tok, None, &TokenUpdates::default()).unwrap();
         let ws_root = base.join("acc/ws");
         std::fs::create_dir_all(&ws_root).unwrap();
         std::fs::write(ws_root.join("AGENTS.md"), "别的客户的 system").unwrap();
-        prepare_home(&cfg, "acc", "conv-a", &tok, None, "我的 system", &updates).unwrap();
-        assert!(!ws_root.join("AGENTS.md").exists(), "旧的共享 AGENTS.md 必须被清掉");
+        prepare_ws(&cfg, "acc", "ws-a", "我的 system").unwrap();
+        assert!(
+            !ws_root.join("AGENTS.md").exists(),
+            "旧的共享 AGENTS.md 必须被清掉"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2816,22 +3450,26 @@ mod tests {
     #[test]
     fn 工作区gc_只删过期的_不碰当前和新鲜的() {
         let (cfg, base) = test_cfg("wsgc");
-        let updates = TokenUpdates::default();
         let tok = fake_jwt(1_500_000);
+        prepare_home(&cfg, "acc", &tok, None, &TokenUpdates::default()).unwrap();
         let ws_root = base.join("acc/ws");
         // 造三个:过期的、无标记的(旧版残骸)、新鲜的。
-        let stale = ws_root.join("conv-stale");
-        let nomark = ws_root.join("conv-nomark");
+        let stale = ws_root.join("ws-stale");
+        let nomark = ws_root.join("ws-nomark");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::create_dir_all(&nomark).unwrap();
-        std::fs::write(stale.join(".last"), (now_secs() - WS_TTL.as_secs() - 60).to_string()).unwrap();
-        let (_, fresh) = prepare_home(&cfg, "acc", "conv-fresh", &tok, None, "s", &updates).unwrap();
-        // 再跑一次别的会话触发 GC(当前会话换成 conv-cur)。
-        let (_, cur) = prepare_home(&cfg, "acc", "conv-cur", &tok, None, "s", &updates).unwrap();
+        std::fs::write(
+            stale.join(".last"),
+            (now_secs() - WS_TTL.as_secs() - 60).to_string(),
+        )
+        .unwrap();
+        let fresh = prepare_ws(&cfg, "acc", "ws-fresh", "s").unwrap();
+        // 再备别的工作区触发 GC(当前工作区换成 ws-cur)。
+        let cur = prepare_ws(&cfg, "acc", "ws-cur", "s").unwrap();
         assert!(!stale.exists(), "过期目录该删");
         assert!(!nomark.exists(), "无 .last 标记的旧残骸该删");
-        assert!(fresh.exists(), "新鲜会话不能删");
-        assert!(cur.exists(), "当前会话不能删");
+        assert!(fresh.exists(), "新鲜工作区不能删");
+        assert!(cur.exists(), "当前工作区不能删");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2840,11 +3478,11 @@ mod tests {
         let (cfg, base) = test_cfg("same");
         let updates = TokenUpdates::default();
         let tok = fake_jwt(1_500_000);
-        prepare_home(&cfg, "acc", "conv-a", &tok, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", &tok, None, &updates).unwrap();
         let file = base.join("acc/.config/cursor/auth.json");
         let before = std::fs::metadata(&file).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        prepare_home(&cfg, "acc", "conv-a", &tok, None, "", &updates).unwrap();
+        prepare_home(&cfg, "acc", &tok, None, &updates).unwrap();
         let after = std::fs::metadata(&file).unwrap().modified().unwrap();
         assert_eq!(before, after, "同 token 不该重写文件(刷 mtime)");
         assert!(updates.lock().unwrap().is_empty());
@@ -2855,6 +3493,7 @@ mod tests {
     fn pending_按tool_use_id键控消费() {
         let conv = CliConv {
             account_id: "acc".into(),
+            ws_id: "w".into(),
             cli_session_id: Mutex::new(None),
             fps: Mutex::new(Vec::new()),
             out: OutQueue::new(),
@@ -2868,13 +3507,15 @@ mod tests {
             .take_pending_matching(&[("toolu_x".into(), "t".into())])
             .is_err());
 
-        let (tx, _rx) = oneshot::channel::<(Result<String, String>, Option<SimSlot>)>();
+        let (tx, _rx) = oneshot::channel::<BridgeAnswer>();
         *conv.pending.lock().unwrap() = Some(PendingSlot {
             tool_use_id: "toolu_abc".into(),
             responder: tx,
+            delivered: false,
         });
         // 错配 → 报错且槽位保留(可带正确结果重试)。
-        let err = match conv.take_pending_matching(&[("toolu_other".into(), "别的结果".into())]) {
+        let err = match conv.take_pending_matching(&[("toolu_other".into(), "别的结果".into())])
+        {
             Ok(_) => panic!("错配不应成功"),
             Err(e) => e,
         };
@@ -2892,11 +3533,506 @@ mod tests {
         assert!(!conv.has_pending());
     }
 
+    /// 弃槽(多模型编排插队的出口):CAS 只按证明过的 id 取槽;`abandon` 向泵发
+    /// 显式 `BridgeAnswer::Abandon`(不是 responder drop —— drop 历史上只会让泵把
+    /// 错误写回 CLI 继续跑,2026-08-21 codex 审查 blocker)。
+    #[test]
+    fn take_pending_for_cas且abandon发显式注销() {
+        let conv = CliConv {
+            account_id: "acc".into(),
+            ws_id: "w".into(),
+            cli_session_id: Mutex::new(None),
+            fps: Mutex::new(Vec::new()),
+            out: OutQueue::new(),
+            pending: Mutex::new(None),
+            at: Mutex::new(Instant::now()),
+            pgid: Mutex::new(None),
+            billed_input: std::sync::atomic::AtomicU64::new(0),
+        };
+        assert_eq!(conv.pending_id(), None);
+        assert!(conv.take_pending_for("toolu_abc").is_none(), "空槽 → None");
+        let (tx, rx) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_abc".into(),
+            responder: tx,
+            delivered: false,
+        });
+        // id 不符 → 不取(防并发下错杀新挂出的调用)。
+        assert!(conv.take_pending_for("toolu_other").is_none());
+        assert!(conv.has_pending(), "id 不符不得动槽");
+        // id 匹配 → 取走;abandon 送达显式 Abandon。
+        let slot = conv.take_pending_for("toolu_abc").expect("匹配应取到");
+        assert!(!conv.has_pending());
+        slot.abandon();
+        assert!(
+            matches!(rx.blocking_recv(), Ok(BridgeAnswer::Abandon)),
+            "泵应收到显式 Abandon,而非通道关闭"
+        );
+        assert!(
+            conv.take_pending_for("toolu_abc").is_none(),
+            "槽已取走,二次 CAS → None"
+        );
+    }
+
+    // ── 多路桶(CliConversations)─────────────────────────────────────────────
+
+    /// 造一条测试用表项(无进程、无桥,纯元数据)。
+    fn test_conv(sid: Option<&str>, ws_id: &str, fps: &[u64]) -> Arc<CliConv> {
+        test_conv_with_account("acc", sid, ws_id, fps)
+    }
+
+    /// [`test_conv`] 的指定账号版(账号轮转场景用)。
+    fn test_conv_with_account(
+        account: &str,
+        sid: Option<&str>,
+        ws_id: &str,
+        fps: &[u64],
+    ) -> Arc<CliConv> {
+        Arc::new(CliConv {
+            account_id: account.into(),
+            ws_id: ws_id.into(),
+            cli_session_id: Mutex::new(sid.map(str::to_string)),
+            fps: Mutex::new(fps.to_vec()),
+            out: OutQueue::new(),
+            pending: Mutex::new(None),
+            at: Mutex::new(Instant::now()),
+            pgid: Mutex::new(None),
+            billed_input: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn bucket_len(convs: &CliConversations, conv: &str) -> usize {
+        convs.map().get(conv).map(|b| b.len()).unwrap_or(0)
+    }
+
+    fn resume_sid_of(l: CliLookup) -> Option<String> {
+        match l {
+            CliLookup::Resume(e) => e.session_id(),
+            CliLookup::Fresh => None,
+        }
+    }
+
+    /// ① 内容碰撞的**核心回归锁**:同键两条血脉(主会话 / 侧链)共存不互逐,
+    /// 各自的历史各命中各自的条目 —— 旧单条目版这里侧链顶掉主会话、互相驱逐。
+    #[test]
+    fn 桶_同键两条血脉共存_各命中各的() {
+        let convs = CliConversations::default();
+        let main = test_conv(Some("s-main"), "w-main", &[1, 2]);
+        let side = test_conv(Some("s-side"), "w-side", &[1, 9]);
+        convs.insert("c", main, true);
+        convs.insert("c", side, true);
+        assert_eq!(bucket_len(&convs, "c"), 2, "插入不得驱逐同键旧血脉");
+
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[1, 2, 3])).as_deref(),
+            Some("s-main"),
+            "主会话的历史必须命中主会话"
+        );
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[1, 9, 4])).as_deref(),
+            Some("s-side"),
+            "侧链的历史必须命中侧链"
+        );
+        assert_eq!(bucket_len(&convs, "c"), 2, "lookup 不得动桶");
+    }
+
+    /// ② 多条前缀命中时选指纹**最长**的那条(最接近当前进度的血脉)。
+    #[test]
+    fn 桶_lookup多条命中取最长指纹() {
+        let convs = CliConversations::default();
+        convs.insert("c", test_conv(Some("s-short"), "w1", &[7]), true);
+        convs.insert("c", test_conv(Some("s-long"), "w2", &[7, 8]), true);
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[7, 8, 9])).as_deref(),
+            Some("s-long"),
+            "两条都是前缀时必须选最长的那条"
+        );
+    }
+
+    /// ③ 无一前缀匹配 → Fresh 重铺,但**条目原样保留**(它们可能是别的并行血脉)。
+    #[test]
+    fn 桶_无前缀匹配返回fresh且条目保留() {
+        let convs = CliConversations::default();
+        convs.insert("c", test_conv(Some("s-a"), "w1", &[5, 5]), true);
+        assert!(
+            matches!(convs.lookup("c", "acc", &[1, 2]), CliLookup::Fresh),
+            "分叉的历史必须判 Fresh 重铺"
+        );
+        assert_eq!(bucket_len(&convs, "c"), 1, "不命中的条目必须保留,不得驱逐");
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[5, 5, 6])).as_deref(),
+            Some("s-a"),
+            "原血脉回来时仍要能续上"
+        );
+        // 异号条目不算候选(别的号的会话不能续)。
+        assert!(matches!(
+            convs.lookup("c", "other", &[5, 5, 6]),
+            CliLookup::Fresh
+        ));
+    }
+
+    /// ④ 桶上限 [`BUCKET_CAP`]:超出按最近触碰淘汰最旧的那条。
+    #[test]
+    fn 桶_超上限按lru淘汰最旧() {
+        let convs = CliConversations::default();
+        for i in 0..(BUCKET_CAP as u64 + 1) {
+            let e = test_conv(Some(&format!("s{i}")), &format!("w{i}"), &[i]);
+            // 越先插入的触碰时间越旧(都远没到 SESSION_TTL,不会被 fresh 清扫)。
+            *e.at.lock().unwrap() = Instant::now() - Duration::from_millis(1000 - i * 10);
+            convs.insert("c", e, true);
+        }
+        assert_eq!(bucket_len(&convs, "c"), BUCKET_CAP, "桶必须夹在上限");
+        assert!(
+            matches!(convs.lookup("c", "acc", &[0, 999]), CliLookup::Fresh),
+            "最旧的那条(fps=[0])必须已被淘汰"
+        );
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[BUCKET_CAP as u64, 999])),
+            Some(format!("s{BUCKET_CAP}")),
+            "最新的那条必须在桶里"
+        );
+    }
+
+    /// ⑤ remove_if_same 桶内按指针摘:摘指定的、留别的,摘空摘键,重复摘返回 false。
+    #[test]
+    fn 桶_remove_if_same按指针摘除() {
+        let convs = CliConversations::default();
+        let a = test_conv(Some("s-a"), "w1", &[1]);
+        let b = test_conv(Some("s-b"), "w2", &[2]);
+        convs.insert("c", a.clone(), true);
+        convs.insert("c", b.clone(), true);
+
+        assert!(convs.remove_if_same("c", &a));
+        assert_eq!(bucket_len(&convs, "c"), 1, "只摘指定的,别的血脉留下");
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[2, 3])).as_deref(),
+            Some("s-b")
+        );
+        assert!(!convs.remove_if_same("c", &a), "已不在桶里的条目 → false");
+        assert!(convs.remove_if_same("c", &b));
+        assert!(convs.map().get("c").is_none(), "桶摘空后键必须摘除");
+    }
+
+    /// 接替序列(start_conv 续轮的路径:先摘旧再插新):同血脉桶恒为 1,
+    /// 碰撞埋点(桶 ≥2 才打)才不会被正常续轮刷屏。
+    #[test]
+    fn 桶_接替同血脉旧槽_桶恒为一条() {
+        let convs = CliConversations::default();
+        let old = test_conv(Some("s-1"), "w", &[1, 2]);
+        convs.insert("c", old.clone(), true);
+        assert!(convs.remove_if_same("c", &old));
+        convs.insert("c", test_conv(Some("s-1"), "w", &[1, 2, 3]), true);
+        assert_eq!(bucket_len(&convs, "c"), 1, "同血脉续轮后桶内仍应只有一条");
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[1, 2, 3, 4])).as_deref(),
+            Some("s-1")
+        );
+    }
+
+    /// 弃槽判定的入口(Finding 2 后的路由):候选要同号 + 历史前缀 + 有挂起;
+    /// 双 pending 时按带回的 results 里的 id 选中正确的那条。
+    #[test]
+    fn find_pending_双pending按结果id选中正确血脉() {
+        let convs = CliConversations::default();
+        let busy_old = test_conv(Some("s-old"), "w1", &[1, 2]);
+        let busy_new = test_conv(Some("s-new"), "w2", &[1, 2]);
+        for (e, pid) in [(&busy_old, "toolu_old"), (&busy_new, "toolu_new")] {
+            let (tx, _rx) = oneshot::channel::<BridgeAnswer>();
+            *e.pending.lock().unwrap() = Some(PendingSlot {
+                tool_use_id: pid.into(),
+                responder: tx,
+                delivered: false,
+            });
+        }
+        convs.insert("c", busy_old.clone(), true);
+        convs.insert("c", busy_new.clone(), true); // 后插入、触碰更新 —— 旧版会瞎挑它
+                                                   // 带回的是旧血脉的结果:必须路由到旧血脉,尽管新血脉触碰更近。
+        match convs.find_pending("c", "acc", &[1, 2, 3], &["toolu_old"]) {
+            PendingPick::One(found) => assert!(Arc::ptr_eq(&found, &busy_old)),
+            _ => panic!("唯一匹配 results 的候选必须被选中"),
+        }
+        // 无候选键 → None;异号 → None(不许操作别号启动的 CLI)。
+        assert!(matches!(
+            convs.find_pending("none", "acc", &[1, 2, 3], &["toolu_old"]),
+            PendingPick::None
+        ));
+        assert!(matches!(
+            convs.find_pending("c", "other", &[1, 2, 3], &["toolu_old"]),
+            PendingPick::None
+        ));
+        // 历史前缀对不上的条目不算候选:两条都要求 [1,2] 前缀,来个分叉历史 → None。
+        assert!(matches!(
+            convs.find_pending("c", "acc", &[9, 9, 9], &["toolu_old"]),
+            PendingPick::None
+        ));
+    }
+
+    /// Finding 2:多候选且按带回 id 也无法唯一确定 → Ambiguous,**不落 pending 接续**。
+    #[test]
+    fn find_pending_歧义不落接续() {
+        let convs = CliConversations::default();
+        let a = test_conv_with_account("acc", Some("s-a"), "w1", &[1]);
+        let b = test_conv_with_account("acc", Some("s-b"), "w2", &[1]);
+        for (e, pid) in [(&a, "toolu_a"), (&b, "toolu_b")] {
+            let (tx, _rx) = oneshot::channel::<BridgeAnswer>();
+            *e.pending.lock().unwrap() = Some(PendingSlot {
+                tool_use_id: pid.into(),
+                responder: tx,
+                delivered: false,
+            });
+        }
+        convs.insert("c", a.clone(), true);
+        convs.insert("c", b.clone(), true);
+        // 带回的 id 谁都不在 results 里(比如别家提供方的 call-<uuid> 形态)→ 歧义。
+        match convs.find_pending("c", "acc", &[1, 2], &["call-xyz-0"]) {
+            PendingPick::Ambiguous {
+                bucket_len,
+                candidates,
+            } => {
+                assert_eq!(bucket_len, 2);
+                assert_eq!(candidates, 2);
+            }
+            _ => panic!("无法唯一路由时必须报歧义,绝不瞎挑"),
+        }
+        // 两条都在 results 里(畸形重放)同样歧义,不猜。
+        assert!(matches!(
+            convs.find_pending("c", "acc", &[1, 2], &["toolu_a", "toolu_b"]),
+            PendingPick::Ambiguous { .. }
+        ));
+        // 只剩一条候选时维持单候选语义(stale 判定交给调用方)。
+        convs.remove_if_same("c", &a);
+        match convs.find_pending("c", "acc", &[1, 2], &["call-xyz-0"]) {
+            PendingPick::One(found) => assert!(Arc::ptr_eq(&found, &b)),
+            _ => panic!("单候选必须保持现有语义"),
+        }
+    }
+
+    /// Finding 1 的危害锁:两条 pending 血脉前缀不同长时,**普通 lookup 会把
+    /// 仍挂起的长血脉唯一选中 Resume**(= 同一上游 session 并发写的形态)。
+    /// 这正是 lib.rs 在 Ambiguous 分支必须 force_fresh 的原因 —— 本测试锁定
+    /// 「危害真实存在」;若哪天 lookup 语义变化使下面的断言失败,
+    /// force_fresh 的保护对象要一并重新评估。
+    #[test]
+    fn find_pending_歧义时普通lookup本会误选挂起血脉() {
+        let convs = CliConversations::default();
+        let long = test_conv(Some("s-long"), "w-long", &[1, 2]);
+        let short = test_conv(Some("s-short"), "w-short", &[1]);
+        for e in [&long, &short] {
+            let (tx, _rx) = oneshot::channel::<BridgeAnswer>();
+            *e.pending.lock().unwrap() = Some(PendingSlot {
+                tool_use_id: format!("toolu-{}", e.ws_id),
+                responder: tx,
+                delivered: false,
+            });
+        }
+        convs.insert("c", long, true);
+        convs.insert("c", short, true);
+        // 路由层:带回的 id 无法唯一确定 → Ambiguous(调用方据此 force_fresh)。
+        assert!(matches!(
+            convs.find_pending("c", "acc", &[1, 2, 3], &["call-xyz-0"]),
+            PendingPick::Ambiguous { .. }
+        ));
+        // 危害证明:若**不** force_fresh 而直接走普通 lookup,
+        // 仍挂起的长血脉会被唯一选中 Resume —— 新进程以同一 SID 并发写上游。
+        match convs.lookup("c", "acc", &[1, 2, 3]) {
+            CliLookup::Resume(e) => {
+                assert_eq!(e.session_id().as_deref(), Some("s-long"));
+                assert!(
+                    e.pending_id().is_some(),
+                    "被选中的血脉还挂着桥调用,Resume 它就是并发双写"
+                );
+            }
+            CliLookup::Fresh => {
+                panic!("lookup 不再选中挂起血脉 —— force_fresh 的保护对象已变,本测试需重估")
+            }
+        }
+    }
+
+    /// Finding 2:带错 id 的请求被拒后,条目 fps **不被污染**、槽保留;
+    /// 带正确 id 重试正常接续,fps 在拿槽成功后才更新。
+    #[test]
+    fn resume_conv_错id不污染指纹_正确id正常接续() {
+        let conv = test_conv(None, "w", &[1, 2]);
+        let (tx, rx) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_abc".into(),
+            responder: tx,
+            delivered: false,
+        });
+        // 错 id:显式拒绝、槽保留(S1-7 不动)、**fps 一字未写**。
+        let err = resume_conv(
+            conv.clone(),
+            vec![("toolu_wrong".into(), "x".into())],
+            vec![9, 9, 9],
+            None,
+        );
+        assert!(err.is_err(), "错配必须显式拒绝");
+        assert!(conv.has_pending(), "错配不得消费槽位");
+        assert_eq!(
+            *conv.fps.lock().unwrap(),
+            vec![1, 2],
+            "错配请求不得污染指纹 —— 否则带正确结果的重试会被前缀筛选卡掉"
+        );
+        // 正确 id 重试:接续成功,fps 此刻才更新,泵收到正确答案。
+        let stream = resume_conv(
+            conv.clone(),
+            vec![("toolu_abc".into(), "正确结果".into())],
+            vec![1, 2, 3],
+            None,
+        )
+        .expect("带正确 id 必须能正常接续");
+        drop(stream);
+        assert_eq!(
+            *conv.fps.lock().unwrap(),
+            vec![1, 2, 3],
+            "槽校验成功后指纹才更新"
+        );
+        assert!(
+            matches!(rx.blocking_recv(), Ok(BridgeAnswer::Answer(text, None)) if text == "正确结果"),
+            "泵应收到正确答案"
+        );
+    }
+
+    /// Finding 1:A→B→A 账号轮转,最长前缀在别号 → 必须 Fresh,
+    /// **不许**退回同号的短祖先(那会只发增量,静默丢 B 处理的中间轮)。
+    #[test]
+    fn 桶_账号轮转不回退别号祖先() {
+        let convs = CliConversations::default();
+        let a_old = test_conv(Some("s-A"), "w-A", &[1, 2]); // A 的旧短条目
+        convs.insert("c", a_old, true);
+        let b_new = test_conv_with_account("B", Some("s-B"), "w-B", &[1, 2, 3, 4, 5]); // B 号上推进了 3 轮
+        convs.insert("c", b_new, true);
+        // 回到 A 号,历史已含 B 的轮次:A 旧条目 [1,2] 仍是前缀,但最长是 B 的 5。
+        assert!(
+            matches!(
+                convs.lookup("c", "A", &[1, 2, 3, 4, 5, 6]),
+                CliLookup::Fresh
+            ),
+            "最长前缀在别号时必须 Fresh 重铺,不许回退同号短祖先"
+        );
+        assert_eq!(bucket_len(&convs, "c"), 2, "Fresh 判定不得驱逐任何条目");
+        // 同号(B)正常续:唯一最长前缀 → Resume。
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "B", &[1, 2, 3, 4, 5, 6])).as_deref(),
+            Some("s-B")
+        );
+    }
+
+    /// Finding 3:完全相同开场的两条会话,各自追加 assistant 指纹后,
+    /// turn2 的历史只对得上自己那条;指纹对不上(歧义/分叉)退 Fresh。
+    #[test]
+    fn 桶_assistant指纹区分相同开场的双会话() {
+        let convs = CliConversations::default();
+        let s1 = test_conv(Some("s-1"), "w-1", &[11]);
+        let s2 = test_conv(Some("s-2"), "w-2", &[11]);
+        convs.insert("c", s1.clone(), true);
+        convs.insert("c", s2.clone(), true);
+
+        // 追加前:两条都是 [11],turn2 历史 [11, …] 对两条都是同长前缀 → 歧义 Fresh。
+        assert!(
+            matches!(convs.lookup("c", "acc", &[11, 22]), CliLookup::Fresh),
+            "未分层的相同开场必须歧义重铺,不许瞎选"
+        );
+
+        // 各自干净收尾,追加各自的 assistant 输出指纹(模拟泵的 Finding 3a 挂载)。
+        let a1 = crate::chat::turn_fp(false, "甲会话的回答");
+        let a2 = crate::chat::turn_fp(false, "乙会话完全不同的回答");
+        s1.fps.lock().unwrap().push(a1);
+        s2.fps.lock().unwrap().push(a2);
+
+        // turn2 各回各的 SID。
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[11, a1, 33])).as_deref(),
+            Some("s-1"),
+            "甲的历史必须续甲的会话"
+        );
+        assert_eq!(
+            resume_sid_of(convs.lookup("c", "acc", &[11, a2, 33])).as_deref(),
+            Some("s-2"),
+            "乙的历史必须续乙的会话"
+        );
+        // 指纹对不上(历史被改写 / 第三方插入的回答)→ 无前缀匹配,Fresh 重铺。
+        let a_bad = crate::chat::turn_fp(false, "谁都没说过的回答");
+        assert!(
+            matches!(convs.lookup("c", "acc", &[11, a_bad, 33]), CliLookup::Fresh),
+            "指纹对不上必须退 Fresh(安全方向),不许续进错的会话"
+        );
+        assert_eq!(bucket_len(&convs, "c"), 2, "判定不得动桶");
+    }
+
+    /// Finding 3a 的指纹口径:`append_assistant_fp` 追加的必须等于
+    /// `history_fps` 对「下轮请求历史里那条 assistant 消息」的计算结果。
+    #[test]
+    fn assistant指纹_与history_fps逐字节同口径() {
+        let conv = test_conv(None, "w", &[11]);
+        // ① 纯文本轮:渲染 = 原文。
+        conv.append_assistant_fp("这是回答");
+        let body = serde_json::json!({"messages":[
+            {"role":"user","content":"开场"},
+            {"role":"assistant","content":"这是回答"},
+        ]});
+        let fps = crate::chat::history_fps(&body);
+        assert_eq!(
+            conv.fps.lock().unwrap().as_slice(),
+            &[11, fps[1]],
+            "纯文本轮的追加必须等于 history_fps 对该 assistant 消息的指纹"
+        );
+        // ② 带 thinking 的历史:thinking 块不进渲染,指纹仍按 text 部分算。
+        let body_think = serde_json::json!({"messages":[
+            {"role":"user","content":"开场"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"(隐藏推理)"},
+                {"type":"text","text":"这是回答"},
+            ]},
+        ]});
+        assert_eq!(
+            crate::chat::history_fps(&body_think)[1],
+            crate::chat::turn_fp(false, "这是回答"),
+            "thinking 块必须被排除在指纹之外(与 extract_text_in_msg 同口径)"
+        );
+        // ③ 多 text 块:渲染 = '\n' 相连 —— SsePhase 按块存就是为了对上这条。
+        let body_blocks = serde_json::json!({"messages":[
+            {"role":"assistant","content":[
+                {"type":"text","text":"第一段"},
+                {"type":"text","text":"第二段"},
+            ]},
+        ]});
+        assert_eq!(
+            crate::chat::history_fps(&body_blocks)[0],
+            crate::chat::turn_fp(false, "第一段\n第二段"),
+            "多 text 块必须按 '\\n' 相连渲染"
+        );
+        // ④ 空正文(纯非文本块)= to_turns 的占位串。
+        let conv2 = test_conv(None, "w", &[]);
+        conv2.append_assistant_fp("");
+        assert_eq!(
+            conv2.fps.lock().unwrap().as_slice(),
+            &[crate::chat::turn_fp(false, "(unsupported content omitted)")],
+            "空正文必须按 to_turns 的占位串口径追加"
+        );
+    }
+
+    /// SsePhase 的文本块累积:text/thinking 交错产生的多个 text 块,
+    /// 渲染必须按 `'\n'` 相连(与调用方历史的 extract_text_in_msg 同口径)。
+    #[test]
+    fn ssephase_文本块按块累积() {
+        let out = OutQueue::new();
+        let mut phase = SsePhase::with_input("m", TokenTally::default(), None, 0);
+        phase.push_text(&out, "text", "第一段", false);
+        phase.push_text(&out, "thinking", "想一想", true);
+        phase.push_text(&out, "text", "第二段", false);
+        assert_eq!(phase.assistant_rendered_text(), "第一段\n第二段");
+    }
+
     /// 阶段超时的纯映射(不碰进程全局):0 = 未设回落默认;< 下限夹到下限;其余原样。
     /// 下限的存在理由:低于 30s 没有任何模型能完成首阶段(CLI 冷启动 + 首 token)。
     #[test]
     fn 阶段超时_纯映射_0回落_下限夹取() {
-        assert_eq!(resolve_phase_timeout_secs(0), CLI_TIMEOUT.as_secs(), "0 = 未设回落默认");
+        assert_eq!(
+            resolve_phase_timeout_secs(0),
+            CLI_TIMEOUT.as_secs(),
+            "0 = 未设回落默认"
+        );
         assert_eq!(resolve_phase_timeout_secs(1), MIN_PHASE_TIMEOUT_SECS);
         assert_eq!(resolve_phase_timeout_secs(29), MIN_PHASE_TIMEOUT_SECS);
         assert_eq!(resolve_phase_timeout_secs(30), MIN_PHASE_TIMEOUT_SECS);
@@ -2911,7 +4047,11 @@ mod tests {
         assert_eq!(phase_timeout(), CLI_TIMEOUT, "env 未设时应为默认 240s");
         assert_eq!(set_phase_timeout_secs(120), 120);
         assert_eq!(phase_timeout(), Duration::from_secs(120), "热改立即生效");
-        assert_eq!(set_phase_timeout_secs(5), MIN_PHASE_TIMEOUT_SECS, "低于下限被夹");
+        assert_eq!(
+            set_phase_timeout_secs(5),
+            MIN_PHASE_TIMEOUT_SECS,
+            "低于下限被夹"
+        );
         assert_eq!(phase_timeout(), Duration::from_secs(30));
         // 0 = 未设(worker 轮询拿到 derive 零值时)→ 回落启动默认,绝不把超时打成 0。
         assert_eq!(set_phase_timeout_secs(0), CLI_TIMEOUT.as_secs());
@@ -2932,12 +4072,20 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 q.push(OutItem::Heartbeat);
             }
-            q.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new("ping", json!({}))))));
-            q.push(OutItem::End);
+            q.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
+                "ping",
+                json!({}),
+            )))));
+            q.push(OutItem::End(None));
         });
-        let items: Vec<_> = drain_stream_with_idle(out, Duration::from_millis(100)).collect().await;
+        let items: Vec<_> = drain_stream_with_idle(out, None, Duration::from_millis(100))
+            .collect()
+            .await;
         assert_eq!(items.len(), 1, "心跳不该产生任何 SSE item");
-        assert!(matches!(&items[0], Ok(StreamItem::Sse(_))), "唯一产出应是真实事件");
+        assert!(
+            matches!(&items[0], Ok(StreamItem::Sse(_))),
+            "唯一产出应是真实事件"
+        );
     }
 
     /// 心跳不是免死金牌:停发(= 泵确认 CLI 已无原始活动)后,idle 死闸照旧收尸。
@@ -2949,9 +4097,155 @@ mod tests {
         tokio::spawn(async move {
             q.push(OutItem::Heartbeat); // 只有一个心跳,之后再无动静
         });
-        let items: Vec<_> = drain_stream_with_idle(out, Duration::from_millis(60)).collect().await;
-        assert_eq!(items.len(), 1, "超时后应只发一条错误再终止(不是每 90s 一条的死循环)");
+        let items: Vec<_> = drain_stream_with_idle(out, None, Duration::from_millis(60))
+            .collect()
+            .await;
+        assert_eq!(
+            items.len(),
+            1,
+            "超时后应只发一条错误再终止(不是每 90s 一条的死循环)"
+        );
         let err = items[0].as_ref().err().expect("应按 idle 超时错误收尾");
         assert!(format!("{err}").contains("没有任何输出"), "实际={err}");
+    }
+
+    /// 送达标记语义:挂起即未送达;**按 id 键控**标记;id 不符/无挂起均不误标;
+    /// `take_pending_for_if_undelivered` 把"判未送达 + 取槽"折进同一把锁。
+    #[test]
+    fn pending_delivered标记语义() {
+        let conv = test_conv(None, "w", &[1]);
+        let (tx, _rx) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_abc".into(),
+            responder: tx,
+            delivered: false,
+        });
+        assert!(conv.pending_undelivered("toolu_abc"), "挂起即未送达");
+        assert!(!conv.pending_undelivered("toolu_other"), "id 不符 → false");
+        // 键控:别的 id 的 End 不得误标本槽(双 drain 抢同一队列的竞态 1)。
+        conv.mark_pending_delivered_for("toolu_other");
+        assert!(
+            conv.pending_undelivered("toolu_abc"),
+            "id 不符的标记不得生效"
+        );
+        conv.mark_pending_delivered_for("toolu_abc");
+        assert!(!conv.pending_undelivered("toolu_abc"), "标记送达后 → false");
+        // 已送达 → CAS 不取(防 TOCTOU 误杀刚送达的槽)。
+        assert!(conv.take_pending_for_if_undelivered("toolu_abc").is_none());
+        assert!(conv.has_pending(), "已送达的槽必须原样保留");
+        // 无挂起时 mark 是 no-op(finish_done/finish_error 的 End(None) 路径),不得 panic。
+        conv.pending.lock().unwrap().take();
+        conv.mark_pending_delivered_for("toolu_abc");
+        assert!(!conv.pending_undelivered("toolu_abc"), "无挂起 → false");
+        // 未送达槽 → CAS 取走。
+        let (tx2, _rx2) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_x".into(),
+            responder: tx2,
+            delivered: false,
+        });
+        assert!(conv.take_pending_for_if_undelivered("toolu_x").is_some());
+        assert!(!conv.has_pending());
+    }
+
+    /// 送达标记的真实链路(2026-08-24 事故修复):阶段队列被完整 drain(到 End)
+    /// ⇒ 挂起槽置为已送达;drain 中途被 drop(客户端吞槽后秒断,tool_use 流进
+    /// 死连接)⇒ 保持未送达,分流据此弃槽重铺而非 400 卡死。
+    #[tokio::test]
+    async fn drain_完整消费标记送达_中途drop保持未送达() {
+        use futures::StreamExt;
+        // 完整 drain 到 End → delivered=true。
+        let conv = test_conv(None, "w", &[1]);
+        let (tx, _rx) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_a".into(),
+            responder: tx,
+            delivered: false,
+        });
+        let out = conv.out.clone();
+        out.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
+            "content_block_start",
+            json!({}),
+        )))));
+        out.push(OutItem::End(Some("toolu_a".into())));
+        let items: Vec<_> = drain_stream(out, conv.clone()).collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(
+            !conv.pending_undelivered("toolu_a"),
+            "drain 到 End ⇒ 已送达"
+        );
+
+        // 取一条即 drop(客户端断流),泵事后推入的 End 无人消费 → 保持未送达。
+        let conv2 = test_conv(None, "w2", &[1]);
+        let (tx2, _rx2) = oneshot::channel::<BridgeAnswer>();
+        *conv2.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_b".into(),
+            responder: tx2,
+            delivered: false,
+        });
+        let out2 = conv2.out.clone();
+        out2.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
+            "content_block_start",
+            json!({}),
+        )))));
+        {
+            let mut s = Box::pin(drain_stream(out2.clone(), conv2.clone()));
+            let _ = s.next().await; // 取走唯一一条 SSE 后 drop(= 客户端断流)
+        }
+        out2.push(OutItem::End(Some("toolu_b".into()))); // 泵后来才推 End,drain 已死
+        assert!(
+            conv2.pending_undelivered("toolu_b"),
+            "drain 未到 End ⇒ 未送达"
+        );
+    }
+
+    /// 竞态 1(2026-08-24 claude 复审):同一条 `conv.out` 被先后两次响应的 drain
+    /// 并发消费时,上一阶段残留的 `End(A)` 不得把本阶段刚挂出的 B 错标为已送达 ——
+    /// 那会让"从未送达的弃血脉"被判成已送达,重新打开本次要修的 400 死锁。
+    #[tokio::test]
+    async fn drain_残留旧end不误标新阶段的槽() {
+        use futures::StreamExt;
+        let conv = test_conv(None, "w", &[1]);
+        // 阶段 N:挂 A、推完 SSE 与 End(A);drain1 只取走一条就停(客户端慢读/半死)。
+        let (tx_a, _rx_a) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_a".into(),
+            responder: tx_a,
+            delivered: false,
+        });
+        let out = conv.out.clone();
+        out.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
+            "content_block_start",
+            json!({}),
+        )))));
+        out.push(OutItem::End(Some("toolu_a".into())));
+        let mut d1 = Box::pin(drain_stream(out.clone(), conv.clone()));
+        let _ = d1.next().await; // 取走 SSE,End(A) 仍躺在队里
+                                 // 客户端带 A 的结果回来:吞 A 槽;泵产出阶段 N+1,挂上 B。
+        conv.pending.lock().unwrap().take();
+        let (tx_b, _rx_b) = oneshot::channel::<BridgeAnswer>();
+        *conv.pending.lock().unwrap() = Some(PendingSlot {
+            tool_use_id: "toolu_b".into(),
+            responder: tx_b,
+            delivered: false,
+        });
+        // drain1 此刻才 pop 到阶段 N 的 End(A):收尾自己,但不得误标 B。
+        assert!(d1.next().await.is_none(), "drain1 应随 End(A) 收尾");
+        assert!(
+            conv.pending_undelivered("toolu_b"),
+            "残留 End(A) 不得误标 B"
+        );
+        // 本阶段的 drain2 完整消费到 End(B) → B 才被标记送达。
+        out.push(OutItem::Item(Ok(StreamItem::Sse(SseEvent::new(
+            "content_block_start",
+            json!({}),
+        )))));
+        out.push(OutItem::End(Some("toolu_b".into())));
+        let items: Vec<_> = drain_stream(out, conv.clone()).collect().await;
+        assert_eq!(items.len(), 1);
+        assert!(
+            !conv.pending_undelivered("toolu_b"),
+            "drain 到 End(B) ⇒ B 已送达"
+        );
     }
 }

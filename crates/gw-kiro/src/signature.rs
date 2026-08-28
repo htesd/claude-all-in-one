@@ -230,18 +230,33 @@ const SYNTH_BODY_MAX_LEN: usize = 1024;
 
 /// 用 SHA256 链确定性派生 `len` 字节（同 model+thinking+label 必得同结果，
 /// 让同一 thinking 的签名稳定可复现，不同内容则不同）。
+///
+/// 【2026-08-20 性能修正,**输出逐字节不变**】原实现在 `while` 里每轮重建 hasher、
+/// 把 `thinking` 整段重喂一遍。单次 `synthesize_signature` 有 5 次 `derive_bytes`
+/// (len = 64/12/12/48/最多1024 → 2+1+1+2+32 = 38 轮),即整段推理文本被哈 **38 遍**;
+/// `is_synthesized_signature` 走的是同一条路径,而它对**每条**历史 thinking 块都要跑
+/// (`history_thinking_turns=-1` 全保留时,长会话每请求上百次)→ 纯浪费。
+///
+/// 现改为:公共前缀(domain|label|0|model|0|thinking)只喂一次,之后按 counter `clone()`
+/// hasher 状态。SHA256 是流式的,`clone()` 后追加 counter 与顺序喂完整字节流**进同一
+/// 哈希函数的字节序列完全相同** → 摘要逐字节相同,不是近似、无概率论证。
+/// 整段文本的哈希次数 38 → 5(每次 `derive_bytes` 一次),同时也加速下行合成路径。
+/// ⚠️ 字段喂入顺序与内容一个字节都不能改 —— 改了就是换签名格式,历史会话全失效。
 fn derive_bytes(model: &str, thinking: &str, label: &[u8], len: usize) -> Vec<u8> {
     use sha2::{Digest, Sha256};
+    // 公共前缀哈一次(counter 之前的全部字节,顺序与原实现逐字节一致)。
+    let mut prefix = Sha256::new();
+    prefix.update(SYNTH_DOMAIN);
+    prefix.update(label);
+    prefix.update([0]);
+    prefix.update(model.as_bytes());
+    prefix.update([0]);
+    prefix.update(thinking.as_bytes());
+
     let mut out = Vec::with_capacity(len);
     let mut counter: u32 = 0;
     while out.len() < len {
-        let mut h = Sha256::new();
-        h.update(SYNTH_DOMAIN);
-        h.update(label);
-        h.update([0]);
-        h.update(model.as_bytes());
-        h.update([0]);
-        h.update(thinking.as_bytes());
+        let mut h = prefix.clone();
         h.update(counter.to_le_bytes());
         out.extend_from_slice(&h.finalize());
         counter = counter.wrapping_add(1);
@@ -395,6 +410,100 @@ mod tests {
         assert_eq!(a, b, "同 model+thinking 应得稳定签名");
         let c = synthesize_signature("claude-opus-4-6", "different thinking");
         assert_ne!(a, c, "不同 thinking 应得不同签名");
+    }
+
+    /// **重构前**的 `derive_bytes` 逐字重放(每轮重建 hasher、整段 thinking 重喂一遍)。
+    /// 只存在于测试:给 2026-08-20 的前缀记忆化重构当参照物。
+    /// ⚠️ 不要"顺手"把它改成调用新实现 —— 那样这个测试就退化成自我肯定。
+    fn derive_bytes_prerefactor(model: &str, thinking: &str, label: &[u8], len: usize) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut out = Vec::with_capacity(len);
+        let mut counter: u32 = 0;
+        while out.len() < len {
+            let mut h = Sha256::new();
+            h.update(SYNTH_DOMAIN);
+            h.update(label);
+            h.update([0]);
+            h.update(model.as_bytes());
+            h.update([0]);
+            h.update(thinking.as_bytes());
+            h.update(counter.to_le_bytes());
+            out.extend_from_slice(&h.finalize());
+            counter = counter.wrapping_add(1);
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// 前缀记忆化重构 == 重构前实现,across 全部 clamp 边界与 counter 档位(对抗评审 #2)。
+    ///
+    /// 金标准测试只有 45 字节样本 → `body_len` 被 clamp 到下界 80 → f5 只走 counter 0..2。
+    /// 本测试补齐 codex 点名的四个缺口:进入动态区间、1023/1024/1025 clamp 上界、
+    /// 最大 32 轮(counter 31)、多字节 UTF-8 跨字节长度边界。
+    #[test]
+    fn derive_bytes_matches_prerefactor_reference_across_boundaries() {
+        // thinking 字节长度覆盖:空 / clamp 下界两侧 / 动态区间 / clamp 上界三点 / Unicode
+        let samples: Vec<String> = vec![
+            String::new(),
+            "x".repeat(79),
+            "x".repeat(80),
+            "x".repeat(81),
+            "x".repeat(512),
+            "x".repeat(1023),
+            "x".repeat(1024),
+            "x".repeat(1025),
+            "推理".repeat(40),   // 240 字节,3 字节/字符
+            "ünïcödé ✓".repeat(9),
+        ];
+        // 覆盖 synthesize_signature 实际用到的全部 (label, len) 组合 + counter 边界档位。
+        let lens = [0usize, 1, 12, 31, 32, 33, 48, 64, 80, 1023, 1024];
+        let labels: [&[u8]; 5] = [b"hdr5", b"f2", b"f3", b"f4", b"f5"];
+        for model in ["claude-opus-4-6", "claude-opus-5", ""] {
+            for t in &samples {
+                for label in labels {
+                    for len in lens {
+                        assert_eq!(
+                            derive_bytes(model, t, label, len),
+                            derive_bytes_prerefactor(model, t, label, len),
+                            "derive_bytes 漂移: model={model} thinking_len={} label={} len={len}",
+                            t.len(),
+                            String::from_utf8_lossy(label)
+                        );
+                    }
+                }
+            }
+        }
+        // 整签名层面同样等价(含 body_len clamp 逻辑),并确认 1024/1025 都夹到同一长度。
+        for t in &samples {
+            let sig = synthesize_signature("claude-opus-4-6", t);
+            assert!(is_synthesized_signature("claude-opus-4-6", t, &sig));
+        }
+        assert_eq!(
+            synthesize_signature("claude-opus-4-6", &"x".repeat(1024)).len(),
+            synthesize_signature("claude-opus-4-6", &"x".repeat(1025)).len(),
+            "clamp 上界:1024 与 1025 应产出同长签名"
+        );
+    }
+
+    /// 【金标准】合成签名字节稳定性 —— 2026-08-20 `derive_bytes` 前缀记忆化重构的护栏。
+    ///
+    /// 期望值由**独立实现**(Python 照抄重构**前**的逐轮重哈算法)算出,不是从本实现
+    /// 反向录制的 —— 所以它同时验证「重构没改字节」和「格式没漂」两件事。
+    /// 这串一旦对不上,说明签名格式变了:所有历史会话里我方合成的签名全部失配,
+    /// `is_synthesized_signature` 认不出旧签名 → 旧假签名会被当真签名发上游吃 400。
+    /// **只有在刻意变更签名格式时才允许改这个常量。**
+    #[test]
+    fn synthesized_signature_is_byte_stable_golden() {
+        const MODEL: &str = "claude-opus-4-6";
+        const THINKING: &str = "golden thinking sample for byte-stability pin";
+        const GOLDEN: &str = "EocCCmUIDhABGAIqQBpAEghh6Z/2CBfPWM6tMsi5gMoCfhvhbi3hDBPAr4vP+8tDtjUrNUS4OE9rRb8B/fCUF9KR1cQAhRcuE4ChBBcyD2NsYXVkZS1vcHVzLTQtNjgAQgh0aGlua2luZxIMqicN+JiCh4qUxPf1GgzHBwKKgY5oQoV+rY0iMEHhVNZ0uUrtmJMXh/GZHDPiHoo5So7+baojw5dFswwjCR3jpwhAGUQkr//J1kqM6ipQ0Hmj0yZYq3RHvGHbBllPck8U1vgIPzNsZqQ0m4Gm1MeCP+U4N0q5ZbmrUSxP7CTfdaacfA5bmfQvJU+d8Kq2/RMIy0oUcpqgNU7Wx+4a/Y8YAQ==";
+        assert_eq!(
+            synthesize_signature(MODEL, THINKING),
+            GOLDEN,
+            "合成签名字节漂移 —— 见本测试文档注释,不要直接改 GOLDEN"
+        );
+        // 自洽:金标准串必须被自己的识别器认出(否则上行会漏放假签名)。
+        assert!(is_synthesized_signature(MODEL, THINKING, GOLDEN));
     }
 
     #[test]

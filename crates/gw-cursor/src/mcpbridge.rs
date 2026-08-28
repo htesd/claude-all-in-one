@@ -70,7 +70,8 @@ pub async fn run(sock: PathBuf, tools: PathBuf) -> anyhow::Result<()> {
                 let answer = sock_lines.next_line().await;
                 match answer {
                     Ok(Some(ans)) => {
-                        let v: Value = serde_json::from_str(&ans).unwrap_or(json!({"error": "bad reply"}));
+                        let v: Value =
+                            serde_json::from_str(&ans).unwrap_or(json!({"error": "bad reply"}));
                         if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
                             Some(json!({
                                 "content": [{"type": "text", "text": format!("工具调用失败: {err}")}],

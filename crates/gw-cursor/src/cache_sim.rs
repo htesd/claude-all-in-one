@@ -533,11 +533,31 @@ mod tests {
         let (_rb, gen_b) = store.peek_at("s", "m", &[fp(2, 200)], t0);
         assert_eq!((ra.cache_read_tokens, gen_a, gen_b), (0, 0, 0));
         // B 先完成:提交成功,代际推进。
-        assert!(store.commit_at("s", "m", vec![fp(2, 200)], t0 + Duration::from_secs(1), gen_b));
+        assert!(store.commit_at(
+            "s",
+            "m",
+            vec![fp(2, 200)],
+            t0 + Duration::from_secs(1),
+            gen_b
+        ));
         // A 后完成:代际已变,提交必须被拒,表内容仍是 B 的。
-        assert!(!store.commit_at("s", "m", vec![fp(1, 100)], t0 + Duration::from_secs(2), gen_a));
-        let (r, _g) = store.peek_at("s", "m", &[fp(2, 200), fp(3, 50)], t0 + Duration::from_secs(3));
-        assert_eq!(r.cache_read_tokens, 200, "下一个请求应命中 B 的内容(先完成者)");
+        assert!(!store.commit_at(
+            "s",
+            "m",
+            vec![fp(1, 100)],
+            t0 + Duration::from_secs(2),
+            gen_a
+        ));
+        let (r, _g) = store.peek_at(
+            "s",
+            "m",
+            &[fp(2, 200), fp(3, 50)],
+            t0 + Duration::from_secs(3),
+        );
+        assert_eq!(
+            r.cache_read_tokens, 200,
+            "下一个请求应命中 B 的内容(先完成者)"
+        );
     }
 
     /// 串行轮次代际链不断:每轮 commit 用本轮 peek 的 gen,必须永远成功。
@@ -550,7 +570,13 @@ mod tests {
             let (_r, gen) = store.peek_at("s", "m", &prev, t0 + Duration::from_secs(i * 10));
             prev.push(fp(100 + i as u64, 20));
             assert!(
-                store.commit_at("s", "m", prev.clone(), t0 + Duration::from_secs(i * 10 + 1), gen),
+                store.commit_at(
+                    "s",
+                    "m",
+                    prev.clone(),
+                    t0 + Duration::from_secs(i * 10 + 1),
+                    gen
+                ),
                 "第 {i} 轮串行 commit 必须成功"
             );
         }
@@ -605,7 +631,12 @@ mod tests {
         let store = CacheSimStore::new();
         let t0 = Instant::now();
         store.observe_at("sess-a", "fable-5", vec![fp(1, 100)], t0);
-        let r = store.observe_at("sess-a", "gpt-5.6", vec![fp(1, 100)], t0 + Duration::from_secs(10));
+        let r = store.observe_at(
+            "sess-a",
+            "gpt-5.6",
+            vec![fp(1, 100)],
+            t0 + Duration::from_secs(10),
+        );
         assert_eq!(r.cache_read_tokens, 0, "换模型必须整段 miss");
     }
 
@@ -695,8 +726,7 @@ mod tests {
         let t0 = Instant::now();
         let fps1 = fingerprints_from_context("sys", &[tool("read")], &[turn("问", true)], est);
         let first = store.observe_at("sess-a", "fable-5", fps1, t0);
-        let fps2 =
-            fingerprints_from_context("sys", &[tool("write")], &[turn("问", true)], est);
+        let fps2 = fingerprints_from_context("sys", &[tool("write")], &[turn("问", true)], est);
         let r = store.observe_at("sess-a", "fable-5", fps2, t0 + Duration::from_secs(10));
         let sys_tokens = est("S\x1fsys") as u32;
         assert_eq!(
@@ -705,8 +735,7 @@ mod tests {
             r.cache_read_tokens, first.total_tokens
         );
         // 工具不变时同一会话整段命中(对照)。
-        let fps3 =
-            fingerprints_from_context("sys", &[tool("write")], &[turn("问", true)], est);
+        let fps3 = fingerprints_from_context("sys", &[tool("write")], &[turn("问", true)], est);
         let r3 = store.observe_at("sess-a", "fable-5", fps3, t0 + Duration::from_secs(20));
         assert!(r3.cache_read_tokens >= r.total_tokens, "工具不变应整段命中");
     }
@@ -734,7 +763,11 @@ mod tests {
     /// 倍率放大命中比例。这三个数是**运营旋钮**,不是估算的一部分。
     #[test]
     fn 夹限与kiro同口径() {
-        let b = CacheBilling { read_multiplier: 1.0, cap_ratio: 0.9, floor_ratio: 0.0 };
+        let b = CacheBilling {
+            read_multiplier: 1.0,
+            cap_ratio: 0.9,
+            floor_ratio: 0.0,
+        };
         // 半命中 × 倍率1.0 → 原样(500/1000 → 0.5 → 1000×0.5=500)
         assert_eq!(reported_cache_read(1000, 500, 1000, b), 500);
         // 全命中被 cap 压到 900 —— 客户侧仍留 100,不会是 0
@@ -743,35 +776,65 @@ mod tests {
         assert_eq!(reported_cache_read(1000, 0, 1000, b), 0);
 
         // 倍率放大:0.5 × 1.8 = 0.9 → 恰好撞 cap
-        let b18 = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.9, floor_ratio: 0.0 };
+        let b18 = CacheBilling {
+            read_multiplier: 1.8,
+            cap_ratio: 0.9,
+            floor_ratio: 0.0,
+        };
         assert_eq!(reported_cache_read(1000, 500, 1000, b18), 900);
 
         // floor 抬底:0 命中也给 75%(线上 kiro 就是这么让利的)
-        let bf = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.95, floor_ratio: 0.75 };
+        let bf = CacheBilling {
+            read_multiplier: 1.8,
+            cap_ratio: 0.95,
+            floor_ratio: 0.75,
+        };
         assert_eq!(reported_cache_read(1000, 0, 1000, bf), 750);
         // 且 floor 永不越过 cap
-        let bad = CacheBilling { read_multiplier: 1.8, cap_ratio: 0.5, floor_ratio: 0.9 };
-        assert!(reported_cache_read(1000, 0, 1000, bad) <= 500, "floor 必须被夹到 cap 以内");
+        let bad = CacheBilling {
+            read_multiplier: 1.8,
+            cap_ratio: 0.5,
+            floor_ratio: 0.9,
+        };
+        assert!(
+            reported_cache_read(1000, 0, 1000, bad) <= 500,
+            "floor 必须被夹到 cap 以内"
+        );
     }
 
     /// NaN/inf 热调值不得让夹限失控(admin 填错、YAML 写了 .nan 之类)。
     #[test]
     fn 非法参数回退默认不panic() {
-        let nan = CacheBilling { read_multiplier: f64::NAN, cap_ratio: f64::NAN, floor_ratio: f64::NAN };
+        let nan = CacheBilling {
+            read_multiplier: f64::NAN,
+            cap_ratio: f64::NAN,
+            floor_ratio: f64::NAN,
+        };
         let r = reported_cache_read(1000, 500, 1000, nan);
         assert!(r <= 1000, "回退默认后仍须 ≤ total");
-        let inf = CacheBilling { read_multiplier: f64::INFINITY, cap_ratio: f64::INFINITY, floor_ratio: -1.0 };
+        let inf = CacheBilling {
+            read_multiplier: f64::INFINITY,
+            cap_ratio: f64::INFINITY,
+            floor_ratio: -1.0,
+        };
         assert!(reported_cache_read(1000, 500, 1000, inf) <= 1000);
         // total=0 / sim_total=0 都不能 panic 或除零
         assert_eq!(reported_cache_read(0, 0, 0, nan), 0);
-        assert_eq!(reported_cache_read(1000, 500, 0, CacheBilling::default()), 0);
+        assert_eq!(
+            reported_cache_read(1000, 500, 0, CacheBilling::default()),
+            0
+        );
     }
 
     /// 热调进程级参数:set 之后立刻读到(worker 30s 轮询靠这条生效)。
     #[test]
     fn 热调计费参数即时生效() {
         let orig = billing();
-        let mine = CacheBilling { read_multiplier: 2.5, cap_ratio: 0.8, floor_ratio: 0.1 };
+        let mine = CacheBilling {
+            read_multiplier: 2.5,
+            cap_ratio: 0.8,
+            floor_ratio: 0.1,
+        };
         set_billing(mine);
         assert_eq!(billing(), mine);
         set_billing(orig); // 还原,免得污染同进程其它测试

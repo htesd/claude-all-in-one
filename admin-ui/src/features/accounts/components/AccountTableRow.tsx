@@ -138,6 +138,11 @@ export function AccountTableRow({
       <TD className="text-muted-foreground">
         <span className="flex flex-wrap items-center gap-1.5">
           {providerTabLabel(row.provider)}
+          {row.driver === 'inference' && (
+            <Badge variant="default" title={t('table.driverInferenceHint')}>
+              {t('table.driverInference')}
+            </Badge>
+          )}
           {row.driver === 'wire' && (
             <Badge variant="warning" title={t('table.driverWireHint')}>
               {t('table.driverWire')}

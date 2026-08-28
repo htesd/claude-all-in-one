@@ -147,6 +147,11 @@ impl FrameDecoder {
     /// 帧长超过这个数就是协议出事了,应当立刻报错。
     const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
+    /// 缓冲里残留的字节数(EOF 时 >0 = 半帧截断)。
+    pub fn pending_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
     /// 取出一个完整帧;不足一帧返回 `None`(等更多字节)。
     ///
     /// 声明长度荒谬时返回 `Err`(而不是无限等)。
@@ -385,7 +390,10 @@ mod tests {
             at13.insert(id.as_bytes()[12]);
             at17.insert(id.as_bytes()[16]);
         }
-        assert!(at13.len() > 8, "第 13 位取值太集中,疑似又退回 UUID 拼接:{at13:?}");
+        assert!(
+            at13.len() > 8,
+            "第 13 位取值太集中,疑似又退回 UUID 拼接:{at13:?}"
+        );
         assert!(at17.len() > 8, "第 17 位取值太集中:{at17:?}");
     }
 
