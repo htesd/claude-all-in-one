@@ -109,7 +109,11 @@ pub const DEFAULT_CURSOR_CLI_NOTICE: &str = "\
      函数表里**。所以你「找不到工具」是**预期现象,不是网关配置错了**:请先调用 \
      GetMcpTools 拿到 gwtools 的工具清单与 schema,再按它返回的名字调用。发现工具\
      不在函数表里时,直接去调 GetMcpTools,不要据此判定自己没有工具、也不要转而\
-     去试别的办法。清单为空时才说明本轮确实没有可用工具。\n\n\
+     去试别的办法。清单为空时才说明本轮确实没有可用工具。如果你的框架预设了\
+     「GetDynamicTools 发现 → CallDynamicTool 包装调用」这套动态工具协议,\
+     **它在这里是可用的**:GetDynamicTools 返回工具目录,CallDynamicTool\
+     (toolName, arguments) 等价于直接调那个工具;它与「按清单全名直接调」\
+     两条路都行,任选其一,不要卡住。\n\n\
      (2) **调用必须使用清单里的完整名字(带前缀)**。用不带前缀的短名发起的调用不会\
      返回任何结果,你的回答会在那里被静默截断,用户只看到半句话。例如清单里给出的是 \
      `mcp__gwtools__read_file`,就必须照抄这个全名调用,而不是 `read_file`。如果发现\
@@ -243,6 +247,35 @@ mod cli_notice_tests {
             "要给一个可照抄的全名示例: {d}"
         );
         assert!(d.contains("截断"), "要讲清短名调用的后果(静默截断): {d}");
+    }
+
+    /// 2026-09-02 回归锁:pi 系 agent(DSH/Hermes)的 AGENTS.md 预设了
+    /// `GetDynamicTools`/`CallDynamicTool` 这套动态发现/包装协议,它们原生只存在于
+    /// 那些框架自己的后端。第一版文案直接否定它们(当时桥里没有),模型仍固执走
+    /// 这套协议;现在 mcpbridge 把这两个 meta 工具**真实合成**了(发现本地应答、
+    /// 包装调用解包成直接调用),文案必须改成「这套协议可用」—— 再宣称不存在就是
+    /// 撒谎,模型会按「可用工具被否认」处理而混乱。
+    /// 注意别走反方向:**不能**删 GetMcpTools 或宣称它不存在(见上方 2026-08-17
+    /// 回归锁,删了模型会把「工具不在函数表」当成网关说谎然后罢工)。
+    #[test]
+    fn 默认文案必须告知pi系发现协议可用且保留GetMcpTools() {
+        let d = super::DEFAULT_CURSOR_CLI_NOTICE;
+        assert!(
+            d.contains("GetDynamicTools") && d.contains("CallDynamicTool"),
+            "必须点名 pi 系的动态发现/包装协议: {d}"
+        );
+        assert!(
+            d.contains("可用的"),
+            "必须说明这套协议在这里可用(桥已合成实现),而非否定: {d}"
+        );
+        assert!(
+            !d.contains("没有 GetDynamicTools") && !d.contains("不存在 GetDynamicTools"),
+            "合成实现上线后不得再宣称它们不存在: {d}"
+        );
+        assert!(
+            d.contains("GetMcpTools"),
+            "GetMcpTools 的发现路径必须保留: {d}"
+        );
     }
 
     /// 文案**不得**含由本轮 tools 推出的能力断言 —— 它跨轮持久,一次错误覆写污染整个

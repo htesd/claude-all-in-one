@@ -2363,6 +2363,46 @@ fn first_phase_basis(
 /// 和刚注册进桶的新条目(调用方直接往它回写本轮指纹,别再按键摸 —— 桶里同键
 /// 可能并排着别的血脉,`get` 语义已经拆掉了)。
 #[allow(clippy::too_many_arguments)]
+/// 清洗调用方给的工具 schema,修掉 cursor-agent CLI 的 Zod 校验会拒收的形态。
+///
+/// 实证(2026-09-03,`agent mcp list-tools` 报错 `tools[i].inputSchema.required
+/// expected: array`):DSH 给无参工具发 `"required": null`,CLI 整条 MCP server
+/// 直接判死("MCP server does not exist"),模型侧表现为 gwtools 命名空间消失。
+/// 递归处理:嵌套 object(items/properties/anyOf…)里的同名问题一并修。
+///
+/// 规则:`required` 为 null → 删;为字符串 → 包成单元素数组;非数组 → 删。
+fn sanitize_tool_schema(mut v: Value) -> Value {
+    fn walk(v: &mut Value) {
+        match v {
+            Value::Object(m) => {
+                match m.get("required") {
+                    Some(Value::Null) => {
+                        m.remove("required");
+                    }
+                    Some(Value::String(s)) => {
+                        m.insert("required".into(), json!([s.clone()]));
+                    }
+                    Some(Value::Array(_)) | None => {}
+                    Some(_) => {
+                        m.remove("required");
+                    }
+                }
+                for x in m.values_mut() {
+                    walk(x);
+                }
+            }
+            Value::Array(a) => {
+                for x in a.iter_mut() {
+                    walk(x);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&mut v);
+    v
+}
+
 pub async fn start_conv(
     cfg: &CliDriverConfig,
     convs: &CliConversations,
@@ -2427,7 +2467,9 @@ pub async fn start_conv(
                 json!({
                     "name": t.name,
                     "description": t.description,
-                    "inputSchema": serde_json::from_str::<Value>(&t.schema).unwrap_or(json!({"type":"object"})),
+                    "inputSchema": sanitize_tool_schema(
+                        serde_json::from_str::<Value>(&t.schema).unwrap_or(json!({"type":"object"}))
+                    ),
                 })
             })
             .collect();
@@ -4247,5 +4289,43 @@ mod tests {
             !conv.pending_undelivered("toolu_b"),
             "drain 到 End(B) ⇒ B 已送达"
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_sanitize_tests {
+    use super::*;
+
+    /// 2026-09-03 实证:DSH 给无参工具发 `"required": null`,cursor-agent 的 Zod
+    /// 校验(`tools[i].inputSchema.required expected: array`)把整条 MCP server 判死,
+    /// 模型侧 gwtools 命名空间消失、集体罢工。必须洗掉。
+    #[test]
+    fn required为null要删掉_字符串要包数组_嵌套也要修() {
+        let v = json!({
+            "type": "object",
+            "required": null,
+            "properties": {
+                "x": {"type": "string"},
+                "nested": {"type": "object", "required": "single_name"},
+                "deep": {"items": {"type": "object", "required": 42}}
+            }
+        });
+        let out = sanitize_tool_schema(v);
+        assert!(out.get("required").is_none(), "null required 要删: {out}");
+        assert_eq!(out["properties"]["nested"]["required"], json!(["single_name"]));
+        assert!(
+            out["properties"]["deep"]["items"].get("required").is_none(),
+            "非数组非字符串的 required 也要删: {out}"
+        );
+    }
+
+    #[test]
+    fn 正常schema不受影响() {
+        let v = json!({
+            "type": "object",
+            "required": ["a", "b"],
+            "properties": {"a": {"type": "string"}, "b": {"type": "number"}}
+        });
+        assert_eq!(sanitize_tool_schema(v.clone()), v);
     }
 }
