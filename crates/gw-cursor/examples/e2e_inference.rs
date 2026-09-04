@@ -43,8 +43,18 @@ async fn main() {
             "messages": [{"role": "user", "content": "Reply with exactly one word: pong"}],
         }),
     };
-    let bytes = gw_cursor::inference::build_request(&body, &model, &conv, false).unwrap();
-    println!("request {} bytes", bytes.len());
+    let bytes = match std::env::var("RAW_IN") {
+        Ok(path) => {
+            let b = std::fs::read(&path).expect("读取 RAW_IN 指向的 protobuf");
+            println!("raw request <- {path} ({} bytes)", b.len());
+            b
+        }
+        Err(_) => {
+            let b = gw_cursor::inference::build_request(&body, &model, &conv, false).unwrap();
+            println!("request {} bytes", b.len());
+            b
+        }
+    };
     if let Ok(path) = std::env::var("RAW_OUT") {
         std::fs::write(&path, &bytes).expect("写入 RAW_OUT");
         println!("raw request -> {path}");
@@ -52,6 +62,15 @@ async fn main() {
     }
 
     let token = std::env::var("TOKEN").expect("联网模式需要 TOKEN env");
+    if std::env::var("PRINT_CHECKSUM").is_ok() {
+        let mid = gw_cursor::wire::default_machine_id(&token);
+        let mac = gw_cursor::wire::default_mac_machine_id(&token);
+        println!("{}", gw_cursor::wire::checksum(&mid, Some(&mac)));
+        println!("{}", gw_cursor::wire::session_id(&token));
+        return;
+    }
+    let client_version =
+        std::env::var("CLIENT_VERSION").unwrap_or_else(|_| "0.18.0".into());
     let mut client = reqwest::Client::builder().http1_only();
     if let Ok(proxy) = std::env::var("PROXY") {
         client = client.proxy(reqwest::Proxy::all(proxy).expect("PROXY 必须是合法代理 URL"));
@@ -67,7 +86,7 @@ async fn main() {
             gw_cursor::wire::checksum(&gw_cursor::wire::default_machine_id(&token), None),
         )
         .header("x-cursor-client-type", "sand")
-        .header("x-cursor-client-version", "0.18.0")
+        .header("x-cursor-client-version", &client_version)
         .header("x-sand-box-namespace", "prod")
         .header("x-ghost-mode", "true")
         .header("x-request-id", uuid::Uuid::new_v4().to_string())
@@ -99,6 +118,33 @@ async fn main() {
                                     }
                                 }
                             }
+                        }
+                        if f == 3 || f == 5 {
+                            // usage{prompt=1,completion=2} / extended_usage{in=1,out=2,cache_read=3,cache_write=4}
+                            let mut vals = Vec::new();
+                            for (sf, sv) in gw_cursor::protobuf::Reader::new(sub) {
+                                if let gw_cursor::protobuf::Value::Varint(n) = sv {
+                                    vals.push(format!("f{sf}={n}"));
+                                }
+                            }
+                            println!("    usage: {}", vals.join(" "));
+                        }
+                        if f == 8 {
+                            // error{message=1, code=2, is_input_token_limit=3, is_output_token_limit=4, error_type=5}
+                            let (mut msg, mut code, mut etype) = (String::new(), String::new(), 0u64);
+                            for (sf, sv) in gw_cursor::protobuf::Reader::new(sub) {
+                                match (sf, sv) {
+                                    (1, gw_cursor::protobuf::Value::Len(s)) => {
+                                        msg = String::from_utf8_lossy(s).into_owned()
+                                    }
+                                    (2, gw_cursor::protobuf::Value::Len(s)) => {
+                                        code = String::from_utf8_lossy(s).into_owned()
+                                    }
+                                    (5, gw_cursor::protobuf::Value::Varint(n)) => etype = n,
+                                    _ => {}
+                                }
+                            }
+                            println!("    ERROR type={etype} code={code} msg={msg}");
                         }
                     }
                 }

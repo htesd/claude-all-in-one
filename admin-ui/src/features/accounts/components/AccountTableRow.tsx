@@ -133,14 +133,15 @@ export function AccountTableRow({
       </TD>
 
       {/* provider：走 providerTabLabel,与筛选器选项同一处维护(kiro→Kiro / claude-dario→ccmax / cursor→Cursor)
-          CLI 驱动的号在这里挂一枚徽章 —— 同一个 provider 下两种上游形态,
-          出问题时第一件要分辨的就是"这号走的哪条路",不该只能进弹窗才看得到。 */}
+          非默认驱动的号在这里挂徽章 —— 同一个 provider 下多种上游形态,
+          出问题时第一件要分辨的就是"这号走的哪条路",不该只能进弹窗才看得到。
+          2026-09-03 起默认 = Inference 直连(无徽章),cli/wire 是回退项(挂徽章)。 */}
       <TD className="text-muted-foreground">
         <span className="flex flex-wrap items-center gap-1.5">
           {providerTabLabel(row.provider)}
-          {row.driver === 'inference' && (
-            <Badge variant="default" title={t('table.driverInferenceHint')}>
-              {t('table.driverInference')}
+          {row.driver === 'cli' && (
+            <Badge variant="muted" title={t('table.driverCliHint')}>
+              {t('table.driverCli')}
             </Badge>
           )}
           {row.driver === 'wire' && (

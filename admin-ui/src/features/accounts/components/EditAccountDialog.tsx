@@ -68,9 +68,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   // 规范化成 JSON 数组落库。空串 = 清除(不限)。
   const [modelAllowlist, setModelAllowlist] = useState('')
   const [initialModelAllowlist, setInitialModelAllowlist] = useState('')
-  // 上游驱动形态(extra.driver,cursor 专用)。2026-08-17 起 **CLI 驱动是默认**:
-  // '' = 默认(CLI 子进程驱动 cursor-agent),'wire' = 该号退回线协议。
-  // 历史值 'cli' 与 '' 等价(都是默认),所以回填时一并归一成 ''。
+  // 上游驱动形态(extra.driver,cursor 专用)。2026-09-03 起 **Inference 直连是默认**:
+  // '' = 默认(InferenceService 直连),'cli' = 退回 CLI 子进程,'wire' = 退回线协议。
+  // 历史值 'inference' 与 '' 等价(都是默认),回填时归一成 ''。
   const [driver, setDriver] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -93,7 +93,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
         : ''
       setModelAllowlist(currentAllowlist)
       setInitialModelAllowlist(currentAllowlist)
-      setDriver(row.driver === 'wire' ? 'wire' : '')
+      setDriver(row.driver === 'wire' || row.driver === 'cli' ? row.driver : '')
       setError(null)
       setSaving(false)
     }
@@ -146,8 +146,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     //（后端写侧校验：通配符只许末尾、非法字符 400，规范化成 JSON 数组落库）。
     if (modelAllowlist !== initialModelAllowlist) patch.model_allowlist = modelAllowlist
     // 驱动形态：与原值比较，没动就不带（同 queue_enabled 的理由：对着不认这个字段的
-    // 旧后端，只改并发也会让整个保存被判 400）。'' = 清除回线协议。
-    if (driver !== (row.driver === 'wire' ? 'wire' : '')) patch.driver = driver
+    // 旧后端，只改并发也会让整个保存被判 400）。'' = 清除回默认(inference 直连)。
+    const currentDriver = row.driver === 'wire' || row.driver === 'cli' ? row.driver : ''
+    if (driver !== currentDriver) patch.driver = driver
 
     const draft: AccountGroupMembership[] = Object.entries(memberships).map(
       ([name, priority]) => ({ name, priority }),
@@ -322,9 +323,10 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
           </div>
 
           {/* 上游驱动形态：只对 cursor 家族有意义（别的 provider 读不到 extra.driver，
-              露出来只会误导）。线协议 = 自己拼 protobuf 打 agent.v1.AgentService/Run；
-              CLI = 子进程驱动官方 cursor-agent，usage 是上游真实值（含 cacheRead），
-              工具走 MCP 桥回路。切换约 30s 内经 worker sync 生效，不用重启。 */}
+              露出来只会误导）。inference = 纯协议直连 InferenceService（默认：无进程校验、
+              真实服务端缓存）；CLI = 子进程驱动官方 cursor-agent（回退项）；
+              线协议 = 自己拼 protobuf 打 agent.v1.AgentService/Run（历史遗留）。
+              切换约 30s 内经 worker sync 生效，不用重启。 */}
           {row?.provider === 'cursor' && (
             <div className="space-y-1.5">
               <span className="text-xs font-medium text-muted-foreground">
@@ -333,7 +335,8 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
               <div className="flex flex-wrap items-center gap-2">
                 <Segment
                   options={[
-                    { value: '', label: t('accounts.driver.cli') },
+                    { value: '', label: t('accounts.driver.inference') },
+                    { value: 'cli', label: t('accounts.driver.cli') },
                     { value: 'wire', label: t('accounts.driver.wire') },
                   ]}
                   value={driver}

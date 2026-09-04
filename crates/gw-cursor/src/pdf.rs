@@ -34,24 +34,42 @@ use std::io::Read;
 const MAX_EXTRACTED: usize = 4 * 1024 * 1024;
 
 /// 扫描的内容流数量上限。防"几万个空流"把 `streams()` 拖成长时间同步占用。
+/// **在 `streams()` 内部生效**(2026-09-03 起):调用侧的 `.take()` 只限制消费,
+/// 管不到扫描阶段本身——一个 12MB 的 PDF 可以含几万个小 stream 段,全切出来
+/// 存进 Vec 同样是同步占用(codex 复审 major#3)。
 const MAX_STREAMS: usize = 512;
+
+/// 全部 Flate 流**累计解压**字节上限。`inflate` 的 16MB 是单流上限,512 个流
+/// 各解 16MB 就是 8GB —— 解压炸弹不需要攻破上游,客户传个畸形 PDF 就能触发。
+const MAX_TOTAL_INFLATED: usize = 64 * 1024 * 1024;
 
 /// 从 PDF 字节里尽力抽出文本。抽不到可读内容 → `None`。
 pub fn extract_text(pdf: &[u8]) -> Option<String> {
     let mut out = String::new();
     let mut truncated = false;
-    for stream in streams(pdf).into_iter().take(MAX_STREAMS) {
+    let mut inflated_total = 0usize;
+    for stream in streams(pdf) {
         if out.len() >= MAX_EXTRACTED {
             truncated = true;
             break;
         }
         let data = match stream.flate {
-            true => match inflate(stream.body) {
-                Some(d) => d,
-                None => continue,
-            },
+            true => {
+                // 单流上限与剩余总量预算取小 —— 别在预算只剩 1MB 时还先解出
+                // 一整条 16MB 再扔(codex 二轮 minor)。
+                let remain = MAX_TOTAL_INFLATED.saturating_sub(inflated_total) as u64;
+                if remain == 0 {
+                    truncated = true;
+                    break;
+                }
+                match inflate(stream.body, remain) {
+                    Some(d) => d,
+                    None => continue,
+                }
+            }
             false => stream.body.to_vec(),
         };
+        inflated_total += data.len();
         collect_shown_text(&data, &mut out);
     }
     if truncated || out.len() > MAX_EXTRACTED {
@@ -75,10 +93,14 @@ struct Stream<'a> {
 }
 
 /// 切出所有 `stream … endstream` 段,并记录它前面的字典里有没有 `/FlateDecode`。
+/// 数量在**这里**封顶(MAX_STREAMS):扫够了就停,不再继续消耗。
 fn streams(pdf: &[u8]) -> Vec<Stream<'_>> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while let Some(rel) = find(&pdf[i..], b"stream") {
+        if out.len() >= MAX_STREAMS {
+            break;
+        }
         let kw = i + rel;
         // 字典在关键字之前。往回看一小段就够判断过滤器 —— 整份回看会把上一个对象的
         // 过滤器算进来。
@@ -109,13 +131,14 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+/// 解压单条流,上限 = min(单流 16MB, `remain` 剩余总量预算)。
+fn inflate(data: &[u8], remain: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     // **限制解压上限**:PDF 是不可信输入,一个几 KB 的流可以声明成天文级尺寸。
     // 16MB 足够任何文字型 PDF 的单个内容流,又不至于把 worker 撑爆。
     const MAX: u64 = 16 * 1024 * 1024;
     flate2::read::ZlibDecoder::new(data)
-        .take(MAX)
+        .take(MAX.min(remain))
         .read_to_end(&mut out)
         .ok()?;
     (!out.is_empty()).then_some(out)
@@ -315,6 +338,19 @@ mod tests {
         assert!(extract_text(pdf).is_none(), "没有 Tj,不该抽出任何正文");
     }
 
+    /// 流数量在**扫描阶段**就封顶:几万个小 stream 段不能拖住扫描
+    ///(codex 复审 2026-09-03 major#3:调用侧 take() 管不到扫描本身)。
+    #[test]
+    fn 流数量扫描期封顶() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        for _ in 0..5000 {
+            pdf.extend_from_slice(b"stream\nBT (x) Tj ET\nendstream\n");
+        }
+        assert_eq!(streams(&pdf).len(), MAX_STREAMS);
+        // 前 512 个流照常参与抽取
+        assert!(extract_text(&pdf).is_some());
+    }
+
     /// 扫描件(无文本层)必须返回 None,好让调用方给模型一句明确说明,
     /// 而不是塞一段空白让它以为文档是空的。
     #[test]
@@ -340,7 +376,7 @@ mod tests {
         let mut e = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         e.write_all(&vec![b'A'; 64 * 1024 * 1024]).unwrap();
         let comp = e.finish().unwrap();
-        let got = inflate(&comp).expect("截断后仍返回内容");
+        let got = inflate(&comp, u64::MAX).expect("截断后仍返回内容");
         assert!(
             got.len() <= 16 * 1024 * 1024,
             "必须被 16MB 上限截住,实际 {}",

@@ -223,19 +223,21 @@ pub struct UpdateAccountBody {
     model_allowlist: Option<String>,
     /// 定点切换上游驱动形态(写 `extra.driver`,走 merge_account_extra 绝不碰凭据)。
     ///
-    /// **2026-08-17 起 CLI 驱动是默认**(理由见 `gw-cursor` 里 `cli_driver` 的注释:
-    /// 线协议发的裸模型名被上游收走过,CLI 发的是官方客户端在用的名字)。所以:
-    /// 缺省=不动;`""` = 清除(回**默认**,即 CLI 驱动);`"wire"` = 该号退回线协议;
-    /// `"cli"` = 显式写默认值(历史值,等价于清除)。其余值直接 400 —— fail-closed,
-    /// 不静默收下一个认不出的驱动名(收下了读侧会当默认处理,与 UI 显示不符)。
+    /// **2026-09-03 起 InferenceService 直连是默认**(理由见 `gw-cursor` lib.rs 驱动
+    /// 选择处的注释:该面无进程校验、真实服务端缓存、全模型记 auto 池,本地 Ultra
+    /// 实测 16 并发零 429)。所以:缺省=不动;`""` = 清除(回**默认**,即 inference);
+    /// `"cli"` = 该号退回 CLI 子进程驱动;`"wire"` = 退回线协议;`"inference"` =
+    /// 显式写默认值。其余值直接 400 —— fail-closed,不静默收下一个认不出的驱动名
+    ///(收下了读侧会当默认处理,与 UI 显示不符)。
     ///
     /// 只对 cursor 家族有意义:别的 provider 读不到这个键,写了也是死字段。
     #[serde(default)]
     driver: Option<String>,
 }
 
-/// `driver` 的写侧校验:`""` → `null`(清除 = 回默认 = CLI 驱动);
-/// `"cli"` → `"cli"`(显式默认,历史值);`"wire"` → `"wire"`(退回线协议)。
+/// `driver` 的写侧校验:`""` → `null`(清除 = 回默认 = InferenceService 直连);
+/// `"cli"` → `"cli"`(退回 CLI 子进程);`"wire"` → `"wire"`(退回线协议);
+/// `"inference"` → `"inference"`(显式默认)。
 /// 其余一律拒绝(fail-closed,理由见 [`UpdateAccountBody::driver`])。
 fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
     match raw.trim() {
@@ -244,8 +246,8 @@ fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
         "wire" => Ok(serde_json::json!("wire")),
         "inference" => Ok(serde_json::json!("inference")),
         other => Err(format!(
-            "未知驱动形态 {other:?};只接受 \"cli\"(默认,子进程驱动 cursor-agent)、\
-             \"wire\"(退回线协议)、\"inference\"(InferenceService 直连)或 \"\"(清除,回默认)"
+            "未知驱动形态 {other:?};只接受 \"inference\"(默认,InferenceService 直连)、\
+             \"cli\"(退回 CLI 子进程)、\"wire\"(退回线协议)或 \"\"(清除,回默认)"
         )),
     }
 }
@@ -408,8 +410,9 @@ fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serd
         // 模型白名单顶层回显(前端编辑框要能读到现值)。缺失/null = 不限,统一吐 null;
         // 键名不含 token/secret/password/key,不会被上面的脱敏改写。
         "model_allowlist": extra.get("model_allowlist").cloned().unwrap_or(serde_json::Value::Null),
-        // 上游驱动形态顶层回显(前端要能显示某号是不是 CLI 驱动)。缺失/null = 线协议,
-        // 统一吐 null;与 `gw-cursor` 读侧 `opt_str("driver")` 同口径。
+        // 上游驱动形态顶层回显(前端要能显示某号走的哪条驱动)。缺失/null = 默认
+        //(2026-09-03 起 = InferenceService 直连),统一吐 null;
+        // 与 `gw-cursor` 读侧 `opt_str("driver")` 同口径。
         "driver": extra.get("driver").filter(|v| !v.is_null()).cloned().unwrap_or(serde_json::Value::Null),
         "disabled": row.disabled,
         "extra": extra,
@@ -2619,11 +2622,11 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{ok:?} 应被 trim 收下");
         }
-        // `wire` = 退回线协议,库里要真的落这个值(读侧据此退出默认的 CLI 驱动)。
+        // `wire` = 退回线协议,库里要真的落这个值(读侧据此退出默认驱动)。
         let row = store.get_account("acc1").unwrap().unwrap();
         assert!(row.extra.contains(r#""driver":"wire""#), "wire 应落库: {}", row.extra);
 
-        // 清除:空串 → null(读侧与缺失同义 = **默认**,即 CLI 驱动)。
+        // 清除:空串 → null(读侧与缺失同义 = **默认**,2026-09-03 起即 inference 直连)。
         let body = serde_json::json!({"driver": ""}).to_string();
         let resp = app
             .clone()

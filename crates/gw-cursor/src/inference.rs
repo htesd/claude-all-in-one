@@ -30,9 +30,12 @@
 //! ## 已知缺口(显式记录,非回归)
 //!
 //! - `tool_choice` 全通道都不支持(含 clidrv/wire),proto 里也没找到对应字段。
-//! - `stop_sequences` 上游认不认未实测;已流出的 delta 无法回收,无法补截断。
-//! - prefill(assistant 结尾)未验证,路由层用 `inference_eligible` 挡掉。
-//! - PDF/document 块、URL 图片不支持(同上门控挡掉,回退 cli/wire)。
+//! - `stop_sequences` 上游**接受**(2026-09-03 实测 200 正常收尾),但是否严格
+//!   在边界截断未经语义级验证;已流出的 delta 无法回收,无法补截断。
+//! - prefill(assistant 结尾)2026-09-03 实测上游 200 接受,门控已放开。
+//! - URL 图片不支持(主动出网下载是 SSRF 面,与 cli/wire 同口径拒绝,回退 cli/wire)。
+//! - PDF/document:文字型走 `pdf.rs` 文本抽取注入(与 cli/wire 同形态);扫描件/
+//!   图片型抽不到文本层时注入「无法读取」说明,不假装支持。
 //! - 剥签名重试只覆盖建流阶段的 400;流起来了再报签名错误无法重试
 //!  (实测签名校验在请求入口,见 kiro 同形经验)。
 
@@ -118,76 +121,107 @@ fn inference_client(
     Ok(client)
 }
 
-/// driver=inference 的形态门控:cli_eligible(尾轮必须是 user)之外，
-/// 再挡 document、URL 图片、非法 base64 与超预算图片(回退 cli/wire)。
+/// driver=inference 的形态门控:2026-09-03 起不再要求尾轮 user
+///(prefill 经本地 Ultra 实测上游 200 接受)。仍挡:空 messages、URL 媒体
+///(主动出网下载是 SSRF 面,与 cli/wire 同口径)、非 PDF 文档、非法 base64、
+/// 超预算附件。
 pub(crate) fn inference_eligible(body: &Json) -> bool {
-    if !crate::chat::cli_eligible(body) {
-        return false;
-    }
     let Some(messages) = body.get("messages").and_then(Json::as_array) else {
         return false;
     };
-    let mut image_bytes = 0usize;
+    if messages.is_empty() {
+        return false;
+    }
+    let mut media_bytes = 0usize;
     for m in messages {
-        let blocks: &[Json] = match m.get("content") {
-            Some(Json::Array(arr)) => arr,
-            _ => continue,
-        };
-        for b in blocks {
-            if !eligible_media_block(b, &mut image_bytes) {
-                return false;
+        // fail-closed 到消息级(codex 二轮 M4):非对象消息、非 string/数组的
+        // content 会在编码器里被静默丢掉,门控不能放行。
+        if !m.is_object() {
+            return false;
+        }
+        match m.get("content") {
+            // 无 content(纯 role 占位)与字符串 content:编码器都能处理
+            None | Some(Json::Null) | Some(Json::String(_)) => continue,
+            Some(Json::Array(arr)) => {
+                for b in arr {
+                    if !b.is_object() || !eligible_media_block(b, &mut media_bytes) {
+                        return false;
+                    }
+                }
             }
+            // 数字/对象/布尔 content:编码器会丢,fail-closed
+            _ => return false,
         }
     }
     true
 }
 
-/// 检查顶层媒体与 tool_result 内嵌媒体。编码器会处理内嵌图片，所以门控必须按
-/// 完全相同的深度扫描；否则大图可绕过预算，document 也会静默丢失而不是回退。
-fn eligible_media_block(block: &Json, image_bytes: &mut usize) -> bool {
+/// base64 媒体源的公共校验:尺寸预算(累计计入 `media_bytes`)+ 解码可行性。
+/// gate 与编码器共用同一套判断,两处不会分叉。
+fn check_base64_source(source: Option<&Json>, media_bytes: &mut usize) -> bool {
+    if source.and_then(|s| s.get("type")).and_then(Json::as_str) != Some("base64") {
+        return false;
+    }
+    let Some(data) = source.and_then(|s| s.get("data")).and_then(Json::as_str) else {
+        return false;
+    };
+    // 先按 base64 长度估原始大小,别先解出 200MB 再判超限。
+    if data.len() / 4 * 3 > MAX_ONE_IMAGE {
+        return false;
+    }
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        return false;
+    };
+    if raw.len() > MAX_ONE_IMAGE {
+        return false;
+    }
+    let Some(total) = media_bytes.checked_add(raw.len()) else {
+        return false;
+    };
+    if total > MAX_ALL_IMAGES {
+        return false;
+    }
+    *media_bytes = total;
+    true
+}
+
+/// base64 PDF 文档块的校验:media_type + 尺寸/解码预算。
+fn check_document_block(block: &Json, media_bytes: &mut usize) -> bool {
+    let source = block.get("source");
+    let mime = source
+        .and_then(|s| s.get("media_type"))
+        .and_then(Json::as_str)
+        .unwrap_or("application/pdf");
+    mime == "application/pdf" && check_base64_source(source, media_bytes)
+}
+
+/// 检查顶层媒体与 tool_result 内嵌媒体。**fail-closed,与编码器严格同集合**
+///(codex 复审 2026-09-03 major#2):编码器只处理 text/image/document/tool_use/
+/// thinking/redacted_thinking 与一层的 tool_result;门控对此外的一切(嵌套
+/// tool_result、未知块类型)一律拒,让请求落回 cli/wire(to_turns 会渲染成文本),
+/// 而不是通过门控后在编码器里静默丢失。
+fn eligible_media_block(block: &Json, media_bytes: &mut usize) -> bool {
     match block.get("type").and_then(Json::as_str) {
-        Some("document") => false,
-        Some("image") => {
-            let source = block.get("source");
-            if source.and_then(|s| s.get("type")).and_then(Json::as_str) != Some("base64") {
-                return false;
-            }
-            let Some(data) = source.and_then(|s| s.get("data")).and_then(Json::as_str) else {
-                return false;
-            };
-            if data.len() / 4 * 3 > MAX_ONE_IMAGE {
-                return false;
-            }
-            let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(data) else {
-                return false;
-            };
-            if raw.len() > MAX_ONE_IMAGE {
-                return false;
-            }
-            let Some(total) = image_bytes.checked_add(raw.len()) else {
-                return false;
-            };
-            if total > MAX_ALL_IMAGES {
-                return false;
-            }
-            *image_bytes = total;
-            true
-        }
-        // tool_result 的 experimental_content 目前只实现图片；内嵌文档必须继续
-        // 回退，不能通过门控后在编码器里静默消失。
-        Some("tool_result") => block
-            .get("content")
-            .and_then(Json::as_array)
-            .map(|content| {
-                !content
-                    .iter()
-                    .any(|nested| nested.get("type").and_then(Json::as_str) == Some("document"))
-                    && content
-                        .iter()
-                        .all(|nested| eligible_media_block(nested, image_bytes))
-            })
-            .unwrap_or(true),
-        _ => true,
+        Some("document") => check_document_block(block, media_bytes),
+        Some("image") => check_base64_source(block.get("source"), media_bytes),
+        Some("tool_result") => match block.get("content") {
+            Some(Json::Array(content)) => content.iter().all(|nested| {
+                match nested.get("type").and_then(Json::as_str) {
+                    Some("text") => true,
+                    Some("image") => check_base64_source(nested.get("source"), media_bytes),
+                    Some("document") => check_document_block(nested, media_bytes),
+                    // 嵌套 tool_result / 未知类型:编码器处理不了,回退
+                    _ => false,
+                }
+            }),
+            // 字符串/缺省 content 不涉及媒体;对象/数字等会被编码器丢,fail-closed
+            None | Some(Json::Null) | Some(Json::String(_)) => true,
+            _ => false,
+        },
+        // 编码器认识的非媒体块
+        Some("text" | "tool_use" | "thinking" | "redacted_thinking") => true,
+        // 未知块类型:fail-closed
+        _ => false,
     }
 }
 
@@ -231,13 +265,46 @@ fn value_bytes(v: &Json) -> Vec<u8> {
 
 fn struct_writer(map: &serde_json::Map<String, Json>) -> Writer {
     let mut s = Writer::new();
-    for (k, v) in map {
+    // 键序说明(2026-09-04):官方客户端经 JS 对象保序,Struct 字段按客户端原始
+    // JSON 顺序上线;serde_json 默认 BTreeMap 重排成字母序。曾怀疑这是 grok/claude
+    // 带 tools 422/400 的根因,但把字节做到与官方库完全一致(仅 uuid 不同)后上游
+    // 照拒 —— 键序**不是**根因(真凶见 tools_skip_inference 注释)。保留 type 首位
+    // 只是让字节更接近官方惯用序,无害;完整保序需 serde_json preserve_order
+    //(波及全 workspace,kiro 字节对齐面未审计,暂缓)。
+    let mut emit = |k: &str, v: &Json| {
         let mut entry = Writer::new();
         entry.string(1, k);
         entry.bytes(2, &value_bytes(v));
         s.message(1, &entry);
+    };
+    if let Some(v) = map.get("type") {
+        emit("type", v);
+    }
+    for (k, v) in map {
+        if k != "type" {
+            emit(k, v);
+        }
     }
     s
+}
+
+/// 带工具声明(tools 非空)的非 composer 请求绕过 inference 直连(2026-09-04 实弹定论):
+/// Cursor 后端把 AgentTool 翻译给模型供应商时,**只要 AgentTool 带 parameters
+/// (任意 schema 内容、任意键序——与官方客户端库逐字节一致的报文照样拒)**,
+/// grok 系 providerStatusCode 422 / claude 系 400;不带 parameters 的空壳工具正常,
+/// composer 全系带 tools 正常。判官样:官方 proto 库(grokbot 重构源码内
+/// generated/aiserver/v1/inference_pb.ts)序列化的同构请求,在 4 个
+/// x-cursor-client-version(0.18.0 / 2026.08.11-e8db854 / 1.7.44 / 2.0.0)、
+/// maxMode 两态、builtInModel、acceptedUnadvertisedToolNames 全组合下均 422。
+/// 结论:平台侧行为(疑 2026-09-03 xAI 故障期开始的回归或有意收紧),字节层面无解。
+/// 这类请求回落 clidrv(AgentService 面,工具链成熟);上游若恢复,把本函数
+/// 改热配置或直接删掉即可。
+pub(crate) fn tools_skip_inference(model: &str, body: &Json) -> bool {
+    let has_tools = body
+        .get("tools")
+        .and_then(Json::as_array)
+        .is_some_and(|t| !t.is_empty());
+    has_tools && !model.to_ascii_lowercase().starts_with("composer")
 }
 
 // ── 请求构建 ────────────────────────────────────────────────────────────────
@@ -261,8 +328,28 @@ fn model_params(model: &str, thinking_enabled: bool) -> (bool, Vec<(&'static str
     }
 }
 
-/// Anthropic user 块的文本/图片 → ContentParts。
-fn user_parts(blocks: &[Json], w: &mut Writer) {
+/// document 块 → 注入文本。与 cli/wire 同形态(chat.rs:1877):抽到文本层就内联,
+/// 抽不到(扫描件/图片型)明确告知模型无法读取 —— 否则它会反复尝试调工具读文件,
+/// 而反代答不了内建终端工具。返回 None = base64 解不出(门控已挡,这里是兜底)。
+fn document_inject_text(b: &Json, doc_n: &mut usize) -> Option<String> {
+    let data = b
+        .get("source")
+        .and_then(|s| s.get("data"))
+        .and_then(Json::as_str)?;
+    let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    let path = format!("/tmp/gw-cursor/doc-{}.pdf", *doc_n);
+    *doc_n += 1;
+    Some(match crate::pdf::extract_text(&raw) {
+        Some(txt) => format!("<document path=\"{path}\">\n{txt}\n</document>\n\n"),
+        None => format!(
+            "<document path=\"{path}\" note=\"无法抽取文本层(可能是扫描件或图片型 PDF);\
+             请直接告知用户无法读取,不要尝试调用工具读文件\"/>\n\n"
+        ),
+    })
+}
+
+/// Anthropic user 块的文本/图片/文档 → ContentParts。
+fn user_parts(blocks: &[Json], doc_n: &mut usize, w: &mut Writer) {
     let mut parts = Writer::new();
     for b in blocks {
         let mut part = Writer::new();
@@ -289,6 +376,16 @@ fn user_parts(blocks: &[Json], w: &mut Writer) {
                 );
                 part.message(2, &ip);
             }
+            Some("document") => {
+                // 文档抽文本层后以 text part 内联(与 cli/wire 同形态)
+                if let Some(doc_text) = document_inject_text(b, doc_n) {
+                    let mut tp = Writer::new();
+                    tp.string(1, &doc_text);
+                    part.message(1, &tp);
+                } else {
+                    continue;
+                }
+            }
             _ => continue,
         }
         parts.message(1, &part);
@@ -305,6 +402,7 @@ fn user_parts(blocks: &[Json], w: &mut Writer) {
 fn tool_result_content(
     blocks: &[Json],
     names: &std::collections::HashMap<String, String>,
+    doc_n: &mut usize,
     w: &mut Writer,
 ) {
     let mut content = Writer::new();
@@ -343,6 +441,12 @@ fn tool_result_content(
                             cp.message(2, &ip); // ContentPart.image
                             image_parts.push(cp);
                         }
+                        Some("document") => {
+                            // 内嵌文档:抽文本层并进结果文本(与 cli/wire 同形态)
+                            if let Some(doc_text) = document_inject_text(c, doc_n) {
+                                push_text(&mut texts, &doc_text);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -378,6 +482,8 @@ pub fn build_request(
 ) -> Result<Vec<u8>, UpstreamError> {
     let mut out = Writer::new();
     let mut tool_names: std::collections::HashMap<String, String> = Default::default();
+    // 文档附件的编号器:/tmp/gw-cursor/doc-N.pdf 路径在请求内唯一(与 cli/wire 同约定)。
+    let mut doc_n = 0usize;
 
     // system → 首条 SYSTEM 消息(官方 converters.ts:175 同款:role=SYSTEM + text)。
     if let Some(sys) = body.get("system") {
@@ -536,14 +642,14 @@ pub fn build_request(
                                     .join("\n");
                                 w.string(2, &joined);
                             } else {
-                                user_parts(&rest, &mut w);
+                                user_parts(&rest, &mut doc_n, &mut w);
                             }
                             out.message(1, &w);
                         }
                         if !tool_results.is_empty() {
                             let mut w = Writer::new();
                             w.uint(1, ROLE_TOOL);
-                            tool_result_content(&tool_results, &tool_names, &mut w);
+                            tool_result_content(&tool_results, &tool_names, &mut doc_n, &mut w);
                             out.message(1, &w);
                         }
                     }
@@ -1187,6 +1293,37 @@ impl Folder {
                     format!("inference 模型不可用: {message}"),
                 ));
             }
+            // 模型供应商级故障(xAI 宕机等)绝不能当 RateLimited 冷却账号 ——
+            // 2026-09-03 生产事故:grok 上游 422/RESOURCE_EXHAUSTED 被误判成限流,
+            // 账号被批量冷却,composer 健康流量被「选号失败」株连,单模型故障
+            // 放大成全通道故障。它的真实语义 = 模型级 Overloaded(不罚号、不换号、
+            // 同号退避重试)。判定:debug.error = ERROR_PROVIDER_ERROR,或
+            // ERROR_RESOURCE_EXHAUSTED 且详情指向 provider(标题/providerStatusCode)。
+            let debug = err
+                .get("details")
+                .and_then(Json::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|d| d.get("debug"));
+            let debug_error = debug
+                .and_then(|d| d.get("error"))
+                .and_then(Json::as_str)
+                .unwrap_or("");
+            let provider_marked = debug
+                .and_then(|d| d.get("details"))
+                .map(|d| {
+                    d.get("title").and_then(Json::as_str).unwrap_or("").contains("provider")
+                        || d.get("detail").and_then(Json::as_str).unwrap_or("").contains("provider")
+                        || d.pointer("/additionalInfo/providerStatusCode").is_some()
+                })
+                .unwrap_or(false);
+            if debug_error == "ERROR_PROVIDER_ERROR"
+                || (debug_error == "ERROR_RESOURCE_EXHAUSTED" && provider_marked)
+            {
+                return Err(UpstreamError::new(
+                    UpstreamErrorKind::Overloaded,
+                    format!("inference 模型供应商不可用[{debug_error}]: {message}"),
+                ));
+            }
             return Err(map_connect_error(code, message));
         }
         Ok(())
@@ -1318,7 +1455,8 @@ pub(crate) async fn chat_stream(
     };
     let conversation_id = crate::chat::conversation_uuid(&material);
 
-    let body_bytes = build_request(&req.body, &upstream_model, &conversation_id, false)?;
+    let body_bytes =
+        build_request_blocking(req.body.clone(), upstream_model.clone(), conversation_id.clone(), false).await?;
     match chat_once(&client, account, token, &req, body_bytes).await {
         Ok(stream) => Ok(stream),
         Err(e) if e.kind == UpstreamErrorKind::BadRequest && history_has_signature(&req.body) => {
@@ -1326,11 +1464,75 @@ pub(crate) async fn chat_stream(
                 account = %account.account_id,
                 "inference: BadRequest 且历史带签名,剥 reasoning_parts 重试一次: {e}"
             );
-            let stripped = build_request(&req.body, &upstream_model, &conversation_id, true)?;
+            let stripped =
+                build_request_blocking(req.body.clone(), upstream_model, conversation_id, true).await?;
             chat_once(&client, account, token, &req, stripped).await
         }
         Err(e) => Err(e),
     }
+}
+
+/// `build_request` 里可能含 PDF 文本抽取(同步 CPU 活,单文档最多解 64MB),
+/// 挪出 Tokio worker 线程,别让一个大 PDF 占住事件循环(codex 复审 2026-09-03 major#3)。
+///
+/// 带 document 的请求先拿进程级并发槽:单抽峰值 ~80MB(64MB 总量预算 + 单流
+/// 16MB 过头),4 槽把并发 PDF 的解压内存压到 ~320MB 上限(codex 二轮 M5)。
+async fn build_request_blocking(
+    body: Json,
+    model: String,
+    conversation_id: String,
+    strip_reasoning: bool,
+) -> Result<Vec<u8>, UpstreamError> {
+    // 纯形状检查(不解 base64),只在有文档时才排队拿槽
+    let permit = if has_document_block(&body) {
+        Some(
+            PDF_EXTRACT_SLOTS
+                .acquire()
+                .await
+                .map_err(|_| UpstreamError::new(UpstreamErrorKind::Other, "PDF 抽取槽已关闭"))?,
+        )
+    } else {
+        None
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        build_request(&body, &model, &conversation_id, strip_reasoning)
+    })
+    .await
+    .map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("inference: 请求构建任务异常退出: {e}"),
+        )
+    })?;
+    drop(permit);
+    result
+}
+
+/// PDF 文本抽取的进程级并发槽(codex 二轮 M5)。
+static PDF_EXTRACT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// 请求里有没有 document 块(顶层或 tool_result 内嵌)。只在拿抽取并发槽前用。
+fn has_document_block(body: &Json) -> bool {
+    let Some(ms) = body.get("messages").and_then(Json::as_array) else {
+        return false;
+    };
+    ms.iter().any(|m| {
+        let Some(arr) = m.get("content").and_then(Json::as_array) else {
+            return false;
+        };
+        arr.iter().any(|b| {
+            b.get("type").and_then(Json::as_str) == Some("document")
+                || b
+                    .get("content")
+                    .and_then(Json::as_array)
+                    .map(|c| {
+                        c.iter().any(|n| {
+                            n.get("type").and_then(Json::as_str) == Some("document")
+                        })
+                    })
+                    .unwrap_or(false)
+        })
+    })
 }
 
 async fn chat_once(
@@ -2106,6 +2308,27 @@ mod tests {
     }
 
     #[test]
+    fn 供应商故障_映射Overloaded而非RateLimited() {
+        // 2026-09-03 生产原文:xAI(grok)宕机时 END trailer 长这样。
+        // 误判成 RateLimited 会冷却账号、株连健康模型流量(选号失败),必须 Overloaded。
+        let provider_422 = br#"{"error":{"code":"resource_exhausted","message":"Error","details":[{"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_PROVIDER_ERROR","details":{"title":"Provider Error","detail":"We're having trouble connecting to the model provider.","isRetryable":false,"additionalInfo":{"providerStatusCode":"422"}},"isExpected":true},"value":"x"}]},"metadata":{"x-cursor-inference-request-error-type":["PROVIDER_ERROR"]}}"#;
+        let mut f = folder("grok-4.6", &[]);
+        let e = f.on_trailer(0, provider_422).unwrap_err();
+        assert_eq!(e.kind, UpstreamErrorKind::Overloaded, "PROVIDER_ERROR 必须 Overloaded: {e}");
+
+        let provider_re = br#"{"error":{"code":"resource_exhausted","message":"Error","details":[{"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_RESOURCE_EXHAUSTED","details":{"title":"Unable to reach the model provider","detail":"We're having trouble connecting to the model provider."},"isExpected":true},"value":"x"}]},"metadata":{"x-cursor-inference-request-error-type":["RESOURCE_EXHAUSTED"]}}"#;
+        let mut f2 = folder("grok-4.6", &[]);
+        let e2 = f2.on_trailer(0, provider_re).unwrap_err();
+        assert_eq!(e2.kind, UpstreamErrorKind::Overloaded, "provider 字样的 RESOURCE_EXHAUSTED 必须 Overloaded: {e2}");
+
+        // 对照:没有 provider 痕迹的 resource_exhausted 仍然是 RateLimited(真限流)
+        let genuine = br#"{"error":{"code":"resource_exhausted","message":"rate limit"}}"#;
+        let mut f3 = folder("grok-4.6", &[]);
+        let e3 = f3.on_trailer(0, genuine).unwrap_err();
+        assert_eq!(e3.kind, UpstreamErrorKind::RateLimited, "真限流不受影响: {e3}");
+    }
+
+    #[test]
     fn http分类_401罚号403不罚() {
         let e = classify_http_error(401, "invalid");
         assert_eq!(e.kind, UpstreamErrorKind::TokenInvalid);
@@ -2162,18 +2385,43 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn tools绕行门控() {
+        use serde_json::json;
+        let tool = json!({"name":"get_weather","description":"d","input_schema":{"type":"object"}});
+        let with_tools = json!({"messages":[{"role":"user","content":"hi"}],"tools":[tool]});
+        let no_tools = json!({"messages":[{"role":"user","content":"hi"}]});
+        let empty_tools = json!({"messages":[{"role":"user","content":"hi"}],"tools":[]});
+        // 带 tools:grok/claude 绕行(平台侧必拒,见 tools_skip_inference 注释)
+        assert!(tools_skip_inference("grok-4.6", &with_tools));
+        assert!(tools_skip_inference("claude-sonnet-5", &with_tools));
+        // composer 带 tools 正常,不绕行
+        assert!(!tools_skip_inference("composer-2.5", &with_tools));
+        // 无 tools / 空 tools:不绕行
+        assert!(!tools_skip_inference("grok-4.6", &no_tools));
+        assert!(!tools_skip_inference("grok-4.6", &empty_tools));
+    }
+
+    #[test]
     fn eligible门控() {
         use base64::Engine as _;
         use serde_json::json;
         // 正常:尾轮 user
         let ok = json!({"messages":[{"role":"user","content":"hi"}]});
         assert!(inference_eligible(&ok));
-        // prefill:尾轮 assistant → 不接
+        // 空 messages → 不接
+        assert!(!inference_eligible(&json!({"messages":[]})));
+        // prefill:尾轮 assistant → 2026-09-03 实测上游 200 接受,接
         let prefill = json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"续"}]});
-        assert!(!inference_eligible(&prefill));
-        // document 块 → 不接
-        let doc = json!({"messages":[{"role":"user","content":[{"type":"document","source":{"data":"x"}}]}]});
-        assert!(!inference_eligible(&doc));
+        assert!(inference_eligible(&prefill));
+        // base64 PDF document → 接(构建期抽文本层注入)
+        let doc = json!({"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","data":"eA==","media_type":"application/pdf"}}]}]});
+        assert!(inference_eligible(&doc));
+        // 非 PDF 文档 / 非 base64 文档源 → 不接
+        let txt_doc = json!({"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","data":"eA==","media_type":"text/plain"}}]}]});
+        assert!(!inference_eligible(&txt_doc));
+        let url_doc = json!({"messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","url":"http://x","media_type":"application/pdf"}}]}]});
+        assert!(!inference_eligible(&url_doc));
         // base64 图片 → 接
         let img = json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"eA==","media_type":"image/png"}}]}]});
         assert!(inference_eligible(&img));
@@ -2185,12 +2433,58 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_ONE_IMAGE + 1]);
         let huge = json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","data":oversized,"media_type":"image/png"}}]}]});
         assert!(!inference_eligible(&huge));
+        // tool_result 内嵌 document(合法 base64 PDF)→ 接
         let nested_doc = json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"document","source":{"type":"base64","data":"eA==","media_type":"application/pdf"}}]}]}]});
-        assert!(!inference_eligible(&nested_doc));
+        assert!(inference_eligible(&nested_doc));
         let nested_invalid = json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","data":"bad!","media_type":"image/png"}}]}]}]});
         assert!(!inference_eligible(&nested_invalid));
         // URL 图片 → 不接
         let url = json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"http://x"}}]}]});
         assert!(!inference_eligible(&url));
+        // 未知块类型 → fail-closed(编码器会静默丢,落回 cli/wire 更诚实)
+        let unknown = json!({"messages":[{"role":"user","content":[{"type":"future_block","x":1}]}]});
+        assert!(!inference_eligible(&unknown));
+        // 嵌套 tool_result(两层)→ 编码器只处理一层,fail-closed
+        let nested_tr = json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"tool_result","tool_use_id":"t2","content":"x"}]}]}]});
+        assert!(!inference_eligible(&nested_tr));
+        // thinking/tool_use 等编码器认识的块 → 接
+        let thinking = json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"..."},{"type":"text","text":"ok"}]},{"role":"user","content":"go"}]});
+        assert!(inference_eligible(&thinking));
+        // 消息级 fail-closed(codex 二轮 M4):非对象消息 / 非标量 content /
+        // tool_result 的对象 content —— 编码器会静默丢,门控必须拒
+        assert!(!inference_eligible(&json!({"messages":[null]})));
+        assert!(!inference_eligible(&json!({"messages":[{"role":"user","content":42}]})));
+        assert!(!inference_eligible(&json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":{"x":1}}]}]})));
+        // 字符串/缺省 content 的 tool_result 不受影响
+        assert!(inference_eligible(&json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]})));
+    }
+
+    #[test]
+    fn document块注入文本层() {
+        use base64::Engine as _;
+        use serde_json::json;
+        // 假 PDF(抽不到文本层)→ 注入「无法读取」说明而不是静默丢弃
+        let fake_pdf = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 fake");
+        let body = json!({"max_tokens":64,"messages":[{"role":"user","content":[
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":fake_pdf}},
+            {"type":"text","text":"看下这个文档"}
+        ]}]});
+        assert!(inference_eligible(&body));
+        let bytes = build_request(&body, "grok-4.6", "c", false).unwrap();
+        let fs = fields(&bytes);
+        let msg = len_of(&fs, 1).expect("user 消息");
+        let mf = fields(msg);
+        let parts = len_of(&mf, 3).expect("ContentParts");
+        let pf = fields(parts);
+        let first_part = len_of(&pf, 1).expect("第一个 part(文档)");
+        let ppf = fields(first_part);
+        let text_part = len_of(&ppf, 1).expect("文档 part 是 text");
+        let tf = fields(text_part);
+        let text = match &tf[0].1 {
+            PVal::Len(s) => String::from_utf8_lossy(s).into_owned(),
+            _ => panic!("text part 字段1应为字符串"),
+        };
+        assert!(text.contains("/tmp/gw-cursor/doc-0.pdf"), "{text}");
+        assert!(text.contains("无法抽取文本层"), "{text}");
     }
 }
