@@ -111,21 +111,26 @@ const BODY_TURN_ID: u32 = 25;
 const MSG_TEXT: u32 = 1;
 const MSG_UUID: u32 = 2;
 const MSG_ATTACH: u32 = 3;
-const MSG_KIND: u32 = 4;
-const MSG_KIND_USER: u64 = 2; // 08-23 实物:三轮都是 2
+const MSG_MODE: u32 = 4;
+/// `agent.v1.AgentMode` 枚举:0=UNSPECIFIED,1=AGENT,2=ASK,3=PLAN
+///(2026-09-04 对照 YeautyYE fork 的 `UserMessage.mode` 钉死)。
+const MSG_MODE_AGENT: u64 = 1;
 
-/// 一条 CLI 形态的用户消息:`{1: text, 2: uuid, 3: '', 4: 2}`(两种轮次同构)。
+/// 一条 CLI 形态的用户消息:`{1: text, 2: uuid, 3: '', 4: <AgentMode>}`(两种轮次同构)。
 ///
 /// uuid 与空附件容器**都在** —— 第一版实现漏掉它们时,上游 200 接受、发完会话
 /// 登记通知后只剩心跳,永不生成(与 IDE 形态缺 `1.2.1.2` 的静默挂起同形态)。
 ///
-/// `.4` = **2**(08-23 三轮实物一致)。早先写 1 是错的。
+/// ⚠️ `.4` 是 **AgentMode,不是消息 kind**:08-23 实物是 2,我们一直当「kind=2 用户消息」
+/// 照抄 —— 但那其实是 **ASK 模式**(当时抓的 CLI 就在 Ask 态),后果是模型
+/// 「不能写文件或改系统」自我设限(2026-09-04 e2e 实证,拒写 notes.md)。
+/// 改发 1 = AGENT:写/改类操作的许可由调用方自己的工具体系管,网关不该替它设限。
 fn cli_user_message(text: &str) -> Writer {
     let mut msg = Writer::new();
     msg.string(MSG_TEXT, text);
     msg.string(MSG_UUID, &uuid::Uuid::new_v4().to_string());
     msg.string(MSG_ATTACH, "");
-    msg.uint(MSG_KIND, MSG_KIND_USER);
+    msg.uint(MSG_MODE, MSG_MODE_AGENT);
     msg
 }
 
@@ -218,6 +223,9 @@ pub enum CliTurn<'a> {
 /// 三轮帧0 解包后字段集完全相同:`{1, 2, 4, 5, 9, 12, 14×9, 16, 25}`。
 /// 所以除了 `1.1` 取值,两种轮次**逐字段同构** —— 没有 `1.15`、`1.9` 不分岔、
 /// `1.14` 两轮都发。旧实现按 `opening` 分岔发 `.15`/裸名 `.9` 是错的,已改。
+///
+/// `tools` 非空时 `1.4` 从空块换成 `McpTools` 目录(见 [`mcp_tools_message`]);
+/// 实物里无工具请求的 `1.4` 本来就是空块,两者同为 length-delimited,形状不漂。
 pub fn build_frame0_cli(
     text: &str,
     model: &Model,
@@ -225,6 +233,7 @@ pub fn build_frame0_cli(
     conversation_id: &str,
     turn_id: &str,
     phase: CliTurn<'_>,
+    tools: &[crate::run::ToolDef],
 ) -> Vec<u8> {
     let mut body = Writer::new();
 
@@ -256,7 +265,7 @@ pub fn build_frame0_cli(
     conv.message(1, &msg_turn);
     body.message(BODY_CONVERSATION, &conv);
 
-    body.bytes(BODY_EMPTY, &[]);
+    body.bytes(BODY_EMPTY, &mcp_tools_message(tools));
     body.string(BODY_CONVERSATION_ID, conversation_id);
 
     // 1.9 当前模型。**两种轮次同一形态**(08-23 三轮都是 `{1:'default'}`)。
@@ -456,6 +465,11 @@ pub fn frame_field5_ack3() -> Vec<u8> {
 }
 
 /// `{3: {3: ''}}`(n=0)或 `{3: {1: n, 3: ''}}`
+///
+/// 2026-09-04 钉死(对照 YeautyYE fork 的 `agent.v1` schema):这是 **KV set_blob 的
+/// 回执** `kv_client_message{id: n, set_blob_result{}}`。`.1` 是**请求 id 回显**,
+/// 不是自增序号(08-23 实物里恰好 0,1,2… 与 id 同值,当时误读成「槽号」)。
+/// 服务端每推一个 set_blob 都要回一条,不回执它不出 checkpoint(90s 心跳死等)。
 pub fn frame_field3_slot(n: u64) -> Vec<u8> {
     let mut inner = Writer::new();
     if n > 0 {
@@ -467,16 +481,18 @@ pub fn frame_field3_slot(n: u64) -> Vec<u8> {
     w.into_bytes()
 }
 
-/// 内容分节上传槽:`{3: {1: slot, 2: {1: 内容字节}}}`。
+/// KV get_blob 的回执(内容分节上传):`{3: {1: id, 2: {1: 内容字节}}}`
+/// = `kv_client_message{id, get_blob_result{blob_data}}`。
 ///
-/// ## 格式与时序(2026-08-23 turn4 实物)
+/// ## 格式与时序(2026-08-23 turn4 实物;id 语义 2026-09-04 钉死)
 ///
-/// 服务端按 hash 逐条点名(field-4 `4.2`,一帧一个),客户端**按点名顺序**交出,
-/// slot 序号从 0 递增。实测 7 个需求 → 7 个槽,每个槽内容的 sha256 正好等于被点名的
-/// 哈希;交完之后服务端才发会话登记通知,客户端随后才发 ENV。
+/// 服务端按 hash 逐条点名(field-4 `4.2`,一帧一个),客户端**按点名顺序**交出。
+/// 实测 7 个需求 → 7 条回执,每条内容的 sha256 正好等于被点名的哈希。
+/// `.1` 回显的是 **KV 请求 id**(实物里恰好 0..6 连续,当时误读成「slot 序号」;
+/// 对照 fork 的 `KvClientMessage{id, get_blob_result}` 后钉死,见 [`frame_field3_slot`])。
 ///
-/// slot 0 **省略 `.1`**(proto3 默认值不上线),与 [`frame_field3_slot`] 同一约定 ——
-/// 实物 req-001(slot 0)里确实没有 `.1`,req-002 起才有。
+/// id 0 **省略 `.1`**(proto3 默认值不上线),与 [`frame_field3_slot`] 同一约定 ——
+/// 实物 req-001(id 0)里确实没有 `.1`,req-002 起才有。
 pub fn content_slot_frame(slot: u64, content: &[u8]) -> Vec<u8> {
     let mut holder = Writer::new();
     holder.bytes(1, content);
@@ -526,6 +542,42 @@ pub fn cli_request_frames(frame0: &[u8], context: &[u8]) -> Vec<(Vec<u8>, bool)>
     v.push((frame_field7_empty(), false));
     v.push((frame_field3_slot(8), false));
     v
+}
+
+// ── MCP 工具目录(RunRequest.4,2026-09-04 对齐 YeautyYE fork 实证)─────────────
+//
+// ## 为什么工具必须走这条路
+//
+// InferenceService 的 `AgentTool.parameters` 对 grok/claude 必被上游拒(xAI 422 /
+// Anthropic 400,与官方 proto 逐字节一致也拒)。AgentService 的 `mcp_tools` 是唯一
+// 实证可行的工具广告通道:模型经 `InteractionUpdate.tool_call_started` 的
+// `mcp_tool_call`(1.2.2.15)回调,我方 `run::parse_tool_call` 已能解。
+//
+// ## 线上形状(fork request.rs:791 + proto.rs `McpTool`)
+//
+/// `McpTools{1: repeated McpTool}`;每个 `McpTool`:
+/// `{1: name, 2: description, 3: google.protobuf.Value(input_schema),
+///   4: 'claude-local', 5: tool_name}`。
+/// ⚠️ 两个坑都是 fork 实测的:tag 3 必须是 **Value 包 struct**(裸 Struct 会被拒
+/// `invalid end group tag`);tag 4/5 缺了 Fable 会**忽略整个工具表**。
+const MCP_PROVIDER_CLAUDE_LOCAL: &str = "claude-local";
+
+/// 把调用方声明的工具编成 `McpTools` 目录消息(RunRequest.4 的载荷)。
+pub fn mcp_tools_message(tools: &[crate::run::ToolDef]) -> Vec<u8> {
+    let mut out = Writer::new();
+    for t in tools {
+        let mut m = Writer::new();
+        m.string(1, &t.name);
+        m.string(2, &t.description);
+        // input_schema 在 ToolDef 里是 JSON 字符串;解回 Value 再按
+        // google.protobuf.Value 编码(struct_value 包 struct,不是裸 Struct)。
+        let schema: Value = serde_json::from_str(&t.schema).unwrap_or(Value::Null);
+        struct_value_field(&mut m, 3, &schema);
+        m.string(4, MCP_PROVIDER_CLAUDE_LOCAL);
+        m.string(5, &t.name);
+        out.message(1, &m);
+    }
+    out.into_bytes()
 }
 
 // ── google.protobuf.Value(JSON schema 走 2.36 推工具定义时用,Phase 3)─────────
@@ -599,6 +651,7 @@ mod tests {
             "conv-1",
             "turn-1",
             CliTurn::Opening,
+            &[],
         );
         let body = sub(&f0, 1).expect("帧 payload 应有 field 1");
         // 顶层字段序:1.1 空、1.2、1.4、1.5、1.9、1.12、1.16、1.25(无目录时)。
@@ -625,6 +678,7 @@ mod tests {
             "conv-1",
             "turn-2",
             CliTurn::Continuation(desc),
+            &[],
         );
         let body = sub(&f0, 1).unwrap();
         assert_eq!(sub(body, 1), Some(desc), "1.1 必须与描述符逐字节相同");
@@ -635,7 +689,7 @@ mod tests {
     #[test]
     fn 首轮1点1为在场空块() {
         let model = Model::new("default");
-        let f0 = build_frame0_cli("x", &model, &[], "c", "t", CliTurn::Opening);
+        let f0 = build_frame0_cli("x", &model, &[], "c", "t", CliTurn::Opening, &[]);
         assert_eq!(sub(sub(&f0, 1).unwrap(), 1), Some(&b""[..]));
     }
 
@@ -654,7 +708,7 @@ mod tests {
             ("首轮", CliTurn::Opening),
             ("续轮", CliTurn::Continuation(desc)),
         ] {
-            let f0 = build_frame0_cli("q", &model, &catalog, "conv", "turn", phase);
+            let f0 = build_frame0_cli("q", &model, &catalog, "conv", "turn", phase, &[]);
             let body = sub(&f0, 1).unwrap();
             let fs = fields_of(body);
             assert_eq!(
@@ -668,19 +722,50 @@ mod tests {
         }
     }
 
-    /// 消息 `.4` = **2**(08-23 三轮一致)。早先写 1 是错的。
+    /// mcp_tools 目录:帧0 `1.4` 装上 `McpTools`(2026-09-04 fork 对齐 + 探针实证)。
+    ///
+    /// 形状断言逐层手解:`McpTools{1: repeated McpTool{1:name, 2:desc,
+    /// 3: google.protobuf.Value(schema), 4:'claude-local', 5:tool_name}}`。
+    /// 无工具时 `1.4` 必须退回空块(与实物一致)。
     #[test]
-    fn 消息kind为2() {
+    fn mcp_tools_进帧0的1点4() {
         let model = Model::new("default");
-        let f0 = build_frame0_cli("hi", &model, &[], "c", "t", CliTurn::Opening);
+        let tools = vec![crate::run::ToolDef {
+            name: "get_weather".into(),
+            description: "查天气".into(),
+            schema: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+        }];
+        let f0 = build_frame0_cli("q", &model, &[], "c", "t", CliTurn::Opening, &tools);
+        let body = sub(&f0, 1).unwrap();
+        let mcp = sub(body, 4).expect("1.4 在场");
+        let tool = sub(mcp, 1).expect("McpTools.1 = 第一个 McpTool");
+        assert_eq!(fields_of(tool), vec![1, 2, 3, 4, 5]);
+        assert_eq!(sub(tool, 1), Some(&b"get_weather"[..]));
+        assert_eq!(sub(tool, 4), Some(&b"claude-local"[..]));
+        assert_eq!(sub(tool, 5), Some(&b"get_weather"[..]));
+        // tag 3 是 Value 包 struct(struct_value = Value.5),不是裸 Struct ——
+        // 裸 Struct 会被服务端拒 `invalid end group tag`(fork 实测)。
+        let schema = sub(tool, 3).expect("input_schema 在场");
+        assert!(fields_of(schema).contains(&5), "tag 3 必须是 Value{{5: struct}}");
+
+        // 无工具:1.4 与实物一致,空块。
+        let f0 = build_frame0_cli("q", &model, &[], "c", "t", CliTurn::Opening, &[]);
+        assert_eq!(sub(sub(&f0, 1).unwrap(), 4), Some(&b""[..]));
+    }
+
+    /// 消息 `.4` = **AgentMode**:发 1 = AGENT(ASK=2 会让模型自我设限,见构造函数注释)。
+    #[test]
+    fn 消息mode为agent() {
+        let model = Model::new("default");
+        let f0 = build_frame0_cli("hi", &model, &[], "c", "t", CliTurn::Opening, &[]);
         let msg = sub(sub(sub(sub(&f0, 1).unwrap(), 2).unwrap(), 1).unwrap(), 1).unwrap();
         assert_eq!(
             fields_of(msg),
             vec![1, 2, 3, 4],
-            "{{1:text,2:uuid,3:'',4:kind}}"
+            "{{1:text,2:uuid,3:'',4:mode}}"
         );
-        // varint 字段读不到就直接找字节:kind 是最后一个字段,值必须是 2。
-        assert_eq!(msg[msg.len() - 1], 2, ".4 必须是 2");
+        // varint 字段读不到就直接找字节:mode 是最后一个字段,值必须是 1(AGENT)。
+        assert_eq!(msg[msg.len() - 1], 1, ".4 必须是 1(AGENT)");
         assert_eq!(sub(msg, 3), Some(&b""[..]), ".3 空附件容器必须在场");
     }
 

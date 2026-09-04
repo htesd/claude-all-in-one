@@ -1,5 +1,192 @@
 # Changelog
 
+## [cursor-wire-agent-tools] 纯协议路线全通:裸态门真相 + KV 回执 + mcp_tools + AGENT 模式 — 2026-09-04
+
+### 背景
+
+clidrv(官方 CLI 子进程)工作区磁盘成本高,一直想把工具流量也收回纯协议。
+朋友推荐两个开源反代(raine/claude-code-proxy、YeautyYE/claude-cursor-proxy,
+Rust),证实**纯 rustls 裸栈即可打通 AgentService** —— 直接推翻「裸态门 =
+TLS/h2 指纹」的旧假设(wreq/BoringSSL 指纹库路线未开工即废弃,Cargo.toml
+已还原)。旧「注入实验」的共变量:帧注入官方进程时官方自己也在发心跳,
+「成功」算到了进程身份头上。
+
+### 三根柱子(全部本地 Ultra 号探针实证,examples/probe_wire_v2)
+
+1. **裸态门 = BiDi 生命周期**。官方 CLI 全程每 ~5s 发 `client_heartbeat`
+   (`{7:}` 空帧);我方只在初始帧序发一次就干等,服务端把流当死客户端 →
+   200 + 只心跳、永不生成。探针补发后裸态立刻消失。已生产化
+   (`chat.rs` 请求侧保活,Drop abort + 发送失败自退)。
+2. **KV 子协议必须回执**。对照 fork 的 `agent.v1` schema 钉死:顶层 field 4 是
+   `kv_server_message{id, get_blob_args, set_blob_args}`;**set_blob 不回执
+   (set_blob_result)服务端就不出 checkpoint**,90s 心跳死等 —— 这是出字后
+   停滞、`.3`/用量尾帧不来的根因。回执 `.1` 是**请求 id 回显**不是自增 slot
+   (08-23 实物巧合同值,当时误读)。`wirev2::WireDriver` 改按 KV 语义反应式
+   回执(生产与探针仍共用一份实现);初版「照实物帧序」预发的 9 条回执证实是
+   无害噪声(服务端忽略未知 id)。探针成绩:turn1 5.9s 干净收尾,turn2 答出
+   暗号(持史 ✔),turn3 cacheRead **98%**,负控判据正确触发。
+3. **mcp_tools 是工具广告唯一实证通道**。帧0 `1.4` 装 `McpTools`
+   (`{1:name, 2:desc, 3:Value(schema), 4:'claude-local', 5:tool_name}`;
+   tag 3 必须 Value 包 struct,缺 4/5 Fable 忽略整表)。探针实证模型按**裸名**
+   回调、参数正确;`run::parse_tool_call`(1.2.2.15)本就能解,无需 ENV .14。
+
+### 顺带钉死的一个旧误读
+
+消息 `.4` 不是「消息 kind=2」,是 **AgentMode 枚举**:08-23 实物是 2=**ASK**
+(抓的 CLI 就在 Ask 态),照抄导致模型「不能写文件」自我设限(e2e 实证拒写)。
+改发 1=AGENT 后 Write/Bash 全通。写/改许可归调用方工具体系,网关不设限。
+
+### 改动
+
+- `cli.rs`:`mcp_tools_message`(帧0 `1.4` 广告目录);`cli_user_message`
+  `.4` 改发 AGENT;`build_frame0_cli` 加 tools 参数。
+- `run.rs`:`kv_requests` 解析器(KvRequest::Get/Set,id 回显);
+  `content_hash_demands`/`section_echoes` 改为委托,签名不变。
+- `wirev2.rs`:WireDriver 按 KV 语义回执(set 存+回、get 按 id 供),
+  移除自增 slot;锁存语义不变。
+- `chat.rs`:请求侧 5s 心跳生产化;cli_mode 放开 tools;护栏文案裸名版
+  `mcp_tool_guard_with`(gwtools- 前缀版是 IDE 口径);工具轮显式作废描述符
+  (服务端停在等工具结果的中间态,链**设计内**中断,下轮重铺);
+  工具轮的判决/作废日志降为 INFO(防 WARN 淹没真异常)。
+- `lib.rs` 路由:带 tools 的请求默认**不再进 clidrv**(整条工具回路纯协议化);
+  显式 `driver="cli"`(账号 extra / CURSOR_DRIVER)仍强制 clidrv = 回滚闸。
+  cli_mode 前提 `CURSOR_PROFILE=cli`;`CURSOR_DRIVER=wire` 可全量走线协议。
+
+### 验证
+
+- 单元:gw-cursor **346 绿**(新增 set_blob 回执手写字节、id 回显、mcp_tools
+  帧0 形状、AgentMode 四条断言)。
+- 探针:3 正 + 2 负全绿(持史 ✔、98% 命中、负控判据触发)。
+- e2e:opencode × grok-4.6(CURSOR_DRIVER=wire + CURSOR_PROFILE=cli)
+  Glob/Read/Bash/Write 工具环全通、多轮记忆正常、worker 日志零 WARN。
+
+### 现状限制
+
+- tool_result 轮仍走 IDE 形态全量重铺(与 fork 的 ClientOnly 同义):工具密集
+  会话每次工具交换付一次全史。要省需把结果回进挂起的原流(fork live.rs 的
+  BiDi 桥,架构成本高,未做)。
+- InferenceService 的 tools 绕行(`tools_skip_inference`)保留:它管的是
+  inference 面,与本条 AgentService 面互补。
+
+## [cursor-inference-tools-bypass] 带 tools 的非 composer 请求绕行 inference — 2026-09-04
+
+### 事故
+
+opencode(pi 系)经 inference 直连访问 grok 全部 529。当日凌晨 xAI 故障恢复后
+tool-less 请求正常,但**任何带 `tools` 的请求**稳定 `ERROR_PROVIDER_ERROR`
+(providerStatusCode 422;claude 系为 400),被归类 Overloaded 快败不烧号,
+用户侧表现为"一直繁忙"。
+
+### 取证(全部本地 Ultra 号实弹,零生产影响)
+
+- 二分生产报文(request_logs 抓原件):触发点是 `tools` 数组,其余字段
+  (thinking/output_config/context_management/system 消息/system 提示)逐个排除。
+- 单个 289B 的工具、手写最简 schema、甚至 `{"type":"object"}` 都 422;
+  **不带 parameters 的空壳工具正常**;composer 全系带 tools 正常。
+- 与官方客户端库(grokbot 重构源码内 generated `inference_pb.ts` + `@bufbuild/protobuf`)
+  序列化的同构请求**逐字节对比**:初差 Struct 键序(我方 BTreeMap 字母序 vs 官方
+  插入序),修正后仅 uuid 不同 —— 上游照拒。键序不是根因。
+- 官方字节 + 4 个 client-version(0.18.0/2026.08.11/1.7.44/2.0.0)+ maxMode 两态 +
+  builtInModel + acceptedUnadvertisedToolNames 全组合:**均 422**。
+- 结论:平台侧拒收「带 parameters 的 AgentTool」(疑 xAI 故障期开始的回归或有意
+  收紧),字节层面无解。composer 不受影响。
+
+### 改动
+
+- `inference.rs`:新增 `tools_skip_inference` —— tools 非空且模型非 composer 系,
+  绕行 inference(落 clidrv,AgentService 面工具链成熟);`struct_writer` 键序
+  改 `type` 首位(贴近官方惯用序,无害;完整保序需 serde_json preserve_order,
+  kiro 字节对齐面未审计,暂缓)。
+- `lib.rs`:inference 分支加该门控。clidrv/wire 回退链不动,`CURSOR_DRIVER` 等
+  退出机制不变。
+- 上游若恢复(可用 `e2e_inference` + 任意带 parameters 的工具复测),把门控改热
+  配置或删除即可。
+
+### 验证
+
+- `tools绕行门控` 单测(grok/claude 绕行、composer 不绕行、空 tools 不绕行)。
+- `cargo test -p gw-cursor` 344 全绿;探针回归:composer-2.5 + 真实 opencode
+  28 工具报文 → 正常出字(inference 面未受影响)。
+- 本地网关 + 本机 opencode 端到端:grok 带工具请求走 clidrv 收敛。
+
+## [cursor-inference-default] cursor 默认驱动翻转为 InferenceService 直连 — 2026-09-03
+
+clidrv(子进程包裹 cursor-agent)从 2026-08-23 起就是**临时方案**;这次把纯协议路线
+转正。取证与结论全部写进 `../docs-cursor-protocol-re-2026-08-23.md` §八。
+
+### 取证(本机 Ultra 号 + `e2e_inference` 探针,零生产影响)
+
+- 三模型基线全通:grok-4.6 / composer-2.5 / claude-sonnet-5,流式 + usage 帧 + 干净收尾。
+- **429 压测未复现**:并发阶梯 1→2→4→8→16 共 93 发全 200,零流内 error。此前
+  「一直 429」在本面不可复现,更可能源于非 Ultra 号或额度耗尽;Pro 号 2026-08-26
+  起官方已开放此面,但限速阈值未实测,灰度期盯。
+- 缓存无漂移:24.7k tok 前缀第 2 发起命中 99.9%(24704/24723)。
+- 门控实测:prefill 上游 200 接受(放开);`stop_sequences` 字段接受(记档);
+  `thinking: disabled` 不影响上游发思考帧(客户端侧丢弃,行为不变);
+  `tool_choice` proto 无字段(维持全通道不支持)。
+
+### 改动
+
+- `inference.rs`:document 块(base64 PDF)接入 —— 构建期 `pdf.rs` 抽文本层内联,
+  与 cli/wire 同形态(含「无法抽取」明示分支,防模型反复调读文件工具);prefill
+  门控放开;URL 媒体维持不接(主动出网是 SSRF 面)。实弹:埋哨兵的真 PDF,
+  模型答出哨兵数字。
+- `lib.rs`:默认驱动 clidrv → inference;`extra.driver="cli"` / `CURSOR_DRIVER=cli`
+  保留秒级回退,**clidrv 代码不删**。inference 不接的形态(URL 媒体)自动落回 cli。
+- admin-ui:驱动三档(Inference 直连(默认)/CLI 子进程(回退)/线协议(退出)),
+  表格徽章改挂非默认项;后端 `normalize_driver` 本已接受三值,只更新注释。
+- 2026-08-17「裸名被上游收走」的教训**不适用**于 inference 面:裸名 + parameters
+  是官方 host 自己在发的形态,不是逆出来的私有面(见 inference.rs 模块文档)。
+
+### 验证
+
+- `cargo test --workspace` 全绿(含门控新用例:prefill 接、PDF 接、非 PDF 文档拒、
+  document 注入文本层断言);admin-ui `tsc + vite build + 64 vitest` 全绿。
+- 部署纪律:灰度先 1-2 个号 `extra.driver=inference` 跑 24h(盯 429 率/缓存命中/
+  auto 池消耗),无异常才切全量;异常时 `CURSOR_DRIVER=cli` 整 worker 秒回滚。
+
+### codex 复审(0 blocker / 3 major / 1 minor)与修复
+
+- **major#1 运行时故障无回退**:inference 建流前失败(未产出任何内容,重放安全)按
+  错误性质分流 —— 账号/请求级(TokenInvalid/RateLimited/QuotaExhausted/ModelNotAvailable/
+  TemporarilyBlocked/Overloaded)原样上抛交调度层;驱动级(ServerError/Network/Other/
+  BadRequest)在 CLI 能接时**回退 clidrv**。EmptyResponse 故意排除(内容级 guardrail
+  空流,换路径重发是"放大"动作)。流内错误仍归 `CURSOR_DRIVER=cli` 人工回滚。
+- **major#2 门控与编码器深度不一致**:门控改 fail-closed —— 只放行编码器认识的块
+  集合(text/image/document/tool_use/thinking/redacted_thinking + 一层 tool_result),
+  未知块/嵌套 tool_result 落回 cli/wire,不再静默丢失。
+- **major#3 PDF 解压炸弹面**:`pdf.rs` 流数量封顶移进扫描阶段(原 take 只管消费)、
+  新增 64MB 累计解压上限;`build_request` 经 `spawn_blocking` 挪出 Tokio worker 线程。
+- minor(URL/非法附件回退后模型看到「(见附件)」占位但拿不到内容)是 cli/wire 共有
+  的存量行为,与本次翻转无关,记档不动。
+
+### codex 二轮复核(0 blocker / 4 major / 2 minor)与修复
+
+- **M1 prefill 请求兜底链被掐断**(回退要求 cli_eligible,prefill 不满足):驱动级失败
+  改为落向下游 —— cli 能接走 clidrv,不能接走 wire,不再直接 `return Err`。
+- **M2 流内错误不自动回退**:**设计取舍,不改**。窥探首帧再决定是否回退会把每个
+  请求的首字延迟搭进去;协议漂移有 warn 日志 + 监视器,人工 `CURSOR_DRIVER=cli`
+  秒级回滚覆盖。
+- **M3 回退路径(clidrv/wire)的 PDF 抽取仍是同步**:存量行为,翻转前生产就如此,
+  非本次回归,记档。
+- **M4 门控消息级不够严**(非对象消息、非标量 content、tool_result 的对象 content
+  会过门控但被编码器丢):门控补到消息级 fail-closed。
+- minor:PDF 抽取加**进程级信号量**(4 并发槽,仅含 document 的请求排队);
+  单流解压按剩余总量预算截取;accounts.rs 过时注释更正。
+
+### 首次上线即事故(2026-09-03 晚)与真凶
+
+默认翻转部署后几分钟全通道 502。**真凶是 xAI(grok)供应商故障,不是翻转** ——
+回退 clidrv 后 grok 照样全挂、composer 全好;本地 Ultra 探针同挂;各号 quota 充足。
+真正被我方放大的环节:END trailer 的 `ERROR_PROVIDER_ERROR`(provider 422)/
+`ERROR_RESOURCE_EXHAUSTED` 被 `map_connect_error("resource_exhausted")` 误判成
+**RateLimited** → 账号批量冷却 → 健康的 composer 流量被「选号失败」株连。
+历史上「inference 一直 429」的体验大概率同一根因。
+
+修复:trailer 按 `details[0].debug.error` 细分,供应商故障 → **Overloaded**
+(模型级语义:不罚号、不换号、同号退避),回归测试用生产原文钉死。
+详见 `../docs-cursor-protocol-re-2026-08-23.md` §八附录。
+
 ## [cursor-turn-trueup] 末轮补差:turn 合计对齐上游真总量 — 2026-08-18
 
 用本机抓包先钉死了一条前提,再据它做补差。**做完这条,之前提的"手填地板常量"方案

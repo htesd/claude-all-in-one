@@ -1826,45 +1826,95 @@ impl Provider for CursorProvider {
 
         let token = Self::token_of(&ctx.account)?;
 
-        // 驱动形态:**CLI 驱动是默认**,线协议要显式退出。提前算是因为 CLI 驱动不需要
-        // machine_id / config_version —— 尤其不能卡在 GetServerConfig 上(那次握手 5–6s,
-        // 且失败会误伤整条链路)。
+        // 驱动形态:**InferenceService 直连是默认**(2026-09-03 起),CLI 驱动退为
+        // 显式回退项。提前算是因为两条快路径都不需要 config_version —— 尤其不能卡在
+        // GetServerConfig 上(那次握手 5–6s,且失败会误伤整条链路)。
         //
-        // ## 为什么 2026-08-17 把默认翻过来
+        // ## 为什么 2026-09-03 把默认从 clidrv 翻成 inference
         //
-        // 线协议给上游发的是**裸模型名**(`to_cursor_model` 出来的 `grok-4.6` 这种),而
-        // CLI 驱动发的是 CLI 那套名字(`cursor-grok-4.6-high`,见 `clidrv::cli_model_name`)。
-        // 当天 06:50 前后上游停止接受裸 `grok-4.6`、随后 `grok-4.5` 也一样,线协议上的
-        // 三个号在几分钟内全部 `ModelNotAvailable`,而同一批号切到 CLI 驱动立刻恢复 ——
-        // `--list-models` 实证上游只有 `cursor-grok-4.x-*` 那一族。
+        // InferenceService.Stream 面(grokbot 路线,见 inference.rs 模块文档与
+        // docs-cursor-protocol-re-2026-08-23.md §七)无进程校验、真实服务端前缀缓存、
+        // 全部模型记 auto 池。2026-09-03 本地 Ultra 实测:三模型(grok/composer/claude)
+        // 全通、16 并发 ×93 发零 429、同前缀第 2 发起缓存命中 99.9%、官方 0.18.0
+        // 版本号仍被接受。clidrv 的整套复杂度(常驻进程/会话桶/resume/分叉重铺/工作区
+        // 磁盘膨胀)在这条面上全部不必要。
         //
-        // 结论是:**裸名那套是我方逆出来的、会被上游单方面收走,而 CLI 用的是官方客户端
-        // 自己在用的名字**,后者才是长期能站住的一侧。加上 CLI 驱动本来就带真实 usage
-        // (含 `cacheReadTokens`)与 MCP 工具桥,没有理由再让它做可选项。
+        // 历史上的两次默认翻转:2026-08-17 线协议(AgentService 面)裸名被上游单方面
+        // 收走 → 默认翻成 clidrv;但那次的教训**不适用**于 inference 面 —— 裸名 +
+        // parameters 是官方 host 自己在发的形态(后缀服务端合成),不是逆出来的私有面。
         //
-        // 退出口留两个(出问题时不必重新部署):账号 `extra.driver="wire"` 单号退出,
-        // 环境变量 `CURSOR_DRIVER=wire` 整个 worker 退出。历史值 `"cli"` 仍然合法(等于默认)。
+        // 退出口照旧留两个(出问题时不必重新部署):账号 `extra.driver="cli"`(或
+        // `"wire"`)单号退出,环境变量 `CURSOR_DRIVER=cli` 整个 worker 退出。
         let account_driver = Self::opt_str(&ctx.account, "driver");
         let env_driver = std::env::var("CURSOR_DRIVER").ok();
         // 生效驱动:环境变量是 worker 级强制开关(回滚时不必逐号改库),设了就压过
         // 账号字段;没设才看账号级灰度(codex 复审 major#13:两条都要有否决权)。
         let effective_driver = env_driver.as_deref().or(account_driver.as_deref());
-        // 第三条路径:InferenceService.Stream 直连(2026-08-26,见 inference.rs 模块文档)。
-        // 纯 H1 + connect 流式,无进程校验,服务端前缀缓存真实回表。
-        let inference_driver = effective_driver == Some("inference");
+        // 默认即 inference;显式 "cli"/"wire" 退出。历史值 "inference" 仍合法(等于默认)。
+        let inference_driver =
+            effective_driver.is_none() || effective_driver == Some("inference");
         let wire_opt_out = effective_driver == Some("wire");
-        // `cli_eligible` 仍是硬前提:assistant 结尾(prefill)这类形态 CLI 接不了,回线协议。
-        let cli_driver = !wire_opt_out && chat::cli_eligible(&req.body);
+        let explicit_cli = effective_driver == Some("cli");
+        // 2026-09-04:带 tools 的请求默认**不再进 clidrv** —— 线协议 CLI 面已能用
+        // 帧0 `1.4` 的 mcp_tools 目录广告工具(探针实证模型按裸名回调),
+        // tool_result 轮落 IDE 形态全量重铺,整条工具回路纯协议化。
+        // 显式 `driver="cli"`(账号 extra 或 CURSOR_DRIVER)仍强制 clidrv ——
+        // 那是协议面出问题时的回滚闸。
+        let req_has_tools = !chat::to_tools(&req.body).is_empty();
+        // inference 不接的形态(URL 媒体等)落回 CLI;`cli_eligible` 是 CLI 的硬前提
+        //(assistant 结尾这类形态 CLI 接不了,回线协议)。
+        let cli_driver =
+            !wire_opt_out && chat::cli_eligible(&req.body) && (explicit_cli || !req_has_tools);
 
         let machine_id = Self::machine_id_of(&ctx.account, &token);
         let mac_machine_id = Self::mac_machine_id_of(&ctx.account, &token);
         let client = self.client_for(&ctx.account)?;
 
-        // ── InferenceService 直连(driver=inference)──────────────────────────
+        // ── InferenceService 直连(默认驱动)─────────────────────────────────
         // 不需要 config_version / 会话注册表 / CLI 工作区,进出国度全在 inference.rs。
-        // 形态门控 inference_eligible:prefill/document/URL 图片回退 cli/wire。
-        if inference_driver && inference::inference_eligible(&req.body) {
-            return inference::chat_stream(&client, &ctx.account, &token, req, ctx).await;
+        // 形态门控 inference_eligible:只挡空 messages / URL 媒体 / 非法或超预算附件,
+        // 挡掉的回退 cli/wire。tools_skip_inference:带 tools 的非 composer 请求
+        // 平台侧必拒(2026-09-04 定论,见 inference.rs),直接绕行 clidrv。
+        if inference_driver
+            && inference::inference_eligible(&req.body)
+            && !inference::tools_skip_inference(&req.model, &req.body)
+        {
+            // 建流前失败(尚未产出任何内容,重放安全)按性质分流:
+            // - 账号/请求级(TokenInvalid/RateLimited/QuotaExhausted/ModelNotAvailable/
+            //   TemporarilyBlocked/Overloaded)原样上抛交调度层 —— 换驱动不解决;
+            // - **驱动级**(ServerError/Network/Other/BadRequest:5xx、协议漂移、
+            //   形态被 upstream 拒)在 CLI 能接时落回 clidrv —— inference 面
+            //   整体故障或协议漂移时,默认路径不至于全灭(codex 复审 2026-09-03 major#1)。
+            //   代价:真坏的请求多付一次 CLI 尝试(几秒),换来可用性兜底。
+            //   EmptyResponse 故意**不在**其中:那是内容级确定性空流(疑 guardrail),
+            //   换路径重发同一内容正是"放大"动作(error_map 注释的封号教训)。
+            // 流起来之后的错误在 ChatStream 里,这里拦不到 —— 那是 `CURSOR_DRIVER=cli`
+            // 人工回滚覆盖的范畴。
+            match inference::chat_stream(&client, &ctx.account, &token, req.clone(), ctx).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    let driver_level = matches!(
+                        e.kind,
+                        UpstreamErrorKind::ServerError
+                            | UpstreamErrorKind::Network
+                            | UpstreamErrorKind::Other
+                            | UpstreamErrorKind::BadRequest
+                    );
+                    // 驱动级失败落到下游:cli_driver 为真走 clidrv,为假(prefill 等
+                    // CLI 接不了的形态)继续走 wire —— 不能在这里直接 return Err,
+                    // 否则 prefill 请求的兜底链被掐断(codex 二轮 M1)。(执行到这里
+                    // 必然不是 wire_opt_out —— 那条路在前面就不进 inference 分支。)
+                    if !driver_level {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        account = %ctx.account.account_id,
+                        error = %e,
+                        cli = cli_driver,
+                        "inference 建流失败(驱动级),本请求回退 CLI/wire 驱动"
+                    );
+                }
+            }
         }
 
         // CLI 形态/CLI 驱动都不需要 config_version(头表里没有这条)—— 省掉

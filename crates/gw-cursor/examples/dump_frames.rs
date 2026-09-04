@@ -31,6 +31,7 @@ fn main() {
         conv,
         turn,
         cli::CliTurn::Opening,
+        &[],
     );
     let env = cli::build_context_frame_cli(SYSTEM, token, conv, TIMEZONE, CWD);
 

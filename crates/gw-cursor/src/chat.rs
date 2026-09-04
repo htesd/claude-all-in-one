@@ -634,6 +634,47 @@ fn builtin_tool_guard_with(tools: &[run::ToolDef], policy: &str) -> String {
     s
 }
 
+/// MCP/CLI 形态(线协议)的护栏:与 [`builtin_tool_guard_with`] 同构,
+/// 但工具以**裸名**注册 —— mcp_tools 目录里没有 `gwtools-` 命名空间前缀,
+/// 模型按裸名回调(2026-09-04 探针实证,get_weather 原样回来)。
+/// 闭集断言与能力替代表保留:Cursor 内建工具我们依旧执行不了。
+fn mcp_tool_guard_with(tools: &[run::ToolDef], policy: &str) -> String {
+    let mut s = String::from("\n\n[运行环境]你的工具在协议里以**裸名**注册(声明为 `read`,调用名就是 `read`,不带任何前缀)。");
+
+    let names: Vec<String> = tools.iter().map(|t| format!("`{}`", t.name)).collect();
+    let listed = names.join("、");
+    if listed.chars().count() <= GUARD_LIST_BUDGET_CHARS {
+        s.push_str("本次可用的**全部**工具就是这 ");
+        s.push_str(&tools.len().to_string());
+        s.push_str(" 个:");
+        s.push_str(&listed);
+        s.push_str("。清单之外**不存在**任何其他工具。");
+    } else {
+        s.push_str("本次声明的工具就是你的全部工具,清单之外**不存在**任何其他工具。");
+    }
+
+    let redirects = capability_redirects(tools);
+    if !redirects.is_empty() {
+        s.push_str("\n需要某项能力时用清单里的对应工具:");
+        for (i, (cap, tool)) in redirects.iter().enumerate() {
+            if i > 0 {
+                s.push_str(";");
+            }
+            s.push_str(cap);
+            s.push_str("调用 `");
+            s.push_str(tool);
+            s.push('`');
+        }
+        s.push_str("。");
+    }
+
+    if !policy.trim().is_empty() {
+        s.push('\n');
+        s.push_str(policy.trim());
+    }
+    s
+}
+
 /// 工具闭集的字符预算(超了就不逐个列名)。
 ///
 /// 1200 个字符 ≈ 300~400 token,大约能装 60 个 `gwtools-Xxx`。到这个量级时
@@ -1795,11 +1836,12 @@ pub async fn chat_stream(
     let tools = to_tools(&req.body);
 
     // ── CLI 形态(2026-08-16 抓包,见 `cli.rs` 模块文档)─────────────────────
-    // 纯文本、无工具、无附件的请求走 CLI 极简形态:只发最后一条新消息,
+    // 纯文本、无附件、用户轮结尾的请求走 CLI 极简形态:只发最后一条新消息,
     // 历史由服务端持有(实测跨进程记得,且上游真缓存命中回来)。
-    // Phase 1 不接工具回路/附件:带这些的请求维持 IDE 形态(生产在跑的那条)。
+    // 2026-09-04 起**工具请求也走这条**:工具经帧0 `1.4` 的 mcp_tools 目录广告
+    // (探针实证模型按裸名回调),不再绕行 clidrv。仍不接的:附件与 tool_result
+    // 轮(带 tool_use/tool_result 块的请求维持 IDE 形态全量重铺,那是今天的路)。
     let cli_mode = ctx.profile.is_cli()
-        && tools.is_empty()
         && images.is_empty()
         && docs.is_empty()
         && !body_has_tool_blocks(&req.body)
@@ -1856,7 +1898,14 @@ pub async fn chat_stream(
     };
     let system = {
         let mut sys = extract_system(&req.body);
-        sys.push_str(&builtin_tool_guard(&tools));
+        // CLI 形态的工具走帧0 `1.4` 的 mcp_tools 目录(裸名注册,模型按裸名回调,
+        // 2026-09-04 探针实证),护栏文案必须用裸名版 —— 带 `gwtools-` 前缀版是
+        // IDE 形态 frame0 的注册口径,写进去会让模型去调不存在的名字。
+        if cli_mode && !tools.is_empty() {
+            sys.push_str(&mcp_tool_guard_with(&tools, &crate::tool_guard_policy()));
+        } else {
+            sys.push_str(&builtin_tool_guard(&tools));
+        }
         sys
     };
 
@@ -1987,6 +2036,7 @@ pub async fn chat_stream(
             &ctx.conversation_id,
             &turn_id,
             phase,
+            &tools,
         );
         let context = crate::cli::build_context_frame_cli(
             &system,
@@ -2388,6 +2438,42 @@ fn stream_to_anthropic(
         // 全程持有发送端:除了「不 half-close」,服务端的 write/read 调用回执
         // 也经它从请求侧送回去(见下面的 exec 分支)。任务结束时随栈 drop,流才收。
         let body_keepalive = body_keepalive;
+        // ── 请求侧保活:`{7:}` client_heartbeat,每 5s 一发,覆盖整轮 ─────────────
+        //
+        // 2026-09-04 探针钉死(examples/probe_wire_v2,对照 YeautyYE fork client.rs:633):
+        // 官方 CLI 全程每 ~5s 发一个 `{7:}` 空帧;我方此前只在初始帧序里发一次,
+        // 之后干等,服务端把这条流当死客户端 → 200 + 只回心跳、永不生成的「裸态」。
+        // 补发后裸态消失,整轮 3-6s 干净收尾。帧与内容槽回执交错是实物形态
+        // (08-23 抓包里 `{7:}` 本就夹在 slot 7/8 之间),不会干扰 KV 子协议。
+        // 防护:本任务所有出口经 Drop abort;心跳任务自身发送失败(流已关)也会退出。
+        struct HeartbeatGuard(Option<tokio::task::JoinHandle<()>>);
+        impl Drop for HeartbeatGuard {
+            fn drop(&mut self) {
+                if let Some(h) = &self.0 {
+                    h.abort();
+                }
+            }
+        }
+        let _hb = body_keepalive.as_ref().map(|sink| {
+            let sink = sink.clone();
+            HeartbeatGuard(Some(tokio::spawn(async move {
+                let frame = wire::frame(&crate::cli::frame_field7_empty());
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    // 发送失败 = 请求流已关/读侧已退,收工,不拖累本轮判决。
+                    if sink
+                        .send_timeout(
+                            Ok(bytes::Bytes::from(frame.clone())),
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })))
+        });
         let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
         let mut decoder = wire::FrameDecoder::new();
@@ -2941,6 +3027,11 @@ fn stream_to_anthropic(
                             if let Some(wu) = usage {
                                 upstream_usage = Some(usage_from_upstream(wu));
                             }
+                            // 工具轮没有 turn_commit(服务端停在「等工具结果」的中间态),
+                            // 描述符链从这里断 —— 作废,下一轮(带工具结果)走重铺;
+                            // 绝不让再下轮拿一张缺了本轮的清单回放(静默失忆)。
+                            // 非 CLI 形态此调用是空操作(见 wire_invalidate 的守卫)。
+                            wire_invalidate("工具调用收口,描述符链中断");
                             // 外部工具支是正常的 tool_use 收尾。
                             saw_end = true;
                             break 'outer;
@@ -3107,15 +3198,31 @@ fn stream_to_anthropic(
             .verdict()
         };
         if wire_verdict != run::WireVerdict::Ok {
-            tracing::warn!(
-                conversation_id = %conversation_id,
-                verdict = ?wire_verdict,
-                saw_descriptor = wire_saw_desc,
-                output_chars,
-                demanded = wire_driver.as_ref().map_or(0, |d| d.demanded()),
-                unavailable = wire_driver.as_ref().map_or(0, |d| d.unavailable()),
-                "cursor Run:wire 判决非 Ok"
-            );
+            // 工具调用轮的 NoDescriptor 是**设计内**的链中断(服务端停在
+            // 「等工具结果」的中间态,本轮没有 turn_commit),不是异常 ——
+            // 生产每次工具调用都 WARN 会把真异常淹没。其余情形照旧 WARN。
+            // (tracing 的 level 必须是常量,两支写开。)
+            if tool_call.is_some() {
+                tracing::info!(
+                    conversation_id = %conversation_id,
+                    verdict = ?wire_verdict,
+                    saw_descriptor = wire_saw_desc,
+                    output_chars,
+                    demanded = wire_driver.as_ref().map_or(0, |d| d.demanded()),
+                    unavailable = wire_driver.as_ref().map_or(0, |d| d.unavailable()),
+                    "cursor Run:wire 判决非 Ok(工具调用轮,设计内)"
+                );
+            } else {
+                tracing::warn!(
+                    conversation_id = %conversation_id,
+                    verdict = ?wire_verdict,
+                    saw_descriptor = wire_saw_desc,
+                    output_chars,
+                    demanded = wire_driver.as_ref().map_or(0, |d| d.demanded()),
+                    unavailable = wire_driver.as_ref().map_or(0, |d| d.unavailable()),
+                    "cursor Run:wire 判决非 Ok"
+                );
+            }
         }
 
         // 描述符作废:三种情形合流 —— ① 排水失败(旧条目缺本轮,codex #2);
@@ -3124,14 +3231,26 @@ fn stream_to_anthropic(
         if must_invalidate {
             if let Some(feed) = &shadow {
                 let dropped = feed.map.invalidate(&conversation_id, &feed.account_id);
-                tracing::warn!(
-                    conversation_id = %conversation_id,
-                    account = %feed.account_id,
-                    dropped,
-                    drain_failed = shadow_must_invalidate,
-                    verdict = ?wire_verdict,
-                    "cursor Run:作废该会话描述符,下轮重铺"
-                );
+                // 工具调用轮同上的理由:设计内中断,降为 info。
+                if tool_call.is_some() {
+                    tracing::info!(
+                        conversation_id = %conversation_id,
+                        account = %feed.account_id,
+                        dropped,
+                        drain_failed = shadow_must_invalidate,
+                        verdict = ?wire_verdict,
+                        "cursor Run:作废该会话描述符,下轮重铺(工具调用轮,设计内)"
+                    );
+                } else {
+                    tracing::warn!(
+                        conversation_id = %conversation_id,
+                        account = %feed.account_id,
+                        dropped,
+                        drain_failed = shadow_must_invalidate,
+                        verdict = ?wire_verdict,
+                        "cursor Run:作废该会话描述符,下轮重铺"
+                    );
+                }
             }
             shadow_staged = None;
         }

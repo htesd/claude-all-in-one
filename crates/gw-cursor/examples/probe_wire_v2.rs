@@ -108,6 +108,8 @@ struct TurnReport {
     /// 算同样是 `Barren`,但那说明的是网络/凭证问题,不是「服务端不认我方描述符」。
     /// 混在一起会让一次 401 被报成「方案不可行」。
     transport_error: Option<String>,
+    /// 本轮捕到的 MCP 工具调用(1.2.2.15,见 `run::parse_tool_call`)。
+    tool_call: Option<run::ToolCall>,
     elapsed_ms: u128,
 }
 
@@ -178,6 +180,7 @@ async fn run_turn(
     label: &str,
     prompt: &str,
     phase: cli::CliTurn<'_>,
+    tools: &[run::ToolDef],
 ) -> TurnReport {
     let mut rep = TurnReport {
         label: label.to_string(),
@@ -191,7 +194,8 @@ async fn run_turn(
     let model = run::Model::new(MODEL);
     let catalog = cli::cli_catalog_lan();
 
-    let frame0 = cli::build_frame0_cli(prompt, &model, &catalog, conversation_id, &turn_id, phase);
+    let frame0 =
+        cli::build_frame0_cli(prompt, &model, &catalog, conversation_id, &turn_id, phase, tools);
     let context = cli::build_context_frame_cli(SYSTEM, token, conversation_id, TIMEZONE, CWD);
     rep.frame0_bytes = frame0.len();
 
@@ -247,6 +251,38 @@ async fn drive_request(
     // 帧0 先进通道;发送端在读完响应前一直不 drop,请求流不 half-close。
     let _ = btx.try_send(Ok(bytes::Bytes::from(framed.remove(0))));
     let body = reqwest::Body::wrap_stream(tokio_stream::wrappers::ReceiverStream::new(brx));
+
+    // ── 周期性 client_heartbeat(`{7:''}`,≈5s 一发,覆盖整轮)──────────────────
+    //
+    // 2026-09-04 新假设(YeautyYE/claude-cursor-proxy 实证,其 client.rs:633):
+    // 裸态门可能不是 TLS 指纹,而是 **BiDi 生命周期** —— 官方 CLI 全程每 ~5s 发一个
+    // `{7:}` 空帧(client_heartbeat)保活;我方此前只在初始帧序里发一次(照 08-23
+    // 实物),之后干等,服务端把这条流当死客户端,只回心跳。
+    // 且 08-23 实物里 `{7:}` 本就夹在内容槽 7/8 之间,交错出现是正常形态。
+    // 防护:函数所有出口经 Drop abort,任务自身发送失败(流已关)也会退出。
+    struct HeartbeatGuard(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for HeartbeatGuard {
+        fn drop(&mut self) {
+            if let Some(h) = &self.0 {
+                h.abort();
+            }
+        }
+    }
+    let hb_frame = wire::frame(&cli::frame_field7_empty());
+    let hb_tx = btx.clone();
+    let _hb = HeartbeatGuard(Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            // 发送失败 = 请求流已关/读侧已退,任务收工,不拖累本轮判决。
+            if hb_tx
+                .send_timeout(Ok(bytes::Bytes::from(hb_frame.clone())), Duration::from_secs(5))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })));
 
     let url = format!("https://{HOST}/agent.v1.AgentService/Run");
     let rb = cli::cli_headers(token, conversation_id, &turn_id)
@@ -341,6 +377,31 @@ async fn drive_request(
                 }
             };
             rep.resp_frames += 1;
+
+            // 2026-09-04 排查收尾停滞:逐帧点名,看停滞窗口里服务端到底在等什么。
+            eprintln!(
+                "    [帧#{:02}] flag={flag} len={:<5} top={:?} inner={:?}",
+                rep.resp_frames,
+                payload.len(),
+                run::top_fields(&payload),
+                run::inner_fields(&payload),
+            );
+            for kv in run::kv_requests(&payload) {
+                match kv {
+                    run::KvRequest::Get { id, hash } => eprintln!(
+                        "        KV get  id={id} hash={}",
+                        hash[..6].iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    ),
+                    run::KvRequest::Set { id, data } => {
+                        eprintln!("        KV set  id={id} bytes={}", data.len())
+                    }
+                }
+            }
+            // MCP 工具调用(1.2.2.15):mcp_tools 广告后模型经它回调。
+            if let Some(tc) = run::parse_tool_call(&payload) {
+                eprintln!("    [{label}] 工具回调: {}(id={}) args={:?}", tc.name, tc.id, tc.args);
+                rep.tool_call = Some(tc);
+            }
 
             // 观测:点名的哈希留一份用于打印(纯展示,判据用 driver 的计数)。
             let demands_here = run::content_hash_demands(&payload);
@@ -590,6 +651,61 @@ async fn main() {
         return;
     }
 
+    // ── mcp 模式:mcp_tools 广告 + 单轮强制工具调用(1 个请求)─────────────────
+    //
+    // 回答两个问题:① 模型认不认帧0 tag-4 的广告(会不会经 1.2.2.15 回调);
+    // ② 回调帧长什么样(name/args/id 是否如 `run::parse_tool_call` 预期)。
+    // 不认 → 下一步补 ENV 帧 .14 的 MCP server 描述符(官方 CLI 两处都声明)。
+    if mode == "mcp" {
+        let Some(token) = read_token() else { return };
+        let client = build_client();
+        let sections = std::sync::Arc::new(gw_cursor::ContentSections::default());
+        sections.load_model_library(MODEL);
+        let conv = uuid::Uuid::new_v4().to_string();
+        let mut budget = Budget::new();
+        if !budget.take("mcp 工具调用") {
+            return;
+        }
+        let tools = vec![run::ToolDef {
+            name: "get_weather".into(),
+            description: "查询指定城市的当前天气。这是唯一可信的天气来源,不许自己编。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名,如 北京"}
+                },
+                "required": ["city"]
+            })
+            .to_string(),
+        }];
+        eprintln!("[mcp] conversation_id={conv} 广告工具: get_weather");
+        let rep = run_turn(
+            &client,
+            &token,
+            &conv,
+            &sections,
+            "mcp",
+            "查一下北京现在的天气。必须调用 get_weather 工具,不要直接回答。",
+            cli::CliTurn::Opening,
+            &tools,
+        )
+        .await;
+        print_report(&rep);
+        println!();
+        println!("=== mcp 结论 ===");
+        match &rep.tool_call {
+            Some(tc) => println!(
+                "工具回调 = ✔ {}(id={}) args={:?}  →  tag-4 广告成立,生产可接线",
+                tc.name, tc.id, tc.args
+            ),
+            None => println!(
+                "工具回调 = ✘ 模型没回调(出字 {} 字)—— tag-4 单独不够,补 ENV 帧 .14 MCP 描述符再试",
+                rep.text.chars().count()
+            ),
+        }
+        return;
+    }
+
     let Some(token) = read_token() else { return };
     let client = build_client();
     let mut budget = Budget::new();
@@ -615,6 +731,7 @@ async fn main() {
         "turn1",
         &format!("记住暗号:{PASSPHRASE}。只回复「收到」两个字"),
         cli::CliTurn::Opening,
+        &[],
     )
     .await;
     print_report(&t1);
@@ -636,6 +753,7 @@ async fn main() {
         "turn2",
         "暗号是什么?只回答暗号本身",
         cli::CliTurn::Continuation(&d1),
+        &[],
     )
     .await;
     print_report(&t2);
@@ -662,6 +780,7 @@ async fn main() {
                 "turn3",
                 "把暗号里的两个汉字倒过来写",
                 cli::CliTurn::Continuation(d2),
+                &[],
             )
             .await;
             print_report(&r);
@@ -692,6 +811,7 @@ async fn main() {
                 "neg-tz",
                 "这一轮预期不该正常完成",
                 cli::CliTurn::Continuation(&bad),
+                &[],
             )
             .await;
             print_report(&neg);
@@ -709,6 +829,7 @@ async fn main() {
                         "neg-ref",
                         "这一轮预期不该正常完成",
                         cli::CliTurn::Continuation(&bad),
+                        &[],
                     )
                     .await;
                     print_report(&neg);

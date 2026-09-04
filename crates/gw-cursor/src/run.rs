@@ -760,6 +760,76 @@ pub fn descriptor_ref_count(desc: &[u8]) -> usize {
         .count()
 }
 
+/// KV 子协议请求(2026-09-04 对齐 YeautyYE/claude-cursor-proxy 的 `agent.v1` schema):
+/// 顶层 field 4 = `kv_server_message` `{1: id(varint), 2: get_blob_args{1: blob_id},
+/// 3: set_blob_args{1: blob_id, 2: blob_data}}`。
+///
+/// ⚠️ 这钉死了早先两个按形状猜的解析:
+/// 1. 回执里的 `.1` 不是「按点名顺序的自增 slot」,是 **KV 请求 id 回显**
+///    (08-23 实物里恰好是 0,1,2…,两者巧合同值);
+/// 2. `4.3`(set_blob)不只是「回显让我们存」,**还必须回执 `set_blob_result{}`**
+///    (= `kv_client_message{1: id, 3: {}}`,即 [`crate::cli::frame_field3_slot`])。
+///    不回执的代价:服务端不出 checkpoint,90s 心跳死等 —— 2026-09-04 探针实证
+///    (出字后 4 帧 set_blob 无人回执,`.3` 描述符与用量尾帧全部不来)。
+pub enum KvRequest<'a> {
+    /// get_blob_args:服务端点名要内容分节。回 `kv_client_message{id, get_blob_result{1: data}}`
+    /// (= [`crate::cli::content_slot_frame`])。
+    Get { id: u64, hash: [u8; 32] },
+    /// set_blob_args:服务端推来一个内容节让我们存。存下并回
+    /// `kv_client_message{id, set_blob_result{}}`(= [`crate::cli::frame_field3_slot`])。
+    Set { id: u64, data: &'a [u8] },
+}
+
+/// 解析一帧里的全部 KV 请求(一帧可含多个顶层 field 4;单个 kv_server_message
+/// 只会带 get/set 之一)。
+pub fn kv_requests(payload: &[u8]) -> Vec<KvRequest<'_>> {
+    let mut out = Vec::new();
+    for (f, v) in Reader::new(payload) {
+        if f != 4 {
+            continue;
+        }
+        let PbValue::Len(kv) = v else { continue };
+        // id 缺省 0(proto3 默认值不上线,实物里 id=0 的请求就是没有 `.1`)。
+        let id = Reader::new(kv)
+            .find_map(|(f2, v2)| match (f2, v2) {
+                (1, PbValue::Varint(n)) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        for (f2, v2) in Reader::new(kv) {
+            let PbValue::Len(args) = v2 else { continue };
+            match f2 {
+                // get_blob_args {1: blob_id}
+                2 => {
+                    for (f3, v3) in Reader::new(args) {
+                        if f3 == 1 {
+                            if let PbValue::Len(s) = v3 {
+                                if let Ok(h) = <[u8; 32]>::try_from(s) {
+                                    out.push(KvRequest::Get { id, hash: h });
+                                }
+                            }
+                        }
+                    }
+                }
+                // set_blob_args {1: blob_id, 2: blob_data}
+                3 => {
+                    for (f3, v3) in Reader::new(args) {
+                        if f3 == 2 {
+                            if let PbValue::Len(data) = v3 {
+                                if !data.is_empty() {
+                                    out.push(KvRequest::Set { id, data });
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// 服务端「要求补传内容分节」的哈希回显个数(field-4 通道的 `4.2 = {1: bin[32]}`)。
 ///
 /// ## 这是描述符路线唯一的地基风险
@@ -802,29 +872,13 @@ pub fn content_hash_echo(payload: &[u8]) -> usize {
 /// 记录哈希(实测 slot1 就是上一轮的 commit 记录 `{1:bin32, 2:bin32×N, 3:turn uuid,
 /// 4:182B 签名, 5:3}`)。回放清单只是第一条腿,**按需交出内容是第二条腿**。
 pub fn content_hash_demands(payload: &[u8]) -> Vec<[u8; 32]> {
-    let mut out = Vec::new();
-    for (f, v) in Reader::new(payload) {
-        if f != 4 {
-            continue;
-        }
-        let PbValue::Len(echo) = v else { continue };
-        for (f2, v2) in Reader::new(echo) {
-            if f2 != 2 {
-                continue;
-            }
-            let PbValue::Len(dem) = v2 else { continue };
-            for (f3, v3) in Reader::new(dem) {
-                if f3 == 1 {
-                    if let PbValue::Len(s) = v3 {
-                        if let Ok(h) = <[u8; 32]>::try_from(s) {
-                            out.push(h);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
+    kv_requests(payload)
+        .into_iter()
+        .filter_map(|r| match r {
+            KvRequest::Get { hash, .. } => Some(hash),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 服务端回显的内容分节(field-4 通道的 `4.3.2` 那一层的**原始字节**)。
@@ -848,29 +902,13 @@ pub fn content_hash_demands(payload: &[u8]) -> Vec<[u8; 32]> {
 /// 所以我方**不需要自建任何节**,也不需要复现服务端的 JSON 序列化(那本来是做不到的:
 /// hash 差一个字节就不认)。只要把回显存下来,后续被点名就能原样交回去。
 pub fn section_echoes(payload: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    for (f, v) in Reader::new(payload) {
-        if f != 4 {
-            continue;
-        }
-        let PbValue::Len(echo) = v else { continue };
-        for (f2, v2) in Reader::new(echo) {
-            if f2 != 3 {
-                continue;
-            }
-            let PbValue::Len(l3) = v2 else { continue };
-            for (f3, v3) in Reader::new(l3) {
-                if f3 == 2 {
-                    if let PbValue::Len(section) = v3 {
-                        if !section.is_empty() {
-                            out.push(section);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
+    kv_requests(payload)
+        .into_iter()
+        .filter_map(|r| match r {
+            KvRequest::Set { data, .. } => Some(data),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 一轮 wire(CLI 形态)请求的收尾体检表 —— **正向判据**。
