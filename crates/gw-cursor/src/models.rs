@@ -665,6 +665,8 @@ mod tests {
 
     #[test]
     fn grok_effort_drops_to_low_when_client_skips_thinking() {
+        // 与 extras 测试共用锁:它会临时改目录,并发跑会读到被替换的参数。
+        let _g = CATALOG_TEST_LOCK.lock().unwrap();
         let get = |m: &Model, k: &str| {
             m.params
                 .iter()

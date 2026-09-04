@@ -20,12 +20,30 @@ use sha2::{Digest, Sha256};
 use crate::run::{self, Model, RunShape, Turn};
 use crate::wire;
 
-/// 上游连续多久「只有心跳、零进展」就判定本轮废了。
+/// 上游连续多久「只有心跳、零进展」就判定本轮废了(首字前)。
 ///
 /// 心跳是 10 秒一个,取 90 秒 = 容忍 9 个心跳。首 token 前的正常等待实测在 2 秒内,
 /// 长思考的模型可能更久,但那期间会持续来 `1.4` 思考帧(算进展),不会触发。
 /// 这个值宁可偏大:误判的代价是把一次本来会成功的慢请求变成失败。
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 已出字后的零进展上限(更紧)。
+///
+/// 出字之后再沉默,有两种完全不同的情形:
+/// - **必死**:模型调用了未注册的工具名,上游一个帧都不回(只剩心跳);
+/// - **大件组装**:模型在服务端逐 token 拼一个巨型工具调用(典型:write 一整份
+///   HTML,几十 KB 参数),期间同样一个帧都不来。组装 500 行 HTML 需要 60~120s。
+/// 30s 会把后者误杀(2026-09-04 本地 e2e 实证:写报纸页必死)。取 150s:
+/// 覆盖大件组装,必死轮次晚两分钟宣判可接受(重试终究会来)。
+const STALL_TIMEOUT_STARTED: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// 工具轮 commit 到手后,再等尾部描述符的宽限。
+///
+/// 探针实测工具轮的尾序是 回调 → KV checkpoint → turn_commit → `.3`×N —— 描述符
+/// 在 commit 之后很快到齐,但流**永不自关**(上游持 BiDi 等工具结果)。宽限给足
+/// 描述符到达的时间就主动收:太短会漏掉 ref 更全的第二份 `.3`,太长每个工具轮
+/// 都白等(客户端的工具执行已经排在这段后面了)。
+const TOOL_COMMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 从发出请求到收到**响应头**的上限。
 ///
@@ -851,6 +869,89 @@ struct BuiltinXlate {
     terminal: Option<(String, String)>,
     /// 读文件 → 同上,如 `("Read", "file_path")`。
     read_file: Option<(String, String)>,
+    /// write 别名:调用方只声明了编辑类工具时的补位(见 [`WriteAlias`])。
+    write_alias: Option<WriteAlias>,
+}
+
+/// write 别名(2026-09-04 生产+本地多次实证)。
+///
+/// grok 系模型**创建文件**时执念调用 `write` —— 调用方(典型:opencode,
+/// 写文件归 `edit` 管)清单里没有这个名字,模型调一个未注册名,Cursor 上游
+/// **一个帧都不回**,只剩心跳到停滞闸(「出字后卡死」的根因)。护栏文案说了
+/// 闭集也不听 —— 那就让清单里**真的有** `write`:广告侧补位(见
+/// [`write_alias_tooldef`]),回调时翻译成编辑工具(opencode 的 `edit`
+/// 实测支持空 oldString 创建新文件)。
+#[derive(Debug, Clone)]
+struct WriteAlias {
+    /// 目标编辑工具裸名(如 `"edit"`)。
+    target: String,
+    /// 目标工具 schema 里的路径键 / 旧串键 / 新串键(键名从 schema 认,不猜)。
+    path_key: String,
+    old_key: String,
+    new_key: String,
+}
+
+/// 别名广告的注册名。取最朴素的 `write`:模型执念的就是它。
+pub(crate) const WRITE_ALIAS_NAME: &str = "write";
+
+/// MCP 工具的「全名」前缀(2026-09-04 实证)。
+///
+/// Cursor 服务端在转录里把我们的 MCP 工具称作 `mcp_claude-local_<name>`
+/// (outerToolName:`mcp_<provider_identifier>_<tool>`,provider 是我方广告的
+/// `claude-local`)。模型从历史/思考里学到这个全名就会直接调它 —— 未注册
+/// 则上游静默挂起(「出字后卡死」的又一形态,本地 e2e 抓思考实证:
+/// 「实际可用的工具是 mcp_claude-local_write」)。mcpalias 探针证实
+/// 全名本身可注册、可路由,故 CLI 形态对每个工具双注册(见帧0 构造处),
+/// 回调在工具臂按此前缀归一回裸名。
+pub(crate) const MCP_FULL_PREFIX: &str = "mcp_claude-local_";
+
+impl WriteAlias {
+    /// 把一次 `write` 回调翻译成目标编辑工具的调用:
+    /// `content` → 新串键,旧串键置空(= 创建/整文件写入),路径同键。
+    fn translate(&self, tc: run::ToolCall) -> run::ToolCall {
+        let pick = |keys: &[&str]| {
+            tc.args
+                .iter()
+                .find(|(k, _)| keys.contains(&k.as_str()))
+                .map(|(_, v)| v.clone())
+        };
+        let path = pick(&[&self.path_key, "filePath", "file_path", "path"]).unwrap_or(Value::Null);
+        let content =
+            pick(&["content", &self.new_key, "newString", "new_string"]).unwrap_or(Value::Null);
+        run::ToolCall {
+            id: tc.id,
+            name: self.target.clone(),
+            args: vec![
+                (self.path_key.clone(), path),
+                (self.old_key.clone(), Value::String(String::new())),
+                (self.new_key.clone(), content),
+            ],
+        }
+    }
+}
+
+/// 别名广告的 [`run::ToolDef`](CLI 形态进 mcp_tools,IDE 形态自动带 `gwtools-` 前缀)。
+fn write_alias_tooldef(a: &WriteAlias) -> run::ToolDef {
+    let mut props = serde_json::Map::new();
+    props.insert(
+        a.path_key.clone(),
+        json!({"type":"string","description":"文件的绝对路径"}),
+    );
+    props.insert(
+        "content".to_string(),
+        json!({"type":"string","description":"要写入的完整内容"}),
+    );
+    run::ToolDef {
+        name: WRITE_ALIAS_NAME.to_string(),
+        description: "创建新文件并写入全部内容(只用于文件尚不存在;修改已有文件请用编辑工具做局部替换)"
+            .to_string(),
+        schema: json!({
+            "type":"object",
+            "properties": Value::Object(props),
+            "required":[a.path_key, "content"]
+        })
+        .to_string(),
+    }
 }
 
 impl BuiltinXlate {
@@ -867,6 +968,42 @@ impl BuiltinXlate {
             let key = keys.iter().find(|k| props.contains_key(**k))?;
             Some((tool, (*key).to_string()))
         };
+        // write 别名:调用方**没有**写文件工具(write/write_file/writefile)、
+        // 但有编辑类工具时补位。键名从编辑工具的 schema 认,认不齐就不补
+        // (猜键名 = 参数张冠李戴,比不补糟)。
+        const WRITE_FAMILY: &[&str] = &["write", "write_file", "writefile"];
+        let has_write = tools
+            .iter()
+            .any(|t| WRITE_FAMILY.contains(&t.name.to_ascii_lowercase().as_str()));
+        let write_alias = if has_write {
+            None
+        } else {
+            redirects
+                .iter()
+                .find(|(c, _)| *c == "写/改文件")
+                .and_then(|(_, tool)| {
+                    let def = tools.iter().find(|t| &t.name == tool)?;
+                    let schema: Value = serde_json::from_str(&def.schema).ok()?;
+                    let props = schema.get("properties")?.as_object()?;
+                    let pick = |keys: &[&str]| {
+                        keys.iter()
+                            .find(|k| props.contains_key(**k))
+                            .map(|k| (*k).to_string())
+                    };
+                    Some(WriteAlias {
+                        target: tool.clone(),
+                        path_key: pick(&[
+                            "filePath",
+                            "file_path",
+                            "path",
+                            "target_file",
+                            "absolute_path",
+                        ])?,
+                        old_key: pick(&["oldString", "old_string", "old_str"])?,
+                        new_key: pick(&["newString", "new_string", "new_str"])?,
+                    })
+                })
+        };
         BuiltinXlate {
             terminal: find("跑命令/终端", &["command", "cmd", "script"]),
             read_file: find(
@@ -879,6 +1016,7 @@ impl BuiltinXlate {
                     "absolute_path",
                 ],
             ),
+            write_alias,
         }
     }
 }
@@ -1082,8 +1220,9 @@ pub(crate) fn last_tool_results(body: &Value) -> Option<Vec<(String, String)>> {
 
 /// 消息里是否含 tool_use / tool_result 块。
 ///
-/// CLI 形态 Phase 1 不接工具回路(工具调用历史文本化与服务端持史冲突,
-/// 正解是 live-stream 桥接,见 PROTOCOL §20 的规划):带这些块的请求回 IDE 形态。
+/// 2026-09-04 起工具回路**可以**走 CLI 形态:工具轮上游给 commit+描述符
+/// (toolcont 探针),工具结果轮用影子表 tool_turn 条目续轮(见 gate 处
+/// `tool_result_turn`)。本函数仍用于把「非结果轮的工具块请求」挡回 IDE。
 fn body_has_tool_blocks(body: &Value) -> bool {
     body.get("messages")
         .and_then(|m| m.as_array())
@@ -1536,6 +1675,37 @@ fn last_user_is_tool_result_only(body: &Value) -> bool {
             .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
 }
 
+/// 末条 user(tool_result 轮)紧邻的上一条消息是否是带 tool_use 的 assistant。
+///
+/// 影子表 tool_turn 条目的宽松匹配只校验指纹链、不校验内容 —— 调用方若把中间那次
+/// assistant 工具调用编辑掉,链照样匹配,续轮就会把「服务端手里的那次调用」和
+/// 「客户端历史里的另一段」拧在一起。结构对不上的结果轮不许进 CLI 续轮
+/// (回 IDE 重铺,宁可慢不错续)。
+fn prev_assistant_has_tool_use(body: &Value) -> bool {
+    let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let mut seen_tail_user = false;
+    for m in msgs.iter().rev() {
+        let role = m.get("role").and_then(|r| r.as_str());
+        if !seen_tail_user {
+            if role == Some("user") {
+                seen_tail_user = true;
+            }
+            continue;
+        }
+        return role == Some("assistant")
+            && m
+                .get("content")
+                .and_then(|c| c.as_array())
+                .is_some_and(|bs| {
+                    bs.iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                });
+    }
+    false
+}
+
 /// 用户**最近一次真实提问**(跳过只装 tool_result 的中间轮)。
 ///
 /// 取最近而不是最初:多轮对话里用户会改主题,拿第一条会把模型带回上个话题。
@@ -1835,7 +2005,25 @@ pub async fn chat_stream(
     // 编号与附件收集顺序同源,不存在两边各数各的漂移。
     let (images, docs, media_placeholders) = to_media(&req.body);
     let raw_turns = to_turns_with_media(&req.body, Some(&media_placeholders));
-    let tools = to_tools(&req.body);
+    let mut tools = to_tools(&req.body);
+    // 兼容转换表按**调用方声明的** tools 生成(别名判定也看它,不看补位后的)。
+    let xlate = BuiltinXlate::from_tools(&tools);
+    // write 别名补位:调用方没有写文件工具时,给上游广告补一个 `write`
+    // (grok 创建文件执念调它,清单没有就会调未注册名 → 上游静默挂起)。
+    // 护栏清单/mcp_tools/IDE 工具表都从这份补位后的 tools 出 —— 模型看得到、
+    // 调得通;回调经 `WriteAlias::translate` 折回编辑工具,客户端无感。
+    if let Some(a) = &xlate.write_alias {
+        tracing::info!(
+            target = %a.target,
+            "cursor:write 别名已补位进上游广告(调用方无写文件工具)"
+        );
+        tools.push(write_alias_tooldef(a));
+    } else if !tools.is_empty() {
+        tracing::debug!(
+            tools = ?tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "cursor:write 别名未补位(调用方已有写工具或无编辑工具)"
+        );
+    }
 
     // ── CLI 形态(2026-08-16 抓包,见 `cli.rs` 模块文档)─────────────────────
     // 纯文本、无附件、用户轮结尾的请求走 CLI 极简形态:只发最后一条新消息,
@@ -1843,10 +2031,16 @@ pub async fn chat_stream(
     // 2026-09-04 起**工具请求也走这条**:工具经帧0 `1.4` 的 mcp_tools 目录广告
     // (探针实证模型按裸名回调),不再绕行 clidrv。仍不接的:附件与 tool_result
     // 轮(带 tool_use/tool_result 块的请求维持 IDE 形态全量重铺,那是今天的路)。
+    // 工具回路续轮(2026-09-04 toolcont 探针实证 + 影子表 tool_turn 宽松匹配):
+    // 末条 user 只装 tool_result、且紧邻上一条是带 tool_use 的 assistant = 工具结果轮,
+    // 允许进 CLI 形态 —— 影子表有描述符就续轮只发增量(工具结果渲染文本),
+    // 没料照旧降级重铺。其它带工具块的请求(本轮不是结果轮)维持回 IDE 形态。
+    let tool_result_turn =
+        last_user_is_tool_result_only(&req.body) && prev_assistant_has_tool_use(&req.body);
     let cli_mode = ctx.profile.is_cli()
         && images.is_empty()
         && docs.is_empty()
-        && !body_has_tool_blocks(&req.body)
+        && (!body_has_tool_blocks(&req.body) || tool_result_turn)
         && raw_turns.last().is_some_and(|t| t.is_user);
 
     // wire v2:续轮的**前提是拿得到描述符**,所以先查影子表,再决定 turns 怎么铺。
@@ -2019,6 +2213,20 @@ pub async fn chat_stream(
 
     // CLI 形态与 IDE 形态分岔:帧序列与头表完全不同(见 `cli.rs` 模块文档)。
     let (frames, rb) = if cli_mode {
+        // 全名双注册(仅 CLI 形态;mcpalias 探针实证可路由):服务端转录把我们
+        // 的工具称作 mcp_claude-local_<name>(见 MCP_FULL_PREFIX),模型学到全名
+        // 就会调它 —— 未注册则上游静默挂起。每个工具补注册一个全名变体;
+        // 回调在工具臂归一回裸名。IDE 形态不做(它的注册全名是 gwtools- 前缀,
+        // 与这套命名无关)。护栏清单与 cache_sim 指纹都用**未扩展**的 tools,
+        // 全名变体只是广告里的路由别名,不该进任何计费/文案口径。
+        let ad_tools: Vec<run::ToolDef> = tools
+            .iter()
+            .flat_map(|t| {
+                let mut full = t.clone();
+                full.name = format!("{MCP_FULL_PREFIX}{}", t.name);
+                [t.clone(), full]
+            })
+            .collect();
         // turn_id 同时是 `1.25` 与 x-request-id/x-original-request-id ——
         // 真 CLI 里这三个值同源(重试时 x-request-id 换新、1.25 与 original 不变;
         // 我方每个网关请求都是新的逻辑尝试,全部同值即可)。
@@ -2038,7 +2246,7 @@ pub async fn chat_stream(
             &ctx.conversation_id,
             &turn_id,
             phase,
-            &tools,
+            &ad_tools,
         );
         let context = crate::cli::build_context_frame_cli(
             &system,
@@ -2180,7 +2388,7 @@ pub async fn chat_stream(
         ctx.conversation_id.clone(),
         ctx.assets.clone(),
         ctx.notices.clone(),
-        BuiltinXlate::from_tools(&tools),
+        xlate,
         usage_fallback,
         sim_cache_read,
         cli_mode,
@@ -2525,13 +2733,19 @@ fn stream_to_anthropic(
         // 于是只发增量却配一个缺一轮的清单 = 静默失忆。
         let mut shadow_must_invalidate = false;
         // 收尾是否「干净可提交」。只在三种干净收尾分支里置位;
-        // 工具调用(轮未完结,上游在等结果)与内建截断都**不**置位;
-        // turn_commit 本身也不置位 —— 它只是排水段的开始(见下)。
+        // 内建截断不置位;工具轮在「commit+描述符宽限收工」时置位(2026-09-04 起,
+        // 见 await_tool_commit);turn_commit 本身不置位 —— 它只是排水段的开始(见下)。
         let mut shadow_committable = false;
         // turn_commit 之后的**纯排水段**标记(codex 三轮 Finding 1):只继续读帧
         // 给影子捕尾部 `.3`,其余一律忽略 —— 尾帧不再过完整状态机(usage 不覆写、
         // 不产 SSE、不动计费),保证「观测零出站变化」。
         let mut draining = false;
+        // 工具轮续捕(2026-09-04 toolcont 探针):置位 = 已把 tool_use 交给调用方
+        // (客户端侧已收尾),流继续读**只为捕工具轮的 turn_commit 与尾部描述符**。
+        // 拿到 commit 的时刻记进 `tool_commit_at`,宽限期到即收(工具轮的流永不
+        // 自关 —— 上游持 BiDi 等工具结果,等 EOF 等于陪跑到停滞闸)。
+        let mut await_tool_commit = false;
+        let mut tool_commit_at: Option<std::time::Instant> = None;
         // wire v2:**所有失败出口都必经的作废点**(codex 三轮 #3)。
         //
         // 早 return 的路径(读流失败 / 错误 trailer / 空回复 / 流断)以前绕过作废,
@@ -2557,7 +2771,10 @@ fn stream_to_anthropic(
             }
         };
         // 上游要求执行的工具(若有)。收尾时变成一个 `tool_use` 块 + `stop_reason: tool_use`。
-        let mut tool_call: Option<run::ToolCall> = None;
+        /// 本轮模型发起的全部工具调用(并行调用帧逐个收,不再只留最后一个 ——
+        /// 旧实现并行调用会静默丢掉除最后一发外的全部,客户端只见一发,
+        /// 模型却等三发结果)。post-loop 逐个下发 tool_use。
+        let mut tool_calls: Vec<run::ToolCall> = Vec::new();
         // 内建工具收口发生在「已经出过字」之后 = 本次回答被截断,但仍会按 end_turn 收尾。
         // 单独记一个标记,让收尾处能把它写进日志 —— 不然它和正常收尾在日志里没有区别。
         let mut builtin_truncated = false;
@@ -2597,21 +2814,47 @@ fn stream_to_anthropic(
                     last_progress = std::time::Instant::now();
                     continue;
                 }
+                // 工具轮宽限收工:commit 到手且描述符已暂存,宽限一到就收。
+                // 工具轮的流永不自关(上游持 BiDi 等结果),等 EOF/停滞闸是白等 ——
+                // 客户端的工具执行排在我们的 message_stop 后面,每晚一秒都是
+                // 工具回路的纯延迟。 biased 序在停滞闸之前:宽限更紧,先判它。
                 _ = tokio::time::sleep_until(
-                    (last_progress + STALL_TIMEOUT).into()
+                    (tool_commit_at.unwrap_or_else(std::time::Instant::now)
+                        + TOOL_COMMIT_GRACE)
+                    .into()
+                ), if await_tool_commit && tool_commit_at.is_some() => {
+                    if wire_saw_desc {
+                        shadow_committable = true;
+                        tracing::debug!("cursor Run:工具轮 commit+描述符到手,宽限收工(描述符可提交)");
+                    } else {
+                        tracing::debug!("cursor Run:工具轮 commit 到手但宽限内无描述符,按链中断作废旧料");
+                        shadow_must_invalidate = true;
+                    }
+                    break 'outer;
+                }
+                _ = tokio::time::sleep_until(
+                    // 两档:首字前 90s(冷启动/长考留余量),出字后 30s
+                    // (沉默≈必死,尽快宣判,见 STALL_TIMEOUT_STARTED)。
+                    (last_progress
+                        + if started { STALL_TIMEOUT_STARTED } else { STALL_TIMEOUT })
+                    .into()
                 ) => {
+                    let stall = if started { STALL_TIMEOUT_STARTED } else { STALL_TIMEOUT };
                     // 排水段的停滞**不是错误**:轮次在 turn_commit 已经成功,
                     // 只是影子失去「干净收尾」资格(不提交),轮次照常收尾。
-                    if draining {
+                    // 工具轮等 commit 时的停滞同义:tool_use 早已交付,轮次是好的,
+                    // 只是续轮料没拿到 —— 作废旧描述符(=旧行为),不判错误。
+                    if draining || await_tool_commit {
                         tracing::debug!(
-                            secs = STALL_TIMEOUT.as_secs(),
-                            "cursor Run:turn_commit 后尾流停滞,放弃影子提交并作废旧描述符(轮次照常成功)"
+                            secs = stall.as_secs(),
+                            tool_turn = await_tool_commit,
+                            "cursor Run:尾流/工具轮停滞,放弃影子提交并作废旧描述符(轮次照常成功)"
                         );
                         shadow_must_invalidate = true;
                         break 'outer;
                     }
                     tracing::warn!(
-                        secs = STALL_TIMEOUT.as_secs(),
+                        secs = stall.as_secs(),
                         started,
                         "cursor Run:上游只发心跳、无任何进展,按上游错误收口"
                     );
@@ -2625,7 +2868,7 @@ fn stream_to_anthropic(
                         UpstreamErrorKind::ServerError,
                         format!(
                             "Cursor Run {}s 内只有心跳、没有任何文本或用量帧",
-                            STALL_TIMEOUT.as_secs()
+                            stall.as_secs()
                         ),
                     ));
                     break 'outer;
@@ -2704,6 +2947,7 @@ fn stream_to_anthropic(
                 let fr = run::parse_frame(&payload);
                 // 上游帧种类很多(会话回显 field 4、计时 field 8、状态 1.8、思考 1.4…),
                 // 只有 1.1.1 是正文。debug 级把每帧点名,排查「200 但没字」时不用再抓包。
+                // 文本/思考带 120 字预览:排「模型说完半句就停」时必须看到它想干什么。
                 tracing::debug!(
                     flag,
                     bytes = payload.len(),
@@ -2712,6 +2956,8 @@ fn stream_to_anthropic(
                     status = ?run::status_code(&payload),
                     text_len = fr.text.chars().count(),
                     thinking_len = fr.thinking.chars().count(),
+                    text_preview = %fr.text.chars().take(120).collect::<String>(),
+                    thinking_preview = %fr.thinking.chars().take(120).collect::<String>(),
                     "cursor Run 响应帧"
                 );
 
@@ -2924,6 +3170,10 @@ fn stream_to_anthropic(
                     if let Some(wu) = usage {
                         upstream_usage = Some(usage_from_upstream(wu));
                     }
+                    // 工具轮的 commit:起宽限计时,宽限臂(commit+3s)来收尾。
+                    if await_tool_commit && tool_commit_at.is_none() {
+                        tool_commit_at = Some(std::time::Instant::now());
+                    }
                     saw_end = true;
                     draining = true;
                 }
@@ -3020,26 +3270,59 @@ fn stream_to_anthropic(
                     match run::parse_tool_call(&payload) {
                         // 我们声明过的工具 → 映射成 Anthropic `tool_use`,交给调用方执行。
                         Some(tc) => {
+                            // 全名回调归一:双注册的全名变体(mcp_claude-local_<name>)
+                            // 折回裸名,后续别名翻译/下发都按裸名口径。
+                            let tc = match tc.name.strip_prefix(MCP_FULL_PREFIX) {
+                                Some(rest) if !rest.is_empty() => {
+                                    tracing::info!(
+                                        bare = %rest,
+                                        "cursor Run:全名工具回调已归一为裸名"
+                                    );
+                                    run::ToolCall {
+                                        name: rest.to_string(),
+                                        ..tc
+                                    }
+                                }
+                                _ => tc,
+                            };
+                            // write 别名回调:折回调用方的编辑工具(见 [`WriteAlias`])。
+                            // 客户端只见它声明过的工具名,别名只存在于上游广告里。
+                            let tc = match &xlate.write_alias {
+                                Some(a) if tc.name == WRITE_ALIAS_NAME => {
+                                    tracing::info!(
+                                        target = %a.target,
+                                        "cursor Run:write 别名回调已翻译成编辑工具调用"
+                                    );
+                                    a.translate(tc)
+                                }
+                                _ => tc,
+                            };
                             tracing::info!(
                                 // 用清洗后的 id:原值带换行,会把这行日志劈成两半。
                                 tool = %tc.name, id = %client_tool_id(&tc.id), args = tc.args.len(),
                                 "cursor Run:模型调用工具,转成 tool_use 交给调用方"
                             );
-                            tool_call = Some(tc);
-                            // 外部工具臂命中即 break(反代一问一答,不能挂流等工具结果)。
-                            // 但同帧若已带 `1.14` 用量,绝不能丢 —— 合帧丢 usage 会让
+                            tool_calls.push(tc);
+                            // 同帧若已带 `1.14` 用量,绝不能丢 —— 合帧丢 usage 会让
                             // 面板/new-api 看到 input=0(见 PROTOCOL §残余假设 #2)。
                             if let Some(wu) = usage {
                                 upstream_usage = Some(usage_from_upstream(wu));
                             }
-                            // 工具轮没有 turn_commit(服务端停在「等工具结果」的中间态),
-                            // 描述符链从这里断 —— 作废,下一轮(带工具结果)走重铺;
-                            // 绝不让再下轮拿一张缺了本轮的清单回放(静默失忆)。
-                            // 非 CLI 形态此调用是空操作(见 wire_invalidate 的守卫)。
-                            wire_invalidate("工具调用收口,描述符链中断");
-                            // 外部工具支是正常的 tool_use 收尾。
+                            // 2026-09-04 探针(probe_wire_v2 toolcont)实证:**工具轮上游
+                            // 照样给 turn_commit 与尾部描述符**,就在回调帧之后 —— 旧写法
+                            // 在这里 break 全扔了,还顺手作废旧链,于是每个工具结果轮都被迫
+                            // IDE 形态全量重铺(10~25s、cache=0,工具回路卡慢的根源)。
+                            // 改为:客户端侧照常 tool_use 收尾(saw_end),但**流继续读**,
+                            // 等 commit+描述符(await_tool_commit)拿到才算真正收工;
+                            // 等不到(停滞闸)才退回旧行为作废旧链。
+                            // 仅 CLI 形态:IDE 没有描述符这套,维持即时收口(白等 30s
+                            // 是纯退化)。
                             saw_end = true;
-                            break 'outer;
+                            if cli_mode {
+                                await_tool_commit = true;
+                            } else {
+                                break 'outer;
+                            }
                         }
                         // 已处理的 exec 调用(资产写/读):**不能 break** ——
                         // protobuf 层没有任何东西阻止上游把 exec 帧和 usage 并进
@@ -3054,6 +3337,19 @@ fn stream_to_anthropic(
                         // 落回收口 + 纠偏 —— 失败单向,绝不输出参数张冠李戴的调用。
                         // preview 留在日志里,是为了万一要扩内建工具映射时有据可查。
                         None => {
+                            // MCP 回调的 **exec 形态回声**(同一 call id、claude-local
+                            // 路由):官方客户端用它渲染 exec UI,不是第二次调用。
+                            // 1.2.2.15 那一份已交给调用方(await_tool_commit 在等
+                            // commit),这份必须忽略 —— 收口会丢掉工具轮的
+                            // commit+描述符,还会误注纠偏把模型绕进重调循环
+                            // (2026-09-04 e2e 实证:webfetch 三连调后停滞)。
+                            if await_tool_commit {
+                                tracing::debug!(
+                                    bytes = payload.len(),
+                                    "cursor Run:忽略工具调用的 exec 回声帧(1.2.2.15 那份已交付)"
+                                );
+                                continue;
+                            }
                             if let Some(tc) = run::parse_builtin_call(&payload)
                                 .and_then(|bc| translate_builtin(bc, &xlate))
                             {
@@ -3063,7 +3359,7 @@ fn stream_to_anthropic(
                                     guard_rev = %crate::tool_guard_rev(),
                                     "cursor Run:内建工具调用已翻译成调用方工具的 tool_use(兼容转换层)"
                                 );
-                                tool_call = Some(tc);
+                                tool_calls.push(tc);
                                 // 同帧用量同样要收(与外部工具臂同一条合帧原则)。
                                 if let Some(wu) = usage {
                                     upstream_usage = Some(usage_from_upstream(wu));
@@ -3147,7 +3443,7 @@ fn stream_to_anthropic(
         // 让 empty-fallback 策略接管。
         // 有工具调用时,「一个字都没出」是**正常**的:模型可以直接决定调工具而不先说话。
         // 那时也必须补一个 message_start,否则后面的块没有依附。
-        if !started && tool_call.is_some() {
+        if !started && !tool_calls.is_empty() {
             let _ = tx
                 .send(Ok(StreamItem::Sse(message_start(&msg_id, &model))))
                 .await;
@@ -3207,7 +3503,7 @@ fn stream_to_anthropic(
             // 「等工具结果」的中间态,本轮没有 turn_commit),不是异常 ——
             // 生产每次工具调用都 WARN 会把真异常淹没。其余情形照旧 WARN。
             // (tracing 的 level 必须是常量,两支写开。)
-            if tool_call.is_some() {
+            if !tool_calls.is_empty() {
                 tracing::info!(
                     conversation_id = %conversation_id,
                     verdict = ?wire_verdict,
@@ -3237,7 +3533,7 @@ fn stream_to_anthropic(
             if let Some(feed) = &shadow {
                 let dropped = feed.map.invalidate(&conversation_id, &feed.account_id);
                 // 工具调用轮同上的理由:设计内中断,降为 info。
-                if tool_call.is_some() {
+                if !tool_calls.is_empty() {
                     tracing::info!(
                         conversation_id = %conversation_id,
                         account = %feed.account_id,
@@ -3290,8 +3586,9 @@ fn stream_to_anthropic(
                 // 本轮 assistant 输出指纹。**工具轮不算**:它的渲染含参数 JSON 的
                 // 调用方再序列化,字节不由我方掌控(键序/空白都可能变),算出来的
                 // 指纹下一轮对不上,反而制造假分叉 —— 与 clidrv 同一条红线。
-                // 缺指纹的条目 lookup 会硬性拒绝,所以宁缺勿错。
-                let assistant_fp = if tool_call.is_some() {
+                // 工具轮条目以 tool_turn=true 入库,lookup 走「链减一条」的宽松
+                // 匹配(见 DescriptorShadow::lookup),不再因缺指纹被硬拒。
+                let assistant_fp = if !tool_calls.is_empty() {
                     None
                 } else {
                     // 空正文(纯 thinking 等)沿用 `to_turns` 的占位串口径。
@@ -3308,6 +3605,7 @@ fn stream_to_anthropic(
                     &model,
                     &feed.fps,
                     assistant_fp,
+                    !tool_calls.is_empty(),
                     &desc,
                     refs,
                 );
@@ -3335,7 +3633,7 @@ fn stream_to_anthropic(
             zeroed => {
                 if zeroed.is_some() {
                     tracing::warn!(
-                        tool = tool_call.as_ref().map(|t| t.name.as_str()),
+                        tool = tool_calls.first().map(|t| t.name.as_str()),
                         "cursor Run:上游用量帧 input/cache 全零,按请求体粗估用量"
                     );
                 }
@@ -3345,8 +3643,9 @@ fn stream_to_anthropic(
                 // 置零),它比估算准,用它的。
                 let text_tokens =
                     ((output_chars - output_nonascii) as u64).div_ceil(4) + output_nonascii as u64;
-                u.output_tokens =
-                    text_tokens + tool_call.as_ref().map(tool_call_tokens).unwrap_or(0);
+                // 并行调用每发的参数都是产出,逐个合计。
+                u.output_tokens = text_tokens
+                    + tool_calls.iter().map(tool_call_tokens).sum::<u64>();
                 if let Some(up) = &zeroed {
                     if up.output_tokens > 0 {
                         u.output_tokens = up.output_tokens;
@@ -3355,7 +3654,7 @@ fn stream_to_anthropic(
                 if u.input_tokens == 0 {
                     tracing::warn!(
                         output_chars,
-                        tool = tool_call.as_ref().map(|t| t.name.as_str()),
+                        tool = tool_calls.first().map(|t| t.name.as_str()),
                         "cursor Run:无上游用量且请求体估出 input=0 —— 计费会失真"
                     );
                 } else {
@@ -3363,7 +3662,7 @@ fn stream_to_anthropic(
                         input = u.input_tokens,
                         output = u.output_tokens,
                         cache = u.cache_read_tokens,
-                        tool = tool_call.as_ref().map(|t| t.name.as_str()),
+                        tool = tool_calls.first().map(|t| t.name.as_str()),
                         "cursor Run:无上游 1.14,使用请求体粗估用量"
                     );
                 }
@@ -3391,42 +3690,46 @@ fn stream_to_anthropic(
             next_idx += 1;
         }
 
-        // 工具调用块。索引接在文本块之后 —— Anthropic 的块索引必须连续且不重复。
+        // 工具调用块(可多个:并行调用逐发下发)。索引接在文本块之后 ——
+        // Anthropic 的块索引必须连续且不重复。
         //
         // `input` 一次性给全,所以 `input_json_delta` 只发一帧。分片发没有意义:
         // 我们是从 protobuf 一次解出来的,本来就没有增量。
-        let stop_reason = if let Some(tc) = &tool_call {
-            let idx = next_idx;
-            // 参数值已经是解好的 JSON(数字仍是数字、对象仍是对象)。
-            // 早先这里是 `Value::String(v.clone())` —— 把一切都变成字符串,
-            // `{"limit": 200}` 会发成 `{"limit": "200"}`,schema 写 number 的工具直接拒。
-            let input: serde_json::Map<String, Value> = tc
-                .args
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let _ = tx
-                .send(Ok(StreamItem::Sse(SseEvent::new(
-                    "content_block_start",
-                    json!({"type":"content_block_start","index":idx,
-                           "content_block":{"type":"tool_use","id":client_tool_id(&tc.id),
-                                            "name":tc.name,"input":{}}}),
-                ))))
-                .await;
-            let _ = tx
-                .send(Ok(StreamItem::Sse(SseEvent::new(
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":idx,
-                           "delta":{"type":"input_json_delta",
-                                    "partial_json": Value::Object(input).to_string()}}),
-                ))))
-                .await;
-            let _ = tx
-                .send(Ok(StreamItem::Sse(SseEvent::new(
-                    "content_block_stop",
-                    json!({"type":"content_block_stop","index":idx}),
-                ))))
-                .await;
+        let stop_reason = if !tool_calls.is_empty() {
+            for tc in &tool_calls {
+                let idx = next_idx;
+                // 参数值已经是解好的 JSON(数字仍是数字、对象仍是对象)。
+                // 早先这里是 `Value::String(v.clone())` —— 把一切都变成字符串,
+                // `{"limit": 200}` 会发成 `{"limit": "200"}`,schema 写 number 的工具直接拒。
+                let input: serde_json::Map<String, Value> = tc
+                    .args
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let _ = tx
+                    .send(Ok(StreamItem::Sse(SseEvent::new(
+                        "content_block_start",
+                        json!({"type":"content_block_start","index":idx,
+                               "content_block":{"type":"tool_use","id":client_tool_id(&tc.id),
+                                                "name":tc.name,"input":{}}}),
+                    ))))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamItem::Sse(SseEvent::new(
+                        "content_block_delta",
+                        json!({"type":"content_block_delta","index":idx,
+                               "delta":{"type":"input_json_delta",
+                                        "partial_json": Value::Object(input).to_string()}}),
+                    ))))
+                    .await;
+                let _ = tx
+                    .send(Ok(StreamItem::Sse(SseEvent::new(
+                        "content_block_stop",
+                        json!({"type":"content_block_stop","index":idx}),
+                    ))))
+                    .await;
+                next_idx += 1;
+            }
             "tool_use"
         } else {
             "end_turn"
@@ -3913,6 +4216,38 @@ mod tests {
         assert!(current.contains("gamma"));
         // 而且要明确禁止重复调用 —— 这就是那 9 次 read 的直接病因。
         assert!(current.contains("不要重复调用"));
+    }
+
+    #[test]
+    fn prev_assistant_has_tool_use_结构校验() {
+        // 标准工具结果轮:assistant tool_use → user tool_result ✔
+        let ok = json!({"messages":[
+            {"role":"user","content":"读 data.txt"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"t1","name":"read","input":{"filePath":"/tmp/x"}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"内容"}]}
+        ]});
+        assert!(prev_assistant_has_tool_use(&ok));
+        assert!(last_user_is_tool_result_only(&ok));
+        // 末条是普通提问(不是结果轮)→ false
+        let ask = json!({"messages":[{"role":"user","content":"你好"}]});
+        assert!(!prev_assistant_has_tool_use(&ask));
+        // 上一条 assistant 没有 tool_use(被编辑过)→ false,不许进 CLI 续轮
+        let edited = json!({"messages":[
+            {"role":"user","content":"读 data.txt"},
+            {"role":"assistant","content":"我看看"},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"内容"}]}
+        ]});
+        assert!(!prev_assistant_has_tool_use(&edited));
+        // 上一条是 user 而不是 assistant → false
+        let doubled = json!({"messages":[
+            {"role":"user","content":"读 data.txt"},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"内容"}]}
+        ]});
+        assert!(!prev_assistant_has_tool_use(&doubled));
     }
 
     #[test]
@@ -4779,6 +5114,55 @@ mod tests {
         }
     }
 
+    /// write 别名:只有编辑工具时补位、有写文件工具时不补、键名认不齐时不补;
+    /// 回调翻译成编辑工具调用(content→newString,oldString 置空)。
+    #[test]
+    fn write别名补位与翻译() {
+        let edit_schema = r#"{"type":"object","properties":{
+            "filePath":{"type":"string"},
+            "oldString":{"type":"string"},
+            "newString":{"type":"string"}}}"#;
+        // opencode 形态:有 edit 无 write → 补位。
+        let tools = vec![tool_with_schema("edit", edit_schema)];
+        let x = BuiltinXlate::from_tools(&tools);
+        let a = x.write_alias.as_ref().expect("有 edit 无 write 必须补位");
+        assert_eq!(a.target, "edit");
+        assert_eq!(a.path_key, "filePath");
+        // 广告定义:裸名 write,schema 用目标工具的路径键。
+        let ad = write_alias_tooldef(a);
+        assert_eq!(ad.name, WRITE_ALIAS_NAME);
+        let ad_schema: Value = serde_json::from_str(&ad.schema).unwrap();
+        assert!(ad_schema["properties"].get("filePath").is_some());
+        assert!(ad_schema["properties"].get("content").is_some());
+        // 回调翻译:content→newString,oldString 置空,名字换成 edit。
+        let tc = a.translate(run::ToolCall {
+            id: "call-w".into(),
+            name: WRITE_ALIAS_NAME.into(),
+            args: vec![
+                ("filePath".into(), json!("/tmp/a.html")),
+                ("content".into(), json!("<html>…</html>")),
+            ],
+        });
+        assert_eq!(tc.name, "edit");
+        assert_eq!(tc.id, "call-w");
+        let get = |k: &str| tc.args.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+        assert_eq!(get("filePath"), Some(json!("/tmp/a.html")));
+        assert_eq!(get("oldString"), Some(json!("")));
+        assert_eq!(get("newString"), Some(json!("<html>…</html>")));
+        // 已有写文件工具 → 不补位。
+        let tools2 = vec![
+            tool_with_schema("edit", edit_schema),
+            tool_with_schema("write", r#"{"type":"object","properties":{"filePath":{"type":"string"}}}"#),
+        ];
+        assert!(BuiltinXlate::from_tools(&tools2).write_alias.is_none());
+        // 编辑工具 schema 认不齐键 → 不补位(不猜)。
+        let tools3 = vec![tool_with_schema(
+            "edit",
+            r#"{"type":"object","properties":{"mystery":{"type":"string"}}}"#,
+        )];
+        assert!(BuiltinXlate::from_tools(&tools3).write_alias.is_none());
+    }
+
     /// 转换表的键名必须来自声明工具的 `input_schema.properties`,绝不猜:
     /// Claude Code 是 `command`/`file_path`,opencode 是 `command`/`filePath`,
     /// schema 里没有候选键就放弃翻译(落回收口)。
@@ -4826,6 +5210,7 @@ mod tests {
         let x = BuiltinXlate {
             terminal: Some(("Bash".into(), "command".into())),
             read_file: None,
+            write_alias: None,
         };
         let tc = translate_builtin(
             run::BuiltinCall::Terminal {
@@ -4893,6 +5278,7 @@ mod tests {
         let xlate = BuiltinXlate {
             terminal: Some(("Bash".into(), "command".into())),
             read_file: None,
+            write_alias: None,
         };
         let out = stream_to_anthropic(
             futures::stream::iter(chunks),

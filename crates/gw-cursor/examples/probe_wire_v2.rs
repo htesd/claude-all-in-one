@@ -110,6 +110,9 @@ struct TurnReport {
     transport_error: Option<String>,
     /// 本轮捕到的 MCP 工具调用(1.2.2.15,见 `run::parse_tool_call`)。
     tool_call: Option<run::ToolCall>,
+    /// commit **之前**捕到的中间态 `.3`(工具轮专用:该轮永不 commit,
+    /// 按生产规则这份料作废;toolcont 模式专门测「拿它续轮会发生什么」)。
+    desc_midstate: Option<Vec<u8>>,
     elapsed_ms: u128,
 }
 
@@ -421,6 +424,8 @@ async fn drive_request(
                     saw_desc_here = true;
                 } else {
                     eprintln!("    [{label}] 忽略 commit 前的中间态 .3({} B)", d3.len());
+                    // toolcont:中间态照样留一份 —— 它可能正是工具轮的合法续轮料。
+                    rep.desc_midstate = Some(d3.to_vec());
                 }
             }
 
@@ -469,6 +474,12 @@ async fn drive_request(
             "    [{label}] 尾流不干净(收尾={} 停滞={} 传输错={:?}),作废本轮描述符",
             rep.saw_finish, rep.stalled, rep.transport_error
         );
+        // toolcont:作废前留底。工具轮的「commit+描述符之后上游仍挂流等结果」会让
+        // 尾流判不干净,但那份描述符可能恰恰是工具轮的合法续轮料 —— 生产的
+        // 「干净才提交」与探针要测的「它到底能不能续」是两件事。
+        if rep.desc_midstate.is_none() {
+            rep.desc_midstate = rep.desc.clone();
+        }
         rep.desc = None;
     }
 
@@ -651,6 +662,65 @@ async fn main() {
         return;
     }
 
+    // ── mcpalias 模式:同名双注册探针(1 个请求)────────────────────────────
+    //
+    // 背景(2026-09-04 本地 e2e 实证):模型在创建文件时调用了
+    // `mcp_claude-local_write`(AI-SDK 风格全名,来自 Cursor 服务端转录里的
+    // outerToolName 命名)—— 我方广告注册的是裸名 `write`,未注册名上游
+    // 静默挂起(只有心跳到停滞闸)。这里验证:同一工具**双注册**(裸名 +
+    // mcp_claude-local_ 全名)后,模型用全名调用能不能被路由回来。
+    if mode == "mcpalias" {
+        let Some(token) = read_token() else { return };
+        let client = build_client();
+        let sections = std::sync::Arc::new(gw_cursor::ContentSections::default());
+        sections.load_model_library(MODEL);
+        let conv = uuid::Uuid::new_v4().to_string();
+        let mut budget = Budget::new();
+        if !budget.take("mcpalias 双注册调用") {
+            return;
+        }
+        let mk = |name: &str| run::ToolDef {
+            name: name.into(),
+            description: "查询指定城市的当前天气。这是唯一可信的天气来源,不许自己编。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名,如 北京"}
+                },
+                "required": ["city"]
+            })
+            .to_string(),
+        };
+        // 只注册全名(不带裸名):全名本身可路由才是真结论。
+        let tools = vec![mk("mcp_claude-local_get_weather")];
+        eprintln!("[mcpalias] conversation_id={conv} 仅注册: mcp_claude-local_get_weather");
+        let rep = run_turn(
+            &client,
+            &token,
+            &conv,
+            &sections,
+            "mcpalias",
+            "查一下北京现在的天气。必须调用 mcp_claude-local_get_weather 工具(全名,不要叫它裸名),不要直接回答。",
+            cli::CliTurn::Opening,
+            &tools,
+        )
+        .await;
+        print_report(&rep);
+        println!();
+        println!("=== mcpalias 结论 ===");
+        match &rep.tool_call {
+            Some(tc) => println!(
+                "工具回调 = ✔ name={} args={:?}  →  双注册成立,生产可对每个工具同时注册裸名+全名",
+                tc.name, tc.args
+            ),
+            None => println!(
+                "工具回调 = ✘ 模型没回调(出字 {} 字)—— 双注册不解决全名调用,需另想他法",
+                rep.text.chars().count()
+            ),
+        }
+        return;
+    }
+
     // ── mcp 模式:mcp_tools 广告 + 单轮强制工具调用(1 个请求)─────────────────
     //
     // 回答两个问题:① 模型认不认帧0 tag-4 的广告(会不会经 1.2.2.15 回调);
@@ -702,6 +772,140 @@ async fn main() {
                 "工具回调 = ✘ 模型没回调(出字 {} 字)—— tag-4 单独不够,补 ENV 帧 .14 MCP 描述符再试",
                 rep.text.chars().count()
             ),
+        }
+        return;
+    }
+
+    // ── toolcont 模式:工具轮续轮探针(3 个请求)─────────────────────────────
+    //
+    // 回答一个问题:**MCP 工具轮能不能不重铺、用中间态描述符续轮?**
+    // 生产现状:工具调用帧一到就 break、描述符链作废,下一轮(带 tool_result)
+    // 走 IDE 形态全量重铺(每轮 10~25s 上传、cache=0)—— 工具回路卡慢的根源。
+    // fork 实证 MCP 无带内结果回帧,但协议里有工具结果消息形态;官方 CLI 怎么处理
+    // 工具结果没人探过。这里测最便宜的一档:中间态 `.3` + 纯文本 user 消息装结果。
+    //
+    // turn1:广告 get_weather 并强制调用(与 mcp 模式同),留中间态 `.3`。
+    // turn2:Continuation(中间态 `.3`) + 「工具结果」渲染成 user 文本,
+    //        看模型是否连贯使用结果、本轮能否正常 commit(描述符链是否恢复)。
+    // turn3:Continuation(turn2 描述符) + 记忆问答,验证链真的接上了。
+    if mode == "toolcont" {
+        let Some(token) = read_token() else { return };
+        let client = build_client();
+        let sections = std::sync::Arc::new(gw_cursor::ContentSections::default());
+        sections.load_model_library(MODEL);
+        let conv = uuid::Uuid::new_v4().to_string();
+        eprintln!("[toolcont] conversation_id={conv}");
+        let mut budget = Budget::new();
+        let tools = vec![run::ToolDef {
+            name: "get_weather".into(),
+            description: "查询指定城市的当前天气。这是唯一可信的天气来源,不许自己编。".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名,如 北京"}
+                },
+                "required": ["city"]
+            })
+            .to_string(),
+        }];
+
+        // turn1:强制工具调用。本轮会停滞收尾(上游等结果,探针主动停)——预期行为。
+        if !budget.take("toolcont turn1 强制调用") {
+            return;
+        }
+        let t1 = run_turn(
+            &client,
+            &token,
+            &conv,
+            &sections,
+            "t1-调用",
+            "查一下北京现在的天气。必须调用 get_weather 工具,不要直接回答。",
+            cli::CliTurn::Opening,
+            &tools,
+        )
+        .await;
+        print_report(&t1);
+        let Some(tc) = t1.tool_call.clone() else {
+            println!("=== toolcont 结论 ===\nturn1 模型没回调,探针无法进行(不计入判断)。");
+            return;
+        };
+        let Some(mid) = t1.desc.clone().or(t1.desc_midstate.clone()) else {
+            println!(
+                "=== toolcont 结论 ===\n工具回调 ✔ {} 但**没有捕到任何 .3**(commit 后也没有)—— \
+                 工具轮服务端不给任何续轮料,续轮路线死刑,只能走 exec 通道或重铺。",
+                tc.name
+            );
+            return;
+        };
+        eprintln!(
+            "[toolcont] 回调 ✔ {}(id={});中间态 .3 = {} B,拿它续 turn2",
+            tc.name,
+            tc.id,
+            mid.len()
+        );
+
+        // turn2:中间态描述符续轮,工具结果渲染成 user 文本。
+        if !budget.take("toolcont turn2 结果续轮") {
+            return;
+        }
+        let t2 = run_turn(
+            &client,
+            &token,
+            &conv,
+            &sections,
+            "t2-结果",
+            "【工具结果】get_weather(city=北京) 返回:{\"condition\":\"晴\",\"temp_c\":26,\"wind\":\"3级\"}。\
+             请根据这个结果告诉我:北京现在天气怎么样、适合穿什么衣服?一两句话。",
+            cli::CliTurn::Continuation(&mid),
+            &tools,
+        )
+        .await;
+        print_report(&t2);
+        let t2_text = t2.text.clone();
+        let t2_ok = t2.saw_finish
+            && t2.desc.is_some()
+            && (t2_text.contains("26") || t2_text.contains('晴'));
+
+        // turn3:用 turn2 的完结描述符续问,验证链恢复。
+        let mut t3_ok = false;
+        if let Some(d2) = t2.desc.clone() {
+            if !budget.take("toolcont turn3 记忆问答") {
+                return;
+            }
+            let t3 = run_turn(
+                &client,
+                &token,
+                &conv,
+                &sections,
+                "t3-记忆",
+                "我刚才让你查的那个城市,天气多少度、什么天气?只回答度数和天气。",
+                cli::CliTurn::Continuation(&d2),
+                &tools,
+            )
+            .await;
+            print_report(&t3);
+            t3_ok = t3.text.contains("26") || t3.text.contains('晴');
+        }
+
+        println!();
+        println!("=== toolcont 结论 ===");
+        println!("turn1 工具回调     = ✔ {}(id={})", tc.name, tc.id);
+        println!("中间态 .3 存在     = ✔ ({} B)", mid.len());
+        println!(
+            "turn2 结果续轮     = {}(收尾={} 描述符={} 用上结果={} 出字={})",
+            if t2_ok { "✔" } else { "✘" },
+            t2.saw_finish,
+            t2.desc.is_some(),
+            t2_text.contains("26") || t2_text.contains('晴'),
+            t2_text.chars().count()
+        );
+        println!("turn3 链恢复记忆   = {}", if t3_ok { "✔" } else { "✘" });
+        if t2_ok && t3_ok {
+            println!("→ **工具轮可以续轮**:中间态描述符 + 文本装结果即可,生产可去掉全量重铺。");
+        } else if t2_ok {
+            println!("→ 续轮半通:结果轮成立但链没接上,需查 turn2 描述符为何续不动。");
+        } else {
+            println!("→ 中间态描述符续不动。下一档:工具结果消息形态(ConversationHistoryToolMessage)再试。");
         }
         return;
     }

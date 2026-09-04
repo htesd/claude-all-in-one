@@ -959,9 +959,19 @@ struct ShadowEntry {
     fps: Vec<u64>,
     /// 本轮 assistant 输出的指纹(`chat::turn_fp(false, 渲染文本)`)。
     ///
-    /// `None` = 这一轮没能算出输出指纹(失败轮 / 工具轮)。**这样的条目永不匹配** ——
-    /// 它的链是残的,拿它回放等于漏掉本轮的回答。
+    /// `None` = 这一轮没能算出输出指纹(失败轮 / 工具轮)。普通条目因此链残、
+    /// 永不匹配;**工具轮条目**(`tool_turn`)另有一套宽松匹配,见
+    /// [`DescriptorShadow::lookup`]。
     assistant_fp: Option<u64>,
+    /// 工具轮条目(2026-09-04 toolcont 探针路线)。
+    ///
+    /// 工具轮的 assistant 输出是一次 `tool_use`,其渲染含参数 JSON 的调用方再
+    /// 序列化(键序/空白不由我方掌控),指纹算不准 → `assistant_fp` 恒 None,
+    /// 链 = 工具轮请求历史(含当时末条 user)。下一轮(工具结果轮)的历史
+    /// 减末条(tool_result)后,尾部正是那条 tool_use 一条 —— lookup 对这类
+    /// 条目改用「链 == 历史减两条」的宽松匹配(结构性校验由调用方在进 CLI
+    /// 形态前做过:末条 tool_result + 上一条 assistant tool_use)。
+    tool_turn: bool,
     /// 尾部 `.3` 的原始字节(不透明,永不解析修改)。
     desc: Vec<u8>,
     /// `.1` 32B blob 引用个数(捕获时数好,读侧不再解)。
@@ -1029,6 +1039,7 @@ impl DescriptorShadow {
         model: &str,
         request_fps: &[u64],
         assistant_fp: Option<u64>,
+        tool_turn: bool,
         desc: &[u8],
         refs: usize,
     ) -> ShadowCommit {
@@ -1076,6 +1087,7 @@ impl DescriptorShadow {
                 e.model = model.to_string();
                 e.fps = chain;
                 e.assistant_fp = assistant_fp;
+                e.tool_turn = tool_turn;
                 e.desc = desc.to_vec();
                 e.refs = refs;
                 e.at = Instant::now();
@@ -1096,6 +1108,7 @@ impl DescriptorShadow {
                     model: model.to_string(),
                     fps: chain,
                     assistant_fp,
+                    tool_turn,
                     desc: desc.to_vec(),
                     refs,
                     at: Instant::now(),
@@ -1196,7 +1209,21 @@ impl DescriptorShadow {
         // 「回退同号短祖先」= clidrv 明确拒绝的那种静默丢轮。
         let exact: Vec<&ShadowEntry> = bucket
             .iter()
-            .filter(|e| e.assistant_fp.is_some() && e.fps == history_fps)
+            .filter(|e| {
+                if e.assistant_fp.is_some() && e.fps == history_fps {
+                    return true;
+                }
+                // 工具轮条目(toolcont 路线):链 = 工具轮请求历史(含当时末条 user),
+                // 没有 assistant 指纹(tool_use 块的调用方再序列化算不准,见
+                // ShadowEntry::tool_turn)。本轮(工具结果轮)历史减末条 tool_result
+                // 后尾部恰好多出那条 assistant tool_use —— 匹配 = 我方链 == 它再减
+                // 这一条。「那一条确实是 tool_use」的结构校验在进 CLI 形态前已做
+                // (chat::prev_assistant_has_tool_use),这里只看链。
+                if e.tool_turn && history_fps.len() == e.fps.len() + 1 {
+                    return e.fps[..] == history_fps[..history_fps.len() - 1];
+                }
+                false
+            })
             .collect();
         match exact.len() {
             0 => None,
@@ -2664,7 +2691,7 @@ mod tests {
     fn 影子表_严格前缀不匹配() {
         let s = DescriptorShadow::default();
         // turn1:请求历史 [u1],输出 a1 → 链 [u1, a1]。
-        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-1", 4);
+        s.commit("conv", "A", "m1", &[1], Some(11), false, b"desc-1", 4);
         // 正:下一轮的历史正是 [u1, a1]。
         assert_eq!(
             s.lookup("conv", "A", "m1", &[1, 11]).as_deref(),
@@ -2685,9 +2712,9 @@ mod tests {
     #[test]
     fn 影子表_两轮推进替换前任() {
         let s = DescriptorShadow::default();
-        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-1", 4);
+        s.commit("conv", "A", "m1", &[1], Some(11), false, b"desc-1", 4);
         // turn2:请求历史 [u1,a1,u2],前任 = [u1,a1] → 替换。
-        let c = s.commit("conv", "A", "m1", &[1, 11, 2], Some(22), b"desc-2", 6);
+        let c = s.commit("conv", "A", "m1", &[1, 11, 2], Some(22), false, b"desc-2", 6);
         assert_eq!(c.same_account, Some(true), "找到精确前任");
         assert_eq!(c.changed, Some(true));
         // 旧链已不存在。
@@ -2708,8 +2735,8 @@ mod tests {
         // 两次 commit 的前任都是 `[]`(request_fps 只有一条),所以第二次找不到前任 →
         // 追加。于是同 conv 下两条条目的链都是 [1, 11] = 真并列。
         let s2 = DescriptorShadow::default();
-        s2.commit("conv", "A", "m1", &[1], Some(11), b"desc-x", 1);
-        s2.commit("conv", "A", "m1", &[1], Some(11), b"desc-y", 1);
+        s2.commit("conv", "A", "m1", &[1], Some(11), false, b"desc-x", 1);
+        s2.commit("conv", "A", "m1", &[1], Some(11), false, b"desc-y", 1);
         // 第二次 commit 的前任 = [] ,与第一条链 [1,11] 不等 → 追加,于是两条链都是 [1,11]。
         assert!(
             s2.lookup("conv", "A", "m1", &[1, 11]).is_none(),
@@ -2721,7 +2748,7 @@ mod tests {
     #[test]
     fn 影子表_跨号与换模型不回放() {
         let s = DescriptorShadow::default();
-        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-A", 4);
+        s.commit("conv", "A", "m1", &[1], Some(11), false, b"desc-A", 4);
         assert!(
             s.lookup("conv", "B", "m1", &[1, 11]).is_none(),
             "跨号必须重铺"
@@ -2739,7 +2766,7 @@ mod tests {
     #[test]
     fn 影子表_缺assistant_fp硬性不匹配() {
         let s = DescriptorShadow::default();
-        s.commit("conv", "A", "m1", &[1], None, b"desc-partial", 4);
+        s.commit("conv", "A", "m1", &[1], None, false, b"desc-partial", 4);
         // 链只有 [1](没追 assistant),按链相等去查也不给。
         assert!(
             s.lookup("conv", "A", "m1", &[1]).is_none(),
@@ -2747,12 +2774,42 @@ mod tests {
         );
     }
 
+    /// 工具轮条目(tool_turn):assistant_fp 恒 None,但走「链 == 历史减两条」的
+    /// 宽松匹配 —— 历史减末条(tool_result)后尾部那条 assistant tool_use 不参与
+    /// 比对(结构校验在 chat::prev_assistant_has_tool_use 做过了)。
+    #[test]
+    fn 影子表_tool_turn宽松匹配() {
+        let s = DescriptorShadow::default();
+        // 工具轮:请求历史 [1, 2](含当时末条 user),无 assistant 指纹。
+        s.commit("conv", "A", "m1", &[1, 2], None, true, b"desc-tool", 5);
+        // 工具结果轮:历史减末条 = [1, 2, <assistant tool_use>] → 命中。
+        assert_eq!(
+            s.lookup("conv", "A", "m1", &[1, 2, 77]).as_deref(),
+            Some(&b"desc-tool"[..]),
+            "链 == 历史减两条 必须命中"
+        );
+        // 不多减一条:[1, 2] 不是工具结果轮的视角(它尾部没有 tool_use)→ 不中。
+        assert!(s.lookup("conv", "A", "m1", &[1, 2]).is_none());
+        // 多减了两条以上 / 前缀不同 → 不中。
+        assert!(s.lookup("conv", "A", "m1", &[1, 2, 77, 88]).is_none());
+        assert!(s.lookup("conv", "A", "m1", &[9, 2, 77]).is_none());
+        // 换号 / 换模型照旧不中(与普通条目同规矩)。
+        assert!(s.lookup("conv", "B", "m1", &[1, 2, 77]).is_none());
+        assert!(s.lookup("conv", "A", "m2", &[1, 2, 77]).is_none());
+        // 工具轮条目之后的正常轮:链推进回精确匹配。模拟结果轮成功提交:
+        // 请求历史 [1, 2, 77, 3](含末条 user)+ assistant 指纹 33。
+        s.commit("conv", "A", "m1", &[1, 2, 77, 3], Some(33), false, b"desc-next", 6);
+        assert!(s
+            .lookup("conv", "A", "m1", &[1, 2, 77, 3, 33])
+            .is_some());
+    }
+
     /// 作废只摘同号,别号血脉不受影响。
     #[test]
     fn 影子表_作废只摘同号() {
         let s = DescriptorShadow::default();
-        s.commit("conv", "A", "m1", &[1], Some(11), b"desc-A", 1);
-        s.commit("conv", "B", "m1", &[2], Some(22), b"desc-B", 1);
+        s.commit("conv", "A", "m1", &[1], Some(11), false, b"desc-A", 1);
+        s.commit("conv", "B", "m1", &[2], Some(22), false, b"desc-B", 1);
         assert_eq!(s.invalidate("conv", "A"), 1);
         assert!(
             s.lookup("conv", "A", "m1", &[1, 11]).is_none(),
