@@ -27,7 +27,7 @@ use crate::wire;
 /// 这个值宁可偏大:误判的代价是把一次本来会成功的慢请求变成失败。
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// 已出字后的零进展上限(更紧)。
+/// 已出字后的零进展上限。
 ///
 /// 出字之后再沉默,有两种完全不同的情形:
 /// - **必死**:模型调用了未注册的工具名,上游一个帧都不回(只剩心跳);
@@ -36,6 +36,14 @@ const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 /// 30s 会把后者误杀(2026-09-04 本地 e2e 实证:写报纸页必死)。取 150s:
 /// 覆盖大件组装,必死轮次晚两分钟宣判可接受(重试终究会来)。
 const STALL_TIMEOUT_STARTED: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// 排水段(turn_commit 之后)的零进展上限。
+///
+/// 正常排水 1~2s 内尾帧到齐、流自关;超过这个值只剩一种形态 —— 上游
+/// 挂住只剩心跳(典型:模型调了未注册工具,服务端在永不返回地等结果)。
+/// 此时轮次在 commit 已成功,多等一秒都是纯延迟:判排水停滞,按
+/// 「轮次照常成功、影子不提交」收口(停滞闸的 draining 分支)。
+const DRAIN_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 工具轮 commit 到手后,再等尾部描述符的宽限。
 ///
@@ -828,6 +836,20 @@ fn capability_redirects(tools: &[run::ToolDef]) -> Vec<(&'static str, String)> {
             .min();
         if let Some((_, _, name)) = best {
             out.push((*cap, name.clone()));
+        }
+    }
+    // 联网回退(2026-09-04 pi 卡死案):声明里没有网页工具、但有终端工具时,
+    // 必须给模型一条**合法出路** —— 用终端跑 curl/wget。没有这句,grok 会去调
+    // 它记忆里 Cursor 的 WebSearch/WebFetch(未注册 → 上游只剩心跳,整轮挂死;
+    // 本地 e2e 两次实证)。没有终端工具时不出行:指向不存在的出路比不出更糟。
+    // 文案带「若允许联网且装有 curl/wget」限定(codex 评审 P2):按名字猜出来的
+    // 终端工具未必能出网,不能把受限沙箱宣传成联网通道。
+    if !out.iter().any(|(cap, _)| *cap == "查网页") {
+        if let Some((_, term)) = out.iter().find(|(cap, _)| *cap == "跑命令/终端") {
+            out.push((
+                "查网页/联网(若该终端允许联网且装有 curl/wget,用它抓取)",
+                term.clone(),
+            ));
         }
     }
     out
@@ -2833,13 +2855,26 @@ fn stream_to_anthropic(
                     break 'outer;
                 }
                 _ = tokio::time::sleep_until(
-                    // 两档:首字前 90s(冷启动/长考留余量),出字后 30s
-                    // (沉默≈必死,尽快宣判,见 STALL_TIMEOUT_STARTED)。
+                    // 三档:排水段 20s(尾帧本该 1~2s 到齐,只剩心跳 = 挂死),
+                    // 首字前 90s(冷启动/长考留余量),出字后 150s
+                    // (大件组装余量,见 STALL_TIMEOUT_STARTED)。
                     (last_progress
-                        + if started { STALL_TIMEOUT_STARTED } else { STALL_TIMEOUT })
+                        + if draining {
+                            DRAIN_STALL_TIMEOUT
+                        } else if started {
+                            STALL_TIMEOUT_STARTED
+                        } else {
+                            STALL_TIMEOUT
+                        })
                     .into()
                 ) => {
-                    let stall = if started { STALL_TIMEOUT_STARTED } else { STALL_TIMEOUT };
+                    let stall = if draining {
+                        DRAIN_STALL_TIMEOUT
+                    } else if started {
+                        STALL_TIMEOUT_STARTED
+                    } else {
+                        STALL_TIMEOUT
+                    };
                     // 排水段的停滞**不是错误**:轮次在 turn_commit 已经成功,
                     // 只是影子失去「干净收尾」资格(不提交),轮次照常收尾。
                     // 工具轮等 commit 时的停滞同义:tool_use 早已交付,轮次是好的,
@@ -2956,6 +2991,13 @@ fn stream_to_anthropic(
                     status = ?run::status_code(&payload),
                     text_len = fr.text.chars().count(),
                     thinking_len = fr.thinking.chars().count(),
+                    // 排障四元组(2026-09-04 pi 卡死案留下):停滞闸不 firing 时,
+                    // 靠 idle_secs 与 started/draining/await_tool_commit 一眼定位
+                    // 是哪个状态在续命。debug 级,常态无成本。
+                    idle_secs = last_progress.elapsed().as_secs(),
+                    started,
+                    draining,
+                    await_tool_commit,
                     text_preview = %fr.text.chars().take(120).collect::<String>(),
                     thinking_preview = %fr.thinking.chars().take(120).collect::<String>(),
                     "cursor Run 响应帧"
@@ -3032,7 +3074,19 @@ fn stream_to_anthropic(
                 // 在 turn_commit 就收尾,这些尾帧本来不会被处理 —— 排水段是纯
                 // 观测附加段,它的存在不得改变轮次的任何外部表现。
                 if draining {
-                    last_progress = std::time::Instant::now();
+                    // ⚠️ 排水段只认「有意义的帧」作进展(codex 评审 P2,2026-09-04
+                    // pi 卡死案):心跳/状态帧/未知回显每 10s 一个,把它们算进展
+                    // 会让停滞闸永不开火,挂死流最后由 gw-app 300s 硬上限代收 ——
+                    // 客户端干等 5 分钟。有意义的口径:描述符 `.3`、正文/思考/用量
+                    // (KV 效果的刷新在上方 driver 分支已做)。真尾帧 1~2s 内到齐,
+                    // 收紧后由 [`DRAIN_STALL_TIMEOUT`] 快速收口。
+                    if run::descriptor_field3(&payload).is_some()
+                        || !fr.text.is_empty()
+                        || !fr.thinking.is_empty()
+                        || fr.usage.is_some()
+                    {
+                        last_progress = std::time::Instant::now();
+                    }
                     continue;
                 }
 
@@ -3163,6 +3217,10 @@ fn stream_to_anthropic(
                 // 排水段的任何失败(停滞/读错/解压错)都只放弃影子提交,
                 // 绝不影响这个已经成功的轮次。
                 if cli_mode && commit_frame {
+                    // commit 本身就是有意义的进展(codex 评审 P1):进排水段必须重置
+                    // 计时,否则「正文帧在 t=0、commit 在 t=25s 才到」的健康轮次,
+                    // 排水闸的 20s 从上一个正文帧算起,等于进段即判停滞。
+                    last_progress = std::time::Instant::now();
                     if let Some(d) = wire_driver.as_mut() {
                         d.set_draining();
                     }
@@ -3315,8 +3373,8 @@ fn stream_to_anthropic(
                             // 改为:客户端侧照常 tool_use 收尾(saw_end),但**流继续读**,
                             // 等 commit+描述符(await_tool_commit)拿到才算真正收工;
                             // 等不到(停滞闸)才退回旧行为作废旧链。
-                            // 仅 CLI 形态:IDE 没有描述符这套,维持即时收口(白等 30s
-                            // 是纯退化)。
+                            // 仅 CLI 形态:IDE 没有描述符这套,维持即时收口(白等一个
+                            // 停滞闸周期是纯退化)。
                             saw_end = true;
                             if cli_mode {
                                 await_tool_commit = true;
@@ -5396,6 +5454,31 @@ mod tests {
         assert!(g.contains("读文件调用 `gwtools-Read`"), "{g}");
         assert!(g.contains("搜代码/找文件调用 `gwtools-Grep`"), "{g}");
         assert!(g.contains("查网页调用 `gwtools-WebSearch`"), "{g}");
+        // 有专用网页工具时不出现 curl 回退行(见下条测试的反面)。
+        assert!(!g.contains("curl/wget"), "{g}");
+    }
+
+    #[test]
+    fn 无网页工具有终端时联网回退到curl() {
+        // 2026-09-04 pi 卡死案:没有网页工具时 grok 会去编 Cursor 的
+        // WebSearch/WebFetch(未注册 → 上游挂死)。给它一条合法出路。
+        let g = guard(&tdefs(&["read", "bash", "edit", "write"]));
+        assert!(g.contains("curl/wget"), "{g}");
+        assert!(g.contains("调用 `gwtools-bash`"), "{g}");
+        // MCP/CLI 裸名版同样要有这条出路。
+        let m = mcp_tool_guard_with(
+            &tdefs(&["read", "bash", "edit", "write"]),
+            crate::DEFAULT_TOOL_GUARD_POLICY,
+        );
+        assert!(m.contains("curl/wget"), "{m}");
+        assert!(m.contains("调用 `bash`"), "{m}");
+    }
+
+    #[test]
+    fn 连终端也没有时不加联网回退() {
+        // 指向不存在的出路比不出更糟。
+        let g = guard(&tdefs(&["Read"]));
+        assert!(!g.contains("curl/wget"), "{g}");
     }
 
     /// gpt-5.6-sol 评审的三处删减,钉成断言 —— 这三句删掉是**刻意的**,

@@ -723,6 +723,45 @@ pub fn is_turn_commit(payload: &[u8]) -> bool {
     false
 }
 
+/// 上游心跳帧(§10.6):4 字节的 `{1: {13: ""}}` —— 顶层 RESP_MESSAGE 里裹一个
+/// 空的 field 13。它唯一的语义是「流还活着」,**不含任何轮次进展**。
+///
+/// 2026-09-04 pi 卡死案的直接教训:排水段把每个心跳都算作「进展」刷新停滞计时,
+/// 于是 commit 之后上游只剩心跳的挂死流永远撞不上停滞闸,要等 gw-app 300s
+/// 硬上限兜底。判读它是为了在计时口径里把它**排除**出去。
+pub fn is_heartbeat(payload: &[u8]) -> bool {
+    // 严格形态(codex 评审):整帧**有且仅有**一个顶层 RESP_MESSAGE,
+    // 子消息里有且仅有一个 field 13、且是空串。值非空、字段重复、
+    // 合帧夹带、截断畸形,一律否 —— 误判的代价是把真进展当零进展,
+    // 排水段会提前放弃影子提交。
+    let mut top = Reader::new(payload);
+    let mut seen = false;
+    while let Some((f, v)) = top.next() {
+        if f != RESP_MESSAGE || seen {
+            return false;
+        }
+        seen = true;
+        let PbValue::Len(sub) = v else { return false };
+        let mut inner = Reader::new(sub);
+        let mut inner_seen = false;
+        while let Some((f2, v2)) = inner.next() {
+            if inner_seen {
+                return false;
+            }
+            inner_seen = true;
+            match (f2, v2) {
+                (13, PbValue::Len(s)) if s.is_empty() => {}
+                _ => return false,
+            }
+        }
+        // 截断防御:子消息没读完就停的,不是心跳。
+        if !inner_seen || !inner.is_done() {
+            return false;
+        }
+    }
+    seen && top.is_done()
+}
+
 /// Run 响应的「续轮描述符」(顶层 field 3,2026-08-23 抓包实证):服务端把跨轮
 /// 状态当**不透明字节**回声给客户端,客户端下一轮原样回放(请求侧 `.1`)。
 ///
@@ -2594,6 +2633,59 @@ mod tests {
         let mut outer = Writer::new();
         outer.message(4, &echo);
         assert_eq!(parse_frame(&outer.into_bytes()), RespFrame::default());
+    }
+
+    /// 心跳的**判读**(排水段计时口径靠它排除零进展帧,2026-09-04 pi 卡死案)。
+    #[test]
+    fn 心跳帧的判读严格钉死形态() {
+        // ① 真心跳 {1:{13:""}} → true。
+        let mut hb_inner = Writer::new();
+        hb_inner.string(13, "");
+        let mut hb = Writer::new();
+        hb.message(RESP_MESSAGE, &hb_inner);
+        assert!(is_heartbeat(&hb.into_bytes()));
+
+        // ② 思考帧(1.4)/正文帧同走顶层 field 1 → 必须 false,否则长思考
+        //    会被当成零进展。
+        let mut th_inner = Writer::new();
+        th_inner.string(4, "在想");
+        let mut th = Writer::new();
+        th.message(RESP_MESSAGE, &th_inner);
+        assert!(!is_heartbeat(&th.into_bytes()));
+
+        // ③ 心跳与别的字段合帧(顶层多一个描述符 .3)→ false:那一帧有真信息。
+        let mut hb_inner2 = Writer::new();
+        hb_inner2.string(13, "");
+        let mut mixed = Writer::new();
+        mixed.message(RESP_MESSAGE, &hb_inner2);
+        mixed.bytes(3, b"descriptor");
+        assert!(!is_heartbeat(&mixed.into_bytes()));
+
+        // ④ 反例(codex 评审):空子消息 / 非空值 / 重复字段 / 截断,一律 false。
+        let mut empty_sub = Writer::new();
+        empty_sub.message(RESP_MESSAGE, &Writer::new());
+        assert!(!is_heartbeat(&empty_sub.into_bytes()), "{{1:{{}}}} 不是心跳");
+
+        let mut nonempty_inner = Writer::new();
+        nonempty_inner.string(13, "x");
+        let mut nonempty = Writer::new();
+        nonempty.message(RESP_MESSAGE, &nonempty_inner);
+        assert!(!is_heartbeat(&nonempty.into_bytes()), "13 非空串不是心跳");
+
+        let mut dup_inner = Writer::new();
+        dup_inner.string(13, "");
+        dup_inner.string(13, "");
+        let mut dup = Writer::new();
+        dup.message(RESP_MESSAGE, &dup_inner);
+        assert!(!is_heartbeat(&dup.into_bytes()), "重复 field 13 不是心跳");
+
+        // 合法心跳掐掉最后一个字节(截断)→ false。
+        let mut hb3_inner = Writer::new();
+        hb3_inner.string(13, "");
+        let mut hb3 = Writer::new();
+        hb3.message(RESP_MESSAGE, &hb3_inner);
+        let hb_bytes = hb3.into_bytes();
+        assert!(!is_heartbeat(&hb_bytes[..hb_bytes.len() - 1]), "截断帧不是心跳");
     }
 
     /// **prefill**:Anthropic 允许以 assistant 消息结尾让模型续写。
