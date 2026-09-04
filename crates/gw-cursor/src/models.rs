@@ -291,18 +291,44 @@ pub fn apply_thinking_pref(model: &mut Model, thinking: Option<&serde_json::Valu
         .and_then(|t| t.get("type"))
         .and_then(|t| t.as_str());
 
-    // ⚠️ **客户端没提 thinking 时保持目录默认(claude 系是 true),不要改成 false。**
+    // ⚠️ **claude 系:客户端没提 thinking 时保持目录默认(true),不要改成 false。**
     //
-    // 绝大多数流量(不开 thinking 的 Claude Code / opencode)走的是这一支。而
     // 2026-08-07 的 A/B 实测显示:这个参数**无论 true 还是 false,上游都不发 `1.4` 帧**
     // (见 PROTOCOL 关于 thinking 杠杆的记录)—— 也就是说我方不知道它到底在控制什么。
     // 对一个作用未知的旋钮,把主流量的取值从抓包实物的 `true` 改成 `false`,
     // 是拿全部请求去赌一个没验证过的假设。只在客户**明确说不要**时才发 false。
+    let has_thinking_key = model.params.iter().any(|(k, _)| k == "thinking");
+    let has_effort_key = model.params.iter().any(|(k, _)| k == "effort");
     match kind {
         Some("disabled") => {
             for (k, v) in model.params.iter_mut() {
                 if k == "thinking" {
                     *v = "false".to_string();
+                }
+            }
+            // grok 系(有 effort、无 thinking 键)没有思考开关:客户明确不要思考,
+            // 就把 effort 同步降到 low,否则目录默认 high 照样整段长考。
+            if !has_thinking_key {
+                for (k, v) in model.params.iter_mut() {
+                    if k == "effort" {
+                        *v = "low".to_string();
+                    }
+                }
+            }
+            return;
+        }
+        // ⚠️ **grok 系:没提 thinking 时把 effort 默认降到 low。**
+        //
+        // grok 没有 thinking 开关,目录默认 `effort=high` 意味着**每个请求都高强度
+        // 长考**;而思考帧按收侧过滤不会透传给没要 thinking 的客户端 —— 首字 =
+        // 整段思考时间(2026-09-04 生产 grok 首字 p50 13s / p90 42s 的直接来源;
+        // 长考超 90s 还会撞 stall 闸被误杀)。客户要思考时经 `thinking:enabled/adaptive`
+        // (或 OpenAI 侧 `reasoning_effort`)显式拉回高档,收侧也会同步透传。
+        // claude 系(有 thinking 键)不走这支:目录默认是抓包实物,作用未知的旋钮不动。
+        None if !has_thinking_key && has_effort_key => {
+            for (k, v) in model.params.iter_mut() {
+                if k == "effort" {
+                    *v = "low".to_string();
                 }
             }
             return;
@@ -635,6 +661,46 @@ mod tests {
             );
             assert_eq!(get(&m).as_deref(), Some(want), "budget={budget}");
         }
+    }
+
+    #[test]
+    fn grok_effort_drops_to_low_when_client_skips_thinking() {
+        let get = |m: &Model, k: &str| {
+            m.params
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
+        };
+        // 没提 thinking(主流量):grok effort high→low —— 2026-09-04 首字慢修复。
+        let mut m = model_by_name("grok-4.6");
+        apply_thinking_pref(&mut m, None);
+        assert_eq!(get(&m, "effort").as_deref(), Some("low"));
+        assert_eq!(get(&m, "fast").as_deref(), Some("false"), "别的参数不动");
+        // 显式 disabled 同样降档。
+        let mut m = model_by_name("grok-4.5");
+        apply_thinking_pref(&mut m, Some(&serde_json::json!({"type":"disabled"})));
+        assert_eq!(get(&m, "effort").as_deref(), Some("low"));
+        // 客户要思考:保留目录 high(没给预算时)。
+        let mut m = model_by_name("grok-4.6");
+        apply_thinking_pref(&mut m, Some(&serde_json::json!({"type":"enabled"})));
+        assert_eq!(get(&m, "effort").as_deref(), Some("high"));
+        // 要思考且给了预算:按既有 budget→tier 分档。
+        let mut m = model_by_name("grok-4.6");
+        apply_thinking_pref(
+            &mut m,
+            Some(&serde_json::json!({"type":"enabled","budget_tokens":8000})),
+        );
+        assert_eq!(get(&m, "effort").as_deref(), Some("medium"));
+        // claude 系不受影响:没提时 thinking/effort 都保持目录默认。
+        let mut m = model_by_name("claude-sonnet-5");
+        apply_thinking_pref(&mut m, None);
+        assert_eq!(get(&m, "thinking").as_deref(), Some("true"));
+        assert_eq!(get(&m, "effort").as_deref(), Some("high"));
+        // 无 effort 键的模型(composer):参数原样。
+        let mut m = model_by_name("composer-2.5");
+        let before = m.params.clone();
+        apply_thinking_pref(&mut m, None);
+        assert_eq!(m.params, before);
     }
 
     #[test]

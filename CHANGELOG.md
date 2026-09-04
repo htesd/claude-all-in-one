@@ -1,5 +1,39 @@
 # Changelog
 
+## [cursor-grok-effort-low] grok 首字慢修复:无 thinking 请求 effort 降 low + 思考帧算流进展 — 2026-09-04
+
+### 背景
+
+用户普遍反映 grok 首字慢。生产数据:grok-4.6 首字 p50 13.1s / p90 42s / p99 84s,
+同窗口 claude 系 p50 只有 3~5s;且 lan 号大量「90s 内只有心跳」误杀(incomplete_stream)。
+
+### 根因(两条叠加)
+
+1. **grok 目录参数写死 `effort=high`**(`models.rs`),`apply_thinking_pref` 只碰
+   claude 系的 `thinking` 键 —— 客户端没请求 thinking 的主流量也按高强度长考,
+   而思考帧按收侧过滤不透传,首字 = 整段思考时间。
+2. **未透传的思考帧不算流进展**(`chat.rs` 旧 `want_thinking` 门控):上游明明在
+   持续发 `1.4`,90s stall 闸把健康的长思考流当「只有心跳」掐死 → 报错重试,
+   重试再占并发,雪上加霜。
+
+### 改动
+
+- `models::apply_thinking_pref`:客户端没提 thinking(或显式 disabled)时,对
+  「有 effort 键、无 thinking 键」的模型(grok 系)把 effort 降到 `low`;claude 系
+  保持目录默认不动(作用未知的旋钮不赌);客户经 `thinking:enabled/adaptive` 或
+  OpenAI 侧 `reasoning_effort` 显式要思考时仍按 budget 分档,不受影响。
+- `chat.rs`:思考帧**一律**刷新 last_progress。真故障(只思考永不出字)由 gw-app
+  300s 静默硬上限兜底;effort 降 low 后长考窗口本身已短。
+
+### 验证
+
+- 单测 gw-cursor 347 绿(+1:`grok_effort_drops_to_low_when_client_skips_thinking`),
+  workspace 全绿。
+- 本地 Ultra 号 e2e:90KB 上下文请求流全程 128s(思考帧持续到达),旧行为 90s 必被
+  掐,现干净收尾;`effort=low` 上游接受(200,无 invalid_argument);thinking 请求
+  照常有 thinking 块(回归无)。
+- 生产对照实验(部署前):同锚点会话钉同号,缓存命中 ~97%,粘性无涉本问题。
+
 ## [cursor-wire-agent-tools] 纯协议路线全通:裸态门真相 + KV 回执 + mcp_tools + AGENT 模式 — 2026-09-04
 
 ### 背景

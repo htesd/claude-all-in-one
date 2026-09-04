@@ -237,10 +237,11 @@ fn usage_from_upstream(u: crate::run::WireUsage) -> ChatUsage {
     }
 }
 
-/// 客户端是否要求透传思考块(以及把思考帧算作流进展)。
+/// 客户端是否要求透传思考块。
 ///
 /// - `enabled` / `adaptive`(Claude Code):要透传。
-/// - `disabled` / 缺省 / 未知:不透传;未下发的思考也不得刷新 stall 计时。
+/// - `disabled` / 缺省 / 未知:不透传(只影响**发不发 thinking 块**;
+///   思考帧无论透不透传都刷新 stall 计时,见流循环里 last_progress 的注释)。
 pub(crate) fn client_wants_thinking(thinking: Option<&Value>) -> bool {
     matches!(
         thinking
@@ -1781,8 +1782,9 @@ pub async fn chat_stream(
     //    客户端要么报未知块类型、要么把推理当正文显示,两种都比不发坏。
     //
     // ⚠️ Claude Code 的 `adaptive` **必须算「要思考」**:只认 `enabled` 时上游仍开
-    // thinking(目录默认 true),收侧却丢掉 `1.4` —— 思考帧还刷新 last_progress,
-    // 90s 心跳 watchdog 进不去,客户端干等直到 gw-app 300s idle abort(无首字)。
+    // thinking(目录默认 true),收侧却丢掉 `1.4` —— 客户端整段长考期间一个 SSE 都
+    // 收不到,首字被吃光(2026-09-04 起思考帧无论透不透传都刷新 last_progress,
+    // 所以后果不再是 90s 误杀,而是纯粹的无首字干等)。
     let thinking = req.body.get("thinking").cloned();
     let want_thinking = client_wants_thinking(thinking.as_ref());
 
@@ -2794,10 +2796,13 @@ fn stream_to_anthropic(
                 // `end_turn` —— 表现为「回答少了结尾」且无任何错误。
                 let usage = fr.usage;
                 let text = fr.text;
-                // 未透传的思考**不算进展**:否则会一边丢 `1.4`、一边续命 last_progress,
-                // 拖到 gw-app 的 300s 静默硬上限才报错(见 client_wants_thinking 注释)。
-                if !text.is_empty() || usage.is_some() || (want_thinking && !fr.thinking.is_empty())
-                {
+                // 思考帧**一律算进展**:它是上游正在干活的确凿信号。旧写法在客户端没要
+                // thinking 时不算(want_thinking 门控):上游明明在持续发 `1.4`,90s
+                // stall 闸却把这条健康的长思考流当「只有心跳」掐死(2026-09-04 生产
+                // grok 号大量此类误杀)。真出故障(只思考永不出字)有 gw-app 300s 静默
+                // 硬上限兜底;且没要 thinking 的请求如今 effort 已降 low(见
+                // models::apply_thinking_pref),长考窗口本身就短。
+                if !text.is_empty() || usage.is_some() || !fr.thinking.is_empty() {
                     last_progress = std::time::Instant::now();
                 }
 
