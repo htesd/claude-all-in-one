@@ -72,6 +72,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
   // '' = 默认(InferenceService 直连),'cli' = 退回 CLI 子进程,'wire' = 退回线协议。
   // 历史值 'inference' 与 '' 等价(都是默认),回填时归一成 ''。
   const [driver, setDriver] = useState('')
+  // 池钉(extra.pool,cursor 专用):'' = 缺省混合(推理面为主),'bot' = 只烧
+  // Bot 周池,'api' = 只烧月池(auto/api)。
+  const [pool, setPool] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
@@ -94,6 +97,7 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
       setModelAllowlist(currentAllowlist)
       setInitialModelAllowlist(currentAllowlist)
       setDriver(row.driver === 'wire' || row.driver === 'cli' ? row.driver : '')
+      setPool(row.pool === 'bot' || row.pool === 'api' ? row.pool : '')
       setError(null)
       setSaving(false)
     }
@@ -149,6 +153,9 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
     // 旧后端，只改并发也会让整个保存被判 400）。'' = 清除回默认(inference 直连)。
     const currentDriver = row.driver === 'wire' || row.driver === 'cli' ? row.driver : ''
     if (driver !== currentDriver) patch.driver = driver
+    // 池钉:与原值比较,没动就不带(同上的旧后端兼容理由)。'' = 清除回缺省混合。
+    const currentPool = row.pool === 'bot' || row.pool === 'api' ? row.pool : ''
+    if (pool !== currentPool) patch.pool = pool
 
     const draft: AccountGroupMembership[] = Object.entries(memberships).map(
       ([name, priority]) => ({ name, priority }),
@@ -344,6 +351,29 @@ export function EditAccountDialog({ open, row, onClose }: EditAccountDialogProps
                 />
               </div>
               <p className="text-xs text-muted-foreground">{t('accounts.field.driverHint')}</p>
+            </div>
+          )}
+
+          {/* 池钉：只对 cursor 家族有意义。sand 身份（推理面）烧 Bot 周池，
+              cli 身份（clidrv/wire）烧月池（auto/api）；钉死后绝不跨池。
+              与驱动闸冲突时驱动优先（回滚命门）。约 30s 内经 worker sync 生效。 */}
+          {row?.provider === 'cursor' && (
+            <div className="space-y-1.5">
+              <span className="text-xs font-medium text-muted-foreground">
+                {t('accounts.field.pool')}
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <Segment
+                  options={[
+                    { value: '', label: t('accounts.pool.mixed') },
+                    { value: 'bot', label: t('accounts.pool.bot') },
+                    { value: 'api', label: t('accounts.pool.api') },
+                  ]}
+                  value={pool}
+                  onChange={(v) => setPool(v)}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">{t('accounts.field.poolHint')}</p>
             </div>
           )}
 

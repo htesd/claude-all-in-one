@@ -240,6 +240,17 @@ pub struct UpdateAccountBody {
     /// 只对 cursor 家族有意义:别的 provider 读不到这个键,写了也是死字段。
     #[serde(default)]
     driver: Option<String>,
+    /// 定点切换池钉(写 `extra.pool`,走 merge_account_extra 绝不碰凭据,仿 `driver`)。
+    ///
+    /// 一个 cursor 号有两个池能服务第三方模型:sand 身份(InferenceService 面,
+    /// 含 field9/TextEmu 门面)烧 Bot 周池;cli 身份(clidrv/wire)烧月池(auto/api)。
+    /// 缺省不钉 = 混合(推理面为主,驱动级故障兜底 clidrv)。
+    /// `""` = 清除(回缺省);`"bot"` = 只走 sand 面,绝不跨池月池;
+    /// `"api"` = 只走 cli 身份,推理面整体跳过。其余值 400 —— fail-closed,
+    /// 与 `driver` 同一纪律(收下一个认不出的池名,读侧会当缺省混合处理,
+    /// 与 UI 显示不符)。
+    #[serde(default)]
+    pool: Option<String>,
 }
 
 /// `driver` 的写侧校验:`""` → `null`(清除 = 回默认 = InferenceService 直连);
@@ -255,6 +266,21 @@ fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
         other => Err(format!(
             "未知驱动形态 {other:?};只接受 \"inference\"(默认,InferenceService 直连)、\
              \"cli\"(退回 CLI 子进程)、\"wire\"(退回线协议)或 \"\"(清除,回默认)"
+        )),
+    }
+}
+
+/// `pool` 的写侧校验:`""` → `null`(清除 = 回缺省混合);`"bot"` → 只烧 Bot 周池;
+/// `"api"` → 只烧月池(auto/api)。其余一律拒绝(fail-closed,理由见
+/// [`UpdateAccountBody::pool`])。
+fn normalize_pool(raw: &str) -> Result<serde_json::Value, String> {
+    match raw.trim() {
+        "" => Ok(serde_json::Value::Null),
+        "bot" => Ok(serde_json::json!("bot")),
+        "api" => Ok(serde_json::json!("api")),
+        other => Err(format!(
+            "未知池钉 {other:?};只接受 \"bot\"(只走 Bot 周池)、\"api\"(只走月池 auto/api)\
+             或 \"\"(清除,回缺省混合)"
         )),
     }
 }
@@ -421,6 +447,9 @@ fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serd
         //(2026-09-03 起 = InferenceService 直连),统一吐 null;
         // 与 `gw-cursor` 读侧 `opt_str("driver")` 同口径。
         "driver": extra.get("driver").filter(|v| !v.is_null()).cloned().unwrap_or(serde_json::Value::Null),
+        // 池钉顶层回显(前端要能显示某号钉了哪个池、并高亮对应额度窗口)。
+        // 缺失/null = 缺省混合,统一吐 null;与 `gw-cursor` 读侧 `opt_str("pool")` 同口径。
+        "pool": extra.get("pool").filter(|v| !v.is_null()).cloned().unwrap_or(serde_json::Value::Null),
         "disabled": row.disabled,
         "extra": extra,
         "created_at": row.created_at,
@@ -1648,6 +1677,19 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
+    // 定点切换池钉(同上:增量 merge,绝不碰凭据)。`""` 写 null = 回缺省混合。
+    if let Some(raw) = &body.pool {
+        let pool_val = match normalize_pool(raw) {
+            Ok(v) => v,
+            Err(msg) => return api_error(StatusCode::BAD_REQUEST, &msg),
+        };
+        let delta = serde_json::json!({ "pool": pool_val }).to_string();
+        match st.store.merge_account_extra(&id, &delta) {
+            Ok(true) => {}
+            Ok(false) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
+            Err(e) => return internal_error(e),
+        }
+    }
     // 落库后 best-effort 捅所有 worker 立即同步(同 delete_account/import 的理由):
     // 否则启用/禁用/换组等改动要等 worker 自己最多 30s 的周期 sync 才生效,期间按号操作
     // (如导入对话框"编辑后立即验活")会误报"没有 worker 持有该账号"。
@@ -1658,6 +1700,7 @@ async fn update_account(
         || body.queue_enabled.is_some()
         || body.model_allowlist.is_some()
         || body.driver.is_some()
+        || body.pool.is_some()
     {
         poke_workers_sync(&st).await;
     }
@@ -2650,6 +2693,121 @@ mod tests {
         let row = store.get_account("acc1").unwrap().unwrap();
         assert!(row.extra.contains(r#""driver":null"#), "清除应写 null: {}", row.extra);
         assert!(row.extra.contains("tok-secret"), "清除驱动不得动凭据");
+    }
+
+    /// 池钉定点切换:设 `bot`/`api` → 落库 + 顶层回显;`""` → 写 null 回缺省混合;
+    /// 认不出的值整单 400 且库内不动(fail-closed,与 driver 同一纪律)。
+    /// 全程不得碰凭据。
+    #[tokio::test]
+    async fn update_pool_sets_clears_and_rejects_unknown() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .create_account("acc1", "G0", "cursor", 2, r#"{"access_token":"tok-secret"}"#)
+            .unwrap();
+
+        // 设 bot。
+        let body = serde_json::json!({"pool": "bot"}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view: serde_json::Value = json_body(resp).await;
+        assert_eq!(view["pool"], serde_json::json!("bot"), "顶层应回显 bot: {view}");
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""pool":"bot""#), "应落库: {}", row.extra);
+        assert!(row.extra.contains("tok-secret"), "凭据不得被定点合并冲掉");
+
+        // 认不出的池名:400,库内不动。
+        for bad in ["BOT", "auto", "monthly", "sand"] {
+            let body = serde_json::json!({ "pool": bad }).to_string();
+            let resp = app
+                .clone()
+                .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?} 的判定与预期不符");
+        }
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""pool":"bot""#), "被拒后库内值必须不动: {}", row.extra);
+
+        // api 合法,落库。
+        let body = serde_json::json!({"pool": " api "}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "前后空白应被 trim 收下");
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""pool":"api""#), "api 应落库: {}", row.extra);
+
+        // 清除:空串 → null(读侧与缺失同义 = 缺省混合)。
+        let body = serde_json::json!({"pool": ""}).to_string();
+        let resp = app
+            .clone()
+            .oneshot(req("PATCH", "/accounts/acc1", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view: serde_json::Value = json_body(resp).await;
+        assert!(view["pool"].is_null(), "清除后顶层应回 null: {view}");
+        let row = store.get_account("acc1").unwrap().unwrap();
+        assert!(row.extra.contains(r#""pool":null"#), "清除应写 null: {}", row.extra);
+        assert!(row.extra.contains("tok-secret"), "清除池钉不得动凭据");
+    }
+
+    #[test]
+    fn normalize_pool_rules() {
+        assert_eq!(super::normalize_pool("").unwrap(), serde_json::Value::Null);
+        assert_eq!(super::normalize_pool("  ").unwrap(), serde_json::Value::Null);
+        assert_eq!(super::normalize_pool("bot").unwrap(), serde_json::json!("bot"));
+        assert_eq!(super::normalize_pool(" api ").unwrap(), serde_json::json!("api"));
+        assert!(super::normalize_pool("BOT").is_err(), "大小写不宽容:读侧只认小写");
+        assert!(super::normalize_pool("auto").is_err(), "auto 不是钉,是月池的一部分");
+        assert!(super::normalize_pool("sand").is_err(), "近义词也不收:读侧只认 bot/api");
+    }
+
+    /// 出口自动均衡只统计正常号:禁用(死)号不计入 —— 2026-09-07 毒 IP 事故回归:
+    /// 13129 上的号被封光后该出口在统计里显得"最空",新上的 4 个 kiro 号被自动
+    /// 均衡全分到毒 IP,瞬间全灭。
+    #[tokio::test]
+    async fn egress_assigner_skips_disabled_accounts() {
+        let (_app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        store
+            .upsert_settings(r#"{"egress_pool":["http://egress-a","http://egress-b"]}"#)
+            .unwrap();
+        // 两个死号堆在 A,一个正常号在 B。
+        store
+            .create_account("dead-1", "G0", "kiro", 2, r#"{"proxy":"http://egress-a"}"#)
+            .unwrap();
+        store
+            .create_account("dead-2", "G0", "kiro", 2, r#"{"proxy":"http://egress-a"}"#)
+            .unwrap();
+        store
+            .create_account("live-1", "G0", "kiro", 2, r#"{"proxy":"http://egress-b"}"#)
+            .unwrap();
+        for id in ["dead-1", "dead-2"] {
+            store
+                .update_account(
+                    id,
+                    &gw_core::store::AccountPatch {
+                        disabled: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let mut a = super::EgressAssigner::from_settings(&store).unwrap();
+        // 若禁用号被计入:A=2 vs B=1 → 会分 B;只算正常号则 A=0 vs B=1 → 必须分 A。
+        assert_eq!(
+            a.next().as_deref(),
+            Some("http://egress-a"),
+            "禁用号必须不计入出口分布"
+        );
     }
 
     #[test]

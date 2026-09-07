@@ -149,6 +149,17 @@ export function AccountTableRow({
               {t('table.driverWire')}
             </Badge>
           )}
+          {/* 池钉徽章:bot/api 钉死后该号只烧对应的池,出问题时第二件要分辨的事。 */}
+          {row.pool === 'bot' && (
+            <Badge variant="muted" title={t('table.poolBotHint')}>
+              {t('table.poolBot')}
+            </Badge>
+          )}
+          {row.pool === 'api' && (
+            <Badge variant="muted" title={t('table.poolApiHint')}>
+              {t('table.poolApi')}
+            </Badge>
+          )}
         </span>
       </TD>
 
@@ -229,8 +240,20 @@ export function AccountTableRow({
                     {quota.windows.map((w, i) => (
                       <span key={w.label}>
                         {i > 0 && <span className="text-muted-foreground"> · </span>}
-                        <span className="text-muted-foreground">{w.label} </span>
-                        <span className={cn(w.percent_used >= 90 && 'text-destructive')}>
+                        <span
+                          className={cn(
+                            'text-muted-foreground',
+                            row.pool === w.label && 'font-semibold text-foreground',
+                          )}
+                        >
+                          {w.label}{' '}
+                        </span>
+                        <span
+                          className={cn(
+                            w.percent_used >= 90 && 'text-destructive',
+                            row.pool === w.label && 'font-semibold text-foreground',
+                          )}
+                        >
                           {Math.round(w.percent_used)}%
                         </span>
                       </span>
@@ -254,9 +277,22 @@ export function AccountTableRow({
                   {quota.windows.map((w, i) => (
                     <span key={w.label}>
                       {i > 0 && <span className="text-muted-foreground"> · </span>}
-                      <span className="text-muted-foreground">{w.label} </span>
+                      {/* 池钉高亮:该号钉了哪个池(bot/api),对应窗口加粗提亮,
+                          双池号一眼看出用量该看哪条。 */}
                       <span
-                        className={cn('font-medium', w.percent_used >= 90 && 'text-destructive')}
+                        className={cn(
+                          'text-muted-foreground',
+                          row.pool === w.label && 'font-semibold text-foreground',
+                        )}
+                      >
+                        {w.label}{' '}
+                      </span>
+                      <span
+                        className={cn(
+                          'font-medium',
+                          w.percent_used >= 90 && 'text-destructive',
+                          row.pool === w.label && 'font-semibold text-foreground',
+                        )}
                       >
                         {Math.round(w.percent_used)}%
                       </span>

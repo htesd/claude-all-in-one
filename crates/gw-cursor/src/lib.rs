@@ -1913,6 +1913,25 @@ impl Provider for CursorProvider {
             effective_driver.is_none() || effective_driver == Some("inference");
         let wire_opt_out = effective_driver == Some("wire");
         let explicit_cli = effective_driver == Some("cli");
+        // 池钉(2026-09-07):一个 cursor 号有两个池能服务第三方模型 ——
+        // sand 身份(整条 InferenceService 面,含 field9/TextEmu 门面)烧 **Bot 周池**;
+        // cli 身份(clidrv 子进程 / wire 线协议)烧 **月池**(auto/api)。缺省不钉 =
+        // 现状混合(推理面为主、驱动级故障落 clidrv)。钉死后**绝不跨池**:
+        // - `extra.pool="bot"`:只走 sand 面。门面未覆盖的 tools 形态、形态门控
+        //   回落、驱动级故障兜底一律禁用 —— 那些路径会静默烧到月池。
+        // - `extra.pool="api"`:只走 cli 身份,推理面整体跳过(语义等同
+        //   driver="cli",但表达的是池不是实现;将来月池侧有了纯协议面可无缝换)。
+        // 冲突口径:显式 driver 闸(cli/wire/CURSOR_DRIVER)是回滚命门,压过池钉;
+        // 同号同时钉 bot 又退 cli/wire 属操作失误,打 warn 提醒。
+        let pool_pin = Self::opt_str(&ctx.account, "pool");
+        let pool_bot = pool_pin.as_deref() == Some("bot");
+        let pool_api = pool_pin.as_deref() == Some("api");
+        if pool_bot && (explicit_cli || wire_opt_out) {
+            tracing::warn!(
+                account = %ctx.account.account_id,
+                "账号钉了 pool=bot 却又设了 cli/wire 驱动闸:driver 优先生效,池钉实际失效"
+            );
+        }
         // 2026-09-04:带 tools 的请求默认**不再进 clidrv** —— 线协议 CLI 面已能用
         // 帧0 `1.4` 的 mcp_tools 目录广告工具(探针实证模型按裸名回调),
         // tool_result 轮落 IDE 形态全量重铺,整条工具回路纯协议化。
@@ -1920,9 +1939,37 @@ impl Provider for CursorProvider {
         // 那是协议面出问题时的回滚闸。
         let req_has_tools = !chat::to_tools(&req.body).is_empty();
         // inference 不接的形态(URL 媒体等)落回 CLI;`cli_eligible` 是 CLI 的硬前提
-        //(assistant 结尾这类形态 CLI 接不了,回线协议)。
-        let cli_driver =
-            !wire_opt_out && chat::cli_eligible(&req.body) && (explicit_cli || !req_has_tools);
+        //(assistant 结尾这类形态 CLI 接不了,回线协议)。pool=api 钉月池:与显式
+        // driver="cli" 同待遇,推理面整体跳过(见上方池钉注释)。
+        let cli_driver = !wire_opt_out
+            && chat::cli_eligible(&req.body)
+            && (explicit_cli || pool_api || !req_has_tools);
+
+        // pool=bot 的「绝不跨池」闸:凡进不了 sand 推理面的请求,**不许**顺着
+        // cli/wire 兜底烧到月池。两种进不去的情形分别处置:
+        // - 形态本身推理面接不了(URL 媒体/超预算附件):请求级问题,BadRequest
+        //   明说,不惩罚账号;
+        // - 带 tools 但门面未覆盖(门面开关被关、或 grok/claude/composer 之外的
+        //   模型带工具):记 (号,模型) 不可用交调度层换号 —— 这号此刻确实服务
+        //   不了这个模型,语义与上游 INVALID_MODEL_ID 一致。
+        if pool_bot && inference_driver {
+            if !inference::inference_eligible(&req.body) {
+                return Err(UpstreamError::bad_request_visible(
+                    "cursor: 该账号已钉 pool=bot(只走 Bot 周池),而本请求形态推理面接不了;\
+                     请改走未钉池的账号或调整请求形态",
+                ));
+            }
+            if inference::tools_skip_inference(&req.model, &req.body) {
+                return Err(UpstreamError::new(
+                    UpstreamErrorKind::ModelNotAvailable,
+                    format!(
+                        "cursor: 账号已钉 pool=bot,而模型 {:?} 带工具的请求没有对应门面,\
+                         只能烧月池 —— 已拒绝跨池,请换号或开门面",
+                        req.model
+                    ),
+                ));
+            }
+        }
 
         let machine_id = Self::machine_id_of(&ctx.account, &token);
         let mac_machine_id = Self::mac_machine_id_of(&ctx.account, &token);
@@ -1934,6 +1981,7 @@ impl Provider for CursorProvider {
         // 挡掉的回退 cli/wire。tools_skip_inference:带 tools 的非 composer 请求
         // 平台侧必拒(2026-09-04 定论,见 inference.rs),直接绕行 clidrv。
         if inference_driver
+            && !pool_api
             && inference::inference_eligible(&req.body)
             && !inference::tools_skip_inference(&req.model, &req.body)
         {
@@ -1962,7 +2010,9 @@ impl Provider for CursorProvider {
                     // CLI 接不了的形态)继续走 wire —— 不能在这里直接 return Err,
                     // 否则 prefill 请求的兜底链被掐断(codex 二轮 M1)。(执行到这里
                     // 必然不是 wire_opt_out —— 那条路在前面就不进 inference 分支。)
-                    if !driver_level {
+                    // pool=bot 例外:兜底链是 cli 身份、烧月池,钉了 bot 池的号
+                    // 宁可把错误交回调度层换号,也绝不跨池。
+                    if !driver_level || pool_bot {
                         return Err(e);
                     }
                     tracing::warn!(

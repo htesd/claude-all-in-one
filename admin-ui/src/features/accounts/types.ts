@@ -63,6 +63,15 @@ export interface AccountRow {
    * 旧缓存响应可能缺失 → 视为线协议。
    */
   driver?: string | null
+  /**
+   * 池钉（`extra.pool`，后端顶层回显）。
+   * - `'bot'` = 只走 sand 身份（InferenceService 面，含门面），只烧 Bot 周池
+   * - `'api'` = 只走 cli 身份（clidrv/wire），只烧月池（auto/api）
+   * - null / 缺失 = 缺省混合（推理面为主，驱动级故障兜底 clidrv）
+   *
+   * **只对 cursor 家族有意义**。旧缓存响应可能缺失 → 视为缺省混合。
+   */
+  pool?: string | null
 }
 
 /** POST /accounts 请求体（注意：这里的分组字段叫 `group`，PATCH 才是 `group_name`）。 */
@@ -118,6 +127,14 @@ export interface UpdateAccountPayload {
    * 走后端定点合并，绝不碰凭据；认不出的值后端 400。
    */
   driver?: string
+  /**
+   * 池钉（cursor 专用）。
+   * - `'bot'` = 只烧 Bot 周池；`'api'` = 只烧月池（auto/api）
+   * - 空字符串 `""` = 清除（回缺省混合）
+   * - 不传 = 不动
+   * 走后端定点合并，绝不碰凭据；认不出的值后端 400。
+   */
+  pool?: string
 }
 
 /** worker 侧账号不可用原因枚举（'' = 无）。 */
