@@ -580,11 +580,14 @@ pub fn builtin_tool_ident(payload: &[u8]) -> Option<u32> {
     })
 }
 
-/// 一次**已实证**的内建工具调用(§13.2 抓包:`.1` 终端命令、`.4` 读文件)。
+/// 一次**已实证**的内建工具调用(§13.2 抓包:`.1` 终端命令、`.4` 读文件;
+/// 2026-09-06 `CURSOR_DUMP_TOOL_FRAMES` 生产形态实证:`.12` 写文件)。
 ///
-/// 只为这两个存在:它们是收口日志里的绝对大头,且参数字段号有实物依据
+/// 只为这三个存在:它们是收口日志里的绝对大头,且参数字段号有实物依据
 /// (`.1` = `{1:{1:'ls -la', 3:超时, 5:'ls', 8:argv, 15:描述}}`,
-///  `.4` = `{1:{2:'README'}}`)。其余内建身份(代码检索、网页搜索…)参数形状
+///  `.4` = `{1:{2:'README'}}`,
+///  `.12` = `{1:{1:路径, 6:完整内容}}`,两枚实物帧交叉验证一致)。
+/// 其余内建身份(代码检索、网页搜索…)参数形状
 /// 未实证,**不猜** —— 翻译错比收口更糟:客户端会执行一个参数张冠李戴的工具。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuiltinCall {
@@ -592,12 +595,25 @@ pub enum BuiltinCall {
     Terminal { id: String, command: String },
     /// `1.2.2.4`:读文件,路径在 `.1.2`。
     ReadFile { id: String, path: String },
+    /// `1.2.2.12`:写文件,路径在 `.12.1.1`,完整内容在 `.12.1.6`。
+    ///
+    /// grok 系模型在协议模式下执念调它(思考里叫它大写 `Write`):不走我们广告的
+    /// MCP 目录,而是抓 Cursor 内建的写文件工具。调了它就**整段 HTML 被吞、
+    /// 客户端只收到 end_turn**(「说完『正在写入』就停」的生产病根)。
+    WriteFile {
+        id: String,
+        path: String,
+        content: String,
+    },
+    /// `1.2.2.37`:网页抓取,URL 在 `.37.1.1`(`.37.1.2` 是 call id 回显)。
+    /// 2026-09-06 e2e 实物帧实证(抓取 news.ycombinator.com 的内建调用)。
+    WebFetch { id: String, url: String },
 }
 
 /// 解一帧**内建**工具调用的参数(chat.rs 兼容转换层用)。
 ///
 /// 与 [`builtin_tool_ident`] 同源(同一个 detail 块),但只认参数形状有抓包
-/// 实证的 `.1` / `.4`;参数缺失或为空一律 `None`,让调用方落回收口 ——
+/// 实证的 `.1` / `.4` / `.12` / `.37`;参数缺失或为空一律 `None`,让调用方落回收口 ——
 /// 转换层的失败必须是单向的(认不出 → 维持原行为),绝不输出错参数的调用。
 pub fn parse_builtin_call(payload: &[u8]) -> Option<BuiltinCall> {
     // ⚠️ 只认 `1.2`(RESP_MESSAGE → 工具通道)的包装形态,与 parse_tool_call 同款。
@@ -654,6 +670,53 @@ pub fn parse_builtin_call(payload: &[u8]) -> Option<BuiltinCall> {
                     return None;
                 }
                 return Some(BuiltinCall::ReadFile { id, path });
+            }
+            // 写文件:`.12.1.1` = 路径,`.12.1.6` = 完整内容(2026-09-06 两枚
+            // CURSOR_DUMP_TOOL_FRAMES 实物帧,字段号与包装层级完全一致)。
+            // 路径空 = 认不出,落回收口(单向失败);内容允许空串(写空文件合法),
+            // 但字段必须**在** —— 缺字段说明形状漂移,不能猜。
+            // 两字段都**严格 UTF-8**(codex 评审:lossy 会让非法字节变成替换符
+            // 照样下发 = 参数被悄悄改写,违背转换层「绝不输出错参数」的红线);
+            // 不是合法 UTF-8 的内容多半是二进制写,本就不该翻成文本写工具。
+            12 => {
+                let inner = Reader::new(body).find_map(|(f2, v2)| match (f2, v2) {
+                    (1, PbValue::Len(s)) => Some(s),
+                    _ => None,
+                })?;
+                let mut path = None;
+                let mut content = None;
+                for (f3, v3) in Reader::new(inner) {
+                    match (f3, v3) {
+                        (1, PbValue::Len(s)) => {
+                            path = std::str::from_utf8(s).ok().map(str::to_owned)
+                        }
+                        (6, PbValue::Len(s)) => {
+                            content = std::str::from_utf8(s).ok().map(str::to_owned)
+                        }
+                        _ => {}
+                    }
+                }
+                let path = path.filter(|p| !p.trim().is_empty())?;
+                let content = content?;
+                return Some(BuiltinCall::WriteFile { id, path, content });
+            }
+            // 网页抓取:`.37.1.1` = URL(2026-09-06 e2e 实物帧,
+            // `.37.1.2` 是同帧的 call id 回显,不是参数)。URL 空 → None(单向失败)。
+            37 => {
+                let inner = Reader::new(body).find_map(|(f2, v2)| match (f2, v2) {
+                    (1, PbValue::Len(s)) => Some(s),
+                    _ => None,
+                })?;
+                let url = Reader::new(inner).find_map(|(f3, v3)| match (f3, v3) {
+                    (1, PbValue::Len(s)) => {
+                        std::str::from_utf8(s).ok().map(str::to_owned)
+                    }
+                    _ => None,
+                })?;
+                if url.trim().is_empty() {
+                    return None;
+                }
+                return Some(BuiltinCall::WebFetch { id, url });
             }
             _ => {}
         }
@@ -3508,6 +3571,117 @@ mod tests {
                 path: "/tmp/a.png".into()
             })
         );
+    }
+
+    /// 内建写文件帧(2026-09-06 实物帧实证 `.12 = {1:{1:路径, 6:完整内容}}`,
+    /// 两枚 CURSOR_DUMP_TOOL_FRAMES 落盘样本交叉一致)。
+    #[test]
+    fn 内建写文件帧解出路径与内容() {
+        let mut wr = Writer::new();
+        wr.string(1, "/tmp/news.html");
+        wr.string(6, "<!DOCTYPE html><html></html>");
+        let mut one = Writer::new();
+        one.message(1, &wr);
+        let mut detail = Writer::new();
+        detail.message(12, &one); // 1.2.2.12 = 写文件
+        let mut ch = Writer::new();
+        ch.string(TC_CALL_ID, "call-w-0");
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        let f = outer.into_bytes();
+        assert!(is_tool_call(&f));
+        assert!(parse_tool_call(&f).is_none(), "内建写不能当成外部工具");
+        assert_eq!(builtin_tool_ident(&f), Some(12));
+        assert_eq!(
+            parse_builtin_call(&f),
+            Some(BuiltinCall::WriteFile {
+                id: "call-w-0".into(),
+                path: "/tmp/news.html".into(),
+                content: "<!DOCTYPE html><html></html>".into()
+            })
+        );
+    }
+
+    /// 内建写文件的边界:路径空 / 内容字段缺失 → None(落回收口,单向失败)。
+    /// 内容空串但字段在 = 合法(写空文件)。
+    #[test]
+    fn 内建写文件帧的边界() {
+        let build = |path: &str, content: Option<&str>| {
+            let mut wr = Writer::new();
+            wr.string(1, path);
+            if let Some(c) = content {
+                wr.string(6, c);
+            }
+            let mut one = Writer::new();
+            one.message(1, &wr);
+            let mut detail = Writer::new();
+            detail.message(12, &one);
+            let mut ch = Writer::new();
+            ch.message(TC_DETAIL, &detail);
+            let mut msg = Writer::new();
+            msg.message(RESP_TOOL_CHANNEL, &ch);
+            let mut outer = Writer::new();
+            outer.message(RESP_MESSAGE, &msg);
+            outer.into_bytes()
+        };
+        assert_eq!(parse_builtin_call(&build("  ", Some("x"))), None, "空路径不收");
+        assert_eq!(parse_builtin_call(&build("/tmp/a", None)), None, "缺内容字段不收");
+        assert_eq!(
+            parse_builtin_call(&build("/tmp/a", Some(""))),
+            Some(BuiltinCall::WriteFile {
+                id: String::new(),
+                path: "/tmp/a".into(),
+                content: String::new()
+            }),
+            "空内容合法(写空文件)"
+        );
+    }
+
+    /// 内建网页抓取帧(2026-09-06 e2e 实物帧实证 `.37 = {1:{1:URL, 2:call id 回显}}`)。
+    #[test]
+    fn 内建网页抓取帧解出_url() {
+        let mut wf = Writer::new();
+        wf.string(1, "https://news.ycombinator.com");
+        wf.string(2, "call-f-0\nfc_echo_0"); // call id 回显,不是参数
+        let mut one = Writer::new();
+        one.message(1, &wf);
+        let mut detail = Writer::new();
+        detail.message(37, &one); // 1.2.2.37 = 网页抓取
+        let mut ch = Writer::new();
+        ch.string(TC_CALL_ID, "call-f-0");
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        let f = outer.into_bytes();
+        assert!(is_tool_call(&f));
+        assert!(parse_tool_call(&f).is_none());
+        assert_eq!(builtin_tool_ident(&f), Some(37));
+        assert_eq!(
+            parse_builtin_call(&f),
+            Some(BuiltinCall::WebFetch {
+                id: "call-f-0".into(),
+                url: "https://news.ycombinator.com".into()
+            })
+        );
+        // 空 URL → None(单向失败)。
+        let mut wf = Writer::new();
+        wf.string(1, "  ");
+        let mut one = Writer::new();
+        one.message(1, &wf);
+        let mut detail = Writer::new();
+        detail.message(37, &one);
+        let mut ch = Writer::new();
+        ch.message(TC_DETAIL, &detail);
+        let mut msg = Writer::new();
+        msg.message(RESP_TOOL_CHANNEL, &ch);
+        let mut outer = Writer::new();
+        outer.message(RESP_MESSAGE, &msg);
+        assert_eq!(parse_builtin_call(&outer.into_bytes()), None);
     }
 
     /// 边界钉死:外部工具帧、exec 资产帧(顶层 field 2)、空命令都不许被

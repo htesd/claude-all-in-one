@@ -154,6 +154,12 @@ impl WireDriver {
         self.draining = true;
     }
 
+    /// 退出排水段(2026-09-06):turn_commit 被证明提前(排水段里来了工具调用帧)
+    /// 时调用 —— 轮次其实还在跑,后续供给重新计入本轮 verdict。
+    pub fn clear_draining(&mut self) {
+        self.draining = false;
+    }
+
     /// **主段**被点名数(进本轮 verdict)。
     pub fn demanded(&self) -> usize {
         self.demanded_total

@@ -857,8 +857,9 @@ fn capability_redirects(tools: &[run::ToolDef]) -> Vec<(&'static str, String)> {
 
 /// 内建工具调用帧 → 它想要的**能力说法**(与 [`capability_redirects`] 的 key 同一套词)。
 ///
-/// 身份是字段号(见 [`run::builtin_tool_ident`]),只有抓包实证过的两个认得出:
-/// `.1` 终端命令、`.4` 读文件。其余返回 `None` —— 那意味着「知道模型调了内建工具、
+/// 身份是字段号(见 [`run::builtin_tool_ident`]),只有抓包实证过的三个认得出:
+/// `.1` 终端命令、`.4` 读文件、`.12` 写文件(2026-09-06 实物帧,见
+/// [`run::BuiltinCall::WriteFile`])。其余返回 `None` —— 那意味着「知道模型调了内建工具、
 /// 但不知道调的是哪个」,此时纠偏只能给通用话术,不能指名工具。
 ///
 /// ⚠️ 不要凭字段号相邻就往上加映射。猜错的后果是下一轮纠偏对着模型说
@@ -868,6 +869,10 @@ fn builtin_capability(payload: &[u8]) -> Option<&'static str> {
     match run::builtin_tool_ident(payload)? {
         1 => Some("跑命令/终端"),
         4 => Some("读文件"),
+        // `.12` 写文件:2026-09-06 实物帧实证(见 run::BuiltinCall::WriteFile)。
+        12 => Some("写/改文件"),
+        // `.37` 网页抓取:2026-09-06 e2e 实物帧实证(见 run::BuiltinCall::WebFetch)。
+        37 => Some("查网页"),
         _ => None,
     }
 }
@@ -893,6 +898,29 @@ struct BuiltinXlate {
     read_file: Option<(String, String)>,
     /// write 别名:调用方只声明了编辑类工具时的补位(见 [`WriteAlias`])。
     write_alias: Option<WriteAlias>,
+    /// 内建写文件(`.12`)的落点(2026-09-06 实物帧实证后新增)。
+    write_file: Option<WriteFileTarget>,
+    /// 内建网页抓取(`.37`)→ `(声明工具裸名, URL 键名)`,如 `("webfetch", "url")`。
+    web_fetch: Option<(String, String)>,
+}
+
+/// 内建写文件调用的翻译落点。
+///
+/// 与终端/读文件的单参数不同,写文件是**双参数**(路径 + 完整内容),所以
+/// 单列一档:
+/// - 调用方有写文件工具(write/Write/write_file…)→ 直接映射,键名从其
+///   schema 认(opencode 是 `filePath`/`content`,Claude Code 是 `file_path`/`content`);
+/// - 调用方只有编辑类工具 → 借 [`WriteAlias`] 的旧串置空语义(= 整文件覆写),
+///   与广告侧的 `write` 补位同一逻辑。
+#[derive(Debug, Clone)]
+enum WriteFileTarget {
+    /// `(工具裸名, 路径键, 内容键)`。
+    Direct {
+        name: String,
+        path_key: String,
+        content_key: String,
+    },
+    Alias(WriteAlias),
 }
 
 /// write 别名(2026-09-04 生产+本地多次实证)。
@@ -994,10 +1022,10 @@ impl BuiltinXlate {
         // 但有编辑类工具时补位。键名从编辑工具的 schema 认,认不齐就不补
         // (猜键名 = 参数张冠李戴,比不补糟)。
         const WRITE_FAMILY: &[&str] = &["write", "write_file", "writefile"];
-        let has_write = tools
+        let write_tool = tools
             .iter()
-            .any(|t| WRITE_FAMILY.contains(&t.name.to_ascii_lowercase().as_str()));
-        let write_alias = if has_write {
+            .find(|t| WRITE_FAMILY.contains(&t.name.to_ascii_lowercase().as_str()));
+        let write_alias = if write_tool.is_some() {
             None
         } else {
             redirects
@@ -1026,6 +1054,37 @@ impl BuiltinXlate {
                     })
                 })
         };
+        // 内建写文件(`.12`)的落点:优先直译到调用方自己的写文件工具
+        // (键名从它的 schema 认,认不齐就放弃直译);没有写工具时借别名。
+        let write_file = match write_tool {
+            Some(def) => {
+                let schema: Option<Value> = serde_json::from_str(&def.schema).ok();
+                let props = schema
+                    .as_ref()
+                    .and_then(|s| s.get("properties"))
+                    .and_then(Value::as_object);
+                let pick = |keys: &[&str]| {
+                    props.and_then(|p| {
+                        keys.iter()
+                            .find(|k| p.contains_key(**k))
+                            .map(|k| (*k).to_string())
+                    })
+                };
+                match (
+                    pick(&["filePath", "file_path", "path", "target_file", "absolute_path"]),
+                    pick(&["content", "newString", "new_string", "text", "contents"]),
+                ) {
+                    (Some(path_key), Some(content_key)) => Some(WriteFileTarget::Direct {
+                        name: def.name.clone(),
+                        path_key,
+                        content_key,
+                    }),
+                    // schema 认不齐键名:不猜,内建写维持收口(单向失败)。
+                    _ => None,
+                }
+            }
+            None => write_alias.clone().map(WriteFileTarget::Alias),
+        };
         BuiltinXlate {
             terminal: find("跑命令/终端", &["command", "cmd", "script"]),
             read_file: find(
@@ -1039,6 +1098,8 @@ impl BuiltinXlate {
                 ],
             ),
             write_alias,
+            write_file,
+            web_fetch: find("查网页", &["url", "uri", "link", "href"]),
         }
     }
 }
@@ -1046,28 +1107,67 @@ impl BuiltinXlate {
 /// 把一次已解出参数的内建调用翻译成调用方工具的 [`run::ToolCall`]。
 /// 转换表里没有对应工具 → `None`(调用方落回收口 + 纠偏)。
 fn translate_builtin(bc: run::BuiltinCall, x: &BuiltinXlate) -> Option<run::ToolCall> {
-    let (id, name, key, val) = match bc {
+    // 空 id 兜底与 parse_tool_call 同款:我方从不把 call id 发回上游
+    // (每轮都是全新的 Opening 请求),合成是安全的。
+    let mkid = |id: String| {
+        if id.trim().is_empty() {
+            format!("call_{}", uuid::Uuid::new_v4().simple())
+        } else {
+            id
+        }
+    };
+    match bc {
         run::BuiltinCall::Terminal { id, command } => {
             let (name, key) = x.terminal.clone()?;
-            (id, name, key, command)
+            Some(run::ToolCall {
+                id: mkid(id),
+                name,
+                args: vec![(key, Value::String(command))],
+            })
         }
         run::BuiltinCall::ReadFile { id, path } => {
             let (name, key) = x.read_file.clone()?;
-            (id, name, key, path)
+            Some(run::ToolCall {
+                id: mkid(id),
+                name,
+                args: vec![(key, Value::String(path))],
+            })
         }
-    };
-    // 空 id 兜底与 parse_tool_call 同款:我方从不把 call id 发回上游
-    // (每轮都是全新的 Opening 请求),合成是安全的。
-    let id = if id.trim().is_empty() {
-        format!("call_{}", uuid::Uuid::new_v4().simple())
-    } else {
-        id
-    };
-    Some(run::ToolCall {
-        id,
-        name,
-        args: vec![(key, Value::String(val))],
-    })
+        // 内建网页抓取(`.37`):单 URL 参数。
+        run::BuiltinCall::WebFetch { id, url } => {
+            let (name, key) = x.web_fetch.clone()?;
+            Some(run::ToolCall {
+                id: mkid(id),
+                name,
+                args: vec![(key, Value::String(url))],
+            })
+        }
+        // 内建写文件(`.12`):双参数(路径 + 完整内容),整文件覆写语义。
+        run::BuiltinCall::WriteFile { id, path, content } => match x.write_file.as_ref()? {
+            WriteFileTarget::Direct {
+                name,
+                path_key,
+                content_key,
+            } => Some(run::ToolCall {
+                id: mkid(id),
+                name: name.clone(),
+                args: vec![
+                    (path_key.clone(), Value::String(path)),
+                    (content_key.clone(), Value::String(content)),
+                ],
+            }),
+            // 借别名的旧串置空翻译:喂给它约定的 `path`/`content` 键,
+            // 由它折成目标编辑工具的 (path_key, old="", new=content)。
+            WriteFileTarget::Alias(a) => Some(a.translate(run::ToolCall {
+                id: mkid(id),
+                name: WRITE_ALIAS_NAME.to_string(),
+                args: vec![
+                    ("path".to_string(), Value::String(path)),
+                    ("content".to_string(), Value::String(content)),
+                ],
+            })),
+        },
+    }
 }
 
 /// 上一轮被内建工具截断时,注入本轮用户消息的纠偏话术。
@@ -2596,7 +2696,7 @@ fn trailer_to_error(e: &run::TrailerError) -> UpstreamError {
 /// call id 发回 Cursor(每轮都是全新的 Opening 请求,上一轮的 call id 被丢弃);
 /// 将来真要走请求侧 `field 2` 工具通道回传结果,那里必须用 `ToolCall::id` 的**原值**,
 /// 不能用这里这个。
-fn client_tool_id(raw: &str) -> String {
+pub(crate) fn client_tool_id(raw: &str) -> String {
     raw.split(['\n', '\r'])
         .next()
         .unwrap_or(raw)
@@ -3074,20 +3174,42 @@ fn stream_to_anthropic(
                 // 在 turn_commit 就收尾,这些尾帧本来不会被处理 —— 排水段是纯
                 // 观测附加段,它的存在不得改变轮次的任何外部表现。
                 if draining {
-                    // ⚠️ 排水段只认「有意义的帧」作进展(codex 评审 P2,2026-09-04
-                    // pi 卡死案):心跳/状态帧/未知回显每 10s 一个,把它们算进展
-                    // 会让停滞闸永不开火,挂死流最后由 gw-app 300s 硬上限代收 ——
-                    // 客户端干等 5 分钟。有意义的口径:描述符 `.3`、正文/思考/用量
-                    // (KV 效果的刷新在上方 driver 分支已做)。真尾帧 1~2s 内到齐,
-                    // 收紧后由 [`DRAIN_STALL_TIMEOUT`] 快速收口。
-                    if run::descriptor_field3(&payload).is_some()
-                        || !fr.text.is_empty()
-                        || !fr.thinking.is_empty()
-                        || fr.usage.is_some()
-                    {
-                        last_progress = std::time::Instant::now();
+                    // ⚠️ **排水段里来工具调用帧 = 之前的 turn_commit 是提前的**
+                    // (误匹配或上游乱序;2026-09-06 e2e 实证:commit 后 367B 内建
+                    // 抓取帧被排水段吞掉,opencode 新闻任务整轮空转)。commit 不是尾、
+                    // 工具调用才是 —— 退出排水段,让这一帧落回下方正常状态机。
+                    // commit 段暂存的描述符同属「未完结轮次的中间态」,一并撤掉
+                    // (与 codex 终审#1「commit 前的 .3 不作数」同一条规则)。
+                    if run::is_tool_call(&payload) {
+                        tracing::warn!(
+                            conversation_id = %conversation_id,
+                            bytes = payload.len(),
+                            "cursor Run:排水段遇到工具调用帧,turn_commit 提前 —— 退出排水段恢复正常处理"
+                        );
+                        draining = false;
+                        saw_end = false;
+                        shadow_staged = None;
+                        wire_saw_desc = false;
+                        if let Some(d) = wire_driver.as_mut() {
+                            d.clear_draining();
+                        }
+                        // 不落 continue:继续走下方正常处理(工具调用臂会认出它)。
+                    } else {
+                        // ⚠️ 排水段只认「有意义的帧」作进展(codex 评审 P2,2026-09-04
+                        // pi 卡死案):心跳/状态帧/未知回显每 10s 一个,把它们算进展
+                        // 会让停滞闸永不开火,挂死流最后由 gw-app 300s 硬上限代收 ——
+                        // 客户端干等 5 分钟。有意义的口径:描述符 `.3`、正文/思考/用量
+                        // (KV 效果的刷新在上方 driver 分支已做)。真尾帧 1~2s 内到齐,
+                        // 收紧后由 [`DRAIN_STALL_TIMEOUT`] 快速收口。
+                        if run::descriptor_field3(&payload).is_some()
+                            || !fr.text.is_empty()
+                            || !fr.thinking.is_empty()
+                            || fr.usage.is_some()
+                        {
+                            last_progress = std::time::Instant::now();
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 // ⚠️ **用量必须最后判。** 「一帧只装一样东西」只是对抓包的观察,
@@ -5269,6 +5391,8 @@ mod tests {
             terminal: Some(("Bash".into(), "command".into())),
             read_file: None,
             write_alias: None,
+            write_file: None,
+            web_fetch: None,
         };
         let tc = translate_builtin(
             run::BuiltinCall::Terminal {
@@ -5306,6 +5430,110 @@ mod tests {
         );
     }
 
+    /// 内建写文件(`.12`)的翻译:调用方有写工具 → 直译(键名认自 schema);
+    /// 只有编辑工具 → 借 write 别名(旧串置空);schema 认不齐 → None(收口)。
+    #[test]
+    fn 内建写文件的翻译落点() {
+        let bc = || run::BuiltinCall::WriteFile {
+            id: "call-w-9".into(),
+            path: "/tmp/news.html".into(),
+            content: "<html>…</html>".into(),
+        };
+        let get = |tc: &run::ToolCall, k: &str| {
+            tc.args.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+        };
+
+        // opencode 形态:有 write(filePath/content) → 直译。
+        let tools = vec![tool_with_schema(
+            "write",
+            r#"{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}}}"#,
+        )];
+        let x = BuiltinXlate::from_tools(&tools);
+        let tc = translate_builtin(bc(), &x).expect("有写工具必须直译");
+        assert_eq!(tc.name, "write");
+        assert_eq!(tc.id, "call-w-9");
+        assert_eq!(get(&tc, "filePath"), Some(json!("/tmp/news.html")));
+        assert_eq!(get(&tc, "content"), Some(json!("<html>…</html>")));
+
+        // Claude Code 形态:Write(file_path/content) → 大小写不敏感命中 write 家族。
+        let tools = vec![tool_with_schema(
+            "Write",
+            r#"{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}"#,
+        )];
+        let x = BuiltinXlate::from_tools(&tools);
+        let tc = translate_builtin(bc(), &x).expect("Write 大写也要命中 write 家族");
+        assert_eq!(tc.name, "Write");
+        assert_eq!(get(&tc, "file_path"), Some(json!("/tmp/news.html")));
+
+        // 只有编辑工具 → 借 write 别名(旧串置空 = 整文件覆写)。
+        let edit_schema = r#"{"type":"object","properties":{
+            "filePath":{"type":"string"},
+            "oldString":{"type":"string"},
+            "newString":{"type":"string"}}}"#;
+        let tools = vec![tool_with_schema("edit", edit_schema)];
+        let x = BuiltinXlate::from_tools(&tools);
+        let tc = translate_builtin(bc(), &x).expect("有编辑工具必须借别名翻译");
+        assert_eq!(tc.name, "edit");
+        assert_eq!(get(&tc, "filePath"), Some(json!("/tmp/news.html")));
+        assert_eq!(get(&tc, "oldString"), Some(json!("")));
+        assert_eq!(get(&tc, "newString"), Some(json!("<html>…</html>")));
+
+        // 写工具 schema 认不齐键名 → None(不猜,落回收口)。
+        let tools = vec![tool_with_schema(
+            "write",
+            r#"{"type":"object","properties":{"mystery":{"type":"string"}}}"#,
+        )];
+        let x = BuiltinXlate::from_tools(&tools);
+        assert_eq!(translate_builtin(bc(), &x), None);
+
+        // 一个工具都没声明 → None。
+        assert_eq!(translate_builtin(bc(), &BuiltinXlate::default()), None);
+    }
+
+    /// 内建网页抓取(`.37`)的翻译:认出「查网页」能力工具 + URL 键名认自 schema。
+    #[test]
+    fn 内建网页抓取的翻译落点() {
+        let bc = || run::BuiltinCall::WebFetch {
+            id: "call-f-3".into(),
+            url: "https://example.com".into(),
+        };
+        let get = |tc: &run::ToolCall, k: &str| {
+            tc.args.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone())
+        };
+
+        // opencode 形态:webfetch(url)。
+        let tools = vec![tool_with_schema(
+            "webfetch",
+            r#"{"type":"object","properties":{"url":{"type":"string"},"format":{"type":"string"}}}"#,
+        )];
+        let x = BuiltinXlate::from_tools(&tools);
+        let tc = translate_builtin(bc(), &x).expect("有网页工具必须翻译");
+        assert_eq!(tc.name, "webfetch");
+        assert_eq!(tc.id, "call-f-3");
+        assert_eq!(get(&tc, "url"), Some(json!("https://example.com")));
+
+        // Claude Code 形态:WebFetch(url+prompt),大小写不敏感。
+        let tools = vec![tool_with_schema(
+            "WebFetch",
+            r#"{"type":"object","properties":{"url":{"type":"string"},"prompt":{"type":"string"}}}"#,
+        )];
+        let x = BuiltinXlate::from_tools(&tools);
+        let tc = translate_builtin(bc(), &x).expect("WebFetch 大写也要命中");
+        assert_eq!(tc.name, "WebFetch");
+        assert_eq!(get(&tc, "url"), Some(json!("https://example.com")));
+
+        // 网页工具 schema 没有 URL 键 → None(不猜)。
+        let tools = vec![tool_with_schema(
+            "webfetch",
+            r#"{"type":"object","properties":{"query":{"type":"string"}}}"#,
+        )];
+        let x = BuiltinXlate::from_tools(&tools);
+        assert_eq!(translate_builtin(bc(), &x), None);
+
+        // 没声明网页工具 → None(落回收口 + 纠偏)。
+        assert_eq!(translate_builtin(bc(), &BuiltinXlate::default()), None);
+    }
+
     /// 造一帧内建终端调用(`1.2.2.1.1.1` = 命令串,§13.2 抓包实证形状)。
     fn builtin_terminal_wire(command: &str) -> Vec<u8> {
         use crate::protobuf::Writer;
@@ -5337,6 +5565,8 @@ mod tests {
             terminal: Some(("Bash".into(), "command".into())),
             read_file: None,
             write_alias: None,
+            write_file: None,
+            web_fetch: None,
         };
         let out = stream_to_anthropic(
             futures::stream::iter(chunks),
@@ -5417,6 +5647,102 @@ mod tests {
         assert!(
             items.iter().any(|it| it.is_err()),
             "没有转换表时必须维持原收口行为(纠偏机制兜底)"
+        );
+    }
+
+    /// 造一帧内建写文件调用(`1.2.2.12.1.1` = 路径、`.6` = 完整内容,
+    /// 2026-09-06 实物帧实证形状)。
+    fn builtin_write_wire(path: &str, content: &str) -> Vec<u8> {
+        use crate::protobuf::Writer;
+        let mut wr = Writer::new();
+        wr.string(1, path);
+        wr.string(6, content);
+        let mut one = Writer::new();
+        one.message(1, &wr);
+        let mut detail = Writer::new();
+        detail.message(12, &one); // 1.2.2.12 = 内建写文件
+        let mut ch = Writer::new();
+        ch.string(1, "call-w-7");
+        ch.message(2, &detail);
+        let mut msg = Writer::new();
+        msg.message(2, &ch);
+        let mut outer = Writer::new();
+        outer.message(1, &msg);
+        outer.into_bytes()
+    }
+
+    /// 「说完正在写入就 end_turn」生产病根的回归锁:内建写文件帧必须
+    /// 翻译成调用方写工具的 tool_use 下发(参数 JSON 含路径与完整内容),
+    /// 而不是收口吞掉。
+    #[tokio::test]
+    async fn 内建写文件调用被翻译成_tool_use_下发() {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![Ok(bytes::Bytes::from(
+            wire::frame(&builtin_write_wire("/tmp/news.html", "<html>报纸</html>")),
+        ))];
+        let xlate = BuiltinXlate {
+            write_file: Some(WriteFileTarget::Direct {
+                name: "write".into(),
+                path_key: "filePath".into(),
+                content_key: "content".into(),
+            }),
+            ..Default::default()
+        };
+        let out = stream_to_anthropic(
+            futures::stream::iter(chunks),
+            "grok-4.6".into(),
+            false,
+            None,
+            None,
+            "conv-xlate-write".into(),
+            std::sync::Arc::new(crate::AssetStore::default()),
+            std::sync::Arc::new(crate::TruncationNotices::default()),
+            xlate,
+            ChatUsage {
+                input_tokens: 10,
+                ..Default::default()
+            },
+            0,
+            false, // cli_mode:测试默认 IDE 形态
+            None,  // upload:本用例不走 wire v2 上传腿
+            None,  // 本用例不关心影子捕获
+        );
+        use futures::StreamExt;
+        let items: Vec<_> = out.collect().await;
+        assert!(
+            !items.iter().any(|it| it.is_err()),
+            "翻译成功的内建写文件不许再报错收口"
+        );
+        let start = items
+            .iter()
+            .find_map(|it| match it {
+                Ok(StreamItem::Sse(e))
+                    if e.event == "content_block_start"
+                        && e.data["content_block"]["type"] == "tool_use" =>
+                {
+                    Some(e)
+                }
+                _ => None,
+            })
+            .expect("必须下发 tool_use 块");
+        assert_eq!(start.data["content_block"]["name"], "write");
+        assert_eq!(start.data["content_block"]["id"], "call-w-7");
+        let delta = items
+            .iter()
+            .find_map(|it| match it {
+                Ok(StreamItem::Sse(e))
+                    if e.event == "content_block_delta"
+                        && e.data["delta"]["type"] == "input_json_delta" =>
+                {
+                    Some(e)
+                }
+                _ => None,
+            })
+            .expect("参数必须经 input_json_delta 下发");
+        let input: Value =
+            serde_json::from_str(delta.data["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            input,
+            json!({"filePath": "/tmp/news.html", "content": "<html>报纸</html>"})
         );
     }
 
@@ -5903,6 +6229,70 @@ mod tests {
             run::descriptor_field3(&desc_final).expect("样本帧带 .3"),
             "入库的必须是尾部那份的原始字节"
         );
+    }
+
+    /// 提前 turn_commit 的回归锁(2026-09-06 e2e 实证):commit 帧之后又来了
+    /// 工具调用帧时,排水段必须**退出**,把该帧交回正常工具调用处理 ——
+    /// 客户端必须收到 tool_use,而不是被排水段吞掉后 end_turn 截断。
+    #[tokio::test]
+    async fn 排水段遇到工具调用帧退出排水正常下发() {
+        let text_payload = [0x0au8, 0x07, 0x0a, 0x05, 0x0a, 0x03, 0xe7, 0xba, 0xa2]; // 「好」
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from(wire::frame(&text_payload))),
+            // 提前的 commit(误匹配/乱序):先进入排水段。
+            Ok(bytes::Bytes::from(wire::frame(&turn_commit_frame()))),
+            // 真正的工具调用帧:必须在排水段里被认出并恢复正常处理。
+            Ok(bytes::Bytes::from(wire::frame(&builtin_write_wire(
+                "/tmp/news.html",
+                "<html>报纸</html>",
+            )))),
+        ];
+        let xlate = BuiltinXlate {
+            write_file: Some(WriteFileTarget::Direct {
+                name: "write".into(),
+                path_key: "filePath".into(),
+                content_key: "content".into(),
+            }),
+            ..Default::default()
+        };
+        let out = stream_to_anthropic(
+            futures::stream::iter(chunks),
+            "grok-4.6".into(),
+            false,
+            None,
+            None,
+            "conv-premature-commit".into(),
+            std::sync::Arc::new(crate::AssetStore::default()),
+            std::sync::Arc::new(crate::TruncationNotices::default()),
+            xlate,
+            ChatUsage {
+                input_tokens: 10,
+                ..Default::default()
+            },
+            0,
+            true, // cli_mode:turn_commit 分支只在 CLI 形态走
+            None,
+            None,
+        );
+        use futures::StreamExt;
+        let items: Vec<_> = out.collect().await;
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "提前 commit 后正常收到工具调用,不许报错: {items:?}"
+        );
+        let start = items
+            .iter()
+            .find_map(|it| match it {
+                Ok(StreamItem::Sse(e))
+                    if e.event == "content_block_start"
+                        && e.data["content_block"]["type"] == "tool_use" =>
+                {
+                    Some(e)
+                }
+                _ => None,
+            })
+            .expect("工具调用必须穿透提前的 commit 下发为 tool_use");
+        assert_eq!(start.data["content_block"]["name"], "write");
     }
 
     /// Finding 1 红线锁①:turn_commit 后的 1.14 usage 帧**不得**进入计费 ——
