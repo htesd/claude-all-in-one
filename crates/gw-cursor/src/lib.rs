@@ -2492,6 +2492,13 @@ impl Provider for CursorProvider {
             Err(e) => tracing::debug!(account = %account.account_id,
                 "cursor GetHardLimit 失败,超额开关未知(不影响套餐额度): {e}"),
         }
+        // Bot(Grok Bot / Sand)周池:与套餐月池独立的第三池。失败同样不拖垮主查询。
+        match usage::get_sand_usage(&client, account, &self.cfg.api_host).await {
+            Ok(Some(w)) => q.windows.push(w),
+            Ok(None) => {} // 无 Bot 池(免费号/未开通)或上游没给百分比:不出空条。
+            Err(e) => tracing::debug!(account = %account.account_id,
+                "cursor GetSandUsageStatus 失败,Bot 池未知(不影响套餐额度): {e}"),
+        }
         Ok(Some(q))
     }
 

@@ -346,6 +346,97 @@ struct PeriodUsageResponse {
     spend_limit_usage: Option<SpendLimitUsage>,
 }
 
+/// 查询 Bot(Grok Bot / Sand)周池用量:`GetSandUsageStatus`。
+///
+/// 与套餐月池(`GetCurrentPeriodUsage`)是**独立的第三池**:付费号(Pro/Pro+/Ultra)
+/// 自带 Sand 资格,周重置。上游只回利用率百分比,不给绝对量 —— 用 [`QuotaWindow`]
+/// 承载(label 固定 `"bot"`),与 auto/api 两条窗口同形态。
+///
+/// 返回 `Ok(None)` = 该号没有非零 Bot 额度(免费号/未开通),不该显示 "bot 0%"
+/// 伪装成「有池但没用量」。查询失败(401/网络/…)照常 Err,由调用方决定忽略力度。
+pub async fn get_sand_usage(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+) -> Result<Option<QuotaWindow>, UpstreamError> {
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "GetSandUsageStatus",
+        &serde_json::json!({}),
+    )
+    .await?;
+    parse_sand_usage(&text)
+}
+
+/// 解析 `GetSandUsageStatus` JSON → Bot 池窗口。
+///
+/// 实测响应:`{"currentPeriodStart":"...","nextResetTimestampUtc":"...",
+/// "usagePercent":32.28,"hasAvailableUsage":true,"hasNonZeroIncludedLimit":true,...}`。
+/// SandClaimer 逆向口径:接口偶尔不回重置时间,此时 reset_at 留 None,
+/// 不做「周期起点+7天」的推算 —— 展示层缺个时间戳比显示一个算错的日期强。
+pub fn parse_sand_usage(body: &str) -> Result<Option<QuotaWindow>, UpstreamError> {
+    let v: SandUsageResponse = serde_json::from_str(body).map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("Cursor GetSandUsageStatus 响应不是 JSON: {e}"),
+        )
+    })?;
+    // 没有非零额度 = 该号没这个池(免费号/未领取资格),不造窗口。
+    if v.has_non_zero_included_limit == Some(false) {
+        return Ok(None);
+    }
+    let Some(p) = v.usage_percent.filter(|p| p.is_finite() && *p >= 0.0) else {
+        // 有池但没给百分比 = 上游改字段,不造 0% 假象。
+        return Ok(None);
+    };
+    let reset_at = v
+        .next_reset_timestamp_utc
+        .as_deref()
+        .and_then(parse_rfc3339_unix);
+    Ok(Some(QuotaWindow {
+        label: "bot".into(),
+        percent_used: p,
+        reset_at,
+    }))
+}
+
+/// `GetSandUsageStatusResponse`(只收我们用的字段,其余忽略)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SandUsageResponse {
+    usage_percent: Option<f64>,
+    next_reset_timestamp_utc: Option<String>,
+    has_non_zero_included_limit: Option<bool>,
+}
+
+/// RFC3339 UTC("2026-09-09T05:30:33.460Z")→ unix 秒。
+///
+/// 与 gw-app `parse_rfc3339_unix` 同算法(Howard Hinnant civil→days),但上游
+/// 这个时间戳带毫秒小数,先把小数段剥掉。纯算术,不引 chrono。
+fn parse_rfc3339_unix(s: &str) -> Option<i64> {
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss_str = t.next().unwrap_or("0");
+    // 剥毫秒/微秒小数段("33.460" → "33")。
+    let ss: i64 = ss_str.split('.').next()?.parse().ok()?;
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
 /// `GetCurrentPeriodUsageResponse.SpendLimitUsage` —— 超额账期用量。
 ///
 /// ⚠️ 单位是**美分**(与同响应的 planUsage 一致),但与 `GetHardLimit.hard_limit` 的
@@ -467,6 +558,50 @@ mod tests {
         let body = r#"{"planUsage":{"includedSpend":100,"limit":40000,"autoPercentUsed":-1.0}}"#;
         let q = parse_period_usage(body).expect("应解析");
         assert!(q.windows.is_empty(), "负百分比不该进窗口: {:?}", q.windows);
+    }
+
+    /// Bot 周池:官方实测形态(带毫秒小数的时间戳)→ bot 窗口 + reset_at。
+    #[test]
+    fn 解析_sand_用量_实测样例() {
+        let body = r#"{
+          "currentPeriodStart": "2026-09-05T18:22:04.315Z",
+          "nextResetTimestampUtc": "2026-09-09T05:30:33.460Z",
+          "usagePercent": 32.282705,
+          "hasAvailableUsage": true,
+          "hasNonZeroIncludedLimit": true,
+          "grokPlanLabel": "Grok Bot Plan"
+        }"#;
+        let w = parse_sand_usage(body)
+            .expect("应解析")
+            .expect("有池应出窗口");
+        assert_eq!(w.label, "bot");
+        assert!((w.percent_used - 32.282705).abs() < 1e-9);
+        // 2026-09-09T05:30:33Z = 1788931833(与 format_unix_utc 互逆校验)。
+        assert_eq!(w.reset_at, Some(1_788_931_833), "reset_at={:?}", w.reset_at);
+    }
+
+    /// 无 Bot 池(免费号)/ 缺百分比 / 缺重置时间:都不造窗口或不造时间戳,
+    /// 绝不把「没有」显示成 0%。
+    #[test]
+    fn sand_无池或缺字段不造窗口() {
+        let no_pool = r#"{"usagePercent":0.0,"hasNonZeroIncludedLimit":false}"#;
+        assert_eq!(parse_sand_usage(no_pool).expect("应解析"), None);
+        let no_percent = r#"{"hasNonZeroIncludedLimit":true}"#;
+        assert_eq!(parse_sand_usage(no_percent).expect("应解析"), None);
+        let no_reset = r#"{"usagePercent":12.5}"#;
+        let w = parse_sand_usage(no_reset)
+            .expect("应解析")
+            .expect("有百分比应出窗口");
+        assert_eq!(w.reset_at, None, "没给重置时间不该推算: {:?}", w.reset_at);
+    }
+
+    #[test]
+    fn rfc3339_解析_与_format_unix_utc_互逆() {
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_unix("2026-06-04T00:00:00Z"), Some(1_780_531_200));
+        // 带毫秒小数的形态(上游实测)。
+        assert_eq!(parse_rfc3339_unix("2026-06-04T00:00:00.999Z"), Some(1_780_531_200));
+        assert_eq!(parse_rfc3339_unix("不是时间"), None);
     }
 
     #[test]
