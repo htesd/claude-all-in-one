@@ -48,8 +48,9 @@ pub(crate) fn account_proxy(extra_json: &str) -> Option<String> {
 }
 
 /// 出口池「最少使用」分配器:把新号粘到当前分配最少的池 URL,使账号均衡铺满 N 个出口 IP
-/// (每号固定一个,粘性)。计数初值 = 现有账号已分配到各池 URL 的数量;每分配一次本地计数 +1,
-/// 保证同一批导入内也均匀(而非全堆到第一个)。
+/// (每号固定一个,粘性)。计数初值 = 现有**正常(未禁用)**账号分配到各池 URL 的数量
+/// —— 禁用号不产生真实流量,计入会把均衡算歪(2026-09-07 毒 IP 事故);每分配一次
+/// 本地计数 +1,保证同一批导入内也均匀(而非全堆到第一个)。
 pub(crate) struct EgressAssigner {
     /// (池 URL, 当前已分配账号数)。
     counts: Vec<(String, usize)>,
@@ -65,6 +66,12 @@ impl EgressAssigner {
         let mut counts: Vec<(String, usize)> = pool.into_iter().map(|u| (u, 0usize)).collect();
         if let Ok(rows) = store.list_accounts() {
             for row in &rows {
+                // 只统计正常号(未禁用)。禁用的号不产生真实流量,计入会把「最少使用」
+                // 算歪:2026-09-07 事故——13129 上的号被封光后,该出口在统计里显得
+                // 最空,新上的 4 个 kiro 号被自动均衡全部分到毒 IP,瞬间全灭。
+                if row.disabled {
+                    continue;
+                }
                 if let Some(p) = account_proxy(&row.extra) {
                     if let Some(c) = counts.iter_mut().find(|(u, _)| *u == p) {
                         c.1 += 1;
@@ -1388,7 +1395,9 @@ async fn rebalance_egress(
         Ok(r) => r,
         Err(e) => return internal_error(e),
     };
-    // 计数基线:已固定在池内的账号都计入(保持均衡),无论是否重铺它们。
+    // 计数基线:已固定在池内的**正常**账号计入(保持均衡);禁用号不产生真实流量,
+    // 不计入 —— 与 EgressAssigner 同口径(2026-09-07 毒 IP 事故的根因就是死号
+    // 把出口显得"最空",新号被均衡到毒 IP)。
     let mut counts: Vec<(String, usize)> = pool.iter().map(|u| (u.clone(), 0usize)).collect();
     let mut to_assign: Vec<String> = Vec::new();
     for row in &rows {
@@ -1396,10 +1405,12 @@ async fn rebalance_egress(
         let in_pool = cur.as_deref().map(|p| pool.iter().any(|u| u == p)).unwrap_or(false);
         if body.only_unassigned {
             if in_pool {
-                // 已在池内:计数,不动。
-                if let Some(p) = &cur {
-                    if let Some(c) = counts.iter_mut().find(|(u, _)| u == p) {
-                        c.1 += 1;
+                // 已在池内:正常号才计数,不动。
+                if !row.disabled {
+                    if let Some(p) = &cur {
+                        if let Some(c) = counts.iter_mut().find(|(u, _)| u == p) {
+                            c.1 += 1;
+                        }
                     }
                 }
             } else if cur.is_none() {
