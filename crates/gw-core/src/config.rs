@@ -407,6 +407,41 @@ pub struct SystemConfig {
     /// `CURSOR_CLI_PHASE_TIMEOUT_SECS`(解析失败按默认),面板热配置再覆盖它。
     #[serde(default = "default_cursor_cli_phase_timeout_secs")]
     pub cursor_cli_phase_timeout_secs: u64,
+    /// **grok 系工具的 field9 门面**(默认 **关**)。2026-09-07 实弹:grok/claude 在
+    /// InferenceService/Stream 面只要 AgentTool 带 parameters 字段(空 Struct 也算)
+    /// 就被平台侧 422/400;但 tools 数组留空、工具名投进
+    /// `accepted_unadvertised_tool_names`(field 9)+ schema 以文本进 system,grok
+    /// 会正常发结构化工具调用。开启后 grok 系带工具请求不再回落 wire 面(烧 api
+    /// 月池),改走 inference 面(烧 Bot 周池)。**claude 系不适用**(任何 tools
+    /// 数组条目都 400,field9 也不认),claude 带工具继续走 wire。
+    /// yaml 缺省读 env `CURSOR_FIELD9_TOOLS`,面板热配置再覆盖。
+    /// 命名空间同 [`Self::cursor_tool_guard`],只影响 cursor 家族。
+    #[serde(default = "default_cursor_field9_tools")]
+    pub cursor_field9_tools: bool,
+    /// **claude 系工具的文本模拟门面**(默认 **关**)。claude 在 Stream 面任何
+    /// tools 数组条目都被平台侧 400、field9 也不认(2026-09-07 双号实弹),唯一
+    /// 通路是把工具契约写进 system、模型吐 `<tool_call>` 文本块、折叠层解析回
+    /// Anthropic tool_use(历史里 tool_use/tool_result 也渲染成文本形态)。
+    /// 开启后 claude 系带工具请求留在 inference 面(烧 Bot 周池),不再回落 wire。
+    /// 与 [`Self::cursor_field9_tools`] 互斥于不同模型族,可同时开。
+    /// yaml 缺省读 env `CURSOR_TEXT_TOOLS`,面板热配置再覆盖。
+    #[serde(default = "default_cursor_text_tools")]
+    pub cursor_text_tools: bool,
+}
+
+/// `cursor_text_tools` 的 yaml 缺省:env `CURSOR_TEXT_TOOLS`(`1`/`true` 开)。
+fn default_cursor_text_tools() -> bool {
+    std::env::var("CURSOR_TEXT_TOOLS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// `cursor_field9_tools` 的 yaml 缺省:env `CURSOR_FIELD9_TOOLS`(`1`/`true` 开)。
+/// 默认关:门面是 2026-09-07 刚验证的实验形态,先灰度再考虑默认。
+fn default_cursor_field9_tools() -> bool {
+    std::env::var("CURSOR_FIELD9_TOOLS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// `cursor_cli_phase_timeout_secs` 的 yaml 缺省:env `CURSOR_CLI_PHASE_TIMEOUT_SECS`,
@@ -1104,6 +1139,14 @@ pub struct SystemSettings {
     /// [`SystemConfig::cursor_cli_phase_timeout_secs`]。**只影响 cursor 家族的 CLI 驱动。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_cli_phase_timeout_secs: Option<i64>,
+    /// grok 系工具的 field9 门面(None = 用 yaml 基线,基线默认关)。
+    /// 详见 [`SystemConfig::cursor_field9_tools`]。**只影响 cursor 家族 grok 系。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_field9_tools: Option<bool>,
+    /// claude 系工具的文本模拟门面(None = 用 yaml 基线,基线默认关)。
+    /// 详见 [`SystemConfig::cursor_text_tools`]。**只影响 cursor 家族 claude 系。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_text_tools: Option<bool>,
     /// 兜住本版本**不认识**的 overlay key(新镜像写、旧镜像读的滚动升级窗口)。
     ///
     /// 存在的唯一理由是让「一个陌生 key」不再作废整份 overlay。它有两个消费者:
@@ -1185,6 +1228,12 @@ impl SystemSettings {
             // 经 `as u64` 变成一个巨大的超时(等于把 watchdog 关了)。
             base.cursor_cli_phase_timeout_secs = u64::try_from(v).unwrap_or(0);
         }
+        if let Some(v) = self.cursor_field9_tools {
+            base.cursor_field9_tools = v;
+        }
+        if let Some(v) = self.cursor_text_tools {
+            base.cursor_text_tools = v;
+        }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -1241,6 +1290,8 @@ impl SystemSettings {
             cursor_tool_guard: Some(cfg.cursor_tool_guard.clone()),
             cursor_cli_notice: Some(cfg.cursor_cli_notice.clone()),
             cursor_cli_phase_timeout_secs: Some(cfg.cursor_cli_phase_timeout_secs as i64),
+            cursor_field9_tools: Some(cfg.cursor_field9_tools),
+            cursor_text_tools: Some(cfg.cursor_text_tools),
             // 全量视图由本进程的有效配置构造,按定义不含未知 key。
             unknown: Default::default(),
         }

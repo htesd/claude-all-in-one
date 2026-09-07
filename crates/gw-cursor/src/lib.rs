@@ -1789,6 +1789,37 @@ impl Provider for CursorProvider {
                 ),
             },
         }
+
+        // grok 系 field9 工具门面(默认关;详见 inference.rs 文件头「field9 门面」)。
+        // 同 present 才覆盖语义。
+        match settings.get("cursor_field9_tools") {
+            None => {}
+            Some(v) => match v.as_bool() {
+                Some(b) => {
+                    crate::inference::set_field9_tools(b);
+                    tracing::debug!(enabled = b, "cursor field9 工具门面已热应用");
+                }
+                None => tracing::warn!(
+                    value = %v,
+                    "settings 里的 cursor_field9_tools 不是布尔，已忽略"
+                ),
+            },
+        }
+
+        // claude 系文本模拟工具门面(默认关;详见 inference.rs「文本模拟工具门面」)。
+        match settings.get("cursor_text_tools") {
+            None => {}
+            Some(v) => match v.as_bool() {
+                Some(b) => {
+                    crate::inference::set_text_tools(b);
+                    tracing::debug!(enabled = b, "cursor 文本工具门面已热应用");
+                }
+                None => tracing::warn!(
+                    value = %v,
+                    "settings 里的 cursor_text_tools 不是布尔，已忽略"
+                ),
+            },
+        }
     }
 
     /// 与 [`Self::apply_hot_settings`] 同进退(trait 文档:只覆盖其中一个就是在撒谎)。

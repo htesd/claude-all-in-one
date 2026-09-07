@@ -70,6 +70,177 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_ONE_IMAGE: usize = 12 * 1024 * 1024;
 const MAX_ALL_IMAGES: usize = 24 * 1024 * 1024;
 
+// ── field9 门面(grok 专用实验,默认关)──────────────────────────────────
+//
+// 2026-09-07 本地 Ultra 号实弹:grok/claude 在本面只要 AgentTool 带 parameters
+// 字段(**空 Struct 也算,字段存在即触发**)就被平台侧拒(grok 422 / claude
+// 400);但 tools 数组整体留空、工具名投进 accepted_unadvertised_tool_names
+// (field 9)、schema 以文本进 system,grok 会正常发结构化 tool_call
+// (tool_name / 增量 args / is_complete 完整)。这是官方 dynamicToolProfile
+// 延迟工具机制的同一条通道,只是我们直接把真工具名放进 field9(实测服务端
+// 不校验名字是不是官方元工具)。
+//
+// claude 系**不适用**:任何 tools 数组条目都 400,field9 它也不认(模型回复
+// 「工具没暴露给我」)—— claude 带工具继续走 wire 面。
+//
+// 门面开启时 grok 系带工具请求留在本面(烧 Bot 周池),不再绕行 wire(烧
+// api 月池)。开关链:env `CURSOR_FIELD9_TOOLS` → yaml 基线 → 热配置
+// `cursor_field9_tools`(见 gw-core config)。
+static FIELD9_TOOLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// field9 门面当前是否开(进程级,worker 启动/30s 轮询设置时热应用)。
+pub fn field9_tools_enabled() -> bool {
+    FIELD9_TOOLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 热设置 field9 门面开关。
+pub fn set_field9_tools(v: bool) {
+    FIELD9_TOOLS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── 文本模拟工具门面(claude 专用实验,默认关)────────────────────────────
+//
+// claude 系在本面的处境(2026-09-07 本地 Ultra 号 + grokbot 团队号双号实弹):
+// tools 数组出现**任何条目**就 400(空 parameters、无 parameters、官方元工具
+// 名都试过了);field9 它不认(模型明确回复「工具没暴露给我」);max_mode 两态、
+// fable-5-1 同样 400。官方 grokbot 的 computer-use 子代理走 agent.v1 另一条面,
+// 本面没有 claude 工具的官方形态可抄。
+//
+// 剩下的唯一通路:文本模拟。schema 与调用契约以文本进 system,模型把工具调用
+// 写成 `<tool_call>{"name":...,"arguments":{...}}</tool_call>` 文本块(Hermes/Qwen 标准形态),我们在折叠层
+// 解析转 Anthropic tool_use;历史里 assistant 的 tool_use 渲染回 `<tool_call>`
+// 文本、tool_result 渲染成 `<tool_result>` 文本进 user 消息(两轮回环已实弹
+// 验证:opus-5 正确读 result 作答)。
+//
+// 开关链:env `CURSOR_TEXT_TOOLS` → yaml 基线 → 热配置 `cursor_text_tools`。
+static TEXT_TOOLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 文本模拟工具门面当前是否开。
+pub fn text_tools_enabled() -> bool {
+    TEXT_TOOLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 热设置文本模拟工具门面开关。
+pub fn set_text_tools(v: bool) {
+    TEXT_TOOLS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 工具门面形态。`None` = 官方原生(tools 数组原样进 tools=2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolFacade {
+    None,
+    /// grok 系:tools 留空,名字进 field9,schema 文本进 system。
+    Field9,
+    /// claude 系:全文本模拟(见上)。
+    TextEmu,
+}
+
+/// 本请求的门面判定:模型族 × 开关 × 是否带工具。composer 永远原生。
+pub(crate) fn tool_facade(model: &str, body: &Json) -> ToolFacade {
+    let has_tools = body
+        .get("tools")
+        .and_then(Json::as_array)
+        .is_some_and(|t| !t.is_empty());
+    if !has_tools {
+        return ToolFacade::None;
+    }
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("grok-") && field9_tools_enabled() {
+        return ToolFacade::Field9;
+    }
+    if m.starts_with("claude-") && text_tools_enabled() {
+        return ToolFacade::TextEmu;
+    }
+    ToolFacade::None
+}
+
+/// field9 门面注入 system 的工具清单文本(每轮全量:本面无状态,重试/换号后省略
+/// 即失效;键序靠 serde_json 的 BTreeMap 天然排序保字节稳定)。
+fn tools_prompt_block(tools: &[Json]) -> String {
+    // 措辞加固(2026-09-07 生产实测):长上下文(180k+)里 grok 会回滑到训练里
+    // 的 Cursor 原生工具名(run_terminal_cmd)或把 shell 命令塞进 name 字段
+    // ("ls -la"),必须明令禁止这两类越界。
+    let mut s = String::from(
+        "Available tools (to use one, emit a structured tool call with the exact tool name \
+         and a JSON arguments object; never describe the call in prose). \
+         The name field accepts ONLY the exact tool names listed below, character for \
+         character (they are all lowercase). NEVER invent tool names, NEVER use \
+         run_terminal_cmd or similar, and NEVER put a shell command in the name field — \
+         commands go in the arguments of the bash tool:\n",
+    );
+    for t in tools {
+        let name = t.get("name").and_then(Json::as_str).unwrap_or("");
+        let desc = t.get("description").and_then(Json::as_str).unwrap_or("");
+        s.push_str("- ");
+        s.push_str(name);
+        if !desc.is_empty() {
+            s.push_str(": ");
+            s.push_str(desc);
+        }
+        if let Some(schema) = t.get("input_schema") {
+            s.push_str("\n  args schema: ");
+            s.push_str(&schema.to_string());
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// 文本模拟门面的 system 契约(实弹验证过的措辞,别随手改:grok/claude 都按
+/// 它输出可解析的 `<tool_call>` 块)。
+fn tools_text_block(tools: &[Json]) -> String {
+    let mut s = String::from(
+        "You have access to the following tools. To call a tool, output a block in exactly \
+         this format:\n\n<tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call>\n\n\
+         Rules:\n- arguments must be a valid JSON object matching the tool's schema.\n\
+         - Do not wrap the block in markdown fences. Do not add commentary inside the block.\n\
+         - After emitting a tool call, stop and wait for the tool result.\n\
+         - Tool results arrive as <tool_result name=\"TOOL_NAME\">...</tool_result> in a user message. \
+         Never emit a <tool_result> block yourself — only the user side provides them.\n\n\
+         Tools:\n",
+    );
+    for t in tools {
+        let name = t.get("name").and_then(Json::as_str).unwrap_or("");
+        let desc = t.get("description").and_then(Json::as_str).unwrap_or("");
+        s.push_str("- ");
+        s.push_str(name);
+        if !desc.is_empty() {
+            s.push_str(": ");
+            s.push_str(desc);
+        }
+        if let Some(schema) = t.get("input_schema") {
+            s.push_str("\n  args schema: ");
+            s.push_str(&schema.to_string());
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// TextEmu 的会话尾部提醒(2026-09-07 消融实验定位):宿主客户端(Claude Code)
+/// 的 system 人格会压过追加在 system 末尾的工具契约 —— claude 把工具调用写成
+/// CC 对话记录格式的 markdown("**Bash** ```json ...```"),永远形不成
+/// <tool_call>;甚至自己编 `_result` 谎称执行成功。同报文消融:换极简 system →
+/// 正常结构化调用;CC system + 工具砍到 2 个 → 依旧散文。把精简提醒钉在会话
+/// 尾巴(模型最后读到的位置)后,同报文立即恢复结构化回调。
+fn textemu_tail_reminder(tools: &[Json]) -> String {
+    let mut s = String::from(
+        "<system-reminder>IMPORTANT: Tool calling in this environment is TEXT-BASED. \
+         To call a tool, your reply MUST contain exactly one \
+         <tool_call>{\"name\":\"<exact tool name>\",\"arguments\":{...}}</tool_call> block \
+         and NOTHING after it. NEVER write tool calls as markdown (like \"**Bash** ```json ...```\"), \
+         NEVER narrate them in prose, and NEVER fabricate a <tool_result> or _result yourself — \
+         tool results are provided by the user in the next turn. Available tools: ",
+    );
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Json::as_str))
+        .collect();
+    s.push_str(&names.join(", "));
+    s.push_str(".</system-reminder>");
+    s
+}
+
 // InferenceMessageRole
 const ROLE_USER: u64 = 1;
 const ROLE_ASSISTANT: u64 = 2;
@@ -299,12 +470,17 @@ fn struct_writer(map: &serde_json::Map<String, Json>) -> Writer {
 /// 结论:平台侧行为(疑 2026-09-03 xAI 故障期开始的回归或有意收紧),字节层面无解。
 /// 这类请求回落 clidrv(AgentService 面,工具链成熟);上游若恢复,把本函数
 /// 改热配置或直接删掉即可。
+///
+/// 2026-09-07 例外:grok 系在 field9 门面开启时**不绕行**(见文件头「field9 门面」
+/// 一节)—— tools 数组留空、名字进 field9,平台侧不拒,模型照常结构化回调。
 pub(crate) fn tools_skip_inference(model: &str, body: &Json) -> bool {
     let has_tools = body
         .get("tools")
         .and_then(Json::as_array)
         .is_some_and(|t| !t.is_empty());
-    has_tools && !model.to_ascii_lowercase().starts_with("composer")
+    has_tools
+        && !model.to_ascii_lowercase().starts_with("composer")
+        && tool_facade(model, body) == ToolFacade::None
 }
 
 // ── 请求构建 ────────────────────────────────────────────────────────────────
@@ -399,6 +575,55 @@ fn user_parts(blocks: &[Json], doc_n: &mut usize, w: &mut Writer) {
 /// 形态说明:官方 host 的 converters 把 AI-SDK 的 `role:"tool"` 消息映成
 /// tool_content;Anthropic 的 tool_result 块住在 user 消息里,我们把它拆成独立的
 /// TOOL 角色消息(role=3,InferenceMessageRole.TOOL 的官方枚举值),与官方同形。
+/// TextEmu 门面的 tool_result 文本渲染(契约措辞见 `tools_text_block`,
+/// 两者必须逐字一致,模型是靠契约文本认这个形态的)。
+fn tool_results_as_text(
+    blocks: &[Json],
+    names: &std::collections::HashMap<String, String>,
+    doc_n: &mut usize,
+) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        let id = b.get("tool_use_id").and_then(Json::as_str).unwrap_or("");
+        let name = names.get(id).map(String::as_str).unwrap_or("");
+        let mut texts = String::new();
+        match b.get("content") {
+            Some(Json::String(s)) => texts.push_str(s),
+            Some(Json::Array(arr)) => {
+                for c in arr {
+                    match c.get("type").and_then(Json::as_str) {
+                        Some("text") => push_text(
+                            &mut texts,
+                            c.get("text").and_then(Json::as_str).unwrap_or(""),
+                        ),
+                        // 图片结果在文本门面里没法回传(契约没定义),明说比静默丢强。
+                        Some("image") => push_text(&mut texts, "[image omitted: text-tool facade]"),
+                        Some("document") => {
+                            if let Some(doc_text) = document_inject_text(c, doc_n) {
+                                push_text(&mut texts, &doc_text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let err = b.get("is_error").and_then(Json::as_bool).unwrap_or(false);
+        if err {
+            out.push_str(&format!(
+                "<tool_result name=\"{name}\" error=\"true\">{texts}</tool_result>"
+            ));
+        } else {
+            out.push_str(&format!("<tool_result name=\"{name}\">{texts}</tool_result>"));
+        }
+    }
+    out
+}
+
 fn tool_result_content(
     blocks: &[Json],
     names: &std::collections::HashMap<String, String>,
@@ -484,24 +709,45 @@ pub fn build_request(
     let mut tool_names: std::collections::HashMap<String, String> = Default::default();
     // 文档附件的编号器:/tmp/gw-cursor/doc-N.pdf 路径在请求内唯一(与 cli/wire 同约定)。
     let mut doc_n = 0usize;
+    // 工具门面(见文件头):Field9 = grok 系 tools 留空走 field 9;TextEmu =
+    // claude 系全文本模拟。历史里的 assistant tool_use / tool_result 在 Field9 下
+    // 保持结构化回传(gpt-6 评审:先不文本化,实测出问题再降级);TextEmu 下必须
+    // 渲染成文本块(上游没见过这些工具的结构化声明,结构化历史会让模型困惑)。
+    let facade = tool_facade(model, body);
 
     // system → 首条 SYSTEM 消息(官方 converters.ts:175 同款:role=SYSTEM + text)。
-    if let Some(sys) = body.get("system") {
-        let text = match sys {
-            Json::String(s) => s.clone(),
-            Json::Array(arr) => arr
-                .iter()
-                .filter_map(|b| b.get("text").and_then(Json::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
-        if !text.is_empty() {
-            let mut m = Writer::new();
-            m.uint(1, ROLE_SYSTEM);
-            m.string(2, &text);
-            out.message(1, &m);
-        }
+    let sys_text = body.get("system").map(|sys| match sys {
+        Json::String(s) => s.clone(),
+        Json::Array(arr) => arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Json::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    });
+    let facade_block = match facade {
+        ToolFacade::Field9 => body
+            .get("tools")
+            .and_then(Json::as_array)
+            .map(|t| tools_prompt_block(t)),
+        ToolFacade::TextEmu => body
+            .get("tools")
+            .and_then(Json::as_array)
+            .map(|t| tools_text_block(t)),
+        ToolFacade::None => None,
+    };
+    let sys_merged = match (sys_text, facade_block) {
+        (Some(t), Some(b)) if !t.is_empty() => Some(format!("{t}\n\n{b}")),
+        (Some(t), None) if !t.is_empty() => Some(t),
+        (None, Some(b)) => Some(b),
+        (_, Some(b)) => Some(b),
+        _ => None,
+    };
+    if let Some(text) = sys_merged {
+        let mut m = Writer::new();
+        m.uint(1, ROLE_SYSTEM);
+        m.string(2, &text);
+        out.message(1, &m);
     }
 
     let messages = body
@@ -570,6 +816,26 @@ pub fn build_request(
                                     w.message(7, &rp);
                                 }
                                 Some("tool_use") => {
+                                    if facade == ToolFacade::TextEmu {
+                                        // 文本门面:历史 tool_use 渲染回模型当初写出的
+                                        // 文本形态(上游从没见过结构化声明,结构化历史
+                                        // 只会让模型困惑)。
+                                        let name =
+                                            b.get("name").and_then(Json::as_str).unwrap_or("");
+                                        let input = b
+                                            .get("input")
+                                            .map(|i| i.to_string())
+                                            .unwrap_or_else(|| "{}".into());
+                                        push_text(
+                                            &mut texts,
+                                            &format!(
+                                                "<tool_call>{{\"name\":{},\"arguments\":{}}}</tool_call>",
+                                                serde_json::to_string(name).unwrap_or_default(),
+                                                input
+                                            ),
+                                        );
+                                        continue;
+                                    }
                                     let mut tc = Writer::new();
                                     tc.string(1, b.get("id").and_then(Json::as_str).unwrap_or(""));
                                     tc.string(
@@ -647,10 +913,19 @@ pub fn build_request(
                             out.message(1, &w);
                         }
                         if !tool_results.is_empty() {
-                            let mut w = Writer::new();
-                            w.uint(1, ROLE_TOOL);
-                            tool_result_content(&tool_results, &tool_names, &mut doc_n, &mut w);
-                            out.message(1, &w);
+                            if facade == ToolFacade::TextEmu {
+                                // 文本门面:tool_result 渲染成 user 文本(契约见
+                                // tools_text_block),与模型看到的协议一致。
+                                let mut w = Writer::new();
+                                w.uint(1, ROLE_USER);
+                                w.string(2, &tool_results_as_text(&tool_results, &tool_names, &mut doc_n));
+                                out.message(1, &w);
+                            } else {
+                                let mut w = Writer::new();
+                                w.uint(1, ROLE_TOOL);
+                                tool_result_content(&tool_results, &tool_names, &mut doc_n, &mut w);
+                                out.message(1, &w);
+                            }
                         }
                     }
                 }
@@ -658,16 +933,45 @@ pub fn build_request(
         }
     }
 
-    // tools → AgentTool{name=1, description=2, parameters=3:Struct}
-    if let Some(tools) = body.get("tools").and_then(Json::as_array) {
-        for t in tools {
-            let mut w = Writer::new();
-            w.string(1, t.get("name").and_then(Json::as_str).unwrap_or(""));
-            w.string(2, t.get("description").and_then(Json::as_str).unwrap_or(""));
-            if let Some(schema) = t.get("input_schema").and_then(Json::as_object) {
-                w.message(3, &struct_writer(schema));
+    // TextEmu 尾部契约提醒(见 textemu_tail_reminder 的消融实验注释):追加一条
+    // 独立 USER 消息钉在会话尾巴 —— 连续 USER 消息本面已有先例(上面 TextEmu 的
+    // tool_result 就是拆成第二条 USER 发的)。assistant 结尾(prefill)不追加。
+    // 位置在消息流末尾,不动历史前缀,缓存命中不受影响。
+    if facade == ToolFacade::TextEmu {
+        let last_is_user = messages
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(Json::as_str)
+            == Some("user");
+        if last_is_user {
+            if let Some(tools) = body.get("tools").and_then(Json::as_array) {
+                let mut w = Writer::new();
+                w.uint(1, ROLE_USER);
+                w.string(2, &textemu_tail_reminder(tools));
+                out.message(1, &w);
             }
-            out.message(2, &w);
+        }
+    }
+
+    // tools → AgentTool{name=1, description=2, parameters=3:Struct}
+    // Field9 门面:tools=2 整体留空(parameters 字段存在即被平台侧拒),
+    // 工具名投进 accepted_unadvertised_tool_names(field 9),schema 已在 system。
+    // TextEmu 门面:连 field 9 都不发(claude 不认,发了只会让它困惑),契约全在 system。
+    if facade != ToolFacade::TextEmu {
+        if let Some(tools) = body.get("tools").and_then(Json::as_array) {
+            for t in tools {
+                if facade == ToolFacade::Field9 {
+                    out.string(9, t.get("name").and_then(Json::as_str).unwrap_or(""));
+                    continue;
+                }
+                let mut w = Writer::new();
+                w.string(1, t.get("name").and_then(Json::as_str).unwrap_or(""));
+                w.string(2, t.get("description").and_then(Json::as_str).unwrap_or(""));
+                if let Some(schema) = t.get("input_schema").and_then(Json::as_object) {
+                    w.message(3, &struct_writer(schema));
+                }
+                out.message(2, &w);
+            }
         }
     }
 
@@ -744,10 +1048,154 @@ fn history_has_signature(body: &Json) -> bool {
 // ── 响应流折叠 ──────────────────────────────────────────────────────────────
 
 /// 缓冲中的工具调用(同一 id 的分片按**到达顺序**拼接;is_complete 到齐才整块吐)。
+///
+/// ⚠️ args 语义(2026-09-07 读官方 agent-host 675.js 实锤):**is_complete 帧的
+/// args 字段就是全量参数**(官方直接 `JSON.parse(complete.args)`,中间帧只当
+/// UI 流式 delta 转发,从不拼接)。中间帧与完成帧可能重复携带同一份全量 args
+/// (grok 实测:两个帧的 args 逐字节相同)—— 无脑拼接会得到 `{...}{...}` 非法
+/// JSON(生产第一发 field9 门面请求就这么挂的)。所以完成帧有 args 就用它;
+/// 完成帧空(理论上的纯 delta 流)才退拼接缓冲。
 struct PendingTool {
     id: String,
     name: String,
+    /// 全部分片的拼接(兜底/观测用,见上)。
     args: String,
+    /// 最近一帧携带的 args(完成帧优先用它 = 官方语义)。
+    args_last: String,
+}
+
+/// TextEmu 门面的流式文本过滤器:在文本 delta 流里识别 `<tool_call>…</tool_call>`
+/// 块。标签可能横跨两个 delta,所以滞回 `OPEN.len()-1` 个字符确认不是标签前缀
+/// 才往下流放(流式体验只损失这 10 个字符的延迟)。
+///
+/// 语义对齐实弹验证过的契约(`tools_text_block`):模型写完一个调用块就停,
+/// 块内是 `{"name":...,"arguments":{...}}` 单个 JSON object(Hermes 标准键;
+/// 解析侧兼容旧契约的 `args`)。
+struct TextToolFilter {
+    /// 疑似标签前缀的滞回缓冲(非块内状态)。
+    holdback: String,
+    /// 已进入块内:Call 累积待解析;Drop 累积待丢弃(幻觉 `<tool_result>` 块)。
+    in_block: Option<(bool, String)>, // bool: true=Call false=Drop
+}
+
+/// 过滤器产出:纯文本往下游走;调用块内容(标签之间的 JSON)去解析。
+enum FilterOut {
+    Text(String),
+    Call(String),
+}
+
+impl TextToolFilter {
+    const OPEN: &'static str = "<tool_call>";
+    const CLOSE: &'static str = "</tool_call>";
+    /// 幻觉结果块:开标签可带属性(`<tool_result name="x">`),按前缀+`>` 识别。
+    /// 契约禁止模型自写 tool_result,但 opus-5 实弹偶尔会抢答一个假结果 ——
+    /// 那是我们的协议标记,模型没有正当理由产出它,留着只会污染用户可见文本。
+    const OPEN_RES_PREFIX: &'static str = "<tool_result";
+    const CLOSE_RES: &'static str = "</tool_result>";
+
+    fn new() -> Self {
+        Self {
+            holdback: String::new(),
+            in_block: None,
+        }
+    }
+
+    fn feed(&mut self, text: &str, out: &mut Vec<FilterOut>) {
+        let mut cur = text.to_string();
+        loop {
+            if let Some((is_call, buf)) = self.in_block.as_mut() {
+                buf.push_str(&cur);
+                let close = if *is_call { Self::CLOSE } else { Self::CLOSE_RES };
+                if let Some(pos) = buf.find(close) {
+                    let inner = buf[..pos].to_string();
+                    let after = buf[pos + close.len()..].to_string();
+                    let is_call = *is_call;
+                    self.in_block = None;
+                    if is_call {
+                        out.push(FilterOut::Call(inner));
+                    } else {
+                        tracing::warn!("inference: TextEmu 丢弃模型幻觉的 tool_result 块");
+                    }
+                    cur = after;
+                    continue;
+                }
+                return;
+            }
+            // 非块内:holdback + 新文本里找两个开标签的最早者。
+            let mut hay = std::mem::take(&mut self.holdback);
+            hay.push_str(&cur);
+            let call_at = hay.find(Self::OPEN);
+            let res_at = hay.find(Self::OPEN_RES_PREFIX);
+            let hit = match (call_at, res_at) {
+                (Some(c), Some(r)) => Some((c.min(r), c <= r)),
+                (Some(c), None) => Some((c, true)),
+                (None, Some(r)) => Some((r, false)),
+                (None, None) => None,
+            };
+            if let Some((pos, is_call)) = hit {
+                if !is_call {
+                    let after_prefix = pos + Self::OPEN_RES_PREFIX.len();
+                    if after_prefix >= hay.len() {
+                        // 前缀都可能没攒全,等下一包。
+                        self.holdback = hay;
+                        return;
+                    }
+                    let c = hay.as_bytes()[after_prefix];
+                    if c != b'>' && !c.is_ascii_whitespace() {
+                        // 不是我们的标签(如 <tool_results>):前缀原样放行,
+                        // 从下一个字符继续扫,别进 Drop 把后文全攒住。
+                        out.push(FilterOut::Text(hay[..after_prefix].to_string()));
+                        cur = hay[after_prefix..].to_string();
+                        continue;
+                    }
+                    // 幻觉结果块:开标签要到 `>` 才算完(属性段),没等到就先攒着。
+                    let Some(gt) = hay[after_prefix..].find('>') else {
+                        self.holdback = hay;
+                        return;
+                    };
+                    if pos > 0 {
+                        out.push(FilterOut::Text(hay[..pos].to_string()));
+                    }
+                    self.in_block = Some((false, String::new()));
+                    cur = hay[after_prefix + gt + 1..].to_string();
+                    continue;
+                }
+                if pos > 0 {
+                    out.push(FilterOut::Text(hay[..pos].to_string()));
+                }
+                self.in_block = Some((true, String::new()));
+                cur = hay[pos + Self::OPEN.len()..].to_string();
+                continue;
+            }
+            // 没找到开标签:末尾保留最长前缀-1 个字符防半标签,其余放行。
+            let hold = Self::OPEN_RES_PREFIX.len() - 1;
+            if hay.len() > hold {
+                // 不在 UTF-8 边界上直接切会 panic,退回 char 边界。
+                let split = hay.floor_char_boundary(hay.len() - hold);
+                out.push(FilterOut::Text(hay[..split].to_string()));
+                self.holdback = hay[split..].to_string();
+            } else {
+                self.holdback = hay;
+            }
+            return;
+        }
+    }
+
+    /// 流收尾:滞回缓冲按文本放掉;未闭合的调用块/幻觉块都原文吐回
+    ///(诚实降级:可能根本不是我们的标签,静默吞掉比原文展示更糟)。
+    fn finish(&mut self, out: &mut Vec<FilterOut>) {
+        if !self.holdback.is_empty() {
+            out.push(FilterOut::Text(std::mem::take(&mut self.holdback)));
+        }
+        if let Some((is_call, buf)) = self.in_block.take() {
+            let open = if is_call {
+                Self::OPEN.to_string()
+            } else {
+                format!("{}>", Self::OPEN_RES_PREFIX)
+            };
+            out.push(FilterOut::Text(format!("{open}{buf}")));
+        }
+    }
 }
 
 /// 流折叠状态机:InferenceStreamResponse 帧 → Anthropic SSE 事件序列。
@@ -793,6 +1241,9 @@ struct Folder {
     /// 已失败(发过 Err):失败终态后绝不再产正常收尾。
     failed: bool,
     pending: Vec<Result<StreamItem, UpstreamError>>,
+    /// TextEmu 门面:文本流里识别 `<tool_call>` 块(见 [`TextToolFilter`])。
+    text_tools: bool,
+    filter: TextToolFilter,
 }
 
 impl Folder {
@@ -801,6 +1252,7 @@ impl Folder {
         declared_tools: std::collections::HashSet<String>,
         show_thinking: bool,
         req_bytes: u64,
+        text_tools: bool,
     ) -> Self {
         Self {
             msg_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
@@ -824,6 +1276,8 @@ impl Folder {
             finale_sent: false,
             failed: false,
             pending: Vec::new(),
+            text_tools,
+            filter: TextToolFilter::new(),
         }
     }
 
@@ -886,7 +1340,7 @@ impl Folder {
         }
     }
 
-    fn on_text(&mut self, text: &str, is_final: bool) {
+    fn on_text_direct(&mut self, text: &str, is_final: bool) {
         if !text.is_empty() {
             self.saw_content = true;
             self.saw_text = true;
@@ -896,6 +1350,61 @@ impl Folder {
         }
         if is_final {
             self.close_block();
+        }
+    }
+
+    fn on_text(&mut self, text: &str, is_final: bool) {
+        if !self.text_tools {
+            self.on_text_direct(text, is_final);
+            return;
+        }
+        // TextEmu 门面:文本流过标签过滤器,`<tool_call>` 块转 Anthropic tool_use。
+        let mut outs = Vec::new();
+        self.filter.feed(text, &mut outs);
+        if is_final {
+            self.filter.finish(&mut outs);
+        }
+        for o in outs {
+            match o {
+                FilterOut::Text(t) => self.on_text_direct(&t, false),
+                FilterOut::Call(raw) => self.publish_text_tool_call(raw),
+            }
+        }
+        // 幂等:没开着块就是 no-op;publish_tool 自己开过闭过不影响这里。
+        if is_final {
+            self.close_block();
+        }
+    }
+
+    /// TextEmu:模型写出的 `<tool_call>` 块内容(两个标签之间的 JSON)→ tool_use。
+    /// 解析失败 / 未声明 / args 非 object:原文按文本吐回(诚实降级,不伪造调用)。
+    fn publish_text_tool_call(&mut self, raw: String) {
+        let parsed = serde_json::from_str::<Json>(&raw).ok();
+        let good = parsed.as_ref().and_then(|v| {
+            let name = v.get("name").and_then(Json::as_str)?;
+            // Hermes 标准是 `arguments`;旧契约(今天早些时候灰度)用 `args`,兼容收。
+            let args = v
+                .get("arguments")
+                .or_else(|| v.get("args"))
+                .filter(|a| a.is_object())?;
+            self.resolve_declared_name(name)
+                .map(|n| (n, args.to_string()))
+        });
+        match good {
+            Some((name, args)) => {
+                self.saw_content = true;
+                // id 是我们合成的(cursor 风格 call-<uuid>-0);客户端回 tool_result
+                // 时按 id→name 映射回名,见 build_request 的 tool_names。
+                let id = format!("call-{}-0", uuid::Uuid::new_v4());
+                self.publish_tool(id, name, args);
+            }
+            None => {
+                tracing::warn!("inference: TextEmu 调用块解析失败/未声明,降级为文本");
+                self.on_text_direct(
+                    &format!("{}{}{}", TextToolFilter::OPEN, raw, TextToolFilter::CLOSE),
+                    false,
+                );
+            }
         }
     }
 
@@ -942,11 +1451,15 @@ impl Folder {
         }
         if let Some(t) = self.pending_tools.iter_mut().find(|t| t.id == id) {
             t.args.push_str(args_delta);
+            if !args_delta.is_empty() {
+                t.args_last = args_delta.to_string();
+            }
         } else {
             self.pending_tools.push_back(PendingTool {
                 id: id.to_string(),
                 name: name.to_string(),
                 args: args_delta.to_string(),
+                args_last: args_delta.to_string(),
             });
         }
         if is_complete {
@@ -958,30 +1471,55 @@ impl Folder {
     ///
     /// `forced`:finish 时没等到 is_complete 的强制 flush。args 必须是合法 JSON
     /// object 才发布 —— 伪造 `{}` 等于让客户端执行与模型原意不同的默认动作;
+    /// 声明清单解析:精确命中 > 大小写折叠唯一命中(实测 grok 会把 `glob`
+    /// 写成 `Glob`)。返回声明清单里的**规范名**;都不沾 → None(模型越界)。
+    fn resolve_declared_name(&self, name: &str) -> Option<String> {
+        if self.declared_tools.contains(name) {
+            return Some(name.to_string());
+        }
+        let folded = name.to_ascii_lowercase();
+        let ci: Vec<&String> = self
+            .declared_tools
+            .iter()
+            .filter(|d| d.to_ascii_lowercase() == folded)
+            .collect();
+        if ci.len() == 1 {
+            tracing::warn!(from = %name, to = %ci[0], "inference: 工具名大小写笔误,按声明名纠正");
+            return Some(ci[0].clone());
+        }
+        None
+    }
+
     /// 拼不出合法参数就进失败终态(内容已流出,Err 比假数据诚实)。
     fn flush_tool(&mut self, id: &str, forced: bool) {
         let Some(pos) = self.pending_tools.iter().position(|t| t.id == id) else {
             return;
         };
-        let tool = self.pending_tools.remove(pos).expect("position 刚查到");
+        let mut tool = self.pending_tools.remove(pos).expect("position 刚查到");
         self.saw_content = true;
         // 未声明的工具:模型越界。**无条件**校验 —— 客户端没声明 tools 时任何
         // 工具调用都是异常,放行的后果是客户端收到不认识的 tool_use 直接卡死。
-        if !self.declared_tools.contains(&tool.name) {
-            tracing::warn!(tool = %tool.name, "inference: 模型调用了未声明的工具,降级为文本块");
-            self.on_text(
-                &format!("[未声明的工具调用 {}({})]", tool.name, tool.args),
-                false,
-            );
-            return;
+        // 唯一豁免是大小写笔误(resolve_declared_name 内处理)。
+        match self.resolve_declared_name(&tool.name) {
+            Some(n) => tool.name = n,
+            None => {
+                tracing::warn!(tool = %tool.name, "inference: 模型调用了未声明的工具,降级为文本块");
+                self.on_text(
+                    &format!("[未声明的工具调用 {}({})]", tool.name, tool.args),
+                    false,
+                );
+                return;
+            }
         }
-        let args_valid = !tool.args.is_empty()
-            && serde_json::from_str::<Json>(&tool.args)
-                .map(|v| v.is_object())
-                .unwrap_or(false);
-        let args = if tool.args.is_empty() {
+        let valid_obj =
+            |s: &str| serde_json::from_str::<Json>(s).map(|v| v.is_object()).unwrap_or(false);
+        // 官方语义:完成帧的 args 就是全量(优先 args_last);完成帧没带才退拼接缓冲
+        //(纯 delta 流)。两者都拼不出合法 object 才进失败终态。
+        let args = if !tool.args_last.is_empty() && valid_obj(&tool.args_last) {
+            tool.args_last
+        } else if tool.args.is_empty() {
             "{}".to_string() // 无参工具的合法形态(真空调用)
-        } else if args_valid {
+        } else if valid_obj(&tool.args) {
             tool.args
         } else {
             self.fail(UpstreamError::new(
@@ -998,6 +1536,12 @@ impl Folder {
             ));
             return;
         };
+        self.publish_tool(tool.id, tool.name, args);
+    }
+
+    /// 整块发布一个工具调用(content_block_start → 全量 input_json_delta → stop)。
+    /// 结构化帧(flush_tool)与文本门面(publish_text_tool_call)共用。
+    fn publish_tool(&mut self, id: String, name: String, args: String) {
         self.ensure_started();
         self.close_block();
         let idx = self.next_idx;
@@ -1005,7 +1549,7 @@ impl Folder {
         self.sse(
             "content_block_start",
             json!({"type":"content_block_start","index":idx,
-                   "content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{}}}),
+                   "content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
         );
         self.sse(
             "content_block_delta",
@@ -1075,7 +1619,12 @@ impl Folder {
                         (String::new(), String::new(), String::new(), false);
                     for (f, v) in Reader::new(sub) {
                         match (f, v) {
-                            (1, PVal::Len(s)) => id = String::from_utf8_lossy(s).into_owned(),
+                            (1, PVal::Len(s)) => {
+                                // 上游 id 是两段换行拼接(call-…\nfc_…):只留第一段
+                                //(与 wire 面 client_tool_id 同口径;客户端校验/日志
+                                // 都见不得换行)。回传走我们自己渲染的历史,不需要原值。
+                                id = crate::chat::client_tool_id(&String::from_utf8_lossy(s));
+                            }
                             (2, PVal::Len(s)) => name = String::from_utf8_lossy(s).into_owned(),
                             (3, PVal::Len(s)) => args = String::from_utf8_lossy(s).into_owned(),
                             (4, PVal::Varint(n)) => done = n != 0,
@@ -1206,6 +1755,18 @@ impl Folder {
             return;
         }
         self.finale_sent = true;
+        // TextEmu:流结束时过滤器里可能还压着滞回文本/半截调用块,先放出来
+        //(要排在 saw_content 检查之前,这部分文本也算内容产出)。
+        if self.text_tools {
+            let mut outs = Vec::new();
+            self.filter.finish(&mut outs);
+            for o in outs {
+                // filter.finish 只产 Text(未闭合块也按原文降级),不会有 Call。
+                if let FilterOut::Text(t) = o {
+                    self.on_text_direct(&t, false);
+                }
+            }
+        }
         self.flush_all_tools();
         if self.failed {
             return; // flush 途中进了失败终态
@@ -1609,7 +2170,18 @@ async fn chat_once(
         Some("disabled")
     );
 
-    let mut folder = Folder::new(&req.model, declared_tools, show_thinking, req_len);
+    // 门面判定与 build_request 用同一个模型口径:客户端名先归一成上游名,
+    // 别名(如 grok4.6)才不会漏判族前缀。
+    let facade = crate::models::resolve_cursor_model(&req.model)
+        .map(|m| tool_facade(&m, &req.body))
+        .unwrap_or(ToolFacade::None);
+    let mut folder = Folder::new(
+        &req.model,
+        declared_tools,
+        show_thinking,
+        req_len,
+        facade == ToolFacade::TextEmu,
+    );
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamItem, UpstreamError>>(32);
     tokio::spawn(async move {
         let mut dec = wire::FrameDecoder::new();
@@ -1998,7 +2570,7 @@ mod tests {
     }
 
     fn folder(model: &str, tools: &[&str]) -> Folder {
-        Folder::new(model, declared(tools), true, 4000)
+        Folder::new(model, declared(tools), true, 4000, false)
     }
 
     fn sse_jsons(f: &mut Folder) -> Vec<String> {
@@ -2075,6 +2647,43 @@ mod tests {
             "客户端不能等不到关块: {joined}"
         );
         assert!(joined.contains("tool_use"), "{joined}");
+    }
+
+    /// 模型把 `glob` 写成 `Glob`(生产实测):按声明清单规范名纠正,工具照常下发;
+    /// 大小写折叠后有多个候选(歧义)才不纠,防错配。
+    #[test]
+    fn 工具名大小写笔误_按声明名纠正() {
+        let mut f = folder("grok-4.6", &["glob", "write"]);
+        f.feed_frame(&tool_call_part("t1", "Glob", "{\"pattern\":\"*.rs\"}", true))
+            .unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(joined.contains(r#""type":"tool_use""#), "{joined}");
+        assert!(joined.contains(r#""name":"glob""#), "规范名下发: {joined}");
+        // 真·未声明(折叠后也不沾)仍降级为文本。
+        let mut f2 = folder("grok-4.6", &["glob"]);
+        f2.feed_frame(&tool_call_part("t2", "GlobX", "{}", true)).unwrap();
+        f2.finish();
+        let j2 = sse_jsons(&mut f2).join("\n");
+        assert!(!j2.contains(r#""type":"tool_use""#), "{j2}");
+        assert!(j2.contains("未声明的工具调用"), "{j2}");
+    }
+    /// grok 实测帧型(2026-09-07):中间帧与完成帧**重复携带同一份全量 args**。
+    /// 无脑拼接会得到 `{...}{...}` 非法 JSON;完成帧的 args 就是全量(官方
+    /// agent-host 直接 JSON.parse(complete.args)),必须优先用它。
+    #[test]
+    fn 工具调用_完成帧重复全量args_不拼接() {
+        let mut f = folder("grok-4.6", &["bash"]);
+        let full = r#"{"command":"ls -la","description":"List files"}"#;
+        f.feed_frame(&tool_call_part("t1", "bash", "", false)).unwrap();
+        f.feed_frame(&tool_call_part("t1", "bash", full, false)).unwrap();
+        f.feed_frame(&tool_call_part("t1", "bash", full, true)).unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(joined.contains("tool_use"), "{joined}");
+        // partial_json 必须是单个合法 JSON object:恰好出现一次 key。
+        assert_eq!(joined.matches(r#"\"command\""#).count(), 1, "{joined}");
+        assert!(!joined.contains("不是合法 JSON"), "{joined}");
     }
 
     #[test]
@@ -2228,7 +2837,7 @@ mod tests {
 
     #[test]
     fn 关闭思考_思考帧不下发但计费() {
-        let mut f = Folder::new("grok-4.6", declared(&[]), false, 4000);
+        let mut f = Folder::new("grok-4.6", declared(&[]), false, 4000, false);
         f.feed_frame(&thinking_part("秘密思考", Some("S"), true))
             .unwrap();
         f.feed_frame(&text_part("答案", true)).unwrap();
@@ -2385,9 +2994,12 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn tools绕行门控() {
         use serde_json::json;
+        // 本用例断言「开关全关」的行为,必须持门面锁(别的用例会翻全局开关)。
+        let _guard = Field9Guard::lock();
+        set_field9_tools(false);
+        set_text_tools(false);
         let tool = json!({"name":"get_weather","description":"d","input_schema":{"type":"object"}});
         let with_tools = json!({"messages":[{"role":"user","content":"hi"}],"tools":[tool]});
         let no_tools = json!({"messages":[{"role":"user","content":"hi"}]});
@@ -2400,6 +3012,297 @@ mod tests {
         // 无 tools / 空 tools:不绕行
         assert!(!tools_skip_inference("grok-4.6", &no_tools));
         assert!(!tools_skip_inference("grok-4.6", &empty_tools));
+    }
+
+    /// field9 门面(2026-09-07 实弹):开关开 + grok 系 + 带 tools → 不绕行,
+    /// tools=2 留空、工具名进 field 9、schema 文本进 system;claude 系不受门面影响。
+    #[test]
+    fn field9门面_报文形态() {
+        use serde_json::json;
+        let tool = json!({"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}});
+        let body = json!({
+            "system": "You are helpful.",
+            "messages":[{"role":"user","content":"weather in Tokyo?"}],
+            "tools":[tool],
+        });
+        let _guard = Field9Guard::lock();
+        set_field9_tools(true);
+        // 门控:grok 不绕行,claude 照旧绕行,composer 不受影响
+        assert!(!tools_skip_inference("grok-4.6", &body));
+        assert!(tools_skip_inference("claude-opus-5", &body));
+        let bytes = build_request(&body, "grok-4.6", "c", false).unwrap();
+        let fs = fields(&bytes);
+        // tools=2 不存在;field 9 = 工具名
+        assert!(len_of(&fs, 2).is_none(), "门面下不该有 tools 数组");
+        let f9: Vec<&[u8]> = fs
+            .iter()
+            .filter(|(f, _)| *f == 9)
+            .filter_map(|(_, v)| match v {
+                PVal::Len(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(f9.len(), 1, "field 9 应恰好一条: {f9:?}");
+        assert_eq!(f9[0], b"get_weather");
+        // system 消息带工具清单文本(schema canonical JSON 在内)
+        let sys = len_of(&fs, 1).expect("system 消息");
+        let sysf = fields(sys);
+        let text = sysf
+            .iter()
+            .find(|(f, _)| *f == 2)
+            .and_then(|(_, v)| match v {
+                PVal::Len(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .expect("system 文本");
+        assert!(text.contains("You are helpful."), "原 system 保留: {text}");
+        assert!(text.contains("get_weather"), "工具名进清单: {text}");
+        assert!(
+            text.contains(r#"{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}"#)
+                || text.contains(r#""city":{"type":"string"}"#),
+            "schema 进清单: {text}"
+        );
+    }
+
+    /// 开关关(默认)时 grok 带 tools 照旧绕行 —— 回滚闸。
+    #[test]
+    fn field9门面_默认关() {
+        use serde_json::json;
+        let tool = json!({"name":"t","description":"d"});
+        let body = json!({"messages":[{"role":"user","content":"hi"}],"tools":[tool]});
+        let _guard = Field9Guard::lock();
+        set_field9_tools(false);
+        assert!(tools_skip_inference("grok-4.6", &body));
+    }
+
+    /// 测试结束把全局开关拨回关,避免串扰;门面用例全程持互斥锁串行
+    ///(cargo test 默认并发作线程,两个用例同时翻全局开关会互踩)。
+    struct Field9Guard(std::sync::MutexGuard<'static, ()>);
+    impl Field9Guard {
+        fn lock() -> Self {
+            static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            Self(M.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+    }
+    impl Drop for Field9Guard {
+        fn drop(&mut self) {
+            set_field9_tools(false);
+            set_text_tools(false);
+        }
+    }
+
+    /// TextEmu 门面报文形态:tools=2 与 field 9 都不发,契约+schema 进 system,
+    /// 历史 tool_use/tool_result 渲染成文本块。
+    #[test]
+    fn textemu门面_报文形态() {
+        use serde_json::json;
+        let _guard = Field9Guard::lock();
+        set_text_tools(true);
+        let tool = json!({"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}});
+        let body = json!({
+            "system": "You are helpful.",
+            "messages":[
+                {"role":"user","content":"weather?"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Let me check."},
+                    {"type":"tool_use","id":"call-x-0","name":"get_weather","input":{"city":"Tokyo"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call-x-0","content":"sunny"}
+                ]}
+            ],
+            "tools":[tool],
+        });
+        // 门控:claude 开 text_tools 不绕行;grokk 没开 field9 仍绕行
+        assert!(!tools_skip_inference("claude-opus-5", &body));
+        assert!(tools_skip_inference("grok-4.6", &body));
+        let bytes = build_request(&body, "claude-opus-5", "c", false).unwrap();
+        let fs = fields(&bytes);
+        assert!(len_of(&fs, 2).is_none(), "TextEmu 不该有 tools 数组");
+        assert!(
+            !fs.iter().any(|(f, _)| *f == 9),
+            "TextEmu 不该发 field 9"
+        );
+        // system 含契约与 schema
+        let sys = len_of(&fs, 1).expect("system 消息");
+        let text = fields(sys)
+            .iter()
+            .find(|(f, _)| *f == 2)
+            .and_then(|(_, v)| match v {
+                PVal::Len(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .expect("system 文本");
+        assert!(text.contains("You are helpful."), "{text}");
+        assert!(text.contains("<tool_call>"), "契约进 system: {text}");
+        assert!(text.contains("get_weather"), "{text}");
+        // 消息序列:system / user / assistant(文本化 tool_use)/ user(文本化 result)
+        // / user(尾部契约提醒,2026-09-07 消融实验后新增)
+        let msgs: Vec<&[u8]> = fs
+            .iter()
+            .filter(|(f, _)| *f == 1)
+            .filter_map(|(_, v)| match v {
+                PVal::Len(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs.len(), 5, "5 条消息: {msgs:?}");
+        let msg_text = |m: &[u8]| {
+            fields(m)
+                .iter()
+                .find(|(f, _)| *f == 2)
+                .and_then(|(_, v)| match v {
+                    PVal::Len(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                    _ => None,
+                })
+        };
+        let asst = msg_text(msgs[2]).expect("assistant 文本");
+        assert!(
+            asst.contains(r#"<tool_call>{"name":"get_weather","arguments":{"city":"Tokyo"}}</tool_call>"#),
+            "历史 tool_use 文本化: {asst}"
+        );
+        assert!(asst.contains("Let me check."), "原正文保留: {asst}");
+        let res = msg_text(msgs[3]).expect("result 文本");
+        assert!(
+            res.contains(r#"<tool_result name="get_weather">sunny</tool_result>"#),
+            "tool_result 文本化: {res}"
+        );
+        let tail = msg_text(msgs[4]).expect("尾部提醒文本");
+        assert!(
+            tail.contains("<system-reminder>") && tail.contains("<tool_call>"),
+            "尾部提醒契约: {tail}"
+        );
+        assert!(tail.contains("get_weather"), "尾部提醒带工具名清单: {tail}");
+        // 提醒里绝不能出现真实工具名之外的幻觉诱饵(措辞别随手改)
+        assert!(tail.contains("NEVER"), "{tail}");
+    }
+
+    /// 尾部提醒只钉在 user 结尾的会话;assistant 结尾(prefill)不追加,
+    /// 免得破坏 prefill 语义。
+    #[test]
+    fn textemu尾部提醒_prefill结尾不追加() {
+        use serde_json::json;
+        let _guard = Field9Guard::lock();
+        set_text_tools(true);
+        let tool = json!({"name":"bash","description":"run","input_schema":{"type":"object"}});
+        let body = json!({
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":[{"type":"text","text":"prefill"}]}
+            ],
+            "tools":[tool],
+        });
+        let bytes = build_request(&body, "claude-opus-5", "c", false).unwrap();
+        let fs = fields(&bytes);
+        let msgs: Vec<&[u8]> = fs
+            .iter()
+            .filter(|(f, _)| *f == 1)
+            .filter_map(|(_, v)| match v {
+                PVal::Len(b) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        let last_text = fields(msgs[msgs.len() - 1])
+            .iter()
+            .find(|(f, _)| *f == 2)
+            .and_then(|(_, v)| match v {
+                PVal::Len(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            !last_text.contains("<system-reminder>"),
+            "prefill 结尾不该追加提醒: {last_text}"
+        );
+    }
+
+    /// TextEmu 折叠:调用块横跨多个 delta 也能完整切出;前文后文各自成块。
+    #[test]
+    fn textemu_流折叠_调用块跨delta() {
+        let mut f = Folder::new(
+            "claude-opus-5",
+            declared(&["get_weather"]),
+            true,
+            4000,
+            true,
+        );
+        let deltas = [
+            "Checking ",
+            "the weather <tool_",
+            "call>{\"name\":\"get_weather\",\"args\":{\"ci",
+            "ty\":\"Tokyo\"}}</tool_call> Done.",
+        ];
+        for d in deltas {
+            f.feed_frame(&text_part(d, false)).unwrap();
+        }
+        f.finish();
+        let evs = sse_jsons(&mut f);
+        // 文本 delta 逐段拼接必须无损还原(标签两侧的空格都在)。
+        let text: String = evs
+            .iter()
+            .filter(|e| e.contains(r#""type":"text_delta""#))
+            .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+            .filter_map(|e| {
+                e.get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(text, "Checking the weather  Done.", "文本还原: {text:?}");
+        let joined = evs.join("\n");
+        assert!(joined.contains(r#""type":"tool_use""#), "{joined}");
+        assert!(joined.contains("Tokyo"), "{joined}");
+        // stop_reason 必须是 tool_use,客户端 agent 循环才会去执行。
+        assert!(joined.contains(r#"tool_use"#), "{joined}");
+    }
+
+    /// TextEmu 诚实降级:块内不是合法 JSON / 未声明工具 → 原文按文本吐,
+    /// 不伪造 tool_use;流尾半截标签也按原文放。
+    #[test]
+    fn textemu_坏块与半截标签降级() {
+        let mut f = Folder::new("claude-opus-5", declared(&["get_weather"]), true, 4000, true);
+        f.feed_frame(&text_part("A<tool_call>{broken}</tool_call>B", false))
+            .unwrap();
+        f.feed_frame(&text_part("C<tool_call>{\"name\":\"undeclared\",\"arguments\":{}}</tool_call>D", false))
+            .unwrap();
+        f.feed_frame(&text_part("E<tool_call>{\"name\":\"get_weather\"", false))
+            .unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(!joined.contains(r#""type":"tool_use""#), "不该有工具块: {joined}");
+        assert!(joined.contains("{broken}"), "坏 JSON 原文: {joined}");
+        assert!(joined.contains("undeclared"), "未声明原文: {joined}");
+        assert!(
+            joined.contains(r#"<tool_call>{\"name\":\"get_weather\""#),
+            "半截标签原文: {joined}"
+        );
+    }
+
+    /// 模型幻觉的 `<tool_result>` 块(契约禁止,opus-5 实弹会抢答)→ 整段丢弃,
+    /// 两侧文本保留;`<tool_results>` 这类相似拼写不是我们的标签,原样放行。
+    #[test]
+    fn textemu_幻觉tool_result块被丢弃() {
+        let mut f = Folder::new("claude-opus-5", declared(&["get_weather"]), true, 4000, true);
+        f.feed_frame(&text_part("前<tool_", false)).unwrap();
+        f.feed_frame(&text_part("result name=\"bash\">2026 Monday</tool_result>中", false))
+            .unwrap();
+        f.feed_frame(&text_part("<tool_results> 是别的东西 </tool_results>后", false))
+            .unwrap();
+        f.finish();
+        let evs = sse_jsons(&mut f);
+        let text: String = evs
+            .iter()
+            .filter(|e| e.contains(r#""type":"text_delta""#))
+            .filter_map(|e| serde_json::from_str::<Json>(e).ok())
+            .filter_map(|e| {
+                e.get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(text, "前中<tool_results> 是别的东西 </tool_results>后", "{text:?}");
     }
 
     #[test]

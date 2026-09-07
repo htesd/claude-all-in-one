@@ -119,6 +119,24 @@ async fn main() {
                                 }
                             }
                         }
+                        if f == 2 {
+                            // tool_call_part{tool_call_id=1, tool_name=2, args=3 增量, is_complete=4, tool_index=5}
+                            for (sf, sv) in gw_cursor::protobuf::Reader::new(sub) {
+                                match (sf, sv) {
+                                    (1, gw_cursor::protobuf::Value::Len(s))
+                                    | (2, gw_cursor::protobuf::Value::Len(s))
+                                    | (3, gw_cursor::protobuf::Value::Len(s)) => println!(
+                                        "    tc f{sf}={}",
+                                        String::from_utf8_lossy(s)
+                                    ),
+                                    (4, gw_cursor::protobuf::Value::Varint(n))
+                                    | (5, gw_cursor::protobuf::Value::Varint(n)) => {
+                                        println!("    tc f{sf}={n}")
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         if f == 3 || f == 5 {
                             // usage{prompt=1,completion=2} / extended_usage{in=1,out=2,cache_read=3,cache_write=4}
                             let mut vals = Vec::new();
