@@ -92,7 +92,11 @@ export interface CreateAccountPayload {
   credentials_json?: string
 }
 
-/** PATCH /accounts/{id}：extra 传了就是整体替换（凭据轮换），不传不动。 */
+/**
+ * PATCH /accounts/{id}：extra 传了默认整体替换（凭据轮换），不传不动。
+ * 替换受凭据丢失守卫：新 extra 丢掉已有的 access_token/refresh_token 会被 400，
+ * 除非同时传 `allow_credential_drop: true`；只想改个别字段用 `extra_merge: true`。
+ */
 export interface UpdateAccountPayload {
   /** '' = 移出分组。 */
   group_name?: string
@@ -101,6 +105,10 @@ export interface UpdateAccountPayload {
   /** 调度优先级：数值越小越优先，缺省 100。不传=不动；走后端定点合并，绝不碰凭据。 */
   priority?: number
   extra?: Record<string, unknown>
+  /** true = extra 按键合并（未传字段保留）；缺省 = 整体替换。 */
+  extra_merge?: boolean
+  /** 替换模式下确认丢弃凭据（守卫要求）。 */
+  allow_credential_drop?: boolean
   /**
    * 出口代理 URL。
    * - 非空字符串 = 设置该账号代理

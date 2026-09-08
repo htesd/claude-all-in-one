@@ -2896,7 +2896,7 @@ async fn handle_chat(
                     stream,
                     &req,
                     &client_key,
-                    ctx.account.clone(),
+                    ctx,
                     started_at,
                     wire,
                 )
@@ -2966,7 +2966,7 @@ async fn handle_chat(
                                     stream,
                                     &req,
                                     &client_key,
-                                    retry_ctx.account.clone(),
+                                    retry_ctx,
                                     started_at,
                                     wire,
                                 )
@@ -3046,7 +3046,7 @@ async fn handle_chat(
                                                         stream,
                                                         &req,
                                                         &client_key,
-                                                        heal_ctx.account.clone(),
+                                                        heal_ctx,
                                                         started_at,
                                                         wire,
                                                     )
@@ -3938,7 +3938,7 @@ async fn finish_web_search_response(
     {
         Ok((events, usage)) => {
             let synth = crate::websearch::synth_stream(events, usage);
-            finish_response(st, lease, synth, req, client_key, account, started_at, wire).await
+            finish_response(st, lease, synth, req, client_key, ctx, started_at, wire).await
         }
         Err(e) => {
             tracing::warn!(account = %account_id, kind = ?e.kind, "web search 回环失败: {e}");
@@ -3958,7 +3958,7 @@ async fn finish_response(
     stream: gw_core::provider::ChatStream,
     req: &ChatRequest,
     client_key: &str,
-    account: Arc<Account>,
+    ctx: CallCtx,
     started_at: std::time::Instant,
     wire: Wire,
 ) -> axum::response::Response {
@@ -3970,9 +3970,10 @@ async fn finish_response(
             stream,
             req.clone(),
             client_key.to_string(),
-            account,
+            ctx,
             started_at,
             wire,
+            false,
         )
         .await
     } else {
@@ -3986,10 +3987,12 @@ async fn finish_response(
             stream,
             req.clone(),
             client_key.to_string(),
-            account,
+            ctx.account.clone(),
             started_at,
             st.provider.family(),
             wire,
+            Some((&st, &ctx)),
+            false,
         )
         .await
     }
@@ -4002,6 +4005,8 @@ async fn finish_response(
 /// 错误响应(不重试:已开始消费流,符合 v60 不放大错误契约)。
 ///
 /// 取显式依赖(scheduler / usage_sink)而非整个 WorkerState,便于单测。
+/// `retry` 是流内 TokenInvalid「同号刷新重试」所需的 worker 全态 + 原 CallCtx;
+/// 测试传 None = 不重试(旧行为)。`token_retried` 防递归重试。
 #[allow(clippy::too_many_arguments)]
 async fn collect_response(
     scheduler: &AccountScheduler,
@@ -4016,6 +4021,8 @@ async fn collect_response(
     started_at: std::time::Instant,
     family: &'static str,
     wire: Wire,
+    retry: Option<(&Arc<WorkerState>, &CallCtx)>,
+    token_retried: bool,
 ) -> axum::response::Response {
     /// 非流式抽干的事件数上限(OOM 粗护栏:正常响应 < 数万事件,远低于此;
     /// 超出视为异常上游,回受控错误而非无界吃内存。审查 #3)。
@@ -4052,6 +4059,69 @@ async fn collect_response(
                 tracing::warn!(account = %account_id, kind = ?e.kind, "非流式抽干时上游错误: {e}");
                 hard_err = Some(e);
                 break;
+            }
+        }
+    }
+
+    // 流内 TokenInvalid(cursor 系 401 以流内错误帧形态到达,主 handler 的同步
+    // refresh-after-rejection 摸不到):先同号刷新重试一次,刷新也失败才按 refresh
+    // 的 kind 定生死 —— 与 stream_response 窥探分支同口径(2026-09-08 ultra-test
+    // 事故:RT 活着却被一次流内 401 永久误杀)。
+    if let Some(e) = &hard_err {
+        if e.kind == UpstreamErrorKind::TokenInvalid
+            && !token_retried
+            && !gw_kiro::machine_id::is_api_key_credential(&account)
+        {
+            if let Some((st, ctx)) = retry {
+                let rejected = ctx.account.extra_str("access_token").map(|s| s.to_string());
+                match st
+                    .refresh_after_rejection(ctx.account.clone(), rejected.as_deref())
+                    .await
+                {
+                    Ok(refreshed) => {
+                        if !st.scheduler.note_upstream_call(&refreshed.account_id, None) {
+                            // 被 RPM 拦住 ≠ 修复失败(号刚证明健康):按 Overloaded 走下方
+                            // 统一失败路径 —— 该 kind 不伤账号健康,客户端拿 529 自行重试。
+                            tracing::info!(account = %account_id,
+                                "非流式 401 刷新成功,重试被 RPM 准入拦住(不上报失败)");
+                            hard_err = Some(gw_core::error::UpstreamError::new(
+                                UpstreamErrorKind::Overloaded,
+                                "刷新后重试被 RPM 准入拦截",
+                            ));
+                        } else {
+                            let retry_ctx = CallCtx {
+                                account: refreshed,
+                                session_id: ctx.session_id.clone(),
+                                cache_key: ctx.cache_key.clone(),
+                            };
+                            match st.provider.chat(req.clone(), &retry_ctx).await {
+                                Ok(new_stream) => {
+                                    tracing::info!(account = %account_id,
+                                        "非流式 401 同号刷新成功,透明重试");
+                                    return Box::pin(collect_response(
+                                        &st.scheduler,
+                                        st.usage_sink.as_ref(),
+                                        st.store.clone(),
+                                        Some(st.pending_writes.clone()),
+                                        lease,
+                                        new_stream,
+                                        req,
+                                        client_key,
+                                        retry_ctx.account.clone(),
+                                        started_at,
+                                        family,
+                                        wire,
+                                        Some((st, &retry_ctx)),
+                                        true,
+                                    ))
+                                    .await;
+                                }
+                                Err(e2) => hard_err = Some(e2), // 重试的真实 kind 走统一失败
+                            }
+                        }
+                    }
+                    Err(e2) => hard_err = Some(e2), // 刷新失败的 kind 才是真实判据
+                }
             }
         }
     }
@@ -4349,17 +4419,25 @@ fn wire_event(f: WireFrame) -> Event {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     st: Arc<WorkerState>,
     lease: scheduler::AccountLease,
     mut stream: gw_core::provider::ChatStream,
     req: ChatRequest,
     client_key: String,
-    account: Arc<Account>,
+    ctx: CallCtx,
     started_at: std::time::Instant,
     wire: Wire,
+    // 是否已做过一次「流内 401 → 同号刷新重试」(防无限递归)。
+    token_retried: bool,
 ) -> axum::response::Response {
+    // ctx 只在「流内 401 刷新重试」分支需要(session/cache 亲和键原样带进重试);
+    // 其余路径沿用解构出的 account,行为与旧签名一致。
+    let CallCtx {
+        account,
+        session_id,
+        cache_key,
+    } = ctx;
     // 首项窥探(2026-08-24 用户报障):上游拒答(疑 guardrail)/空流的形态是"前导帧
     // 之后 Err 或流尽",老路同步返回 200 SSE,客户端只看到裸断(Claude Code 只会说
     // "check any proxy")。在响应头定稿前窥探:窗口内压前导帧,Err/流尽 → 回真实
@@ -4417,6 +4495,74 @@ async fn stream_response(
     let stream: gw_core::provider::ChatStream = match verdict {
         Verdict::Commit => Box::pin(futures::stream::iter(buffered).chain(stream)),
         Verdict::Fail(e) => {
+            // 流内 TokenInvalid(cursor 系 401 以流内错误帧形态到达,主 handler 同步
+            // 分支的 refresh-after-rejection 永远摸不到它):过去落到这就直接永久禁号
+            // —— 2026-09-08 ultra-test 事故,RT 明明活着,一次流内 401 被秒杀。
+            // 与同步分支同口径:先同号刷新重试一次,刷新也失败才按 refresh 的 kind
+            // 定生死(TokenInvalid=真死;transient=对应轻罚,不误杀)。
+            if e.kind == UpstreamErrorKind::TokenInvalid
+                && !token_retried
+                && !gw_kiro::machine_id::is_api_key_credential(&account)
+            {
+                let rejected = account.extra_str("access_token").map(|s| s.to_string());
+                match st
+                    .refresh_after_rejection(account.clone(), rejected.as_deref())
+                    .await
+                {
+                    Ok(refreshed) => {
+                        // 定频准入:这是同一 lease 上的第二次上游调用(口径同同步分支);
+                        // 被拦 ≠ 修复失败 —— 号刚证明健康,绝不上报失败,回 529 让客户重试。
+                        if !st
+                            .scheduler
+                            .note_upstream_call(&refreshed.account_id, None)
+                        {
+                            tracing::info!(account = %lease.account_id(),
+                                "流内 401 刷新成功,但重试被 RPM 准入拦住(不上报失败)");
+                            let gate = gw_core::error::UpstreamError::new(
+                                UpstreamErrorKind::Overloaded,
+                                "刷新后重试被 RPM 准入拦截",
+                            );
+                            let usage = buffered_usage(&buffered);
+                            return fail_pre_first_byte(
+                                &st, lease, &req, &client_key, &account, started_at, wire,
+                                &gate, usage, false,
+                            );
+                        }
+                        let retry_ctx = CallCtx {
+                            account: refreshed,
+                            session_id,
+                            cache_key,
+                        };
+                        match st.provider.chat(req.clone(), &retry_ctx).await {
+                            Ok(new_stream) => {
+                                tracing::info!(account = %lease.account_id(),
+                                    "流内 401 同号刷新成功,透明重试");
+                                return Box::pin(stream_response(
+                                    st, lease, new_stream, req, client_key, retry_ctx,
+                                    started_at, wire, true,
+                                ))
+                                .await;
+                            }
+                            Err(e2) => {
+                                // 重试仍败:上报真实 kind 后按首包前失败回显。
+                                let usage = buffered_usage(&buffered);
+                                return fail_pre_first_byte(
+                                    &st, lease, &req, &client_key, &retry_ctx.account,
+                                    started_at, wire, &e2, usage, true,
+                                );
+                            }
+                        }
+                    }
+                    Err(e2) => {
+                        // 刷新失败:e2.kind 才是真实判据(TokenInvalid=永久,其余=轻罚)。
+                        let usage = buffered_usage(&buffered);
+                        return fail_pre_first_byte(
+                            &st, lease, &req, &client_key, &account, started_at, wire, &e2,
+                            usage, true,
+                        );
+                    }
+                }
+            }
             // 首项(或前导后)即上游错误 = 首包前失败:与主 handler「chat 失败」分支
             // 同口径(report_failure + 失败请求日志 + 对外错误状态),只是把 200 空流
             // 换成真实状态码。不另起换号重试:与今天流内 Err 分支的行为一致。
@@ -5453,7 +5599,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic, None, false).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["content"][0]["text"], "hi", "非流式应折叠成单个 Messages JSON");
@@ -5479,7 +5625,7 @@ mod tests {
                 serde_json::json!({"type":"error","error":{"type":"overloaded_error","message":"x"}}),
             ))),
         ];
-        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic).await;
+        let resp = collect_response(&sched, None, None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic, None, false).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "SSE error 应回非流式错误");
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "overloaded_error");
@@ -5504,7 +5650,7 @@ mod tests {
             })),
         ];
         let resp =
-            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic).await;
+            collect_response(&sched, Some(&dyn_sink), None, None, lease, chat_stream(items), req_model_m(), String::new(), Arc::new(acct(&[])), std::time::Instant::now(), "kiro", Wire::Anthropic, None, false).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let rows = sink.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -5523,6 +5669,15 @@ mod tests {
             disabled: false,
             created_at: 0,
             extra: map,
+        }
+    }
+
+    /// stream_response 测试的 CallCtx 快捷构造(无亲和键)。
+    fn test_ctx(extra: &[(&str, &str)]) -> CallCtx {
+        CallCtx {
+            account: Arc::new(acct(extra)),
+            session_id: String::new(),
+            cache_key: String::new(),
         }
     }
 
@@ -6281,6 +6436,180 @@ mod tests {
         assert_eq!(a.rpm_used, 2, "被拦的验证调用不得记账");
     }
 
+    /// 流内 401 测试桩:第一次 chat 产「首项即 Err(TokenInvalid)」的流(cursor 系
+    /// 真实形态 —— 401 以流内错误帧到达),第二次起产正常文本流;refresh_auth 按
+    /// refresh_ok 决定换新 token 还是 invalid_grant。
+    struct Instream401Provider {
+        chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+        refresh_ok: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Instream401Provider {
+        fn family(&self) -> &'static str {
+            "cursor"
+        }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] {
+            &[]
+        }
+        async fn list_models(&self) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> {
+            Ok(vec![])
+        }
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _ctx: &CallCtx,
+        ) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+            let n = self
+                .chat_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(chat_stream(vec![Err(UpstreamError::new(
+                    UpstreamErrorKind::TokenInvalid,
+                    "in-stream unauthenticated",
+                ))]))
+            } else {
+                Ok(text_reply_stream())
+            }
+        }
+        async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
+            if !self.refresh_ok {
+                return Err(UpstreamError::new(UpstreamErrorKind::TokenInvalid, "invalid_grant"));
+            }
+            let mut a = account.clone();
+            a.extra
+                .insert("access_token".into(), serde_json::json!("at-new"));
+            a.extra
+                .insert("expires_at".into(), serde_json::json!("2099-01-01T00:00:00Z"));
+            Ok(a)
+        }
+    }
+
+    /// 流内 401 测试夹具:账号带 at-old/rt-1 + 宽裕 RPM,WorkerState 挂指定 provider。
+    fn instream_401_state(
+        provider: Arc<dyn Provider>,
+    ) -> (Arc<WorkerState>, Arc<Account>) {
+        let mut extra = BTreeMap::new();
+        extra.insert("access_token".into(), serde_json::json!("at-old"));
+        extra.insert("refresh_token".into(), serde_json::json!("rt-1"));
+        extra.insert("expires_at".into(), serde_json::json!("2099-01-01T00:00:00Z"));
+        extra.insert("rpm_limit".into(), serde_json::json!(100));
+        let acc = Arc::new(Account {
+            account_id: "a".into(),
+            provider: "cursor".into(),
+            max_concurrency: 1,
+            disabled: false,
+            created_at: 0,
+            extra,
+        });
+        let st = Arc::new(WorkerState {
+            instance: 0,
+            egress_desc: String::new(),
+            group: String::new(),
+            provider,
+            settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
+            scheduler: AccountScheduler::new(
+                vec![acc.clone()],
+                &gw_core::config::SchedulerConfig::default(),
+            ),
+            refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            usage_sink: None,
+            pending_writes: PendingWrites::new(),
+            store: None,
+            quota_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            quota_inflight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            quota_sem: Arc::new(tokio::sync::Semaphore::new(1)),
+            sync_lock: tokio::sync::Mutex::new(()),
+            group_views: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            _client: reqwest::Client::new(),
+        });
+        (st, acc)
+    }
+
+    /// 2026-09-08 ultra-test 误杀事故回归:cursor 系 401 以流内错误帧到达,必须先
+    /// 同号刷新重试;RT 活着时一次流内 401 绝不得把号永久禁掉。
+    #[tokio::test]
+    async fn instream_token_invalid_refreshes_and_retries_instead_of_disabling() {
+        let chat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(Instream401Provider {
+            chat_calls: chat_calls.clone(),
+            refresh_ok: true,
+        });
+        let (st, acc) = instream_401_state(provider);
+        let ctx = CallCtx {
+            account: acc,
+            session_id: "s".into(),
+            cache_key: "s".into(),
+        };
+        let first = st.provider.chat(req_model_m(), &ctx).await.unwrap();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            first,
+            req_model_m(),
+            String::new(),
+            ctx,
+            std::time::Instant::now(),
+            Wire::Anthropic,
+            false,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "刷新重试应透明救回请求");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(body.contains("hi"), "重试后的正常内容应送达客户端");
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "首发 + 刷新后重试 = 2 次上游调用"
+        );
+        let snap = st.scheduler.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(!a.disabled, "RT 活着时流内 401 不得禁号");
+    }
+
+    /// 同一事故的另一面:刷新也失败(RT 真死)才永久禁号 —— 不能反过来变成
+    /// 永远不敢禁用(那样真死号会一直在池里吃请求)。
+    #[tokio::test]
+    async fn instream_token_invalid_still_disables_when_refresh_fails() {
+        let chat_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider: Arc<dyn Provider> = Arc::new(Instream401Provider {
+            chat_calls: chat_calls.clone(),
+            refresh_ok: false,
+        });
+        let (st, acc) = instream_401_state(provider);
+        let ctx = CallCtx {
+            account: acc,
+            session_id: "s".into(),
+            cache_key: "s".into(),
+        };
+        let first = st.provider.chat(req_model_m(), &ctx).await.unwrap();
+        let lease = st.scheduler.acquire(Some("s")).await.unwrap();
+        let resp = stream_response(
+            st.clone(),
+            lease,
+            first,
+            req_model_m(),
+            String::new(),
+            ctx,
+            std::time::Instant::now(),
+            Wire::Anthropic,
+            false,
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            chat_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "刷新失败不重试,不放大上游调用"
+        );
+        let snap = st.scheduler.status_snapshot();
+        let a = snap.iter().find(|x| x.account_id == "a").unwrap();
+        assert!(a.disabled, "刷新失败 = RT 真死,必须永久禁用");
+        assert_eq!(a.reason, "invalid_refresh_token");
+    }
+
     /// upstream_cut(静默掐流前兆)收尾纪律:只喂软冷却 + 请求日志 error_kind,
     /// 客户端 finale 原样送达,健康/禁用体系零变化(2026-07-25 事故 + 评审#2)。
     #[tokio::test]
@@ -6340,9 +6669,10 @@ mod tests {
             cut_stream(),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6362,9 +6692,10 @@ mod tests {
             cut_stream(),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         let _ = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
@@ -6536,9 +6867,10 @@ mod tests {
             text_reply_stream(),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::OpenAiChat { include_usage: true },
+        false,
         )
         .await;
         let body = sse_body(resp).await;
@@ -6567,9 +6899,10 @@ mod tests {
             text_reply_stream(),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::OpenAiResponses,
+        false,
         )
         .await;
         let body = sse_body(resp).await;
@@ -6596,9 +6929,10 @@ mod tests {
             ))]),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         // EmptyResponse → 400(止住对同一被拒内容的重试风暴),文案含可操作提示。
@@ -6620,9 +6954,10 @@ mod tests {
             chat_stream(vec![]),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6652,9 +6987,10 @@ mod tests {
             ]),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6679,9 +7015,10 @@ mod tests {
             }))]),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6721,9 +7058,10 @@ mod tests {
             chat_stream(items),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6757,9 +7095,10 @@ mod tests {
             ]),
             req_model_m(),
             String::new(),
-            Arc::new(acct(&[])),
+            test_ctx(&[]),
             std::time::Instant::now(),
             Wire::Anthropic,
+        false,
         )
         .await;
         // rate_limit_error → RateLimited → 502(可重试),绝不是 200。
@@ -6787,6 +7126,8 @@ mod tests {
             std::time::Instant::now(),
             "cursor",
             Wire::OpenAiChat { include_usage: false },
+        None,
+        false,
         )
         .await;
         assert_eq!(chat.status(), StatusCode::OK);
@@ -6810,6 +7151,8 @@ mod tests {
             std::time::Instant::now(),
             "cursor",
             Wire::OpenAiResponses,
+        None,
+        false,
         )
         .await;
         let v = body_json(responses).await;
@@ -6836,6 +7179,8 @@ mod tests {
             std::time::Instant::now(),
             "kiro",
             Wire::Anthropic,
+        None,
+        false,
         )
         .await;
         let v = body_json(resp).await;

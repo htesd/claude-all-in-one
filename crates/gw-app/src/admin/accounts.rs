@@ -47,6 +47,11 @@ pub(crate) fn account_proxy(extra_json: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// PATCH extra 替换模式的凭据丢失守卫键:这些键在 DB 里已有非空值,而新 extra
+/// 把它们弄丢了(未传/空串)且调用方未显式确认 → 拒绝(2026-09-08 bot2 事故)。
+/// 三个 provider(kiro/cursor/dario)的凭据都落在这两个键上。
+const CREDENTIAL_GUARD_KEYS: &[&str] = &["access_token", "refresh_token"];
+
 /// 出口池「最少使用」分配器:把新号粘到当前分配最少的池 URL,使账号均衡铺满 N 个出口 IP
 /// (每号固定一个,粘性)。计数初值 = 现有**正常(未禁用)**账号分配到各池 URL 的数量
 /// —— 禁用号不产生真实流量,计入会把均衡算歪(2026-09-07 毒 IP 事故);每分配一次
@@ -201,8 +206,23 @@ pub struct UpdateAccountBody {
     #[serde(default)]
     disabled: Option<bool>,
     /// 整体替换 extra(凭据轮换);缺省不动。
+    ///
+    /// ⚠️ 替换语义受**凭据丢失守卫**约束:新 extra 若会丢掉 DB 里现有的
+    /// access_token / refresh_token(未传、或传空串),一律 400 —— 2026-09-08
+    /// 事故:运维只想补一个 `pool` 字段,PATCH `{"extra":{"pool":"bot"}}` 把
+    /// 整份凭据静默抹掉,账号当场判死。只想定点改个别字段请用 `extra_merge`
+    /// 或专用定点字段(`proxy_url`/`priority`/`pool`/`driver`/…);确要清空
+    /// 凭据须同时传 `allow_credential_drop: true`。
     #[serde(default)]
     extra: Option<serde_json::Map<String, serde_json::Value>>,
+    /// extra 合并模式:`true` = 传入的键逐条并入现有 extra(未传的字段原样保留,
+    /// `***` 哨兵照旧解析为 DB 原值);缺省/false = 整体替换(见 `extra` 的守卫)。
+    #[serde(default)]
+    extra_merge: Option<bool>,
+    /// 显式确认丢弃凭据:仅替换模式下新 extra 会丢掉已有的
+    /// access_token / refresh_token 时才需要传 `true`,否则守卫 400。
+    #[serde(default)]
+    allow_credential_drop: Option<bool>,
     /// 定点更新出口代理(走 merge_account_extra,**绝不**碰其它凭据字段)。
     /// 字段缺省=不动 proxy;`""`(空串)=清除;非空串=设代理 URL。
     /// (用 `Option<String>` 而非 `Option<Value>`:serde 会把 JSON `null` 折叠成 `None`,
@@ -1618,6 +1638,40 @@ async fn update_account(
                     }
                 }
             }
+            if body.extra_merge == Some(true) {
+                // 合并模式:传入键逐条盖到现有 extra 上,未传字段原样保留。
+                // 部分更新(补 pool/driver 之类单字段)的唯一安全通道 —— 替换语义
+                // 在这种用法下会静默抹掉凭据(2026-09-08 bot2 事故)。
+                let mut merged = current.clone();
+                for (k, v) in &resolved {
+                    merged.insert(k.clone(), v.clone());
+                }
+                resolved = merged;
+            } else {
+                // 替换模式(凭据轮换)+ 凭据丢失守卫:新 extra 把 DB 里已有的
+                // 凭据键弄丢了(没传或传空),而调用方又没显式确认 → 拒绝。
+                // 哨兵解析已在上游完成,带 `***` 的常规整表回传天然过守卫。
+                for ck in CREDENTIAL_GUARD_KEYS {
+                    let had = current
+                        .get(*ck)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
+                    let kept = resolved
+                        .get(*ck)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
+                    if had && !kept && body.allow_credential_drop != Some(true) {
+                        return api_error(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "PATCH extra 是整体替换,新 extra 会丢掉已有的凭据字段 \
+                                 `{ck}`。若只想改个别字段,请用 `extra_merge: true` 或对应 \
+                                 定点字段;确要清空该凭据,请加 `allow_credential_drop: true`。"
+                            ),
+                        );
+                    }
+                }
+            }
             match serde_json::to_string(&resolved) {
                 Ok(s) => Some(s),
                 Err(e) => return internal_error(e),
@@ -2488,6 +2542,101 @@ mod tests {
         assert!(raw.extra.contains("rt-rotated-8888"), "新 token 应写入");
         assert!(raw.extra.contains("cs-keep-1234"), "脱敏哨兵字段必须保留原值");
         assert!(!raw.extra.contains("***"), "哨兵本身不得落库");
+    }
+
+    #[tokio::test]
+    async fn patch_extra_replace_dropping_credentials_rejected() {
+        // 2026-09-08 bot2 事故回归:只想补一个字段却用替换语义,凭据被静默抹掉。
+        let (app, store) = app();
+        store
+            .create_account(
+                "cur-guard",
+                "",
+                "cursor",
+                1,
+                r#"{"access_token":"at-live","refresh_token":"rt-live"}"#,
+            )
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                "/accounts/cur-guard",
+                Some(r#"{"extra":{"pool":"bot"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "丢凭据的替换必须 400");
+        let raw = store.get_account("cur-guard").unwrap().unwrap();
+        assert!(raw.extra.contains("rt-live"), "被拒后 DB 凭据必须原样");
+        // 显式确认后才允许清空凭据。
+        let resp = app
+            .oneshot(req(
+                "PATCH",
+                "/accounts/cur-guard",
+                Some(r#"{"extra":{"pool":"bot"},"allow_credential_drop":true}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = store.get_account("cur-guard").unwrap().unwrap();
+        assert!(!raw.extra.contains("rt-live"), "确认后替换生效");
+    }
+
+    #[tokio::test]
+    async fn patch_extra_merge_preserves_credentials() {
+        // 合并模式:只传要补的键,凭据原样保留(部分更新的安全通道)。
+        let (app, store) = app();
+        store
+            .create_account(
+                "cur-merge",
+                "",
+                "cursor",
+                1,
+                r#"{"access_token":"at-live","refresh_token":"rt-live","region":"us"}"#,
+            )
+            .unwrap();
+        let resp = app
+            .oneshot(req(
+                "PATCH",
+                "/accounts/cur-merge",
+                Some(r#"{"extra":{"pool":"bot"},"extra_merge":true}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let extra = store.get_account("cur-merge").unwrap().unwrap().extra;
+        let v: serde_json::Value = serde_json::from_str(&extra).unwrap();
+        assert_eq!(v["pool"], "bot", "新键并入");
+        assert_eq!(v["refresh_token"], "rt-live", "凭据保留");
+        assert_eq!(v["region"], "us", "未传字段保留");
+    }
+
+    #[tokio::test]
+    async fn patch_extra_replace_with_new_credentials_passes_guard() {
+        // 正当的凭据轮换(新 extra 自带新凭据)不受守卫影响。
+        let (app, store) = app();
+        store
+            .create_account(
+                "cur-rot",
+                "",
+                "cursor",
+                1,
+                r#"{"access_token":"at-old","refresh_token":"rt-old","region":"us"}"#,
+            )
+            .unwrap();
+        let resp = app
+            .oneshot(req(
+                "PATCH",
+                "/accounts/cur-rot",
+                Some(r#"{"extra":{"access_token":"at-new","refresh_token":"rt-new"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let extra = store.get_account("cur-rot").unwrap().unwrap().extra;
+        assert!(extra.contains("rt-new"));
+        assert!(!extra.contains("region"), "替换语义:未传字段按约定被换掉");
     }
 
     #[tokio::test]

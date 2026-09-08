@@ -328,6 +328,14 @@ fn extract_text_in_msg(content: &Value, media: Option<(usize, &MediaPlaceholders
                                         // 调用点不带表),沿旧行为不渲染,编号不空洞。
                                         "image" | "document" => media
                                             .and_then(|(mi, map)| map.get(&(mi, bi, ni)).cloned()),
+                                        // CC 工具搜索的延迟工具引用:渲染成占位文本,
+                                        // 别让模型看不到它引用了哪个工具。
+                                        "tool_reference" => Some(format!(
+                                            "[引用工具 {}]",
+                                            n.get("tool_name")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("?")
+                                        )),
                                         _ => None,
                                     };
                                     if let Some(p) = piece {
@@ -347,6 +355,11 @@ fn extract_text_in_msg(content: &Value, media: Option<(usize, &MediaPlaceholders
                             if err { "出错" } else { "" }
                         ))
                     }
+                    // CC 工具搜索的延迟工具引用(顶层块):渲染成一行占位文本。
+                    "tool_reference" => Some(format!(
+                        "[引用工具 {}]",
+                        b.get("tool_name").and_then(|t| t.as_str()).unwrap_or("?")
+                    )),
                     // 顶层 image / document 不进文本 —— 它们走 `to_media` 内联成真附件
                     // (图片 → 1.2.1.1.3,文档 → 1.2.1.2.20),渲染成文字反而会丢内容。
                     _ => None,

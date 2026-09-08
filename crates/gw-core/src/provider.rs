@@ -257,6 +257,7 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamItem, UpstreamError
 /// (如 Kiro 按 `account.extra.proxy` / 全局默认代理解析出专属 client);**同一账号的
 /// 刷新/配额/发包应走同一出口**。账号无专属代理时回退 base(进程源 IP)。
 /// 客户端 key / usage 归属由 gw-app 持有(provider 只产 [`ChatUsage`] token 数)。
+#[derive(Debug, Clone)]
 pub struct CallCtx {
     /// 本次选中的账号。
     pub account: Arc<Account>,

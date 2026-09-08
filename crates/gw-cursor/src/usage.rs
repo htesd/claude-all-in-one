@@ -202,11 +202,16 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
         UpstreamError::new(UpstreamErrorKind::Other, "Cursor 用量响应缺少 planUsage")
     })?;
 
-    // ## 三种形态,不是两种
+    // ## 四种形态,不是两种
     //
     // `includedSpend`/`limit` 是**套餐内**额度。付费号两个都给;**FREE 号两个都不给**
     // (免费号没有套餐,上游只给 `totalSpend`/`bonusSpend` 与几个百分比)。
-    // 只缺其中一个才是真异常(上游改字段/账号状态诡异)。
+    // 只缺其中一个而另一个字段能推出来的,也不是异常:
+    //   2026-09-08 bot3/4/5 实弹(团队/试用 seat):无 `includedSpend`,但
+    //   `remaining`+`limit` 都在 → 已用 = limit - remaining。此前按「缺一个=上游
+    //   改字段」报错,面板上这批号的额度栏整体空白。
+    // 只有「includedSpend 缺且 remaining/limit 凑不齐」才是真异常(上游改字段/账号
+    // 状态诡异)。
     //
     // 此前这里对「两个都缺」也报错,后果是 **FREE 号的配额查询整体失败** →
     // 后台额度栏空白、档位也拿不到,只能翻上游原始报文才知道号是被降级了。
@@ -223,8 +228,13 @@ pub fn parse_period_usage(body: &str) -> Result<AccountQuota, UpstreamError> {
     // FREE 档没有套餐额度,三个数都是 0(不是"未知":免费号的套餐内额度确实是 0)。
     let used = if free_plan {
         0.0
+    } else if let Some(u) = plan.included_spend {
+        cents_to_usd(u)
+    } else if let (Some(r), Some(l)) = (plan.remaining, plan.limit) {
+        // 团队/试用 seat 形态:无 includedSpend,已用 = limit - remaining。
+        cents_to_usd(l - r)
     } else {
-        cents_to_usd(plan.included_spend.ok_or_else(missing)?)
+        return Err(missing());
     };
     let limit = if free_plan {
         0.0
@@ -546,6 +556,28 @@ mod tests {
         assert!((q.windows[0].percent_used - 0.0).abs() < 1e-9);
         assert_eq!(q.windows[1].label, "api");
         assert!((q.windows[1].percent_used - 46.444).abs() < 1e-9);
+    }
+
+    /// 团队/试用 seat 形态(2026-09-08 bot3/4/5 生产实弹):无 includedSpend,
+    /// 但 remaining+limit 都在 → 已用 = limit - remaining,额度栏不再空白。
+    #[test]
+    fn 无includedSpend但有remaining和limit的seat形态() {
+        let body = r#"{
+          "billingCycleStart": "1786211373000",
+          "billingCycleEnd": "1788889773000",
+          "planUsage": {
+            "remaining": 1500,
+            "limit": 2000,
+            "autoPercentUsed": 0,
+            "apiPercentUsed": 25.0,
+            "totalPercentUsed": 25.0
+          },
+          "enabled": true
+        }"#;
+        let q = parse_period_usage(body).expect("seat 形态应解析");
+        assert!((q.used - 5.0).abs() < 1e-9, "used={}", q.used); // 2000-1500 美分 = $5
+        assert!((q.limit - 20.0).abs() < 1e-9, "limit={}", q.limit);
+        assert!((q.remaining - 15.0).abs() < 1e-9, "remaining={}", q.remaining);
     }
 
     /// 上游没给两条百分比时不造窗口(缺省 ≠ 0%),前端据此不渲染空进度条。

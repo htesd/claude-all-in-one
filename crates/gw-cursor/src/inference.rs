@@ -193,6 +193,8 @@ fn tools_text_block(tools: &[Json]) -> String {
         "You have access to the following tools. To call a tool, output a block in exactly \
          this format:\n\n<tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call>\n\n\
          Rules:\n- arguments must be a valid JSON object matching the tool's schema.\n\
+         - STRICT JSON: every key needs an explicit value — write boolean flags as {\"flag\":true}, \
+         never a bare {\"flag\"}.\n\
          - Do not wrap the block in markdown fences. Do not add commentary inside the block.\n\
          - After emitting a tool call, stop and wait for the tool result.\n\
          - Tool results arrive as <tool_result name=\"TOOL_NAME\">...</tool_result> in a user message. \
@@ -228,7 +230,8 @@ fn textemu_tail_reminder(tools: &[Json]) -> String {
         "<system-reminder>IMPORTANT: Tool calling in this environment is TEXT-BASED. \
          To call a tool, your reply MUST contain exactly one \
          <tool_call>{\"name\":\"<exact tool name>\",\"arguments\":{...}}</tool_call> block \
-         and NOTHING after it. NEVER write tool calls as markdown (like \"**Bash** ```json ...```\"), \
+         and NOTHING after it. arguments must be strict JSON — boolean flags need explicit \
+         values (\"-n\":true), never bare keys. NEVER write tool calls as markdown (like \"**Bash** ```json ...```\"), \
          NEVER narrate them in prose, and NEVER fabricate a <tool_result> or _result yourself — \
          tool results are provided by the user in the next turn. Available tools: ",
     );
@@ -381,6 +384,8 @@ fn eligible_media_block(block: &Json, media_bytes: &mut usize) -> bool {
                     Some("text") => true,
                     Some("image") => check_base64_source(nested.get("source"), media_bytes),
                     Some("document") => check_document_block(nested, media_bytes),
+                    // CC 工具搜索的延迟工具引用块:纯引用标记,编码器渲染成占位文本。
+                    Some("tool_reference") => true,
                     // 嵌套 tool_result / 未知类型:编码器处理不了,回退
                     _ => false,
                 }
@@ -389,8 +394,8 @@ fn eligible_media_block(block: &Json, media_bytes: &mut usize) -> bool {
             None | Some(Json::Null) | Some(Json::String(_)) => true,
             _ => false,
         },
-        // 编码器认识的非媒体块
-        Some("text" | "tool_use" | "thinking" | "redacted_thinking") => true,
+        // 编码器认识的非媒体块;tool_reference 是 CC 工具搜索的延迟引用,渲染成占位文本
+        Some("text" | "tool_use" | "thinking" | "redacted_thinking" | "tool_reference") => true,
         // 未知块类型:fail-closed
         _ => false,
     }
@@ -562,6 +567,13 @@ fn user_parts(blocks: &[Json], doc_n: &mut usize, w: &mut Writer) {
                     continue;
                 }
             }
+            // CC 工具搜索的延迟工具引用(顶层块):一行占位文本,别静默丢。
+            Some("tool_reference") => {
+                let tn = b.get("tool_name").and_then(Json::as_str).unwrap_or("?");
+                let mut tp = Writer::new();
+                tp.string(1, &format!("[tool_reference: {tn}]"));
+                part.message(1, &tp);
+            }
             _ => continue,
         }
         parts.message(1, &part);
@@ -602,6 +614,11 @@ fn tool_results_as_text(
                             if let Some(doc_text) = document_inject_text(c, doc_n) {
                                 push_text(&mut texts, &doc_text);
                             }
+                        }
+                        // CC 工具搜索的延迟工具引用:让模型看到名字,别静默丢。
+                        Some("tool_reference") => {
+                            let tn = c.get("tool_name").and_then(Json::as_str).unwrap_or("?");
+                            push_text(&mut texts, &format!("[tool_reference: {tn}]"));
                         }
                         _ => {}
                     }
@@ -671,6 +688,12 @@ fn tool_result_content(
                             if let Some(doc_text) = document_inject_text(c, doc_n) {
                                 push_text(&mut texts, &doc_text);
                             }
+                        }
+                        // CC 工具搜索的延迟工具引用:结构化结果里没有它的字段,
+                        // 渲染成一行文本并进结果(让模型看到名字,别静默丢)。
+                        Some("tool_reference") => {
+                            let tn = c.get("tool_name").and_then(Json::as_str).unwrap_or("?");
+                            push_text(&mut texts, &format!("[tool_reference: {tn}]"));
                         }
                         _ => {}
                     }
@@ -1064,6 +1087,508 @@ struct PendingTool {
     args_last: String,
 }
 
+/// 兜底宽容解析器:专门收拾严格解析 + 两级修复都救不回的块 —— 字符串值里混着
+/// **裸引号**(2026-09-08 生产实弹:write_file/Bash 的参数里塞 python 代码,
+/// `"depthTestEnable":` 这种内容引号让严格解析直接崩)。
+///
+/// 与修复链的根本区别:不在文本层面修补,而是按 `{"name":..,"arguments":{..}}`
+/// 的目标形态做前向解析。字符串值的终止引号判定:**仅当**该引号之后(跳过空白)
+/// 紧跟 `}`(对象收尾)或 `,"<标识符>":`(下一个键)才算终止;否则视为内容里的
+/// 裸引号,原样收进值。键名一律严格(键里出现裸引号 = 不是我们认识的形态,放弃)。
+/// 值内容做宽容反转义:合法转义(\\n/\\t/\\"/\\\\/\\uXXXX 等)照译,非法转义
+/// (\d 之类)原样保留反斜杠 —— 那正是模型想写进命令里的正则。
+///
+/// 只在完全走完形态(根对象恰好闭合到 EOF)时返回 Some;任何一步对不上 → None,
+/// 调用方继续走诚实降级,绝不伪造一个结构可疑的调用。
+fn parse_tool_call_lenient(raw: &str) -> Option<Json> {
+    let cs: Vec<char> = raw.chars().collect();
+    let mut p = LenientParser { cs: &cs, i: 0 };
+    p.ws();
+    let v = p.object()?;
+    p.ws();
+    if p.i != cs.len() {
+        return None; // 尾巴上有东西:形态不符
+    }
+    Some(v)
+}
+
+struct LenientParser<'a> {
+    cs: &'a [char],
+    i: usize,
+}
+
+impl LenientParser<'_> {
+    fn ws(&mut self) {
+        while self.i < self.cs.len() && self.cs[self.i].is_whitespace() {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.cs.get(self.i).copied()
+    }
+
+    fn eat(&mut self, c: char) -> Option<()> {
+        if self.peek() == Some(c) {
+            self.i += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// 严格字符串(键名用):不支持任何宽容;返回反转义后的串。
+    fn strict_string(&mut self) -> Option<String> {
+        self.eat('"')?;
+        let start = self.i;
+        while self.i < self.cs.len() {
+            match self.cs[self.i] {
+                '"' => {
+                    let raw: String = self.cs[start..self.i].iter().collect();
+                    self.i += 1;
+                    return Some(lenient_unescape(&raw));
+                }
+                '\\' => self.i += 2, // 跳过转义对,内容留给反转义统一处理
+                // 键/结构串里的裸控制字符:不容忍(键不该有这种东西)。
+                c if (c as u32) < 0x20 => return None,
+                _ => self.i += 1,
+            }
+        }
+        None // 未闭合
+    }
+
+    /// 宽容字符串值:终止引号判定见 [`parse_tool_call_lenient`]。返回(内容, 是否闭合)。
+    fn lenient_string_value(&mut self) -> Option<String> {
+        self.eat('"')?;
+        let start = self.i;
+        let mut out = String::new();
+        while self.i < self.cs.len() {
+            let c = self.cs[self.i];
+            if c == '\\' && self.i + 1 < self.cs.len() {
+                // 转义对先两个都收下,合法与否留给反转义阶段判。
+                out.push('\\');
+                out.push(self.cs[self.i + 1]);
+                self.i += 2;
+                continue;
+            }
+            if c == '"' {
+                // 终止符还是内容引号?向后看:跳过空白后紧跟 `}` / `,"<键>":` 才终止。
+                let mut j = self.i + 1;
+                while j < self.cs.len() && self.cs[j].is_whitespace() {
+                    j += 1;
+                }
+                let terminates = match self.cs.get(j) {
+                    Some('}') => true,
+                    Some(',') => {
+                        // 试读 `,"<ident>":` —— 读得出才终止。
+                        let mut k = j + 1;
+                        while k < self.cs.len() && self.cs[k].is_whitespace() {
+                            k += 1;
+                        }
+                        if self.cs.get(k) == Some(&'"') {
+                            k += 1;
+                            let ks = k;
+                            while k < self.cs.len()
+                                && (self.cs[k].is_ascii_alphanumeric()
+                                    || matches!(self.cs[k], '_' | '-' | '.'))
+                            {
+                                k += 1;
+                            }
+                            let key_ok = k > ks && k - ks <= 64;
+                            let mut m = k;
+                            while m < self.cs.len() && self.cs[m].is_whitespace() {
+                                m += 1;
+                            }
+                            key_ok
+                                && self.cs.get(m) == Some(&'"')
+                                && {
+                                    m += 1;
+                                    while m < self.cs.len() && self.cs[m].is_whitespace() {
+                                        m += 1;
+                                    }
+                                    self.cs.get(m) == Some(&':')
+                                }
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if terminates {
+                    self.i += 1; // 吃掉终止引号,调用方从 `,`/`}` 继续
+                    return Some(lenient_unescape(&out));
+                }
+                // 内容引号:原样收进值,继续。
+                out.push('"');
+                self.i += 1;
+                continue;
+            }
+            // 其余一切(含裸换行/制表符)原样收。
+            out.push(c);
+            self.i += 1;
+        }
+        None // 一直没等到终止引号:截断块,放弃
+    }
+
+    /// 标量(数字/布尔/null):读到 , } ] 为止,严格解析。容器不在这里:
+    /// 容器必须递归走宽容 object/array(它们的字符串值里可能有裸引号,
+    /// 严格容器读取在生产语料上必炸 —— 2239933 的 arguments 就是)。
+    fn scalar(&mut self) -> Option<Json> {
+        let start = self.i;
+        while self.i < self.cs.len() && !matches!(self.cs[self.i], ',' | '}' | ']') {
+            self.i += 1;
+        }
+        let text: String = self.cs[start..self.i].iter().collect::<String>().trim().into();
+        if text.is_empty() {
+            return None;
+        }
+        serde_json::from_str(&text).ok()
+    }
+
+    /// 数组:元素同 [`Self::value`] 分派(宽容)。
+    fn array(&mut self) -> Option<Json> {
+        self.eat('[')?;
+        let mut items = Vec::new();
+        self.ws();
+        if self.peek() == Some(']') {
+            self.i += 1;
+            return Some(Json::Array(items));
+        }
+        loop {
+            items.push(self.value()?);
+            self.ws();
+            match self.peek()? {
+                ',' => {
+                    self.i += 1;
+                }
+                ']' => {
+                    self.i += 1;
+                    return Some(Json::Array(items));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// 值分派:字符串走宽容,容器递归宽容,标量严格。
+    fn value(&mut self) -> Option<Json> {
+        self.ws();
+        match self.peek()? {
+            '"' => self.lenient_string_value().map(Json::String),
+            '{' => self.object(),
+            '[' => self.array(),
+            _ => self.scalar(),
+        }
+    }
+
+    /// 对象:键严格、值宽容。`,`/`}` 收尾后由调用方继续。
+    fn object(&mut self) -> Option<Json> {
+        self.eat('{')?;
+        let mut map = serde_json::Map::new();
+        self.ws();
+        if self.peek() == Some('}') {
+            self.i += 1;
+            return Some(Json::Object(map));
+        }
+        loop {
+            self.ws();
+            let key = self.strict_string()?;
+            self.ws();
+            self.eat(':')?;
+            let v = self.value()?;
+            map.insert(key, v);
+            self.ws();
+            match self.peek()? {
+                ',' => {
+                    self.i += 1;
+                }
+                '}' => {
+                    self.i += 1;
+                    return Some(Json::Object(map));
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// 宽容反转义:合法 JSON 转义照译;非法转义(如 `\d`)原样保留两个字符 ——
+/// 模型写正则时想要的就是字面反斜杠。
+fn lenient_unescape(raw: &str) -> String {
+    let cs: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(cs.len());
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == '\\' && i + 1 < cs.len() {
+            let n = cs[i + 1];
+            match n {
+                'n' => {
+                    out.push('\n');
+                    i += 2;
+                }
+                't' => {
+                    out.push('\t');
+                    i += 2;
+                }
+                'r' => {
+                    out.push('\r');
+                    i += 2;
+                }
+                'b' => {
+                    out.push('\u{8}');
+                    i += 2;
+                }
+                'f' => {
+                    out.push('\u{c}');
+                    i += 2;
+                }
+                '"' | '\\' | '/' => {
+                    out.push(n);
+                    i += 2;
+                }
+                'u' => {
+                    let hex: String = cs.iter().skip(i + 2).take(4).collect();
+                    let parsed_cp = if hex.len() == 4 && hex.chars().all(|h| h.is_ascii_hexdigit())
+                    {
+                        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                    } else {
+                        None
+                    };
+                    match parsed_cp {
+                        Some(ch) => {
+                            out.push(ch);
+                            i += 6;
+                        }
+                        None => {
+                            out.push('\\');
+                            i += 1;
+                        }
+                    }
+                }
+                // 非法转义:反斜杠原样保留,下一字符走正常流程。
+                _ => {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(cs[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// TextEmu 契约 JSON 的字符串内容消毒:模型写长命令(heredoc / 正则)时常见的
+/// 两类字符串内畸形,实弹均见于 2026-09-08 Windows CC 用户的生产报文:
+/// 1. **裸控制字符**:heredoc 里的真换行/制表符直接写进字符串(严格 JSON 禁止),
+///    转义成 \\n/\\t/\\r/\u00XX;
+/// 2. **非法转义**:正则的 `\d`/`\s` 等单反斜杠序列(JSON 只认 \" \\ \/ \b \f \n
+///    \r \t \uXXXX),把反斜杠加倍成 `\\d`。
+/// 字符串外一个字符不动;已合法的转义序列(含 \\u 四位十六进制)原样保留。
+fn repair_json_string_escapes(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut in_str = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_str {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 字符串内
+        match c {
+            '"' => {
+                in_str = false;
+                out.push(c);
+                i += 1;
+            }
+            '\\' => {
+                let next = chars.get(i + 1).copied();
+                let valid = match next {
+                    Some('"') | Some('\\') | Some('/') | Some('b') | Some('f') | Some('n')
+                    | Some('r') | Some('t') => Some(2),
+                    Some('u') => {
+                        let hex_ok = (2..=5).all(|k| {
+                            chars.get(i + k).is_some_and(|h| h.is_ascii_hexdigit())
+                        });
+                        if hex_ok {
+                            Some(6)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                match valid {
+                    Some(n) => {
+                        // 合法转义:整段原样过。
+                        for k in 0..n {
+                            out.push(chars[i + k]);
+                        }
+                        i += n;
+                    }
+                    None => {
+                        // 非法转义:反斜杠加倍,后随字符保持原样(孤立 \ 也一样补)。
+                        out.push_str("\\\\");
+                        if let Some(n2) = next {
+                            out.push(n2);
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            '\n' => {
+                out.push_str("\\n");
+                i += 1;
+            }
+            '\t' => {
+                out.push_str("\\t");
+                i += 1;
+            }
+            '\r' => {
+                out.push_str("\\r");
+                i += 1;
+            }
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// TextEmu 契约 JSON 的窄修复:模型(实弹里是 claude 系)偶尔把布尔旗标写成
+/// 裸键 —— `{"-n","glob":"*.rs"}`(合法 JSON 要求 `{"-n":true,...}`)。
+/// 扫描级修复:**对象内 key 位置**读完一个字符串后,下一个非空白字符是 `,`/`}`
+/// 而不是 `:` → 补 `:true`。只动这一种畸形;其它(截断/缺括号等)原样返回,
+/// 解析仍失败则走诚实降级。字符串/转义/嵌套容器状态全程跟踪,不会误伤值位置
+/// 的字符串(如 `"name":"grep"` 的 `"grep"`)。
+fn repair_json_bare_flags(raw: &str) -> String {
+    /// 容器上下文:数组,或对象的三个相位(等 key / 等 value / value 已完)。
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ctx {
+        Arr,
+        Key,
+        Val,
+        AfterVal,
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut stack: Vec<Ctx> = Vec::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    // 对象里刚读完一个候选 key 字符串,等 ':' 的证据(否则就是裸键)。
+    let mut bare_key = false;
+    for c in raw.chars() {
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '"' => {
+                    in_str = false;
+                    match stack.last() {
+                        Some(Ctx::Key) => bare_key = true,
+                        Some(Ctx::Val) => {
+                            *stack.last_mut().unwrap() = Ctx::AfterVal;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if bare_key {
+            match c {
+                // key 与 ':' 之间允许空白,先原样留住。
+                c if c.is_whitespace() => {
+                    out.push(c);
+                    continue;
+                }
+                ':' => {
+                    bare_key = false;
+                    *stack.last_mut().unwrap() = Ctx::Val;
+                    out.push(c);
+                    continue;
+                }
+                ',' => {
+                    // 裸键实锤:补 :true,然后按「下一个 key」继续。
+                    bare_key = false;
+                    out.push_str(":true");
+                    *stack.last_mut().unwrap() = Ctx::Key;
+                    out.push(c);
+                    continue;
+                }
+                '}' => {
+                    bare_key = false;
+                    out.push_str(":true");
+                    stack.pop();
+                    if let Some(Ctx::Val) = stack.last() {
+                        *stack.last_mut().unwrap() = Ctx::AfterVal;
+                    }
+                    out.push(c);
+                    continue;
+                }
+                // 其它字符:不是合法的 key 后继,放弃这一处的修复尝试。
+                _ => bare_key = false,
+            }
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+            }
+            '{' => {
+                stack.push(Ctx::Key);
+                out.push(c);
+            }
+            '[' => {
+                stack.push(Ctx::Arr);
+                out.push(c);
+            }
+            '}' | ']' => {
+                stack.pop();
+                // 容器作为对象 value 收尾:父级相位推进到 AfterVal。
+                if let Some(Ctx::Val) = stack.last() {
+                    *stack.last_mut().unwrap() = Ctx::AfterVal;
+                }
+                out.push(c);
+            }
+            ',' => {
+                // value(标量/字符串/容器)后的逗号 → 等下一个 key。
+                if matches!(stack.last(), Some(Ctx::AfterVal) | Some(Ctx::Val)) {
+                    *stack.last_mut().unwrap() = Ctx::Key;
+                }
+                out.push(c);
+            }
+            ':' => {
+                if let Some(Ctx::Key) = stack.last() {
+                    *stack.last_mut().unwrap() = Ctx::Val;
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// TextEmu 门面的流式文本过滤器:在文本 delta 流里识别 `<tool_call>…</tool_call>`
 /// 块。标签可能横跨两个 delta,所以滞回 `OPEN.len()-1` 个字符确认不是标签前缀
 /// 才往下流放(流式体验只损失这 10 个字符的延迟)。
@@ -1377,9 +1902,26 @@ impl Folder {
     }
 
     /// TextEmu:模型写出的 `<tool_call>` 块内容(两个标签之间的 JSON)→ tool_use。
-    /// 解析失败 / 未声明 / args 非 object:原文按文本吐回(诚实降级,不伪造调用)。
+    /// 解析失败先经 [`repair_json_bare_flags`] 做一次窄修复(裸布尔旗标),
+    /// 仍失败 / 未声明 / args 非 object:原文按文本吐回(诚实降级,不伪造调用)。
     fn publish_text_tool_call(&mut self, raw: String) {
-        let parsed = serde_json::from_str::<Json>(&raw).ok();
+        let parsed = serde_json::from_str::<Json>(&raw)
+            .ok()
+            .or_else(|| {
+                // 两级窄修复:字符串内容消毒(真换行/非法转义)+ 对象裸布尔旗标。
+                let repaired = repair_json_bare_flags(&repair_json_string_escapes(&raw));
+                serde_json::from_str::<Json>(&repaired)
+                    .ok()
+                    .inspect(|_| {
+                        tracing::warn!("inference: TextEmu 契约 JSON 修复生效(转义/裸旗标)")
+                    })
+            })
+            .or_else(|| {
+                // 最后兜底:宽容前向解析(字符串值里的裸引号,生产实弹形态)。
+                parse_tool_call_lenient(&raw).inspect(|_| {
+                    tracing::warn!("inference: TextEmu 契约 JSON 经宽容解析救回(裸引号)")
+                })
+            });
         let good = parsed.as_ref().and_then(|v| {
             let name = v.get("name").and_then(Json::as_str)?;
             // Hermes 标准是 `arguments`;旧契约(今天早些时候灰度)用 `args`,兼容收。
@@ -3306,6 +3848,147 @@ mod tests {
     }
 
     #[test]
+    fn textemu_裸布尔旗标被修复() {
+        // 2026-09-08 生产实弹畸形:{"name":"grep","arguments":{"-n","glob":...}} —
+        // 布尔旗标写成裸键,严格 JSON 不合法。窄修复后应正常产出 tool_use。
+        let mut f = Folder::new("claude-opus-5", declared(&["grep"]), true, 4000, true);
+        f.feed_frame(
+            &text_part(
+                "<tool_call>{\"name\":\"grep\",\"arguments\":{\"-n\",\"glob\":\"*.{h,cpp}\",\"pattern\":\"class T\"}}</tool_call>",
+                false,
+            ),
+        )
+        .unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(
+            joined.contains(r#""type":"tool_use""#),
+            "修复后应产出 tool_use 而非降级文本: {joined}"
+        );
+        assert!(joined.contains(r#""-n\":true"#), "裸键补 true: {joined}");
+        assert!(joined.contains("class T"), "其余参数原样保留: {joined}");
+    }
+
+    #[test]
+    fn repair_json_bare_flags_只修对象key位置() {
+        // 合法 JSON 原样不动(含值位置的字符串)。
+        let ok = r#"{"name":"grep","arguments":{"pattern":"class T","-n":true}}"#;
+        assert_eq!(repair_json_bare_flags(ok), ok);
+        // 对象末尾的裸键(} 前)。
+        assert_eq!(
+            repair_json_bare_flags(r#"{"a":{"x":1,"flag"}}"#),
+            r#"{"a":{"x":1,"flag":true}}"#
+        );
+        // 嵌套对象里的裸键,后面还跟着正常键值对。
+        assert_eq!(
+            repair_json_bare_flags(r#"{"name":"g","arguments":{"-n","glob":"*.rs"}}"#),
+            r#"{"name":"g","arguments":{"-n":true,"glob":"*.rs"}}"#
+        );
+        // 字符串值内含逗号/引号转义/括号:不受影响。
+        let tricky = r#"{"a":"x,\"}, y"}"#;
+        assert_eq!(repair_json_bare_flags(tricky), tricky);
+        // 数组里的字符串不是 key,不修。
+        let arr = r#"{"a":["x","y"]}"#;
+        assert_eq!(repair_json_bare_flags(arr), arr);
+        // 截断 JSON 依旧不合法(修不了的东西不伪造),调用方走诚实降级。
+        let cut = r#"{"name":"grep","arguments":{"pattern":"class T"#;
+        assert!(serde_json::from_str::<Json>(&repair_json_bare_flags(cut)).is_err());
+    }
+
+    #[test]
+    fn textemu_字符串内字面换行被修复() {
+        // 2026-09-08 生产实弹(Windows CC 用户):heredoc 里的真换行写进 JSON
+        // 字符串,严格解析失败 → 整条调用降级成用户可见原文,CC 干等。
+        let mut f = Folder::new("claude-opus-5", declared(&["Bash"]), true, 4000, true);
+        let payload = "<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"cd /e/proj && cat > /tmp/x.py <<'EOF'\nimport sys\nprint('hi')\nEOF\npython3 /tmp/x.py\"}}</tool_call>";
+        f.feed_frame(&text_part(payload, false)).unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(
+            joined.contains(r#""type":"tool_use""#),
+            "字面换行修复后应产出 tool_use: {joined}"
+        );
+        assert!(joined.contains("import sys"), "heredoc 内容应保留: {joined}");
+        assert!(
+            !joined.contains("<tool_call>"),
+            "修复成功后原文标签不得泄漏: {joined}"
+        );
+    }
+
+    #[test]
+    fn repair_json_string_escapes_只动字符串内() {
+        // 字符串内的真换行/制表符被转义
+        assert_eq!(
+            repair_json_string_escapes("{\"a\":\"x\ny\tz\"}"),
+            "{\"a\":\"x\\ny\\tz\"}"
+        );
+        // 字符串外的换行(排版)原样保留
+        assert_eq!(
+            repair_json_string_escapes("{\"a\":1,\n\"b\":2}"),
+            "{\"a\":1,\n\"b\":2}"
+        );
+        // 已合法的转义不重复转义(含 \n 与 \uXXXX)
+        assert_eq!(
+            repair_json_string_escapes("{\"a\":\"x\\ny\\u0041z\"}"),
+            "{\"a\":\"x\\ny\\u0041z\"}"
+        );
+        // 非法转义(正则 \d \s):反斜杠加倍 —— 2026-09-08 生产实弹形态
+        assert_eq!(
+            repair_json_string_escapes("{\"a\":\"(\\d)|(\\s)\"}"),
+            "{\"a\":\"(\\\\d)|(\\\\s)\"}"
+        );
+        // 已合法的双反斜杠与非法单反斜杠混排(同一条生产报文里的真实情况)
+        assert_eq!(
+            repair_json_string_escapes("{\"a\":\"\\\\s*(\\d)\"}"),
+            "{\"a\":\"\\\\s*(\\\\d)\"}"
+        );
+        // 与裸键修复链式兼容:两类畸形一次修好
+        let both = "{\"name\":\"g\",\"arguments\":{\"-n\",\"cmd\":\"a\nb (\\d)\"}}";
+        let fixed = repair_json_bare_flags(&repair_json_string_escapes(both));
+        let v = serde_json::from_str::<Json>(&fixed).unwrap();
+        assert_eq!(v["arguments"]["-n"], true);
+        assert_eq!(v["arguments"]["cmd"], "a\nb (\\d)");
+    }
+
+    #[test]
+    fn textemu_裸引号经宽容解析救回() {
+        // 2026-09-08 生产实弹(Windows CC 用户):write_file/Bash 的参数里塞 python
+        // 代码,内容引号("depthTestEnable": 这种)让严格解析与两级修复全部失败。
+        let mut f = Folder::new("claude-opus-5", declared(&["Bash"]), true, 4000, true);
+        let payload = "<tool_call>{\"name\":\"Bash\",\"arguments\":{\"command\":\"python3 -c '\nres = {\n    \"depthTestEnable\": bool(ds.depthTestEnable),\n}\nprint(res)'\n\",\"max_lines\":120}}</tool_call>";
+        f.feed_frame(&text_part(payload, false)).unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(
+            joined.contains(r#""type":"tool_use""#),
+            "裸引号块应被宽容解析救回: {joined}"
+        );
+        assert!(joined.contains("depthTestEnable"), "内容应完整: {joined}");
+        assert!(!joined.contains("<tool_call>"), "原文标签不得泄漏: {joined}");
+    }
+
+    #[test]
+    fn 宽容解析器_边界形态() {
+        // 正常块也过宽容解析(幂等)
+        let ok = r#"{"name":"Bash","arguments":{"command":"ls","max_lines":10}}"#;
+        let v = parse_tool_call_lenient(ok).unwrap();
+        assert_eq!(v["arguments"]["max_lines"], 10);
+        // 多键 + 尾带标量 + 内容含裸引号与真换行(生产 2239933 同形态)
+        let tricky = "{\"name\":\"bash\",\"arguments\":{\"command\":\"cat > /tmp/x.py <<'EOF'\nd = {\"a\": 1}\nEOF\npython3 /tmp/x.py\",\"timeout\":600}}";
+        let v = parse_tool_call_lenient(tricky).unwrap();
+        assert_eq!(v["arguments"]["timeout"], 600);
+        assert!(v["arguments"]["command"].as_str().unwrap().contains("\"a\": 1"));
+        // 数组参数(宽容路径递归)
+        let arr = r#"{"name":"f","arguments":{"ids":[1,2,3],"q":"x"}}"#;
+        let v = parse_tool_call_lenient(arr).unwrap();
+        assert_eq!(v["arguments"]["ids"], serde_json::json!([1, 2, 3]));
+        // 尾巴带垃圾 → 拒(形态不符,宁可降级)
+        assert!(parse_tool_call_lenient(r#"{"name":"f","arguments":{}} trailing"#).is_none());
+        // 半截块(无终止) → 拒
+        assert!(parse_tool_call_lenient(r#"{"name":"f","arguments":{"a":"bc"#).is_none());
+    }
+
+    #[test]
     fn eligible门控() {
         use base64::Engine as _;
         use serde_json::json;
@@ -3347,6 +4030,12 @@ mod tests {
         // 未知块类型 → fail-closed(编码器会静默丢,落回 cli/wire 更诚实)
         let unknown = json!({"messages":[{"role":"user","content":[{"type":"future_block","x":1}]}]});
         assert!(!inference_eligible(&unknown));
+        // CC 工具搜索的 tool_reference(嵌套在 tool_result 里,生产实弹 2241573)→ 接
+        let tool_ref = json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"x"},{"type":"tool_reference","tool_name":"TaskOutput"}]}]}]});
+        assert!(inference_eligible(&tool_ref));
+        // 顶层 tool_reference → 接
+        let top_ref = json!({"messages":[{"role":"user","content":[{"type":"tool_reference","tool_name":"TaskOutput"}]}]});
+        assert!(inference_eligible(&top_ref));
         // 嵌套 tool_result(两层)→ 编码器只处理一层,fail-closed
         let nested_tr = json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"tool_result","tool_use_id":"t2","content":"x"}]}]}]});
         assert!(!inference_eligible(&nested_tr));
@@ -3391,3 +4080,4 @@ mod tests {
         assert!(text.contains("无法抽取文本层"), "{text}");
     }
 }
+
