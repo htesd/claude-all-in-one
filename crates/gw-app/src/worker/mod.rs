@@ -263,7 +263,38 @@ impl WorkerState {
         &self,
         base: Arc<Account>,
     ) -> Result<Arc<Account>, gw_core::error::UpstreamError> {
-        let refreshed = Arc::new(self.provider.refresh_auth(&base).await?);
+        let refreshed = match self.provider.refresh_auth(&base).await {
+            Ok(a) => Arc::new(a),
+            Err(e) => {
+                // 孪生号自愈(2026-09-07):复制号( extra.twin_of → 源号 )与源号共享
+                // 上游账号、各自持一条 token 链。源号先轮换后,复制号手里的旧 RT 过
+                // 宽限期失效(cursor 实测:旧 RT 只在短时 leeway 内可用)。此时别直接
+                // 判死 —— 若源号当前 RT 与本地不同(源号已轮换),借源号的链头重刷
+                // 一次;源号也救不回才按原错误上抛(真封禁不受此机制影响)。
+                if e.kind != gw_core::error::UpstreamErrorKind::TokenInvalid {
+                    return Err(e);
+                }
+                match self.twin_resync(&base) {
+                    Some((src, tw)) => match self.provider.refresh_auth(&tw).await {
+                        Ok(a) => {
+                            tracing::warn!(
+                                account = %base.account_id,
+                                twin_of = %src,
+                                "孪生号本地 RT 已失效,借源号链头刷新成功(自愈)"
+                            );
+                            Arc::new(a)
+                        }
+                        Err(e2) => {
+                            tracing::warn!(account = %base.account_id,
+                                "孪生自愈失败(源号链头也刷不动): {e2}");
+                            return Err(e); // 维持原判:永久失效
+                        }
+                    },
+                    None => return Err(e),
+                }
+            }
+        };
+
         // 回写 scheduler:带新 token 的副本进入选号池(单一事实来源)。
         // **原子**「替换 + 置脏」(同一把 entries 锁):分两步的话,30s sync 会在
         // 中间窗口看到 dirty=false,用 DB 旧值洗掉新 token(审查②R Skeptic#1)。
@@ -293,6 +324,42 @@ impl WorkerState {
             None => self.scheduler.clear_extra_dirty(&refreshed.account_id),
         }
         Ok(refreshed)
+    }
+
+    /// 孪生自愈的取链动作:`extra.twin_of` 指向的源号当前 refresh_token 与本号不同
+    /// (源号已轮换)时,返回(源号 ID, 换了源号 token 链的本号候选副本)。
+    /// 源号不存在/无 RT/与本号同一代 → None(没有可借的新链)。
+    fn twin_resync(&self, base: &Arc<Account>) -> Option<(String, Arc<Account>)> {
+        let src_id = base.extra_str("twin_of")?.to_string();
+        if src_id == base.account_id {
+            return None; // 防自指
+        }
+        let store = self.store.as_ref()?;
+        let src = match store.get_account(&src_id) {
+            Ok(Some(r)) => r,
+            _ => return None,
+        };
+        let src_extra: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&src.extra).unwrap_or_default();
+        let rt_of = |e: &serde_json::Map<String, serde_json::Value>| {
+            e.get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let src_rt = rt_of(&src_extra)?;
+        let my_rt = base.extra_str("refresh_token").unwrap_or("");
+        if src_rt == my_rt {
+            return None; // 同一代链,借了也白借
+        }
+        let mut cand = (**base).clone();
+        for k in ["refresh_token", "access_token", "expires_at"] {
+            if let Some(v) = src_extra.get(k) {
+                cand.extra.insert(k.to_string(), v.clone());
+            }
+        }
+        Some((src_id, Arc::new(cand)))
     }
 
     /// 读账号配额缓存;命中(<TTL,含失败记录)直接返回,陈旧/缺失则触发**后台**刷新

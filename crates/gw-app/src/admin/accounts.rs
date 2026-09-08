@@ -1280,15 +1280,78 @@ async fn import_accounts(
             continue;
         }
         let has_mid = imp.has_machine_id();
-        let existing = match st.store.get_account(&imp.account_id) {
+        let mut target_id = imp.account_id.clone();
+        // 孪生标记:同邮箱不同真号派生了新 ID 时,结果里带上源 ID 供对账。
+        let mut twin_of: Option<String> = None;
+        let mut existing = match st.store.get_account(&target_id) {
             Ok(v) => v,
             Err(e) => return internal_error(e),
         };
+        // 孪生号(2026-09-07 实案):同一邮箱下的不同真号(同 IdC 实例不同区域注册,
+        // profileArn/clientId 不同)。邮箱派生的 account_id 相同,若走智能合并,
+        // 第二个号的 refresh_token 会被「token 字段合并不覆盖」规则静默丢掉 ——
+        // 第二个号永远上不了。
+        //
+        // 判定用 **client_id 不同**而不是 RT 不同:RT 不同还可能是「同号的旧导出」
+        //(服务器已轮换,导出里的是死 RT)——那种情况创孪生只会多个带死 RT 的垃圾号;
+        // client_id 不同则是另一个 IdC 注册,确证不同真号。确证后派生新 ID
+        //(`base-2`/`-3`…)按新号全字段写入,不进合并路径;无法确证的照旧走
+        // 下面的合并/碰撞防护。
+        if let Some(row) = &existing {
+            let existing_extra: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&row.extra).unwrap_or_default();
+            fn cid_of(e: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+                match e.get("client_id").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => Some(s.trim()),
+                    _ => None,
+                }
+            }
+            let is_twin = match (cid_of(&imp.extra), cid_of(&existing_extra)) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            };
+            if is_twin {
+                let mut found = None;
+                for n in 2..=99u32 {
+                    let cand = format!("{}-{}", imp.account_id, n);
+                    if validate_account_id(&cand).is_err() {
+                        break;
+                    }
+                    match st.store.get_account(&cand) {
+                        Ok(None) => {
+                            found = Some(cand);
+                            break;
+                        }
+                        Ok(Some(_)) => continue,
+                        Err(e) => return internal_error(e),
+                    }
+                }
+                match found {
+                    Some(cand) => {
+                        twin_of = Some(imp.account_id.clone());
+                        target_id = cand;
+                        existing = None; // 落入新号创建路径
+                    }
+                    None => {
+                        skipped += 1;
+                        items.push(serde_json::json!({
+                            "account_id": imp.account_id, "action": "skipped",
+                            "reason": "孪生号派生 ID 耗尽(-2..-99 全占用)"
+                        }));
+                        continue;
+                    }
+                }
+            }
+        }
         let Some(row) = existing else {
-            // 新账号:全字段写入(含 token)。create_account 是 INSERT OR IGNORE,
+            // 新账号(含孪生派生):全字段写入(含 token)。create_account 是 INSERT OR IGNORE,
             // 返回 false = 并发下别人刚插了同 id(竞态)→ 当 skipped,不谎报 created。
             // 批量代理:操作员显式意图,写进新账号 extra.proxy(已校验归一)。
             let mut new_extra = imp.extra.clone();
+            // 孪生号:记下源号 ID,供 worker 侧 RT 失效时借链自愈(twin_resync)。
+            if let Some(src) = &twin_of {
+                new_extra.insert("twin_of".into(), serde_json::json!(src));
+            }
             if let Some(bp) = &batch_proxy {
                 new_extra.insert("proxy".into(), serde_json::json!(bp));
             } else if let Some(url) = egress_picker.next() {
@@ -1299,17 +1362,18 @@ async fn import_accounts(
                 Ok(s) => s,
                 Err(e) => return internal_error(e),
             };
-            match st.store.create_account(&imp.account_id, group, "kiro", 2, &extra_json) {
+            match st.store.create_account(&target_id, group, "kiro", 2, &extra_json) {
                 Ok(true) => {
                     created += 1;
                     items.push(serde_json::json!({
-                        "account_id": imp.account_id, "action": "created", "has_machine_id": has_mid
+                        "account_id": target_id, "action": "created", "has_machine_id": has_mid,
+                        "twin_of": twin_of
                     }));
                 }
                 Ok(false) => {
                     skipped += 1;
                     items.push(serde_json::json!({
-                        "account_id": imp.account_id, "action": "skipped", "reason": "并发已存在"
+                        "account_id": target_id, "action": "skipped", "reason": "并发已存在"
                     }));
                 }
                 Err(e) => return internal_error(e),
@@ -3192,6 +3256,62 @@ mod tests {
         assert!(row.extra.contains("u-FIRST"), "应是第一个真号");
         assert!(!row.extra.contains("u-SECOND"), "第二个真号绝不能并进来");
         assert!(!row.extra.contains("rt-second"), "第二个号的凭据不得污染第一个");
+    }
+
+    /// 孪生号(2026-09-07 实案):同邮箱不同 IdC 注册(client_id 不同)= 不同真号,
+    /// 必须派生新 ID 都收进来,并在 extra 里记 twin_of 供借链自愈;
+    /// 同 client_id 仅 RT 不同 = 同号旧导出,照旧合并不创新号(防垃圾号)。
+    #[tokio::test]
+    async fn import_twin_same_email_different_client_id_creates_both() {
+        let (app, store) = app();
+        store.create_group("G0", "", "").unwrap();
+        // 第一只:eu 区注册。
+        store
+            .create_account(
+                "twin-x.com",
+                "G0",
+                "kiro",
+                1,
+                r#"{"refresh_token":"rt-eu","client_id":"cid-EU","email":"twin@x.com"}"#,
+            )
+            .unwrap();
+        // 第二只:同邮箱,us 区注册(client_id 不同)。
+        let export = serde_json::json!({
+            "accounts": [{
+                "email": "twin@x.com", "machineId": "d".repeat(64),
+                "credentials": {"refreshToken": "rt-us", "clientId": "cid-US",
+                                "clientSecret": "sec-us", "region": "us-east-1", "provider": "Enterprise"}
+            }]
+        });
+        let body = serde_json::json!({"group_name": "G0", "json": export.to_string()}).to_string();
+        let resp = app.clone().oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        assert_eq!(v["created"], 1, "孪生应创建新号: {v}");
+        // 新 ID 带 -2 后缀且记 twin_of。
+        let twin = store.get_account("twin-x.com-2").unwrap().unwrap();
+        assert!(twin.extra.contains("rt-us"), "孪生号的 RT 必须全字段写入");
+        assert!(twin.extra.contains("cid-US"), "孪生号的 client_id 写入");
+        assert!(twin.extra.contains(r#""twin_of":"twin-x.com""#), "应记 twin_of: {}", twin.extra);
+        // 原号不被污染。
+        let first = store.get_account("twin-x.com").unwrap().unwrap();
+        assert!(first.extra.contains("rt-eu") && !first.extra.contains("rt-us"));
+
+        // 对照:同 client_id、仅 RT 不同(同号旧导出)→ 合并,不创孪生。
+        let export = serde_json::json!({
+            "accounts": [{
+                "email": "twin@x.com",
+                "credentials": {"refreshToken": "rt-eu-STALE", "clientId": "cid-EU",
+                                "region": "us-east-1", "provider": "Enterprise"}
+            }]
+        });
+        let body = serde_json::json!({"group_name": "G0", "json": export.to_string()}).to_string();
+        let resp = app.oneshot(req("POST", "/accounts/import", Some(&body))).await.unwrap();
+        let v = json_body(resp).await;
+        assert_eq!(v["created"], 0, "同 client_id 不得创孪生: {v}");
+        assert!(store.get_account("twin-x.com-3").unwrap().is_none(), "不得派生 -3");
+        let first = store.get_account("twin-x.com").unwrap().unwrap();
+        assert!(first.extra.contains("rt-eu"), "旧导出的死 RT 不得覆盖服务器 token");
     }
 
     #[tokio::test]
