@@ -1414,8 +1414,8 @@ pub async fn run(
     // 却只能用 Anthropic 协议去要 —— 给它开 OpenAI 入口,顺带省掉下游 NewAPI 那道
     // 有损的 Claude→OpenAI 转换(它只认 5 种事件,见 `keepalive_frame` 的注释)。
     //
-    // **按 family 条件挂载**是结构性闸门:kiro / dario / claude-subprocess 上这两条路径
-    // 根本不存在(404),不靠文档里的君子协定约束。它们的主链路全程 Anthropic、
+    // **按 family 条件挂载**是结构性闸门:kiro / dario / claude-subprocess 只挂拒绝入口
+    // (404 + 未执行标记)，不进入协议转换或 provider。它们的主链路全程 Anthropic、
     // 零转换,那是刻意保住的资产(见 gw_core::provider 模块文档),不该被 OpenAI 入口稀释。
     if mount_openai_wire(state.provider.family()) {
         app = app
@@ -1425,6 +1425,11 @@ pub async fn run(
             family = state.provider.family(),
             "已挂载 OpenAI 线缆入口: /v1/chat/completions + /v1/responses"
         );
+    } else {
+        // 明确拒绝且不进入 provider，供新版 router 安全识别未执行的协议入口。
+        app = app
+            .route("/v1/chat/completions", post(unsupported_openai_endpoint))
+            .route("/v1/responses", post(unsupported_openai_endpoint));
     }
 
     // worker 不做对外鉴权、且信任 router 注入的 X-Gw-Client-Key;必须只绑 loopback,
@@ -2712,6 +2717,14 @@ fn sanitize_message_contents(body: &mut serde_json::Value) -> Result<Vec<String>
 ///
 /// 目前只有 `cursor`。单拎成函数是为了让这条策略**可被测试点名** —— 一句
 /// `family == "cursor"` 埋在路由构造里,没人能证明它有没有被悄悄放宽。
+async fn unsupported_openai_endpoint() -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(crate::ENDPOINT_UNAVAILABLE_HEADER, "1")],
+        Json(serde_json::json!({"error":{"message":"当前入口不可用","type":"invalid_request_error"}})),
+    ).into_response()
+}
+
 fn mount_openai_wire(family: &str) -> bool {
     family == "cursor"
 }

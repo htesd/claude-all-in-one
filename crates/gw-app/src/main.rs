@@ -27,6 +27,9 @@ pub const CLIENT_KEY_HEADER: &str = "x-gw-client-key";
 /// 头缺席 = 未分组请求(worker 用全量池,与本次重构之前逐字节相同)。
 pub const GROUP_HEADER: &str = "x-gw-group";
 
+/// worker 明确未处理该协议入口；只由本地入口拒绝响应设置，router 不向客户透传。
+pub(crate) const ENDPOINT_UNAVAILABLE_HEADER: &str = "x-gw-endpoint-unavailable";
+
 /// 优雅停机信号:SIGTERM(docker stop / systemd)或 Ctrl-C。
 /// 触发后 axum 停止接收新连接,在途请求(含流式 SSE)自然跑完;不设排空上限——
 /// 硬截止由 supervisor 兜底(docker 默认 10s 后 SIGKILL,systemd TimeoutStopSec)。

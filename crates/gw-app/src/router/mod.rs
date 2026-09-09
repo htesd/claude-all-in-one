@@ -88,6 +88,16 @@ struct RouterState {
     http: reqwest::Client,
 }
 
+/// 内网转发只连接配置中的 worker，不跟随跳转、不走系统代理。
+/// 否则跳转后的连接失败无法证明原 POST 未送达。
+fn worker_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+}
+
 /// 未分组 key 回落:`group_name` 为空(或鉴权降级无 group)时用 router 主组。
 fn resolve_group<'a>(key_group: Option<&'a str>, default: &'a str) -> &'a str {
     match key_group {
@@ -336,7 +346,7 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
         default_group,
         affinity: Mutex::new(AffinityTable::new()),
         store,
-        http: reqwest::Client::new(),
+        http: worker_client()?,
     });
 
     let max_body = system.effective_max_request_body_bytes();
@@ -502,10 +512,8 @@ async fn forward_to(
         return wire_unavailable(path, StatusCode::SERVICE_UNAVAILABLE);
     };
 
-    // ③ 转发(流式透传)。send() 失败 = worker 进程可能已挂但仍在配置里(连接拒绝):
-    // 对这种**未送达**的请求做一次故障转移——丢弃指向故障实例的亲和、换 worker 重发,
-    // 否则该 session 会钉死故障 worker 502 长达 AFFINITY_TTL(审查 Architect#1)。
-    // client 未设总超时,Err 基本是 connect 级错误,重复送达上游的风险可忽略。
+    // ③ 只有确定连接未建立才允许故障转移。响应头前断开也可能已提交上游，
+    // 不能把 send() 的全部错误视为未送达；未知状态保留亲和并返回错误。
     let mut target = target;
     let mut failed_over = false;
     // 已经因「无此协议入口」被排除掉的实例(与连接失败的 `failed_over` 分开计数)。
@@ -522,27 +530,13 @@ async fn forward_to(
         )
         .await
         {
-            // 404 + OpenAI 路径 = 这个 worker 的 provider 家族没挂 OpenAI 入口。
-            //
-            // router 的拓扑模型里没有 provider family(它读 instances.yaml,family 在
-            // accounts.yaml 的组里),所以选 worker 时无法按「协议能力」过滤。分组的 owner
-            // 集合若同时含 cursor 与非 cursor worker,按负载就可能选中挂不了的那个。
-            // 而 404 对 reqwest 是**成功响应** —— 不做处理的话客户拿到 404、
-            // 且会话还会继续亲和到这个永远 404 的 worker(对抗评审 Architect#6)。
-            // 复用既有故障转移:它会丢弃指向该实例的亲和并在同组其余 worker 里重选。
-            // 404 + OpenAI 路径 = 这个 worker 的 provider 家族没挂 OpenAI 入口。
-            //
-            // router 的拓扑模型里没有 provider family(它读 instances.yaml,family 在
-            // accounts.yaml 的组里),所以选 worker 时无法按「协议能力」过滤。分组的 owner
-            // 集合若同时含 cursor 与非 cursor worker,按负载就可能选中挂不了的那个。
-            // 而 404 对 reqwest 是**成功响应** —— 不做处理的话客户拿到 404、
-            // 且会话还会继续亲和到这个永远 404 的 worker(对抗评审 Architect#6)。
-            //
-            // ⚠️ 这里**不能**和下面的连接失败共用一个 `failed_over` 布尔:mixed-family 组下
-            // A=kiro、B=dario、C=cursor,只重试一次会在 B 上宣告失败,可用的 C 从未试过
-            // (对抗评审 Minimalist#3)。故按「试过哪些实例」逐个排除,直到穷尽同组候选。
+            // 仅信任 worker 对未处理入口的明确标记；旧 worker 的普通 404 原样返回。
+            // 按已尝试实例排除，保持混合家族组内有界查找，不能退回已试过的实例。
             Ok(resp)
-                if resp.status() == reqwest::StatusCode::NOT_FOUND && path != PATH_MESSAGES =>
+                if resp.status() == reqwest::StatusCode::NOT_FOUND
+                    && path != PATH_MESSAGES
+                    && resp.headers().get(crate::ENDPOINT_UNAVAILABLE_HEADER)
+                        .is_some_and(|v| v == "1") =>
             {
                 tried.push(target.instance);
                 match capability_failover(&st, session_id.as_deref(), group, &tried) {
@@ -565,6 +559,9 @@ async fn forward_to(
             Ok(resp) => return proxy_response(resp),
             Err(e) => {
                 tracing::error!(instance = target.instance, "转发到 worker 失败: {e}");
+                if !e.is_connect() {
+                    return wire_unavailable(path, StatusCode::BAD_GATEWAY);
+                }
                 // OpenAI 路径:连接失败与「无此协议入口」共用**同一个** `tried` 排除集。
                 // 分开算的后果:A 不支持协议(进 tried)、B 连接失败(走 failover_target,
                 // 它只排除 B、不看 tried)→ 可能又选回 A → 最终 502,而真正可用的 C
@@ -1065,6 +1062,142 @@ mod embedded_ui {
 mod tests {
     use super::*;
 
+    /// 真正读完 POST 再按指定方式回应，覆盖 HTTP 送达事实而非只测错误分类。
+    struct ReplayWorker {
+        url: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ReplayWorker {
+        fn drop(&mut self) { self.task.abort(); }
+    }
+
+    impl ReplayWorker {
+        async fn start(response: &'static [u8]) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut data = Vec::new();
+                    let mut chunk = [0; 4096];
+                    loop {
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 { break; }
+                        data.extend_from_slice(&chunk[..n]);
+                        assert!(data.len() < 64 * 1024);
+                        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                            let len: usize = headers.lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .unwrap().trim().parse().unwrap();
+                            if data.len() >= end + 4 + len { break; }
+                        }
+                    }
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    socket.write_all(response).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            });
+            Self { url, calls, task }
+        }
+
+        fn count(&self) -> usize { self.calls.load(std::sync::atomic::Ordering::SeqCst) }
+    }
+
+    const REPLAY_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+
+    async fn replay_probe(path: &'static str, response: &'static [u8], may_retry: bool, body_error: bool) {
+        let a = ReplayWorker::start(response).await;
+        let b = ReplayWorker::start(REPLAY_OK).await;
+        let other = ReplayWorker::start(REPLAY_OK).await;
+        let mut state = mk_state_grouped(vec![(0, "G0".into()), (1, "G0".into()), (2, "OTHER".into())]);
+        state.http = worker_client().unwrap();
+        for (w, fake) in state.workers.iter_mut().zip([&a, &b, &other]) {
+            w.base_url = fake.url.clone();
+        }
+        let body = Bytes::from(serde_json::json!({"model":"test", "max_tokens":10,
+            "messages":[{"role":"user","content":"probe"}], "input":"probe"}).to_string());
+        let sid = parse_session_id(&body, path).unwrap();
+        state.affinity.lock().entries.insert(affinity_key("G0", &sid),
+            AffinityEntry { instance: 0, last_seen: Instant::now() });
+        let state = Arc::new(state);
+        let result = tokio::time::timeout(Duration::from_secs(5),
+            forward_to(state.clone(), HeaderMap::new(), body, path)).await.unwrap();
+        let status = result.status();
+        assert!(!result.headers().contains_key("x-gw-endpoint-unavailable"));
+        let collected = axum::body::to_bytes(result.into_body(), 4096).await;
+        assert_eq!(collected.is_err(), body_error);
+        assert_eq!(a.count(), 1);
+        assert_eq!(b.count(), usize::from(may_retry), "{path}: 送达未知不得重放");
+        assert_eq!(other.count(), 0, "不得跨组");
+        assert_eq!(state.affinity.lock().entries[&affinity_key("G0", &sid)].instance,
+            u32::from(may_retry), "未知送达必须保留亲和");
+        if may_retry { assert_eq!(status, StatusCode::OK); }
+    }
+
+    #[tokio::test]
+    async fn replay_unknown_delivery_does_not_replay_any_wire() {
+        for path in [PATH_MESSAGES, PATH_OPENAI_CHAT, PATH_OPENAI_RESPONSES] {
+            replay_probe(path, b"", false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_body_disconnect_keeps_existing_no_retry_behavior() {
+        for path in [PATH_MESSAGES, PATH_OPENAI_CHAT, PATH_OPENAI_RESPONSES] {
+            replay_probe(path, b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx", false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_unmarked_404_is_not_capability_evidence() {
+        for path in [PATH_MESSAGES, PATH_OPENAI_CHAT, PATH_OPENAI_RESPONSES] {
+            replay_probe(path, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_redirect_is_not_followed_or_retried() {
+        for path in [PATH_MESSAGES, PATH_OPENAI_CHAT, PATH_OPENAI_RESPONSES] {
+            replay_probe(path, b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_connect_refused_only_tries_same_group() {
+        for path in [PATH_MESSAGES, PATH_OPENAI_CHAT, PATH_OPENAI_RESPONSES] {
+            for same_group in [true, false] {
+                let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dead_url = format!("http://{}", dead.local_addr().unwrap());
+                let b = ReplayWorker::start(REPLAY_OK).await;
+                let mut state = mk_state_grouped(vec![(0, "G0".into()),
+                    (1, if same_group { "G0" } else { "OTHER" }.into())]);
+                state.workers[0].base_url = dead_url;
+                state.workers[1].base_url = b.url.clone();
+                drop(dead);
+                let body = Bytes::from(serde_json::json!({"model":"test", "max_tokens":10,
+                    "messages":[{"role":"user","content":"probe"}],"input":"probe"}).to_string());
+                let response = tokio::time::timeout(Duration::from_secs(5),
+                    forward_to(Arc::new(state), HeaderMap::new(), body, path)).await.unwrap();
+                assert_eq!(response.status(), if same_group { StatusCode::OK } else { StatusCode::BAD_GATEWAY });
+                assert_eq!(b.count(), usize::from(same_group));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_explicit_missing_endpoint_can_try_same_group() {
+        let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nx-gw-endpoint-unavailable: 1\r\nConnection: close\r\n\r\n";
+        for path in [PATH_OPENAI_CHAT, PATH_OPENAI_RESPONSES] {
+            replay_probe(path, response, true, false).await;
+        }
+        replay_probe(PATH_MESSAGES, response, false, false).await;
+    }
+
     fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -1321,7 +1454,7 @@ mod tests {
             default_group,
             affinity: Mutex::new(AffinityTable::new()),
             store: None,
-            http: reqwest::Client::new(),
+            http: worker_client().unwrap(),
         }
     }
 
