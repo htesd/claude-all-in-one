@@ -1,5 +1,54 @@
 # GrokBot 0.39.0 协议逆向与网关复刻设计(2026-09-09)
 
+## 2026-09-10 更新：本地工具与原始附件
+
+- box 的 `/api/uploadAttachment` 接收 `{agentId,filename,bytesBase64}`，
+  返回 `{path}`。随后 `/api/sendPrompt` 带 `attachmentPaths` 和
+  `attachmentNames`。PNG/PDF 上传均已实测 200；识别验收见客户端报告。
+- `box_attachments.rs` 将内联图片和 PDF 转为稳定引用，保留原始字节上传；
+  支持工具结果中的嵌套附件，增量续轮只上传新轮附件，重建时上传全量历史。
+- box 原生 shell 与客户端 Bash 是两个执行环境。实际 Claude Code /
+  OpenCode 曾在云端执行而报本机路径不存在；box 专用转发契约将本地操作
+  明确编码成 send-message 中的 `<tool_call>`，等待客户端工具结果。
+- 限制：最多 16 个附件、20 MiB 解码总量，图片类型为 PNG/JPEG/WebP/GIF；
+  不抓取 URL 附件，避免默默丢图或引入任意 URL 请求。Temporal 附件仍受旧限制。
+
+## 2026-09-09 晚间更新：云端 box 网关可独立聊天
+
+用 bot13 的现有 access token、账号固定代理，在生产服务器运行独立 HTTP
+探针，连续两轮收到各自的随机标记。未启动桌面客户端，也未刷新 token。
+这证明该测试账号的 box 网关可用；不推论所有账号均已开放。
+
+调用顺序：
+
+1. `EnsureSandBox {}` 返回 `gateway_url`(10)、`gateway_token`(11)、
+   `network_token`(4)。网关请求同时携带 `Authorization: Bearer <gateway_token>`
+   和 `x-anyrun-network-token: <network_token>`；缺后者实测为 404。
+2. `POST /api/createAgent`：`name`、`description`、`creationRoute:{kind:"box"}`、
+   `isIntroductionSuppressed:true`、`isKickstartRequested:false`、
+   `supportsTemporalHarness:true`、`clientNonce`。响应取 `agent.id`。
+3. 先连 `GET /events`，再 `POST /api/sendPrompt`：`agentId`、`prompt`、
+   `clientNonce`、`source:"desktop"`；响应 `{accepted:true}`。
+4. SSE `channel:"transcript"` 的 payload 含 `agentId`、`type:appended/updated`、
+   `entry`。用户回声是 `kind:"message",role:"user"`，`requestId` 可能在后续
+   updated 事件才出现。模型对外回复是 `kind:"send-message"` 的
+   `message:{type:"text",content:"..."}`；按同一 `requestId` 收集。
+5. `channel:"agent-upserted"` 中 `agent.lastTurnSettlement` 的
+   `clientNonce` 匹配本轮且 `outcome:"success"` 才算运行完成；此刻
+   `isRunning` 仍可能短暂为 true。结算后补读 `getAgentTranscriptTail`
+   作为正文完整性屏障，避免 SSE 与快照交错截断末段。
+
+实现位于 `crates/gw-cursor/src/sandchat/box_gateway.rs`，仅在已确认 Temporal
+门控时降级进入。每个客户端会话创建独立 box agent；不同会话、分叉、
+system/tools 变化均不复用旧 agent。保留固定出口、TextEmu 与估算计费；
+box 网关鉴权失败不按 OAuth token 失效处理。禁止网关 HTTP 跳转，以免
+自定义网络凭据头被带到其他主机。
+
+会话在进程内保存，TTL 为 2 小时，每账号最多保留 64 条；淘汰和失败时只
+清理本进程创建的 agent。进程异常退出可能留下云端 agent，重启后新建独立
+会话并全量发送历史，不认领用户已有 agent。图片/附件已按 9 月 10 日更新
+接入 box 上传；此路径不是恢复旧 BOT 面的任意模型选择。
+
 ## 背景
 
 旧 BOT 池推理面 `aiserver.v1.InferenceService/Stream` 于 2026-09-09 被服务端锁死
@@ -23,8 +72,8 @@ DashboardService 正常)。官方 grokbot 桌面端已升级到 0.39.0,推理架
     (+ "/" + macMachineId);zyg:`t=165; b=(b^t + i%256) & 255; t=b`
   - `x-cursor-client-type: sand`、`x-cursor-client-version: 0.39.0`、
     `x-sand-box-namespace: prod`、`x-request-id: <uuid>`、`te: trailers`
-- 复刻不需要:EnsureSandBox / box 网关(`*.cursorvm.com`)—— 那是 computer-use 通道,
-  纯聊天(temporal harness)全程只打 api2。
+- Temporal 可用时，纯聊天全程只打 api2；Temporal 未开放时，使用上文已验证
+  的 EnsureSandBox / box 网关路径。
 
 ## 核心 RPC(proto 字段表,逐字段实锤)
 
@@ -105,10 +154,9 @@ req `{1 agent_id, 2 reason, 3 session_id opt}` — 客户端断开时喊停,避�
 5. **api2 建的 box agent 不能跑**:CreateGrokBotAgent(harness=BOX)能建成(200),
    但发消息持续 503 `unavailable/isRetryable`(EnsureSandBox、kickstart_requested
    都试过,无效)——能跑的 box agent 是官方 app「宿主中介创建」+ 接着用户电脑的
-   local-exec 通道的那只。**网关唯一可行路径是 temporal agent**;temporal 能力是否
-   对新号开放,必须拿活号实测(GetGrokBotRuntimeCapabilities 第 3 项)。
-   若新号也没有 temporal → 退路是 box 网关路径(EnsureSandBox → gateway_url →
-   `POST /api/sendPrompt` + `GET /events`,工程量翻倍,见子代理报告 §1b)。
+   local-exec 通道的那只。这些结果仅针对 api2 的直接发消息路径；晚间已经
+   验证 box 网关创建与收发可以独立工作，见本文开头。Temporal 能力是否
+   对其他账号开放仍需逐账号实测，不能由几个样本推断全部账号。
 
 ## 模型
 

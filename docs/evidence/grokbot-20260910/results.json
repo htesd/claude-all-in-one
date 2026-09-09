@@ -1,0 +1,281 @@
+{
+  "date": "2026-09-10",
+  "model": "grok_bot_auto",
+  "route": "existing public router /v1/messages; existing BOT group key",
+  "versions": {
+    "claude_code": "2.1.266",
+    "opencode": "1.18.30"
+  },
+  "image": "claude-all-in-one:box-gateway-20260910-ready",
+  "image_sha256": "7e7e6d35a19942bda8fd36a8877799225c36c7b16fd9faeec9c05911466e04f9",
+  "workspace_tests": {
+    "passed": 1744,
+    "failed": 0
+  },
+  "cases": [
+    {
+      "client": "cc",
+      "phase": "bash",
+      "tools": [
+        {
+          "name": "Bash",
+          "input": {
+            "command": "node -e \"const fs=require('fs');const v='BASH_'+require('crypto').randomBytes(12).toString('hex');fs.writeFileSync('bash-proof.txt',v);console.log(v)\"",
+            "description": "Generate and write random proof value"
+          }
+        }
+      ],
+      "result": "BASH_4eb2f8493de501c5b25ec513",
+      "complete": true,
+      "cli_success": true,
+      "turns": 2,
+      "duration_ms": 29442
+    },
+    {
+      "client": "cc",
+      "phase": "image",
+      "tools": [
+        {
+          "name": "Read",
+          "input": {
+            "file_path": "/tmp/caio-client-e2e/media/image.png"
+          }
+        }
+      ],
+      "result": "The verification code is `IMG-BE070A893C`.",
+      "complete": true,
+      "cli_success": true,
+      "turns": 2,
+      "duration_ms": 111047
+    },
+    {
+      "client": "cc",
+      "phase": "pdf",
+      "tools": [
+        {
+          "name": "Read",
+          "input": {
+            "file_path": "/tmp/caio-client-e2e/media/document.pdf"
+          }
+        }
+      ],
+      "result": "I’m reading the attached PDF now.Verification code: `PDF-59C61E31CC`\nInvoice total: `391` units",
+      "complete": true,
+      "cli_success": true,
+      "turns": 2,
+      "duration_ms": 188753
+    },
+    {
+      "client": "cc",
+      "phase": "recall",
+      "tools": [],
+      "result": "CC_MEMORY_bd97a05eb53073c5",
+      "complete": true,
+      "cli_success": true,
+      "turns": 1,
+      "duration_ms": 118146
+    },
+    {
+      "client": "cc",
+      "phase": "tools",
+      "tools": [
+        {
+          "name": "Read",
+          "input": {
+            "file_path": "/tmp/caio-client-e2e/cc-work/input.txt"
+          }
+        },
+        {
+          "name": "Read",
+          "input": {
+            "file_path": "/tmp/caio-client-e2e/cc-work/output.txt"
+          }
+        },
+        {
+          "name": "Edit",
+          "input": {
+            "replace_all": false,
+            "file_path": "/tmp/caio-client-e2e/cc-work/output.txt",
+            "old_string": "PENDING",
+            "new_string": "VERIFIED: CC_READ_ba6fc535725b8dbad5d5e1f8"
+          }
+        }
+      ],
+      "result": "CC_READ_ba6fc535725b8dbad5d5e1f8\nDONE",
+      "complete": true,
+      "cli_success": true,
+      "turns": 4,
+      "duration_ms": 223127,
+      "initial_strict_file_format_passed": false
+    },
+    {
+      "client": "cc",
+      "phase": "editfix",
+      "tools": [
+        {
+          "name": "Edit",
+          "input": {
+            "replace_all": false,
+            "file_path": "/tmp/caio-client-e2e/cc-work/output.txt",
+            "old_string": "VERIFIED: CC_READ_ba6fc535725b8dbad5d5e1f8",
+            "new_string": "VERIFIED:CC_READ_ba6fc535725b8dbad5d5e1f8"
+          }
+        }
+      ],
+      "result": "Updated. output.txt now has VERIFIED:CC_READ_ba6fc535725b8dbad5d5e1f8 with no space after the colon.",
+      "complete": true,
+      "cli_success": true,
+      "turns": 2,
+      "duration_ms": 269015,
+      "corrected_file_format_passed": true
+    },
+    {
+      "client": "opencode",
+      "phase": "bash",
+      "tools": [
+        {
+          "name": "bash",
+          "status": "completed",
+          "input": {
+            "command": "node -e \"const fs=require('fs');const v='OC_BASH_'+require('crypto').randomBytes(12).toString('hex');fs.writeFileSync('bash-proof.txt',v);console.log(v)\"",
+            "workdir": "/tmp/caio-client-e2e/opencode-work"
+          },
+          "output": "OC_BASH_4bc608338a96341160089b34\n"
+        }
+      ],
+      "result": "OC_BASH_4bc608338a96341160089b34",
+      "complete": true
+    },
+    {
+      "client": "opencode",
+      "phase": "image",
+      "tools": [],
+      "result": "IMG-BE070A893C",
+      "complete": true
+    },
+    {
+      "client": "opencode",
+      "phase": "pdf",
+      "tools": [
+        {
+          "name": "read",
+          "status": "completed",
+          "input": {
+            "filePath": "/tmp/caio-client-e2e/opencode-work/document.pdf"
+          },
+          "output": "PDF read successfully"
+        }
+      ],
+      "result": "I’m inspecting the attached PDF now.Verification code: `PDF-59C61E31CC`\nInvoice total: `391 units`",
+      "complete": true
+    },
+    {
+      "client": "opencode",
+      "phase": "recall",
+      "tools": [],
+      "result": "OC_BASH_4bc608338a96341160089b34",
+      "complete": true
+    },
+    {
+      "client": "opencode",
+      "phase": "bash_final",
+      "tools": [
+        {
+          "name": "bash",
+          "status": "completed",
+          "input": {
+            "command": "node -e \"const fs=require('fs');const v='OC_BASH_'+require('crypto').randomBytes(12).toString('hex');fs.writeFileSync('bash-final-proof.txt',v);console.log(v)\""
+          },
+          "output": "OC_BASH_ff5fb27f8f11bee8dece7843\n"
+        }
+      ],
+      "result": "OC_BASH_ff5fb27f8f11bee8dece7843",
+      "complete": true
+    },
+    {
+      "client": "http",
+      "phase": "api-json",
+      "status": 200,
+      "passed": true,
+      "elapsed_ms": 26508,
+      "result": "{\"content\":[{\"text\":\"API_10e8be7dca66340c78f0\",\"type\":\"text\"}],\"id\":\"msg_8d092c8df327423580f9a307ef2cc98f\",\"model\":\"grok_bot_auto\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":14,\"output_tokens\":6}}"
+    },
+    {
+      "client": "http",
+      "phase": "api-stream",
+      "status": 200,
+      "passed": true,
+      "elapsed_ms": 45710,
+      "result": "event: ping\ndata: {\"type\":\"ping\"}\n\nevent: message_start\ndata: {\"message\":{\"content\":[],\"id\":\"msg_2fc065b98f0641b8a7eca2c2b02d51d4\",\"model\":\"grok_bot_auto\",\"role\":\"assistant\",\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}},\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"content_block\":{\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}\n\nevent: content_block_delta\ndata: {\"delta\":{\"text\":\"API_410dd0636baa462f4ac7\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}\n\nevent: content_block_stop\ndata: {\"index\":0,\"type\":\"content_block_stop\"}\n\nevent: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"type\":\"message_delta\",\"usage\":{\"input_tokens\":14,\"output_tokens\":6}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    },
+    {
+      "client": "http",
+      "phase": "api-image",
+      "status": 200,
+      "passed": true,
+      "elapsed_ms": 15766,
+      "result": "{\"content\":[{\"text\":\"The verification code is `IMG-BE070A893C`.\",\"type\":\"text\"}],\"id\":\"msg_4fcb54ed7344492bb8ab4bac75d922aa\",\"model\":\"grok_bot_auto\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":78,\"output_tokens\":10}}"
+    },
+    {
+      "client": "http",
+      "phase": "api-pdf",
+      "status": 200,
+      "passed": true,
+      "elapsed_ms": 24802,
+      "result": "{\"content\":[{\"text\":\"Opening the PDF now to grab the verification code and invoice total.Verification code: `PDF-59C61E31CC`\\nInvoice total: 391 units\",\"type\":\"text\"}],\"id\":\"msg_bb8aebc1f84b4a5fac00351be561ec5d\",\"model\":\"grok_bot_auto\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"input_tokens\":78,\"output_tokens\":32}}"
+    }
+  ],
+  "local_files": {
+    "cc-work/bash-proof.txt": {
+      "content": "BASH_4eb2f8493de501c5b25ec513",
+      "sha256": "a0a4cfd5022432426567014f68f3e466b9e8dd5861429ad9606981a28fb2e2e5"
+    },
+    "opencode-work/bash-proof.txt": {
+      "content": "OC_BASH_4bc608338a96341160089b34",
+      "sha256": "2bb9613629fcca12f4504e6c90e80b469adf233e1e9585f0391f7a13cc9178c3"
+    },
+    "opencode-work/bash-final-proof.txt": {
+      "content": "OC_BASH_ff5fb27f8f11bee8dece7843",
+      "sha256": "0d5ec63ed7c77da1875506516f5d3468d20922319bbfcf35ac63c3ecd43c0682"
+    },
+    "cc-work/output.txt": {
+      "content": "VERIFIED:CC_READ_ba6fc535725b8dbad5d5e1f8\n",
+      "sha256": "520b3ecb4d8dd26203ed561bbdf1a270d83a1bcf6df064de2c2381cac2704b92"
+    }
+  },
+  "disabled_accounts": [
+    "bot1",
+    "bot11",
+    "bot12",
+    "bot2",
+    "bot3",
+    "bot4",
+    "bot5",
+    "bot6",
+    "bot7-2",
+    "bot8"
+  ],
+  "pre_fix_responses": [
+    {
+      "phase": "before_deploy",
+      "status": 503,
+      "body": "{\"error\":{\"message\":\"服务暂时不可用,请稍后重试\",\"type\":\"overloaded_error\"},\"type\":\"error\"}"
+    },
+    {
+      "phase": "pdf",
+      "status": 502,
+      "passed": false,
+      "elapsed_ms": 4405,
+      "body": "{\"error\":{\"message\":\"服务鉴权异常,请联系管理员\",\"type\":\"api_error\"},\"type\":\"error\"}"
+    }
+  ],
+  "notes": [
+    "Full Bash/image/PDF matrix completed on v3; final readiness handoff and PDF prevalidation ordering were separately reviewed and tested.",
+    "The first Edit wrote an extra space after VERIFIED:, so the strict file-format assertion failed; editfix is a separate follow-up assertion.",
+    "No claim of stable low latency: some attachment and resumed-session turns took minutes.",
+    "ultra-test produced three consecutive upstream run failures; the existing scheduler disabled it at runtime. Its persistent enabled flag was not changed."
+  ],
+  "runtime_unavailable_accounts": [
+    "ultra-test"
+  ]
+}

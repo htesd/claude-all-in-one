@@ -291,6 +291,15 @@ pub(crate) fn inference_client(
     })?;
     let client = reqwest::Client::builder()
         .http1_only()
+        // box 网关网络凭据是自定义头，reqwest 跨域跳转不会自动移除它。
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().last().and_then(|u| u.host_str())
+                .is_some_and(|h| h.ends_with(".cursorvm.com")) {
+                attempt.stop()
+            } else {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }
+        }))
         .proxy(p)
         .connect_timeout(std::time::Duration::from_secs(20))
         .build()
@@ -4332,4 +4341,3 @@ mod tests {
         assert!(text.contains("无法抽取文本层"), "{text}");
     }
 }
-

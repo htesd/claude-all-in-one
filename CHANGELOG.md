@@ -1,5 +1,55 @@
 # Changelog
 
+## [grokbot-client-tools-and-attachments] - 2026-09-10
+
+### 功能
+
+- box 网关上传内联 PNG/JPEG/WebP/GIF 与 PDF，通过 `attachmentPaths` /
+  `attachmentNames` 随消息提交；包含 `tool_result` 中的附件。
+- 明确区分客户端工具与云端原生工具，Bash/Read/Edit 等通过 TextEmu 返回
+  本地客户端执行，修正上游在云端寻找客户端本机路径的问题。
+- 等 box 准备成功再交出流对象，准备失败交回 worker 原有换号预算，避免
+  create/upload/send 的错误因过早返回流对象而直接向客户端回显 502。
+
+### 设计依据
+
+- Claude Code 与 OpenCode 实际测试发现：普通回复、简单虚拟工具通过，
+  不代表本地 Bash 可用；必须校验客户端真实执行及结果续轮。
+- 附件先校验数量、base64 和解码预算，再渲染；内容摘要进入会话指纹，
+  避免更换图片/PDF 后仍误复用旧历史。box 不再预先抽取随后丢弃的 PDF。
+
+### 注意事项
+
+- 一次请求历史最多 16 个附件、解码总量 20 MiB；暂不抓取 URL 附件。
+- 原生工具与本地工具隔离仍依赖上游遵守提示契约，协议未提供禁用原生
+  工具的能力。图片/PDF 新上传能力仅接在 box 路径。
+- 本地全工作区测试 1,744 项通过；公网入口、客户端及部署验证见
+  `docs/grokbot-client-e2e-20260910.md`。
+
+## [grokbot-box-gateway] - 2026-09-09
+
+### 功能
+
+- `grok_bot_auto` 在账号未开放 Temporal 时使用官方云端 box 网关，接入
+  `EnsureSandBox`、JSON 命令与 SSE transcript，复用 TextEmu 和 Anthropic 输出。
+- 客户端会话各用独立 agent，同会话增量续轮；历史分叉或 system/tools 变化
+  时新建，防止串话和沿用过期工具定义。
+
+### 设计依据
+
+- 独立探针已在 bot13 上验证 headless 两轮回复；不再把 api2 的 box 发消息
+  失败推广为所有 box 路径不可用。
+- 按 `clientNonce → requestId` 过滤回声和旧轮重放；结算后补读最终正文，
+  避免 SSE 与快照交错时提前收尾。保留固定出口和账号刷新保护。
+
+### 注意事项
+
+- box 网络 token 与 OAuth token 分开处理，并禁止网关重定向泄漏自定义头。
+- 每账号串行执行，进程内最多保留 64 个会话，2 小时过期；进程异常退出
+  可能遗留云端 agent。重启后创建新 agent 并发送完整历史。
+- token 用量仍为估算，图片/附件支持仍受原 sandchat 限制；不支持指定 BOT
+  底层模型。可用性以账号实际返回为准。
+
 ## [cursor-tool-continuation] 工具轮续轮:工具回路不再全量重铺 + 卡死根因全清 — 2026-09-04
 
 ### 背景

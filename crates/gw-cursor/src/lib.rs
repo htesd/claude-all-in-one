@@ -1440,9 +1440,23 @@ impl ConvRegistry {
 
 impl CursorProvider {
     pub fn new(cfg: CursorConfig) -> Self {
-        Self::with_client(cfg, reqwest::Client::new())
+        // 默认构造路径也禁止 box 鉴权头随跳转外泄。
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().last().and_then(|u| u.host_str())
+                    .is_some_and(|h| h.ends_with(".cursorvm.com")) {
+                    attempt.stop()
+                } else {
+                    reqwest::redirect::Policy::default().redirect(attempt)
+                }
+            }))
+            .build()
+            .expect("构造 Cursor 默认 HTTP client");
+        Self::with_client(cfg, client)
     }
 
+    /// 注入固定出口 client；调用方须禁止 *.cursorvm.com 的 HTTP 跳转，
+    /// 防止 box 自定义网络鉴权头外泄。生产 egress::build_client 已满足此约束。
     pub fn with_client(cfg: CursorConfig, egress_client: reqwest::Client) -> Self {
         chat::warn_if_dump_enabled();
         Self {

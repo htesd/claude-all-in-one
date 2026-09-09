@@ -26,6 +26,15 @@ pub fn build_client(egress: &EgressConfig, timeout_secs: u64) -> anyhow::Result<
         timeout_secs
     };
     let mut builder = Client::builder()
+        // box 网关携带独立网络 token，禁止该域的跳转泄漏自定义鉴权头。
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().last().and_then(|u| u.host_str())
+                .is_some_and(|h| h.ends_with(".cursorvm.com")) {
+                attempt.stop()
+            } else {
+                reqwest::redirect::Policy::default().redirect(attempt)
+            }
+        }))
         .timeout(Duration::from_secs(timeout_secs))
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(60));

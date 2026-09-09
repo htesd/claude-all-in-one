@@ -50,8 +50,8 @@
 //!
 //! - `cursor_too_old` 直接报错;TODO(二期):`ListGrokBotTranscriptEntries`
 //!   权威重拉后从断点续收(请求/响应字段表已核:A7/U7)。
-//! - 附件(图片/文件)未复刻:官方走宿主 IPC 写 agent 文件系统,网关侧没有
-//!   对应通道;图片渲染成占位文本,PDF 仍抽文本层内联(与 inference 同形)。
+//! - Temporal 附件暂未接入，图片仍为占位、PDF 抽文本；box 降级路径已
+//!   通过 uploadAttachment 上传内联图片/PDF，见 box_attachments 模块。
 //! - 同账号多会话共用一个 temporal agent 并全程串行(run gate 排队);
 //!   并发排队策略与 agent 池化是二期议题(协议文档「待解」)。
 //! - `GetGrokBotSendStatus` 的送达轮询/重发未接(v1 靠回声等待 + 超时兜底)。
@@ -69,6 +69,9 @@ use serde_json::Value as Json;
 
 use crate::protobuf::{Reader, Value as PVal, Writer};
 use crate::wire;
+
+mod box_gateway;
+mod box_attachments;
 
 /// GrokBotService 的 RPC 根(官方 `SAND_BACKEND_URL` 缺省值,0.39.0 实锤)。
 const BASE: &str = "https://api2.cursor.sh/aiserver.v1.GrokBotService";
@@ -183,6 +186,8 @@ enum SandLookup {
 /// (换号 = 失忆,天然 New —— 与 ConvRegistry「会话属于某一个账号」同口径)。
 #[derive(Default)]
 pub(crate) struct SandSessions {
+    /// box 默认会话不支持 temporal session_id，按客户端会话隔离 agent。
+    box_state: box_gateway::State,
     /// (account_id, 会话指纹) → 绑定。
     map: Mutex<HashMap<(String, String), SandSession>>,
     /// account_id → 已确保的 agent_id(进程内真值;extra 落库有轮询延迟)。
@@ -1350,11 +1355,6 @@ pub(crate) async fn chat_stream(
     // 与 inference 同纪律:账号代理 → H1 专用 client(fail-closed),无代理 → egress。
     let client = crate::inference::inference_client(account, egress)?;
 
-    // 渲染(PDF 抽文本层是同步 CPU 活,挪出 tokio worker 线程 + 拿并发槽,
-    // 与 inference build_request_blocking 同一份考虑)。
-    let body = req.body.clone();
-    let rendered = render_blocking(body).await?;
-
     // 会话指纹:与 inference/clidrv 同一 material 口径(router 下发 > cache_key
     // > 内容派生),保证「同会话」在三张面之间是同一个概念。
     let material = if !ctx.session_id.is_empty() {
@@ -1366,6 +1366,16 @@ pub(crate) async fn chat_stream(
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
     };
     let conv_fp = crate::chat::conversation_uuid(&material);
+
+    // 先选协议面；box 先校验附件预算再渲染，不能提前抽取随后会被丢弃的 PDF。
+    let agent_id = match ensure_agent(&client, account, token, sessions, updates, None).await {
+        Ok(id) => id,
+        Err(_) if sessions.is_temporal_gated(&account.account_id) => {
+            return box_gateway::chat_stream(client, account, token, req, conv_fp, sessions).await;
+        }
+        Err(e) => return Err(e),
+    };
+    let rendered = render_blocking(req.body.clone()).await?;
 
     // 会话绑定:前缀命中 → 增量续包;否则全量重铺(New 用定基 session_id,
     // Restart 加随机后缀避开服务端旧 transcript)。
@@ -1397,8 +1407,6 @@ pub(crate) async fn chat_stream(
             render_full(&rendered),
         ),
     };
-
-    let agent_id = ensure_agent(&client, account, token, sessions, updates, None).await?;
 
     // 同账号单 agent:全程串行。guard 移进流任务,流结束才放 —— 排队是 v1
     // 接受的形态(模块文档「已知缺口」)。
