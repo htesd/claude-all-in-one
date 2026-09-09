@@ -7,6 +7,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// 认证链及其注册上下文必须一起比较；普通运行时字段独立处理。
+pub const CREDENTIAL_EXTRA_KEYS: &[&str] = &[
+    "access_token", "refresh_token", "expires_at", "client_id", "client_secret",
+    "auth_region", "auth_method",
+];
+
+/// 待写字段的比较基准与目标值。None 表示字段缺失，不等同于 JSON null。
+#[derive(Clone, PartialEq)]
+pub struct ExtraChange {
+    pub previous: Option<serde_json::Value>,
+    pub value: Option<serde_json::Value>,
+    /// worker 内存版本，仅用于确认对应待写项，不作为数据库全局时钟。
+    pub revision: u64,
+    /// 该发现结果依赖查询时的认证身份；身份冲突时与凭据一起丢弃。
+    pub requires_credentials: bool,
+}
+
+pub type ExtraChanges = BTreeMap<String, ExtraChange>;
+
 /// 账号字段类型(决定前端控件 + 校验)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

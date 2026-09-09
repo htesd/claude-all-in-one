@@ -1096,6 +1096,39 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// 条件合并 worker 待写字段。管理员已改变同字段时采用 DB 值；认证链整组比较，
+    /// 普通字段各自比较。返回事务内实际值供内存收敛；None 表示账号已删除。
+    pub fn apply_account_extra_changes(
+        &self,
+        account_id: &str,
+        changes: &gw_core::account::ExtraChanges,
+    ) -> anyhow::Result<Option<std::collections::BTreeMap<String, serde_json::Value>>> {
+        use gw_core::account::CREDENTIAL_EXTRA_KEYS;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx.query_row(
+            "SELECT extra FROM accounts WHERE account_id = ?1", [account_id], |r| r.get(0),
+        ).optional()?;
+        let Some(current) = current else { return Ok(None) };
+        let mut current: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&current)?;
+        let credential_matches = |target: bool| changes.iter()
+            .filter(|(key, _)| CREDENTIAL_EXTRA_KEYS.contains(&key.as_str()))
+            .all(|(key, change)| current.get(key) == if target { change.value.as_ref() } else { change.previous.as_ref() });
+        let credential_conflict = !credential_matches(false) && !credential_matches(true);
+        for (key, change) in changes {
+            if (CREDENTIAL_EXTRA_KEYS.contains(&key.as_str()) || change.requires_credentials) && credential_conflict { continue; }
+            if current.get(key) != change.previous.as_ref() && current.get(key) != change.value.as_ref() { continue; }
+            match &change.value {
+                Some(value) => { current.insert(key.clone(), value.clone()); }
+                None => { current.remove(key); }
+            }
+        }
+        tx.execute("UPDATE accounts SET extra = ?1 WHERE account_id = ?2",
+            (serde_json::to_string(&current)?, account_id))?;
+        tx.commit()?;
+        Ok(Some(current))
+    }
+
     /// `settings` 表里模型目录快照(`ListAvailableModels` 结果)的键名。
     /// 与 `'system'` 同表不同键 —— 复用现成的表意味着**零 schema 变更、零迁移**。
     pub const KEY_MODEL_CATALOG: &'static str = "model_catalog";
@@ -2829,6 +2862,35 @@ mod restock_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_extra_changes_keep_admin_credentials_and_registration() {
+        use gw_core::account::{ExtraChange, ExtraChanges};
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_account("a", "G", "kiro", 1,
+            r#"{"access_token":"at-admin","refresh_token":"rt-admin","client_id":"registration-new"}"#).unwrap();
+        let mut changes = ExtraChanges::new();
+        for (key, previous, value) in [("access_token", Some("at-old"), "at-worker"),
+            ("refresh_token", Some("rt-old"), "rt-worker"),
+            ("client_id", Some("registration-old"), "registration-old"),
+            ("profile_arn", None, "arn-old-identity"),
+            ("sand_agent_id", None, "agent-new")] {
+            changes.insert(key.into(), ExtraChange { previous: previous.map(|v| serde_json::json!(v)),
+                value: Some(serde_json::json!(value)), revision: 1, requires_credentials: key == "profile_arn" });
+        }
+        let actual = store.apply_account_extra_changes("a", &changes).unwrap().unwrap();
+        assert_eq!(actual["access_token"], "at-admin");
+        assert_eq!(actual["refresh_token"], "rt-admin");
+        assert_eq!(actual["client_id"], "registration-new");
+        assert_eq!(actual["sand_agent_id"], "agent-new");
+        assert!(!actual.contains_key("profile_arn"), "旧身份的 ARN 不能与管理员新凭据混合");
+        assert!(store.apply_account_extra_changes("deleted", &changes).unwrap().is_none());
+        // 只有注册变化也要阻止整组凭据落库，不能拼出新注册 + 旧注册的 token。
+        store.update_account_extra("a", r#"{"access_token":"at-old","refresh_token":"rt-old","client_id":"registration-new"}"#).unwrap();
+        let actual = store.apply_account_extra_changes("a", &changes).unwrap().unwrap();
+        assert_eq!(actual["access_token"], "at-old");
+        assert_eq!(actual["refresh_token"], "rt-old");
+    }
 
     #[test]
     fn admin_extra_edit_serializes_with_rotation_on_independent_connections() {

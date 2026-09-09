@@ -328,35 +328,11 @@ impl WorkerState {
             }
         };
 
-        // 回写 scheduler:带新 token 的副本进入选号池(单一事实来源)。
-        // **原子**「替换 + 置脏」(同一把 entries 锁):分两步的话,30s sync 会在
-        // 中间窗口看到 dirty=false,用 DB 旧值洗掉新 token(审查②R Skeptic#1)。
-        self.scheduler.update_account_dirty(refreshed.clone());
-        // 持久化(rolling refresh_token 不落库,重启即回退已作废旧 token):
-        // - **增量合并**只写本次刷新改动的字段(相对 base),不整块替换——并发的
-        //   admin 修改(priority/region 等)不被旧内存快照抹掉(审查 Architect#4);
-        // - 置脏后持久化、成功才清位:失败窗口内 sync 不会用 DB 旧值洗内存,
-        //   由 sync 循环负责重试(审查 Minimalist#1)。
-        match &self.store {
-            Some(store) => {
-                let delta: std::collections::BTreeMap<&String, &serde_json::Value> = refreshed
-                    .extra
-                    .iter()
-                    .filter(|(k, v)| base.extra.get(*k) != Some(*v))
-                    .collect();
-                let persisted = serde_json::to_string(&delta)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|j| store.merge_account_extra(&refreshed.account_id, &j));
-                match persisted {
-                    Ok(_) => self.scheduler.clear_extra_dirty(&refreshed.account_id),
-                    Err(e) => tracing::warn!(account = %refreshed.account_id,
-                        "刷新回写 DB 失败,已置脏待 sync 重试: {e}"),
-                }
-            }
-            // 无库(降级模式):没有 sync 循环、也没人会清脏,直接清掉避免悬挂标记。
-            None => self.scheduler.clear_extra_dirty(&refreshed.account_id),
-        }
-        Ok(refreshed)
+        let delta = refreshed.extra.iter().filter(|(k, v)| base.extra.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.scheduler.queue_extra_for_credentials(&base, delta);
+        persist_pending_extra(&self.scheduler, self.store.as_deref(), &base.account_id, "认证刷新");
+        Ok(self.scheduler.account(&base.account_id).unwrap_or(refreshed))
     }
 
     /// 孪生自愈的取链动作:`extra.twin_of` 指向的源号当前 refresh_token 与本号不同
@@ -466,12 +442,7 @@ impl WorkerState {
             .insert(account_id.to_string(), (value, std::time::Instant::now()));
     }
 
-    /// 把配额响应里的订阅档位写回账号 extra(内存就地合并 + 持久化 DB)。
-    ///
-    /// - 内存:`merge_extra` 在调度器锁内单字段合并,不携带旧账号快照,与并发
-    ///   token 刷新互不覆盖;值未变(60s 周期刷新的常态)直接跳过。
-    /// - 持久化:取 per-account 刷新锁与 token 刷新的「置脏→落库→清脏」互斥,
-    ///   避免本函数 clear 误清掉刷新失败留下的脏标记(丢 rolling token 重试)。
+    /// 配额发现字段与认证刷新共用账号锁和待写增量入口。
     async fn backfill_subscription_title(&self, account_id: &str, title: &str) {
         self.persist_extra_field(
             account_id,
@@ -482,11 +453,7 @@ impl WorkerState {
         .await;
     }
 
-    /// 把一个**发现/查询得来的持久字段**写回账号 extra(内存就地合并 + DB 持久化)。
-    /// subscription_title(配额回填)、profile_arn(ListAvailableProfiles 发现)共用。
-    ///
-    /// 必须先拿 per-account 刷新锁再动内存:token 刷新在锁内「读基底→整块替换」,
-    /// 锁外 merge 会落进它的读写窗口被整块覆盖(审查②R Minimalist#2)。
+    /// 单字段发现结果进入待写增量；成功只确认本次写出的版本。
     async fn persist_extra_field(
         &self,
         account_id: &str,
@@ -496,23 +463,9 @@ impl WorkerState {
     ) {
         let lock = self.refresh_lock(account_id);
         let _guard = lock.lock().await;
-        if !self.scheduler.merge_extra(account_id, key, value.clone()) {
-            return; // 值未变,无事可做。
-        }
-        let Some(store) = &self.store else { return };
-        // 账号已有待重试的整块脏 extra(刷新回写失败):不抢着写,30s sync 的
-        // flush_dirty_extras 会连本字段一起落库。
-        if self.scheduler.is_extra_dirty(account_id) {
-            return;
-        }
-        self.scheduler.mark_extra_dirty(account_id);
-        let delta = serde_json::json!({ key: value }).to_string();
-        match store.merge_account_extra(account_id, &delta) {
-            Ok(_) => self.scheduler.clear_extra_dirty(account_id),
-            Err(e) => tracing::warn!(account = %account_id,
-                "{what} 回写 DB 失败,置脏待 sync 重试: {e}"),
-        }
-        tracing::debug!(account = %account_id, key, "已回填 {what}");
+        let Some(base) = self.scheduler.account(account_id) else { return };
+        self.scheduler.queue_extra(&base, [(key.to_string(), value)].into());
+        persist_pending_extra(&self.scheduler, self.store.as_deref(), account_id, what);
     }
 
     /// 确保企业/IdC 账号带 profileArn:缺失则 `ListAvailableProfiles` 发现并持久化,
@@ -533,15 +486,7 @@ impl WorkerState {
         }
         match self.provider.discover_profile_arn(&account).await {
             Ok(Some(arn)) => {
-                self.persist_extra_field(
-                    &account.account_id,
-                    "profile_arn",
-                    serde_json::Value::String(arn.clone()),
-                    "profileArn(ListAvailableProfiles 发现)",
-                )
-                .await;
-                tracing::info!(account = %account.account_id, "已发现并持久化 profileArn");
-                self.correct_region_from_arn(&account, &arn).await;
+                self.persist_discovered_profile(&account, &arn, "profileArn 发现").await;
                 // 取回带新 profile_arn 的副本供本次请求使用。
                 self.scheduler.account(&account.account_id).unwrap_or(account)
             }
@@ -660,14 +605,7 @@ impl WorkerState {
         }
         match self.provider.force_discover_profile_arn(account).await {
             Ok(Some(arn)) => {
-                self.persist_extra_field(
-                    &account.account_id,
-                    "profile_arn",
-                    serde_json::Value::String(arn.clone()),
-                    trigger,
-                )
-                .await;
-                self.correct_region_from_arn(account, &arn).await;
+                self.persist_discovered_profile(account, &arn, trigger).await;
                 Some(
                     self.scheduler
                         .account(&account.account_id)
@@ -679,31 +617,17 @@ impl WorkerState {
         }
     }
 
-    /// profileArn 一旦被**真正发现**(运行时首次拿到,导入时该号没带),就反过来修正
-    /// `region`/`api_region`——号商导出常不带 profileArn、顶层 region 靠猜(常错),
-    /// 真实服务区只有靠 ARN 才知道。与导入时 [`gw_kiro::import::region_from_profile_arn`]
-    /// 同一份真理来源,不重复实现;`ensure_profile_arn`/`discover_paid_profile_arn` 首次
-    /// 发现 ARN 后都调用本方法,自愈不需要人工 PATCH。不改 `auth_region`(独立来源)。
-    async fn correct_region_from_arn(&self, account: &Account, arn: &str) {
-        let Some(region) = region_correction_from_arn(arn, account.extra_str("region")) else {
-            return;
-        };
-        tracing::info!(account = %account.account_id, region,
-            "profileArn 揭示服务区不符,自动修正 region/api_region");
-        self.persist_extra_field(
-            &account.account_id,
-            "region",
-            serde_json::Value::String(region.into()),
-            "region(profileArn 揭示服务区)",
-        )
-        .await;
-        self.persist_extra_field(
-            &account.account_id,
-            "api_region",
-            serde_json::Value::String(region.into()),
-            "api_region(profileArn 揭示服务区)",
-        )
-        .await;
+    /// ARN 与派生服务区共享查询时的认证基准。管理员换号后，旧身份的发现结果整批拒绝。
+    async fn persist_discovered_profile(&self, base: &Account, arn: &str, context: &str) {
+        let lock = self.refresh_lock(&base.account_id);
+        let _guard = lock.lock().await;
+        let mut delta = std::collections::BTreeMap::from([("profile_arn".into(), serde_json::json!(arn))]);
+        if let Some(region) = region_correction_from_arn(arn, base.extra_str("region")) {
+            delta.insert("region".into(), serde_json::json!(region));
+            delta.insert("api_region".into(), serde_json::json!(region));
+        }
+        self.scheduler.queue_extra_for_credentials(base, delta);
+        persist_pending_extra(&self.scheduler, self.store.as_deref(), &base.account_id, context);
     }
 
     /// 从 DB 重读组内账号集并同步进 scheduler —— 30s 周期循环与 `/sync` 立即同步
@@ -748,6 +672,7 @@ impl WorkerState {
         // 分别读、分别发布会留下无限期的撕裂态:membership 成功而账号读失败 → 新视图
         // 立即生效但账号快照停在上一轮;反过来 membership 读失败而账号成功 → **已被撤销
         // 的成员边继续授权**,这是提权方向,尤其危险。任一失败就整轮跳过。
+        let revisions = self.scheduler.extra_revisions();
         let (memberships, accounts) = match (
             store.load_group_memberships(&self.group),
             store.load_owned_accounts(&self.group),
@@ -767,7 +692,7 @@ impl WorkerState {
             .collect();
         let accounts =
             filter_by_provider(accounts.into_iter().map(Arc::new).collect(), self.provider.family());
-        let out = self.scheduler.sync_accounts(accounts);
+        let out = self.scheduler.sync_accounts_since(accounts, &revisions);
         if out.added + out.removed > 0 {
             tracing::info!(added = out.added, removed = out.removed, "账号集已按 DB 同步");
             // 新进账号若缺订阅档位,预热配额查询补齐(模型过滤数据源)。
@@ -1555,13 +1480,8 @@ fn lock_for(locks: &RefreshLocks, account_id: &str) -> Arc<tokio::sync::Mutex<()
         .clone()
 }
 
-/// 把调度器里标脏的 extra(刷新成功但 DB 回写失败的 rolling token)逐个落盘,
-/// 成功才清脏位——清位前 sync 不会用 DB 旧值覆盖内存新 token。
-/// 30s sync 循环(失败下轮重试)和停机排空(最后机会,失败即丢)共用。
-///
-/// **必须**逐账号持 refresh_lock 并在锁内重读副本+重查脏位:用入口处的旧快照
-/// 直接 merge 会与并发刷新竞速——刷新已落库新 token 并清脏后,本函数再把旧快照
-/// 整块写回 = DB 回滚到已作废 refresh_token(审查②R Skeptic#2)。
+/// 持账号锁重读并重试待写字段；不使用入口时的完整账号快照。
+/// 周期同步和停机共用，失败保留待写项供下次重试。
 async fn flush_dirty_extras(
     scheduler: &AccountScheduler,
     store: &SqliteStore,
@@ -1580,87 +1500,50 @@ async fn flush_dirty_extras(
         if !scheduler.is_extra_dirty(&id) {
             continue;
         }
-        let Some(acc) = scheduler.account(&id) else { continue };
-        let persisted = serde_json::to_string(&acc.extra)
-            .map_err(anyhow::Error::from)
-            .and_then(|j| store.merge_account_extra(&id, &j));
-        match persisted {
-            Ok(_) => {
-                scheduler.clear_extra_dirty(&id);
-                tracing::info!(account = %id, "{context}: 脏 extra 持久化成功");
-            }
-            Err(e) => tracing::warn!(account = %id,
-                "{context}: 脏 extra 持久化失败: {e}"),
-        }
+        persist_pending_extra(scheduler, Some(store), &id, context);
     }
 }
 
-/// 把 provider 捕获的外部 token 轮换(cursor CLI 子进程自刷新)合并进 scheduler + 落库。
-///
-/// 为什么必须做:CLI 会自己刷新并回写它 HOME 里的 auth.json,号库里的
-/// refresh_token 随之被上游作废。不采纳的话,`ensure_credentialed` 下次拿旧 rt
-/// 去 OAuth 刷新 → invalid_grant → TokenInvalid → 号被永久判死(对抗审查共识:
-/// 这条不靠流量不靠攻击者,轮换是定时自己发生的)。
-///
-/// CAS 两道(防旧回声覆盖新状态),**仅对带 access_token 的增量适用**:
-/// 1. access_token 相同 = 已应用过,跳过;
-/// 2. 两边 expires_at 都在且传入的不更新 → 跳过(传入格式 `YYYY-...Z` 零填充,
-///    字典序即时间序;gw-app 可能刚 OAuth 刷过更新的)。
-/// 与 `do_refresh_and_persist` 同尾段:增量 merge 落库 + 置脏,成功才清脏。
-///
-/// 增量也可以**不带** access_token:那是 provider 侧的非凭据 extra 更新
-/// (如 gw-cursor sandchat 的 `sand_agent_id`),没有旧回声问题,跳过 CAS
-/// 直接 merge 落库。两条路都拿 per-account 锁,与刷新互斥。
+/// 调用者持账号刷新锁。确认整批实际结果，失败保留待写项；删除不是写入成功。
+fn persist_pending_extra(scheduler: &AccountScheduler, store: Option<&SqliteStore>, id: &str, context: &str) {
+    let changes = scheduler.pending_extra(id);
+    if changes.is_empty() { return; }
+    let Some(store) = store else {
+        if let Some(account) = scheduler.account(id) {
+            scheduler.acknowledge_extra(id, &changes, &account.extra);
+        }
+        return;
+    };
+    match store.apply_account_extra_changes(id, &changes) {
+        Ok(Some(actual)) => scheduler.acknowledge_extra(id, &changes, &actual),
+        Ok(None) => tracing::warn!(account = %id, "{context}: 账号已删除，等待同步移除内存待写项"),
+        Err(e) => tracing::warn!(account = %id, "{context}: 增量落库失败，保留待写项: {e}"),
+    }
+}
+
+/// 接收 provider 的凭据与普通字段增量。凭据先按 access_token / expires_at 筛旧，
+/// 普通字段独立保留，再经同一待写入口进行 SQLite 条件合并。
 async fn adopt_provider_token_updates(
     provider: &Arc<dyn Provider>,
     scheduler: &AccountScheduler,
     store: &SqliteStore,
     refresh_locks: &RefreshLocks,
 ) {
-    for (account_id, delta) in provider.poll_token_updates() {
-        let incoming_at = delta.get("access_token").and_then(|v| v.as_str());
+    for (account_id, mut delta) in provider.poll_token_updates() {
         let lock = lock_for(refresh_locks, &account_id);
         let _guard = lock.lock().await;
-        let Some(base) = scheduler.account(&account_id) else {
-            continue;
-        };
-        if let Some(incoming_at) = incoming_at {
-            if base.extra_str("access_token") == Some(incoming_at) {
-                continue; // CAS①:已是这枚 token(上轮已应用)。
-            }
-            let stale = match (
-                delta.get("expires_at").and_then(|v| v.as_str()),
-                base.extra_str("expires_at"),
-            ) {
-                (Some(inc), Some(cur)) => inc <= cur,
-                _ => false, // 缺一边没法比:放行(捕获侧已按 exp 比过一轮)。
-            };
-            if stale {
-                tracing::debug!(account = %account_id, "外部 token 轮换是比现存更旧的回声,跳过");
-                continue; // CAS②:旧回声不覆盖新刷新。
-            }
+        let Some(base) = scheduler.account(&account_id) else { continue };
+        let stale_credentials = delta.get("access_token").and_then(|v| v.as_str()).is_some_and(|at| {
+            base.extra_str("access_token") == Some(at) || match (
+                delta.get("expires_at").and_then(|v| v.as_str()), base.extra_str("expires_at"),
+            ) { (Some(inc), Some(cur)) => inc <= cur, _ => false }
+        });
+        if stale_credentials {
+            // 凭据回声与普通字段分开：不能连带丢掉刚发现的 agent id。
+            delta.retain(|key, _| !gw_core::account::CREDENTIAL_EXTRA_KEYS.contains(&key.as_str()));
         }
-        let mut updated = (*base).clone();
-        for (k, v) in &delta {
-            updated.extra.insert(k.clone(), v.clone());
-        }
-        scheduler.update_account_dirty(Arc::new(updated));
-        let persisted = serde_json::to_string(&delta)
-            .map_err(anyhow::Error::from)
-            .and_then(|j| store.merge_account_extra(&account_id, &j));
-        match persisted {
-            Ok(_) => {
-                scheduler.clear_extra_dirty(&account_id);
-                if incoming_at.is_some() {
-                    tracing::info!(account = %account_id, "已采纳外部轮换的 token(CLI 自刷新捕获)");
-                } else {
-                    tracing::info!(account = %account_id, keys = ?delta.keys().collect::<Vec<_>>(),
-                        "已采纳 provider 侧的账号 extra 增量(非凭据)");
-                }
-            }
-            Err(e) => tracing::warn!(account = %account_id,
-                "外部增量落库失败,已置脏待 sync 重试: {e}"),
-        }
+        scheduler.queue_extra(&base, delta);
+        persist_pending_extra(scheduler, Some(store), &account_id, "provider 增量");
     }
 }
 
@@ -5533,9 +5416,10 @@ mod tests {
             extra: BTreeMap::new(),
         };
         acc.extra
-            .insert("refresh_token".into(), serde_json::Value::String("rt-new".into()));
+            .insert("refresh_token".into(), serde_json::Value::String("rt-old".into()));
         let scheduler = AccountScheduler::new(vec![Arc::new(acc)], &Default::default());
-        scheduler.mark_extra_dirty("acc-1");
+        scheduler.queue_extra(&scheduler.account("acc-1").unwrap(),
+            [("refresh_token".into(), serde_json::json!("rt-new"))].into());
 
         let locks: RefreshLocks = parking_lot::Mutex::new(std::collections::HashMap::new());
         flush_dirty_extras(&scheduler, &store, &locks, "停机排空").await;
@@ -5586,6 +5470,69 @@ mod tests {
         }
         fn poll_token_updates(&self) -> Vec<(String, BTreeMap<String, serde_json::Value>)> {
             std::mem::take(&mut *self.updates.lock().unwrap())
+        }
+    }
+
+    struct RacedProfileProvider {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RacedProfileProvider {
+        fn family(&self) -> &'static str { "kiro" }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] { &[] }
+        async fn list_models(&self) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> { Ok(vec![]) }
+        async fn chat(&self, _: ChatRequest, _: &CallCtx) -> Result<gw_core::provider::ChatStream, UpstreamError> { unreachable!() }
+        async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> { Ok(account.clone()) }
+        async fn discover_profile_arn(&self, _: &Account) -> Result<Option<String>, UpstreamError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Some("arn:aws:codewhisperer:eu-west-1:123456789012:profile/old-identity".into()))
+        }
+        async fn force_discover_profile_arn(&self, account: &Account) -> Result<Option<String>, UpstreamError> {
+            self.discover_profile_arn(account).await
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_extra_profile_discovery_keeps_original_identity_baseline() {
+        for force in [false, true] {
+            for sync_before_completion in [false, true] {
+                let provider = Arc::new(RacedProfileProvider { entered: Default::default(), release: Default::default() });
+                let mut base = acct(&[("access_token", "at-A"), ("refresh_token", "rt-A"),
+                    ("subscription_title", "PAID"), ("region", "us-east-1")]);
+                base.provider = "kiro".into();
+                let base = Arc::new(base);
+                let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+                store.create_account(&base.account_id, "G0", "kiro", 1, &serde_json::to_string(&base.extra).unwrap()).unwrap();
+                let mut state = catalog_state_with_accounts("kiro", vec![base.clone()]);
+                let mutable = Arc::get_mut(&mut state).unwrap();
+                mutable.provider = provider.clone();
+                mutable.store = Some(store.clone());
+                let worker = state.clone();
+                let query_base = base.clone();
+                let query = tokio::spawn(async move {
+                    if force { worker.discover_paid_profile_arn(&query_base, "竞态测试").await; }
+                    else { worker.ensure_profile_arn(query_base).await; }
+                });
+                provider.entered.notified().await;
+                let mut replacement = (*base).clone();
+                replacement.extra.insert("access_token".into(), serde_json::json!("at-B"));
+                replacement.extra.insert("refresh_token".into(), serde_json::json!("rt-B"));
+                store.update_account_extra(&base.account_id, &serde_json::to_string(&replacement.extra).unwrap()).unwrap();
+                if sync_before_completion { state.scheduler.sync_accounts(vec![Arc::new(replacement)]); }
+                provider.release.notify_one();
+                query.await.unwrap();
+                let actual: serde_json::Value = serde_json::from_str(&store.get_account(&base.account_id).unwrap().unwrap().extra).unwrap();
+                assert_eq!(actual["access_token"], "at-B");
+                assert!(actual.get("profile_arn").is_none(), "旧 ARN 不得污染替换身份");
+                assert_eq!(actual["region"], "us-east-1", "拒绝 ARN 时也拒绝派生服务区");
+                assert!(actual.get("api_region").is_none());
+                let memory = state.scheduler.account(&base.account_id).unwrap();
+                assert_eq!(memory.extra_str("access_token"), Some("at-B"));
+                assert!(memory.extra_str("profile_arn").is_none());
+            }
         }
     }
 
@@ -5652,6 +5599,55 @@ mod tests {
         );
         let row = store.get_account("acc-c").unwrap().unwrap();
         assert!(row.extra.contains("at-new"), "DB 也不得被旧回声覆盖: {}", row.extra);
+    }
+
+    #[tokio::test]
+    async fn pending_extra_failed_write_preserves_admin_fields_and_mixed_update() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let extra: BTreeMap<String, serde_json::Value> = serde_json::from_value(serde_json::json!({
+            "access_token":"at-old", "refresh_token":"rt-old", "expires_at":"2026-01-01T00:00:00Z",
+            "proxy":"old-proxy", "region":"old-region"
+        })).unwrap();
+        let base = Arc::new(Account { account_id: "delta".into(), provider: "cursor".into(),
+            max_concurrency: 1, disabled: false, created_at: 0, extra });
+        // 损坏行使条件写失败；随后管理员修复并更改无关配置。
+        store.create_account("delta", "G0", "cursor", 1, "null").unwrap();
+        let scheduler = AccountScheduler::new(vec![base.clone()], &Default::default());
+        scheduler.queue_extra(&base, [("access_token".into(), serde_json::json!("at-new")),
+            ("refresh_token".into(), serde_json::json!("rt-new")),
+            ("expires_at".into(), serde_json::json!("2027-01-01T00:00:00Z"))].into());
+        persist_pending_extra(&scheduler, Some(&store), "delta", "故障注入");
+        assert!(scheduler.is_extra_dirty("delta"));
+        let mut repaired = base.extra.clone();
+        repaired.insert("proxy".into(), serde_json::json!("admin-proxy"));
+        repaired.insert("region".into(), serde_json::json!("admin-region"));
+        store.update_account_extra("delta", &serde_json::to_string(&repaired).unwrap()).unwrap();
+        let locks: RefreshLocks = Default::default();
+        for (at, exp, agent) in [("at-new", "2027-01-01T00:00:00Z", "agent-1"),
+            ("at-stale", "2026-01-01T00:00:00Z", "agent-2")] {
+            let delta = [("access_token".into(), serde_json::json!(at)),
+                ("refresh_token".into(), serde_json::json!("rt-stale")),
+                ("expires_at".into(), serde_json::json!(exp)),
+                ("sand_agent_id".into(), serde_json::json!(agent))].into();
+            let provider: Arc<dyn Provider> = Arc::new(TokenUpdateMockProvider {
+                updates: std::sync::Mutex::new(vec![("delta".into(), delta)]),
+            });
+            adopt_provider_token_updates(&provider, &scheduler, &store, &locks).await;
+            let actual: serde_json::Value = serde_json::from_str(&store.get_account("delta").unwrap().unwrap().extra).unwrap();
+            assert_eq!(actual["refresh_token"], "rt-new");
+            assert_eq!(actual["sand_agent_id"], agent);
+            assert_eq!(actual["proxy"], "admin-proxy");
+            assert_eq!(actual["region"], "admin-region");
+        }
+        assert!(!scheduler.is_extra_dirty("delta"));
+        // 删除不是写成功；不得清掉待写状态并记录虚假的持久化成功。
+        store.delete_account("delta").unwrap();
+        scheduler.queue_extra(&scheduler.account("delta").unwrap(),
+            [("sand_agent_id".into(), serde_json::json!("agent-3"))].into());
+        persist_pending_extra(&scheduler, Some(&store), "delta", "删除竞态");
+        assert!(scheduler.is_extra_dirty("delta"));
+        scheduler.sync_accounts(vec![]);
+        assert!(scheduler.dirty_accounts().is_empty());
     }
 
     /// 不带 access_token 的增量(如 sandchat 的 `sand_agent_id`):跳过 token CAS,

@@ -340,10 +340,10 @@ struct CredentialState {
     /// 最近一次从配置(DB)看到的 disabled 值。sync 只在**翻转**时动 runtime:
     /// 配置 false→false 不得反复清掉运行时冷却/封禁(admin 显式开关才算意图)。
     config_disabled: bool,
-    /// 内存 extra 比 DB 新且尚未持久化成功(刷新回写失败时置位)。
-    /// 置位期间 sync 不得用 DB 旧值覆盖内存(否则丢已 roll 的 token),
-    /// 由 worker 的 sync 循环负责重试持久化、成功后清位。
-    extra_dirty: bool,
+    /// 未落库的字段增量；每项保留首次基准和最新目标。
+    pending_extra: gw_core::account::ExtraChanges,
+    /// 本地修改或写确认都会递增，阻止较早读取的 DB 快照倒灌。
+    extra_revision: u64,
     /// 冷却到期时刻(仅 cooldown 类有效);到点后选号前 sweep 自愈。
     disabled_until: Option<Instant>,
     /// 连续 API 失败次数(成功清零;达 tuning.max_failures 禁用)。
@@ -421,7 +421,8 @@ impl CredentialState {
             default_rank,
             disabled: account.disabled,
             config_disabled: account.disabled,
-            extra_dirty: false,
+            pending_extra: Default::default(),
+            extra_revision: 0,
             disabled_reason: None,
             disabled_until: None,
             failure_count: 0,
@@ -2656,6 +2657,11 @@ impl AccountScheduler {
     /// 配置 disabled **翻转**才动 runtime(→true 强制禁用,→false 视为 admin
     /// 显式复活,清运行时禁用)。
     pub fn sync_accounts(&self, accounts: Vec<Arc<Account>>) -> SyncOutcome {
+        self.sync_accounts_since(accounts, &self.extra_revisions())
+    }
+
+    /// 读取 DB 前捕获版本，发布时只接纳没有被本地更新越过的 extra。
+    pub fn sync_accounts_since(&self, accounts: Vec<Arc<Account>>, revisions: &HashMap<String, u64>) -> SyncOutcome {
         let mut out = SyncOutcome::default();
         let mut entries = self.entries.lock();
 
@@ -2722,11 +2728,19 @@ impl AccountScheduler {
                             }
                         }
                     }
-                    // 内存 extra 未持久化(刷新回写失败):跳过配置覆盖,保住新 token;
-                    // disabled 翻转仍生效(上方已处理),持久化由 worker 重试后清位。
-                    if e.extra_dirty {
-                        continue;
+                    let mut acc = (*acc).clone();
+                    if revisions.get(&acc.account_id) != Some(&e.extra_revision) {
+                        acc.extra = e.account.extra.clone();
+                    } else {
+                        // 只覆盖待写字段；管理员修改的并发、priority、proxy 等继续生效。
+                        for (key, change) in &e.pending_extra {
+                            match &change.value {
+                                Some(value) => { acc.extra.insert(key.clone(), value.clone()); }
+                                None => { acc.extra.remove(key); }
+                            }
+                        }
                     }
+                    let acc = Arc::new(acc);
                     // 并发上限变化 → 换新信号量(在途许可持旧信号量,自然衰减)。
                     if acc.max_concurrency != e.account.max_concurrency {
                         e.semaphore =
@@ -2773,33 +2787,92 @@ impl AccountScheduler {
         out
     }
 
-    /// 标记某账号内存 extra 未持久化(刷新回写 DB 失败时调用)。
-    pub fn mark_extra_dirty(&self, id: &str) {
-        if let Some(e) = self.entries.lock().get_mut(id) {
-            e.extra_dirty = true;
-        }
+    pub fn extra_revisions(&self) -> HashMap<String, u64> {
+        self.entries.lock().iter().map(|(id, e)| (id.clone(), e.extra_revision)).collect()
     }
 
-    /// 取所有待持久化账号的内存副本(worker sync 循环重试回写用)。
     pub fn dirty_accounts(&self) -> Vec<Arc<Account>> {
-        self.entries
-            .lock()
-            .values()
-            .filter(|e| e.extra_dirty)
-            .map(|e| e.account.clone())
-            .collect()
+        self.entries.lock().values().filter(|e| !e.pending_extra.is_empty())
+            .map(|e| e.account.clone()).collect()
     }
 
-    /// 持久化成功后清除脏标记。
-    pub fn clear_extra_dirty(&self, id: &str) {
-        if let Some(e) = self.entries.lock().get_mut(id) {
-            e.extra_dirty = false;
-        }
+    pub fn pending_extra(&self, id: &str) -> gw_core::account::ExtraChanges {
+        self.entries.lock().get(id).map(|e| e.pending_extra.clone()).unwrap_or_default()
     }
 
-    /// 该账号是否有待持久化的脏 extra。
     pub fn is_extra_dirty(&self, id: &str) -> bool {
-        self.entries.lock().get(id).map(|e| e.extra_dirty).unwrap_or(false)
+        !self.pending_extra(id).is_empty()
+    }
+
+    /// 只确认本次已写版本。期间新增字段或同字段新版本继续待写。
+    pub fn acknowledge_extra(&self, id: &str, written: &gw_core::account::ExtraChanges,
+        actual: &std::collections::BTreeMap<String, serde_json::Value>) {
+        let mut entries = self.entries.lock();
+        let Some(e) = entries.get_mut(id) else { return };
+        let mut acc = (*e.account).clone();
+        let credential_conflict = written.iter().any(|(key, change)|
+            gw_core::account::CREDENTIAL_EXTRA_KEYS.contains(&key.as_str())
+                && actual.get(key) != change.value.as_ref());
+        for (key, change) in written {
+            let Some(pending) = e.pending_extra.get_mut(key) else { continue };
+            let conflict = ((gw_core::account::CREDENTIAL_EXTRA_KEYS.contains(&key.as_str()) || change.requires_credentials)
+                && credential_conflict) || actual.get(key) != change.value.as_ref();
+            if pending.revision != change.revision && !conflict {
+                // 旧写入已落库，新版本应以上次写后的 DB 值为比较基准。
+                pending.previous = actual.get(key).cloned();
+                continue;
+            }
+            e.pending_extra.remove(key);
+            match actual.get(key) {
+                Some(value) => { acc.extra.insert(key.clone(), value.clone()); }
+                None => { acc.extra.remove(key); }
+            }
+        }
+        e.account = Arc::new(acc);
+        e.extra_revision += 1;
+    }
+
+    /// 相对网络调用前的基准生成增量，合入当前账号；不回写整个旧 Account。
+    pub fn queue_extra(&self, base: &Account, delta: std::collections::BTreeMap<String, serde_json::Value>) {
+        self.queue_extra_inner(base, delta, false);
+    }
+
+    /// 刷新/身份发现返回的数据须保留网络调用前的认证基准。
+    pub fn queue_extra_for_credentials(&self, base: &Account, delta: std::collections::BTreeMap<String, serde_json::Value>) {
+        self.queue_extra_inner(base, delta, true);
+    }
+
+    fn queue_extra_inner(&self, base: &Account, delta: std::collections::BTreeMap<String, serde_json::Value>, requires_credentials: bool) {
+        use gw_core::account::{CREDENTIAL_EXTRA_KEYS, ExtraChange};
+        let mut entries = self.entries.lock();
+        let Some(e) = entries.get_mut(&base.account_id) else { return };
+        if requires_credentials && CREDENTIAL_EXTRA_KEYS.iter().any(|key| e.account.extra.get(*key) != base.extra.get(*key)) {
+            // 已知本地身份变更时不短暂发布旧查询结果；DB 尚未同步的竞态由事务兜底。
+            return;
+        }
+        let credentials_changed = delta.iter().any(|(key, value)|
+            CREDENTIAL_EXTRA_KEYS.contains(&key.as_str()) && base.extra.get(key) != Some(value));
+        let mut values: std::collections::BTreeMap<String, Option<serde_json::Value>> = delta.into_iter()
+            .filter(|(key, value)| base.extra.get(key) != Some(value))
+            .map(|(key, value)| (key, Some(value))).collect();
+        if credentials_changed || (requires_credentials && !values.is_empty()) {
+            for &key in CREDENTIAL_EXTRA_KEYS {
+                values.entry(key.into()).or_insert_with(|| base.extra.get(key).cloned());
+            }
+        }
+        if values.is_empty() { return; }
+        e.extra_revision += 1;
+        let mut acc = (*e.account).clone();
+        for (key, value) in values {
+            let previous = e.pending_extra.get(&key).map(|c| c.previous.clone())
+                .unwrap_or_else(|| base.extra.get(&key).cloned());
+            match &value {
+                Some(value) => { acc.extra.insert(key.clone(), value.clone()); }
+                None => { acc.extra.remove(&key); }
+            }
+            e.pending_extra.insert(key, ExtraChange { previous, value, revision: e.extra_revision, requires_credentials });
+        }
+        e.account = Arc::new(acc);
     }
 
     /// 全账号运行态快照(worker /status → admin 账号页;id 升序稳定输出)。
@@ -2892,27 +2965,19 @@ impl AccountScheduler {
     }
 
     /// 刷新后回写账号(带新 token 的副本),供下次选号使用。保留运行态(并发/计数/LRU)。
+    #[cfg(test)]
     pub fn update_account(&self, account: Arc<Account>) {
         let mut entries = self.entries.lock();
         if let Some(e) = entries.get_mut(&account.account_id) {
             e.account = account;
-        }
-    }
-
-    /// **原子**替换账号副本并置脏(同一把 entries 锁)。刷新回写专用:
-    /// 「先 update 后 mark_dirty」两步之间,30s sync 看到 dirty=false 会用 DB 旧值
-    /// 覆盖内存,丢掉刚 roll 的 refresh_token(审查 Architect#1)。
-    pub fn update_account_dirty(&self, account: Arc<Account>) {
-        let mut entries = self.entries.lock();
-        if let Some(e) = entries.get_mut(&account.account_id) {
-            e.account = account;
-            e.extra_dirty = true;
+            e.extra_revision += 1;
         }
     }
 
     /// 锁内就地合并**单个** extra 字段(配额回填 subscription_title 等元数据用)。
     /// 与 [`Self::update_account`] 的整体替换不同:不携带调用方的旧账号快照,
     /// 不会与并发 token 刷新互相覆盖。值未变化返回 false(调用方可跳过持久化)。
+    #[cfg(test)]
     pub fn merge_extra(&self, id: &str, key: &str, value: serde_json::Value) -> bool {
         let mut entries = self.entries.lock();
         let Some(e) = entries.get_mut(id) else { return false };
@@ -5947,14 +6012,67 @@ mod tests {
         assert_eq!(a.max_concurrency, 4);
     }
 
+    #[test]
+    fn pending_extra_acknowledges_only_written_revision_and_keeps_config() {
+        let s = sched(vec![acct("a", 1, None)]);
+        let base = s.account("a").unwrap();
+        s.queue_extra(&base, [("refresh_token".into(), serde_json::json!("rt-1"))].into());
+        let first = s.pending_extra("a");
+        let current = s.account("a").unwrap();
+        s.queue_extra(&current, [("refresh_token".into(), serde_json::json!("rt-2")),
+            ("sand_agent_id".into(), serde_json::json!("agent-1"))].into());
+        let actual = [("refresh_token".into(), serde_json::json!("rt-1"))].into();
+        s.acknowledge_extra("a", &first, &actual);
+        let pending = s.pending_extra("a");
+        assert_eq!(pending["refresh_token"].previous, Some(serde_json::json!("rt-1")));
+        assert_eq!(pending["refresh_token"].value, Some(serde_json::json!("rt-2")));
+        assert!(pending.contains_key("sand_agent_id"));
+        let mut db = (*base).clone();
+        db.max_concurrency = 7;
+        db.extra.insert("proxy".into(), serde_json::json!("admin-proxy"));
+        s.sync_accounts(vec![Arc::new(db)]);
+        let got = s.account("a").unwrap();
+        assert_eq!(got.extra_str("refresh_token"), Some("rt-2"));
+        assert_eq!(got.extra_str("proxy"), Some("admin-proxy"));
+        assert_eq!(got.max_concurrency, 7);
+    }
+
+    #[test]
+    fn pending_extra_partial_ack_and_admin_conflict_do_not_erase_or_rebase_old_tokens() {
+        let s = sched(vec![acct("a", 1, None)]);
+        s.queue_extra(&s.account("a").unwrap(), [("refresh_token".into(), serde_json::json!("rt-1"))].into());
+        let first = s.pending_extra("a");
+        s.queue_extra(&s.account("a").unwrap(), [("sand_agent_id".into(), serde_json::json!("agent"))].into());
+        let ordinary = s.pending_extra("a").into_iter().filter(|(key, _)| key == "sand_agent_id").collect();
+        s.acknowledge_extra("a", &ordinary, &[("sand_agent_id".into(), serde_json::json!("agent"))].into());
+        assert!(s.pending_extra("a").contains_key("refresh_token"));
+        s.queue_extra(&s.account("a").unwrap(), [("refresh_token".into(), serde_json::json!("rt-2"))].into());
+        s.acknowledge_extra("a", &first, &[("refresh_token".into(), serde_json::json!("rt-admin"))].into());
+        assert_eq!(s.account("a").unwrap().extra_str("refresh_token"), Some("rt-admin"));
+        assert!(!s.is_extra_dirty("a"), "冲突不能重设基准让下一次 flush 覆盖管理员凭据");
+    }
+
+    #[test]
+    fn pending_extra_rejects_snapshot_read_before_successful_rotation() {
+        let s = sched(vec![acct("a", 1, None)]);
+        let versions = s.extra_revisions();
+        let snapshot = s.account("a").unwrap();
+        s.queue_extra(&snapshot, [("refresh_token".into(), serde_json::json!("rt-new"))].into());
+        let written = s.pending_extra("a");
+        let actual = s.account("a").unwrap().extra.clone();
+        s.acknowledge_extra("a", &written, &actual);
+        assert!(!s.is_extra_dirty("a"));
+        s.sync_accounts_since(vec![snapshot], &versions);
+        assert_eq!(s.account("a").unwrap().extra_str("refresh_token"), Some("rt-new"));
+    }
+
     #[tokio::test]
     async fn sync_skips_extra_overwrite_when_dirty() {
         let s = sched(vec![acct("a", 1, None)]);
         // 刷新成功但回写 DB 失败:内存进新 token + 置脏。
         let mut refreshed = (*acct("a", 1, None)).clone();
         refreshed.extra.insert("refresh_token".into(), serde_json::json!("rt-new"));
-        s.update_account(Arc::new(refreshed));
-        s.mark_extra_dirty("a");
+        s.queue_extra(&s.account("a").unwrap(), refreshed.extra);
 
         // DB 里还是旧 token:sync 不得把内存洗回去。
         let mut stale = (*acct("a", 1, None)).clone();
@@ -5968,7 +6086,8 @@ mod tests {
         assert_eq!(s.dirty_accounts().len(), 1);
 
         // 持久化成功 → 清脏,之后 sync 恢复正常覆盖。
-        s.clear_extra_dirty("a");
+        let pending = s.pending_extra("a");
+        s.acknowledge_extra("a", &pending, &s.account("a").unwrap().extra);
         s.sync_accounts(vec![Arc::new(stale)]);
         assert_eq!(s.account("a").unwrap().extra_str("refresh_token"), Some("rt-stale"));
     }
