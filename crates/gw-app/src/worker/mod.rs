@@ -99,6 +99,14 @@ struct WorkerState {
     /// per-account 刷新单飞锁:同一账号同时只允许一个 in-flight refresh(契约 H4)。
     /// 避免两个首请求并发刷新、互相覆盖 rolling refresh_token 导致一方 invalid_grant。
     refresh_locks: parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 401/403 被拒刷新的冷却表:account_id → 上次**成功**刷新时刻。
+    /// 2026-09-09 实态:bot7-3/grokbot1 在一小时内被「401 → 同号刷新 → 再 401 → 再刷」
+    /// 风暴反复打 oauth/token,最终 shouldLogout 终态死亡(疑似 RT 轮换重用检测/高频
+    /// 风控)。token 本来 60 天有效,高频刷新零收益高风险 → 同账号 10 分钟内只允许
+    /// 一次被拒刷新,再 401 直接拿新 token 重试,仍失败就交上层判死,绝不连环刷。
+    rejection_refresh_at: parking_lot::Mutex<
+        std::collections::HashMap<String, std::time::Instant>,
+    >,
     /// usage 落库汇(#130)。打开失败时为 None(降级:usage 仅记日志不入库)。
     usage_sink: Option<Arc<dyn UsageSink>>,
     /// 在途异步 usage 落库登记(停机排空时等它们收尾)。
@@ -230,7 +238,32 @@ impl WorkerState {
             }
             None => account,
         };
-        self.do_refresh_and_persist(base).await
+        // 刷新风暴防护(2026-09-09,bot7-3/grokbot1 疑似被连环刷新踢成 shouldLogout):
+        // 同账号 10 分钟内已经成功刷过一次 → 现在这枚 token 就是最新货,再 401 说明
+        // 不是"token 旧了"而是真被拒,连环刷 RT 只会加速死亡。跳过上上游,直接把最新
+        // 副本交给调用方重试;仍 401 由上层计失败/判死。
+        const REJECTION_REFRESH_COOLDOWN: std::time::Duration =
+            std::time::Duration::from_secs(600);
+        {
+            let cooldown = self.rejection_refresh_at.lock();
+            if let Some(t) = cooldown.get(&base.account_id) {
+                if t.elapsed() < REJECTION_REFRESH_COOLDOWN {
+                    tracing::warn!(
+                        account = %base.account_id,
+                        "被拒刷新冷却中(10min 内已刷过),跳过上上游、用最新 token 重试"
+                    );
+                    return Ok(base);
+                }
+            }
+        }
+        let account_id = base.account_id.clone();
+        let out = self.do_refresh_and_persist(base).await;
+        if out.is_ok() {
+            self.rejection_refresh_at
+                .lock()
+                .insert(account_id, std::time::Instant::now());
+        }
+        out
     }
 
     /// 单飞锁内刷新:锁内二次检查(他人可能刚刷好)→ 仍需则 refresh_auth → 回写 scheduler。
@@ -1167,6 +1200,7 @@ pub async fn run(
         provider,
         scheduler,
         refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
         usage_sink,
         pending_writes: PendingWrites::new(),
         store: store.clone(),
@@ -1563,11 +1597,15 @@ async fn flush_dirty_extras(
 /// 去 OAuth 刷新 → invalid_grant → TokenInvalid → 号被永久判死(对抗审查共识:
 /// 这条不靠流量不靠攻击者,轮换是定时自己发生的)。
 ///
-/// CAS 两道(防旧回声覆盖新状态):
+/// CAS 两道(防旧回声覆盖新状态),**仅对带 access_token 的增量适用**:
 /// 1. access_token 相同 = 已应用过,跳过;
 /// 2. 两边 expires_at 都在且传入的不更新 → 跳过(传入格式 `YYYY-...Z` 零填充,
 ///    字典序即时间序;gw-app 可能刚 OAuth 刷过更新的)。
 /// 与 `do_refresh_and_persist` 同尾段:增量 merge 落库 + 置脏,成功才清脏。
+///
+/// 增量也可以**不带** access_token:那是 provider 侧的非凭据 extra 更新
+/// (如 gw-cursor sandchat 的 `sand_agent_id`),没有旧回声问题,跳过 CAS
+/// 直接 merge 落库。两条路都拿 per-account 锁,与刷新互斥。
 async fn adopt_provider_token_updates(
     provider: &Arc<dyn Provider>,
     scheduler: &AccountScheduler,
@@ -1575,27 +1613,27 @@ async fn adopt_provider_token_updates(
     refresh_locks: &RefreshLocks,
 ) {
     for (account_id, delta) in provider.poll_token_updates() {
-        let Some(incoming_at) = delta.get("access_token").and_then(|v| v.as_str()) else {
-            continue;
-        };
+        let incoming_at = delta.get("access_token").and_then(|v| v.as_str());
         let lock = lock_for(refresh_locks, &account_id);
         let _guard = lock.lock().await;
         let Some(base) = scheduler.account(&account_id) else {
             continue;
         };
-        if base.extra_str("access_token") == Some(incoming_at) {
-            continue; // CAS①:已是这枚 token(上轮已应用)。
-        }
-        let stale = match (
-            delta.get("expires_at").and_then(|v| v.as_str()),
-            base.extra_str("expires_at"),
-        ) {
-            (Some(inc), Some(cur)) => inc <= cur,
-            _ => false, // 缺一边没法比:放行(捕获侧已按 exp 比过一轮)。
-        };
-        if stale {
-            tracing::debug!(account = %account_id, "外部 token 轮换是比现存更旧的回声,跳过");
-            continue; // CAS②:旧回声不覆盖新刷新。
+        if let Some(incoming_at) = incoming_at {
+            if base.extra_str("access_token") == Some(incoming_at) {
+                continue; // CAS①:已是这枚 token(上轮已应用)。
+            }
+            let stale = match (
+                delta.get("expires_at").and_then(|v| v.as_str()),
+                base.extra_str("expires_at"),
+            ) {
+                (Some(inc), Some(cur)) => inc <= cur,
+                _ => false, // 缺一边没法比:放行(捕获侧已按 exp 比过一轮)。
+            };
+            if stale {
+                tracing::debug!(account = %account_id, "外部 token 轮换是比现存更旧的回声,跳过");
+                continue; // CAS②:旧回声不覆盖新刷新。
+            }
         }
         let mut updated = (*base).clone();
         for (k, v) in &delta {
@@ -1608,10 +1646,15 @@ async fn adopt_provider_token_updates(
         match persisted {
             Ok(_) => {
                 scheduler.clear_extra_dirty(&account_id);
-                tracing::info!(account = %account_id, "已采纳外部轮换的 token(CLI 自刷新捕获)");
+                if incoming_at.is_some() {
+                    tracing::info!(account = %account_id, "已采纳外部轮换的 token(CLI 自刷新捕获)");
+                } else {
+                    tracing::info!(account = %account_id, keys = ?delta.keys().collect::<Vec<_>>(),
+                        "已采纳 provider 侧的账号 extra 增量(非凭据)");
+                }
             }
             Err(e) => tracing::warn!(account = %account_id,
-                "外部轮换 token 落库失败,已置脏待 sync 重试: {e}"),
+                "外部增量落库失败,已置脏待 sync 重试: {e}"),
         }
     }
 }
@@ -1842,7 +1885,12 @@ async fn refresh_account(
             // rt 永久失效(TokenInvalid)→ 立即标 invalid_refresh_token 禁用,仪表盘即时
             // 见死号、不再被路由到;transient(网络/5xx)→ 仅计失败数(救号一键清)。
             // 不在此换号/重试(人工动作就是要看这一次结果)。
-            st.scheduler.report_failure_with_gen(&id, e.kind, gen);
+            st.scheduler.report_failure_with_detail(
+                &id,
+                e.kind,
+                gen,
+                &e.to_string().chars().take(300).collect::<String>(),
+            );
             // 运维端点:人工点"刷新"就是要看这一次的真实失败原因。
             admin_error_response(&e)
         }
@@ -2059,7 +2107,11 @@ async fn quota_account(
             // (网络/5xx/429)只透传给前端展示,不计入与 chat 共用的失败池/冷却——
             // 否则上游抖动期间批量验活会把好号验成 too_many_failures。
             if matches!(e.kind, UpstreamErrorKind::TokenInvalid) {
-                st.scheduler.report_failure(&id, e.kind);
+                st.scheduler.report_failure_detail(
+                    &id,
+                    e.kind,
+                    &e.to_string().chars().take(300).collect::<String>(),
+                );
             }
             // 失败也写"尝试时刻"(None),与后台轮询同一节流口径。
             st.quota_cache
@@ -2358,6 +2410,42 @@ async fn sync_now(State(st): State<Arc<WorkerState>>) -> axum::response::Respons
     }
 }
 
+/// cursor 专用降级:同号刷新**刚成功**(凭据此刻必然活着)而透明重试仍 401 时,
+/// 把 TokenInvalid 降为 Other —— cursor 旧 inference 面 2026-09-09 起对**所有**号
+/// 退役(401 与号无关,健康号同样 401),重试的 401 证明不了凭据死亡;kiro 不适用
+/// (kiro 刷新成功 + chat 仍 403 = entitlement 被撤,是最强真死信号,见同步分支注释)。
+/// 真死号由刷新环节(shouldLogout / invalid_grant)权威判定,轮不到这里。
+fn demote_cursor_retry_401(
+    family: &str,
+    e: gw_core::error::UpstreamError,
+) -> gw_core::error::UpstreamError {
+    if family == "cursor" && e.kind == UpstreamErrorKind::TokenInvalid {
+        gw_core::error::UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!(
+                "刷新成功但重试仍 401:推理面/请求形态问题而非凭据死亡(原 TokenInvalid 已降级): {e}"
+            ),
+        )
+    } else {
+        e
+    }
+}
+
+/// 纯 bot 池判定:cursor worker 且持有的账号**全部**钉 `extra.pool="bot"`。
+///
+/// 无账号(还没 sync 到)或混有任何非 bot 号 → false,维持全量目录:
+/// 裁剪只是**客户体验优化**,拿不准时绝不裁(裁错了客户端连能用的模型都看不到)。
+fn bot_pool_only(st: &WorkerState) -> bool {
+    if st.provider.family() != "cursor" {
+        return false;
+    }
+    let accounts = st.scheduler.accounts_snapshot();
+    !accounts.is_empty()
+        && accounts
+            .iter()
+            .all(|a| a.extra.get("pool").and_then(|v| v.as_str()) == Some("bot"))
+}
+
 /// `GET /v1/models` —— 暴露 provider 的模型目录(Anthropic 线缆格式)。
 /// provider 一处实现 `list_models`,框架在此映射成对外响应(写一次,各 provider 共享)。
 async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response {
@@ -2376,6 +2464,16 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
     let openai_shape = mount_openai_wire(st.provider.family());
     match st.provider.list_models().await {
         Ok(list) => {
+            // 纯 bot 池裁剪:grokbot 0.39(sandchat 面)没有模型字段,服务端
+            // 永远是同一个 Grok;把全量目录给客户端只会诱导它点到 bot 号接不了
+            // 的模型、然后撞「已钉 pool=bot」拒绝。worker 持有的账号**全部**钉
+            // pool=bot 时只留 grok_bot_auto 一项;混合池/无账号维持全量目录
+            // (判据与调度器账号集同源,见 accounts_snapshot)。
+            let list = if bot_pool_only(&st) {
+                gw_cursor::bot_pool_list()
+            } else {
+                list
+            };
             let data: Vec<serde_json::Value> = list
                 .iter()
                 .map(|m| {
@@ -2842,7 +2940,12 @@ async fn handle_chat(
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(account = %account_id, kind = ?e.kind, "凭证刷新失败: {e}");
-                st.scheduler.report_failure_with_gen(&account_id, e.kind, suspend_gen);
+                st.scheduler.report_failure_with_detail(
+                    &account_id,
+                    e.kind,
+                    suspend_gen,
+                    &e.to_string().chars().take(300).collect::<String>(),
+                );
                 drop(lease);
                 if !e.kind.worth_switching_account()
                     || retry_started.elapsed() >= RETRY_DEADLINE
@@ -3064,11 +3167,19 @@ async fn handle_chat(
                                 // 刷新成功后仍失败:上报**真实** e2.kind + 换号。heal 已把可救的
                                 // profileArn 套错救回(救回则上面直接 return);走到这里=该号确实当前
                                 // 不能服务——e3(带真 ARN 仍 403)是最强死号信号、或非付费/发现失败,
-                                // 一律保留原分类语义(TokenInvalid→invalid_refresh_token 永久禁用),
+                                // kiro 一律保留原分类语义(TokenInvalid→invalid_refresh_token 永久禁用),
                                 // 不弱化死号识别。注:「刷新成功⇒rt 有效」只证认证有效,不代表 entitlement
-                                // 未被服务端撤销,故不能据此把 TokenInvalid 一律降级(对抗审查 HIGH)。
+                                // 未被服务端撤销,故 kiro 不能据此把 TokenInvalid 一律降级(对抗审查 HIGH)。
+                                // cursor 例外:旧 inference 面 2026-09-09 起对**所有**号退役,
+                                // 重试的 401 与号无关,降级 Other(见 demote_cursor_retry_401)。
+                                let e2 = demote_cursor_retry_401(st.provider.family(), e2);
                                 tracing::warn!(account = %account_id, kind = ?e2.kind, "刷新后重试仍失败: {e2}");
-                                st.scheduler.report_failure_with_gen(&account_id, e2.kind, suspend_gen);
+                                st.scheduler.report_failure_with_detail(
+                                    &account_id,
+                                    e2.kind,
+                                    suspend_gen,
+                                    &e2.to_string().chars().take(300).collect::<String>(),
+                                );
                                 drop(lease);
                                 if !e2.kind.worth_switching_account()
                                     || retry_started.elapsed() >= RETRY_DEADLINE
@@ -3083,7 +3194,12 @@ async fn handle_chat(
                     Err(re) => {
                         // 刷新失败:invalid_grant→永久禁用;transient→换号重试。
                         tracing::warn!(account = %account_id, kind = ?re.kind, "同号刷新失败: {re}");
-                        st.scheduler.report_failure_with_gen(&account_id, re.kind, suspend_gen);
+                        st.scheduler.report_failure_with_detail(
+                            &account_id,
+                            re.kind,
+                            suspend_gen,
+                            &re.to_string().chars().take(300).collect::<String>(),
+                        );
                         drop(lease);
                         if !re.kind.worth_switching_account()
                             || retry_started.elapsed() >= RETRY_DEADLINE
@@ -3098,7 +3214,12 @@ async fn handle_chat(
             Err(e) => {
                 let kind = e.kind;
                 tracing::warn!(account = %account_id, kind = ?kind, "chat 失败: {e}");
-                st.scheduler.report_failure_with_gen(&account_id, kind, suspend_gen);
+                st.scheduler.report_failure_with_detail(
+                    &account_id,
+                    kind,
+                    suspend_gen,
+                    &e.to_string().chars().take(300).collect::<String>(),
+                );
                 // 该号对本模型不可用(INVALID_MODEL_ID):记 (号,模型) 不可用,后续选号跳过它、
                 // 路由到有该模型的号(该号**不禁用**,仍服务其它模型)。
                 if kind == UpstreamErrorKind::ModelNotAvailable {
@@ -3161,8 +3282,12 @@ fn fail_pre_first_byte(
     report_failure: bool,
 ) -> axum::response::Response {
     if report_failure {
-        st.scheduler
-            .report_failure_with_gen(lease.account_id(), e.kind, lease.suspend_gen);
+        st.scheduler.report_failure_with_detail(
+            lease.account_id(),
+            e.kind,
+            lease.suspend_gen,
+            &e.to_string().chars().take(300).collect::<String>(),
+        );
     }
     if let (Some(sink), Some(u)) = (st.usage_sink.clone(), usage.clone()) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -4116,7 +4241,9 @@ async fn collect_response(
                                     ))
                                     .await;
                                 }
-                                Err(e2) => hard_err = Some(e2), // 重试的真实 kind 走统一失败
+                                // 重试的真实 kind 走统一失败;cursor 死面降级见
+                                // demote_cursor_retry_401(kiro 维持原判)。
+                                Err(e2) => hard_err = Some(demote_cursor_retry_401(family, e2)),
                             }
                         }
                     }
@@ -4124,6 +4251,14 @@ async fn collect_response(
                 }
             }
         }
+    }
+
+    // 透明重试(递归调用,token_retried=true)的 401 以**流内错误帧**形态在抽干
+    // 阶段到达:上面的 demote 只包得住 chat() 同步 Err,包不住这里 —— cursor 旧
+    // inference 死面对所有号 401,刷新刚成功就证明凭据活着,补降级防误杀
+    // (kiro 不适用,demote 内部按 family 拦截,见 demote_cursor_retry_401)。
+    if token_retried {
+        hard_err = hard_err.map(|e| demote_cursor_retry_401(family, e));
     }
 
     // 先定结果,再统一收尾(账号生命周期 + usage 落库),保证 success 与真实结果一致
@@ -4161,11 +4296,14 @@ async fn collect_response(
         // 非流式折叠成功 = 完整成功(消息体已收齐),可清 suspend 退避进度。
         scheduler.report_success_observed(&account_id, lease.suspend_gen, true);
     } else {
-        let kind = match &outcome {
-            Outcome::Upstream(e) => e.kind,
-            _ => UpstreamErrorKind::ServerError,
+        let (kind, detail) = match &outcome {
+            Outcome::Upstream(e) => (
+                e.kind,
+                e.to_string().chars().take(300).collect::<String>(),
+            ),
+            _ => (UpstreamErrorKind::ServerError, String::new()),
         };
-        scheduler.report_failure_with_gen(&account_id, kind, lease.suspend_gen);
+        scheduler.report_failure_with_detail(&account_id, kind, lease.suspend_gen, &detail);
         // 防御:理论上 INVALID_MODEL_ID 是首包前 400 走主循环,但若上游 mid-stream 冒出
         // 也在此记 (号,模型) 不可用,与主循环口径一致(不禁号 + 后续选号跳过该号)。
         if kind == UpstreamErrorKind::ModelNotAvailable {
@@ -4544,7 +4682,9 @@ async fn stream_response(
                                 .await;
                             }
                             Err(e2) => {
-                                // 重试仍败:上报真实 kind 后按首包前失败回显。
+                                // 重试仍败:上报真实 kind 后按首包前失败回显;cursor 死面降级
+                                // 见 demote_cursor_retry_401(kiro 维持原判)。
+                                let e2 = demote_cursor_retry_401(st.provider.family(), e2);
                                 let usage = buffered_usage(&buffered);
                                 return fail_pre_first_byte(
                                     &st, lease, &req, &client_key, &retry_ctx.account,
@@ -4566,6 +4706,16 @@ async fn stream_response(
             // 首项(或前导后)即上游错误 = 首包前失败:与主 handler「chat 失败」分支
             // 同口径(report_failure + 失败请求日志 + 对外错误状态),只是把 200 空流
             // 换成真实状态码。不另起换号重试:与今天流内 Err 分支的行为一致。
+            //
+            // 递归重试(token_retried=true)的 401 同样是**流内错误帧**形态,上面
+            // chat() 同步 Err 上的 demote 包不住它 —— cursor 旧 inference 死面对
+            // 所有号 401,刷新刚成功即证明凭据活着,补降级防误杀(kiro 不适用,
+            // demote 内部按 family 拦截,见 demote_cursor_retry_401)。
+            let e = if token_retried {
+                demote_cursor_retry_401(st.provider.family(), e)
+            } else {
+                e
+            };
             tracing::warn!(
                 account = %lease.account_id(),
                 kind = ?e.kind,
@@ -5002,10 +5152,11 @@ async fn stream_response(
                     }
                     if !ctx.reported {
                         ctx.reported = true;
-                        ctx.st.scheduler.report_failure_with_gen(
+                        ctx.st.scheduler.report_failure_with_detail(
                             &ctx.account_id,
                             e.kind,
                             ctx.suspend_gen,
+                            &e.to_string().chars().take(300).collect::<String>(),
                         );
                     }
                     if let Some(conv) = ctx.conv.as_mut() {
@@ -5471,6 +5622,50 @@ mod tests {
         );
         let row = store.get_account("acc-c").unwrap().unwrap();
         assert!(row.extra.contains("at-new"), "DB 也不得被旧回声覆盖: {}", row.extra);
+    }
+
+    /// 不带 access_token 的增量(如 sandchat 的 `sand_agent_id`):跳过 token CAS,
+    /// 纯 merge 进 scheduler + 落库,绝不碰凭据字段。
+    #[tokio::test]
+    async fn adopt_provider_token_updates_merges_plain_extra_delta() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_account(
+                "acc-s",
+                "G0",
+                "cursor",
+                1,
+                r#"{"access_token":"at-keep","refresh_token":"rt-keep"}"#,
+            )
+            .unwrap();
+        let mut extra = BTreeMap::new();
+        extra.insert("access_token".into(), serde_json::json!("at-keep"));
+        extra.insert("refresh_token".into(), serde_json::json!("rt-keep"));
+        let acc = Arc::new(Account {
+            account_id: "acc-s".into(),
+            provider: "cursor".into(),
+            max_concurrency: 1,
+            disabled: false,
+            created_at: 0,
+            extra,
+        });
+        let scheduler = AccountScheduler::new(vec![acc], &Default::default());
+        let locks: RefreshLocks = parking_lot::Mutex::new(std::collections::HashMap::new());
+
+        let mut delta = BTreeMap::new();
+        delta.insert("sand_agent_id".into(), serde_json::json!("agent-42"));
+        let provider: Arc<dyn Provider> = Arc::new(TokenUpdateMockProvider {
+            updates: std::sync::Mutex::new(vec![("acc-s".into(), delta)]),
+        });
+        adopt_provider_token_updates(&provider, &scheduler, &store, &locks).await;
+
+        let acc = scheduler.account("acc-s").unwrap();
+        assert_eq!(acc.extra_str("sand_agent_id"), Some("agent-42"), "scheduler 应收下增量");
+        assert_eq!(acc.extra_str("access_token"), Some("at-keep"), "凭据字段不得被动");
+        let row = store.get_account("acc-s").unwrap().unwrap();
+        assert!(row.extra.contains("agent-42"), "增量应落库: {}", row.extra);
+        assert!(row.extra.contains("at-keep"), "merge 语义:凭据保留: {}", row.extra);
+        assert!(scheduler.dirty_accounts().is_empty(), "落库成功应清脏位");
     }
 
     /// 记录到内存的假 sink,断言 finalize_usage 的落库决策。
@@ -6404,6 +6599,7 @@ mod tests {
                 &gw_core::config::SchedulerConfig::default(),
             ),
             refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
             usage_sink: None,
             pending_writes: PendingWrites::new(),
             store: None,
@@ -6513,6 +6709,7 @@ mod tests {
                 &gw_core::config::SchedulerConfig::default(),
             ),
             refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
             usage_sink: None,
             pending_writes: PendingWrites::new(),
             store: None,
@@ -6627,6 +6824,7 @@ mod tests {
                 &gw_core::config::SchedulerConfig::default(),
             ),
             refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
             usage_sink: None,
             pending_writes: PendingWrites::new(),
             store: None,
@@ -6748,6 +6946,13 @@ mod tests {
     }
 
     fn catalog_state(family: &'static str) -> Arc<WorkerState> {
+        catalog_state_with_accounts(family, vec![Arc::new(acct(&[]))])
+    }
+
+    fn catalog_state_with_accounts(
+        family: &'static str,
+        accounts: Vec<Arc<Account>>,
+    ) -> Arc<WorkerState> {
         let provider: Arc<dyn Provider> = Arc::new(CatalogMockProvider(family));
         Arc::new(WorkerState {
             instance: 0,
@@ -6756,10 +6961,11 @@ mod tests {
             provider,
             settings_sync: parking_lot::RwLock::new(SettingsSync::default()),
             scheduler: AccountScheduler::new(
-                vec![Arc::new(acct(&[]))],
+                accounts,
                 &gw_core::config::SchedulerConfig::default(),
             ),
             refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
             usage_sink: None,
             pending_writes: PendingWrites::new(),
             store: None,
@@ -6796,6 +7002,42 @@ mod tests {
         // 两套字段并存:Anthropic 侧一个都不能少。
         assert_eq!(item["type"], "model");
         assert_eq!(item["display_name"], "Grok");
+    }
+
+    /// 纯 bot 池(grokbot 0.39 面无模型字段)的 `/v1/models` 只留 grok_bot_auto
+    /// 一项;混有任何非 bot 号、无 pool 钉、非 cursor 家族 → 维持 provider 全量目录。
+    #[tokio::test]
+    async fn models_端点_纯bot池_只出单模型() {
+        let bot_a = |id: &str| {
+            let mut a = acct(&[("pool", "bot")]);
+            a.account_id = id.into();
+            Arc::new(a)
+        };
+        // 纯 bot 池:所有账号钉 pool=bot → 单项目录。
+        let st = catalog_state_with_accounts("cursor", vec![bot_a("a1"), bot_a("a2")]);
+        let body = body_json(models(State(st)).await).await;
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "纯 bot 池只能看到 grok_bot_auto: {body}");
+        assert_eq!(data[0]["id"], gw_cursor::bot_pool_list()[0].id);
+        assert_eq!(data[0]["owned_by"], "cursor");
+
+        // 混有一个非 bot 号 → 维持全量(provider 目录原样)。
+        let mut api = acct(&[("pool", "api")]);
+        api.account_id = "b".into();
+        let st = catalog_state_with_accounts("cursor", vec![bot_a("a1"), Arc::new(api)]);
+        let body = body_json(models(State(st)).await).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 1, "mock 目录只有一项,不裁时应原样返回");
+        assert_eq!(body["data"][0]["id"], "grok-4.5");
+
+        // 无 pool 钉(未钉号)→ 不裁。
+        let st = catalog_state_with_accounts("cursor", vec![Arc::new(acct(&[]))]);
+        let body = body_json(models(State(st)).await).await;
+        assert_eq!(body["data"][0]["id"], "grok-4.5");
+
+        // 非 cursor 家族即使账号钉了 pool=bot 也不裁(kiro 不该认识 pool 语义)。
+        let st = catalog_state_with_accounts("kiro", vec![bot_a("a1")]);
+        let body = body_json(models(State(st)).await).await;
+        assert_eq!(body["data"][0]["id"], "grok-4.5");
     }
 
     /// 一段典型的 Anthropic 回复流:文本 + 用量 + 正常收尾。
@@ -6840,6 +7082,7 @@ mod tests {
                 &gw_core::config::SchedulerConfig::default(),
             ),
             refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
             usage_sink: None,
             pending_writes: PendingWrites::new(),
             store: None,
@@ -7239,6 +7482,7 @@ mod tests {
                 &gw_core::config::SchedulerConfig::default(),
             ),
             refresh_locks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            rejection_refresh_at: parking_lot::Mutex::new(std::collections::HashMap::new()),
             usage_sink: None,
             pending_writes: PendingWrites::new(),
             store: None,

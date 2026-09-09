@@ -2963,6 +2963,15 @@ impl AccountScheduler {
         self.entries.lock().get(id).map(|e| e.account.clone())
     }
 
+    /// 当前持有账号的凭证副本快照(只读、无副作用)。
+    ///
+    /// 消费方:`/v1/models` 按账号属性(pool 钉)裁剪目录 —— 这类判定必须
+    /// 与调度器眼中的账号集同源,不能另查库,否则裁剪口径和真实选号口径
+    /// 会在 sync 窗口内打架。
+    pub fn accounts_snapshot(&self) -> Vec<Arc<Account>> {
+        self.entries.lock().values().map(|e| e.account.clone()).collect()
+    }
+
     /// 上报成功:清失败计数。**完整成功**口径的便捷包装(测试/无 lease 路径用):
     /// 以当前世代 + complete=true 上报。生产链路应走
     /// [`Self::report_success_observed`] 显式传世代与完整标志。
@@ -3114,18 +3123,38 @@ impl AccountScheduler {
     /// 便捷包装:以**当前**世代上报(测试/无 lease 路径)。生产链路应走
     /// [`Self::report_failure_with_gen`] 携带 lease 快照的世代。
     pub fn report_failure(&self, id: &str, kind: UpstreamErrorKind) {
+        self.report_failure_detail(id, kind, "");
+    }
+
+    /// [`Self::report_failure`] 的带详情版:详情只进日志(判死必须留证据),
+    /// 不改任何生命周期判定。
+    pub fn report_failure_detail(&self, id: &str, kind: UpstreamErrorKind, detail: &str) {
         let gen = self
             .entries
             .lock()
             .get(id)
             .map(|e| e.suspend_gen)
             .unwrap_or(0);
-        self.report_failure_with_gen(id, kind, gen);
+        self.report_failure_with_detail(id, kind, gen, detail);
     }
 
     /// `gen` = lease 选号时的世代快照;旧世代的迟到 suspend 上报会被丢弃
     /// (同一次封禁的回声不重复计击)。其余错误类别不看世代。
     pub fn report_failure_with_gen(&self, id: &str, kind: UpstreamErrorKind, gen: u64) {
+        self.report_failure_with_detail(id, kind, gen, "");
+    }
+
+    /// [`Self::report_failure_with_gen`] 的带详情版。`detail` = 上游错误原文
+    /// (截断):TokenInvalid 判死必须留下证据 —— shouldLogout(服务端踢会话,
+    /// 终态)/ 401(RT 被外部轮换)/ 403(出口被拦)外观相同但处置完全不同,
+    /// 2026-09-08 bot3/4/5 事故排查就卡在日志只剩一句"永久失效"。
+    pub fn report_failure_with_detail(
+        &self,
+        id: &str,
+        kind: UpstreamErrorKind,
+        gen: u64,
+        detail: &str,
+    ) {
         let now = Instant::now();
         let tuning = self.tuning.read().clone();
         let mut flush: Option<(String, gw_core::store::SuspendLifecycle, bool)> = None;
@@ -3273,7 +3302,11 @@ impl AccountScheduler {
                 e.disabled = true;
                 e.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
                 e.disabled_until = None;
-                tracing::error!(account = %id, "refresh_token 永久失效,禁用");
+                if detail.is_empty() {
+                    tracing::error!(account = %id, "refresh_token 永久失效,禁用");
+                } else {
+                    tracing::error!(account = %id, "refresh_token 永久失效,禁用: {detail}");
+                }
             }
             UpstreamErrorKind::ServerError | UpstreamErrorKind::Network | UpstreamErrorKind::Other => {
                 e.failure_count += 1;
