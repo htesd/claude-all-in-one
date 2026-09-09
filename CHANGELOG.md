@@ -7,6 +7,7 @@
 - box 区分提交确认丢失与明确未接纳；box/Temporal 接纳后的续收错误统一标为 Submitted。
 - Temporal 提交网络错误标为 Unknown；Kiro、Dario 与 Cursor inference 的 POST 发送错误同样
   保守标注，Cursor 内部驱动回退也检查送达状态。
+- 已提交或送达未知的 OAuth 推理 401 不再未经刷新验证就永久禁用账号；API key 保留原有健康分类。
 
 ### 设计理由
 - 错误健康类别、推理送达事实和客户端输出阶段分别处理，不伪装成请求错误来阻止重试。

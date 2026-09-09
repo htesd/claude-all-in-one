@@ -3297,7 +3297,7 @@ fn fail_pre_first_byte(
     usage: Option<ChatUsage>,
     report_failure: bool,
 ) -> axum::response::Response {
-    if report_failure {
+    if report_failure && should_report_inference_failure(account, e) {
         st.scheduler.report_failure_with_detail(
             lease.account_id(),
             e.kind,
@@ -3335,6 +3335,14 @@ fn fail_pre_first_byte(
     );
     drop(lease);
     upstream_error_response_wire(wire, e)
+}
+
+/// 停止重放不等于已证明 refresh token 永久失效；续收鉴权失败保留诊断而不判死。
+/// API key 无可刷新凭据，维持既有判定。
+fn should_report_inference_failure(account: &Account, error: &UpstreamError) -> bool {
+    !(error.delivery.may_have_executed()
+        && error.kind == UpstreamErrorKind::TokenInvalid
+        && !gw_kiro::machine_id::is_api_key_credential(account))
 }
 
 /// `Overloaded` 的同号退避梯度(毫秒)。长度即重试次数上限。
@@ -4320,7 +4328,9 @@ async fn collect_response(
             ),
             _ => (UpstreamErrorKind::ServerError, String::new()),
         };
-        scheduler.report_failure_with_detail(&account_id, kind, lease.suspend_gen, &detail);
+        if !matches!(&outcome, Outcome::Upstream(e) if !should_report_inference_failure(&account, e)) {
+            scheduler.report_failure_with_detail(&account_id, kind, lease.suspend_gen, &detail);
+        }
         // 防御:理论上 INVALID_MODEL_ID 是首包前 400 走主循环,但若上游 mid-stream 冒出
         // 也在此记 (号,模型) 不可用,与主循环口径一致(不禁号 + 后续选号跳过该号)。
         if kind == UpstreamErrorKind::ModelNotAvailable {
@@ -5170,12 +5180,14 @@ async fn stream_response(
                     }
                     if !ctx.reported {
                         ctx.reported = true;
-                        ctx.st.scheduler.report_failure_with_detail(
+                        if should_report_inference_failure(&ctx.account, &e) {
+                          ctx.st.scheduler.report_failure_with_detail(
                             &ctx.account_id,
                             e.kind,
                             ctx.suspend_gen,
                             &e.to_string().chars().take(300).collect::<String>(),
-                        );
+                          );
+                        }
                     }
                     if let Some(conv) = ctx.conv.as_mut() {
                         for f in conv.fail(&sse_error_payload(&e)) {
@@ -6713,7 +6725,7 @@ mod tests {
                     let mut b = (*account).clone(); b.account_id = "b".into();
                     state.scheduler.sync_accounts(vec![account, Arc::new(b)]);
                     let response = tokio::time::timeout(std::time::Duration::from_secs(5), handle_chat(
-                        state, HeaderMap::new(), serde_json::json!({"model":"m","stream":stream,
+                        state.clone(), HeaderMap::new(), serde_json::json!({"model":"m","stream":stream,
                             "max_tokens":10,"messages":[{"role":"user","content":"probe"}]}), Wire::Anthropic,
                     )).await.unwrap();
                     let status = response.status();
@@ -6723,6 +6735,10 @@ mod tests {
                     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), expected, "{delivery:?} {kind:?}");
                     assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), usize::from(may_retry && kind == UpstreamErrorKind::TokenInvalid));
                     assert_eq!(status == StatusCode::OK, may_retry);
+                    if kind == UpstreamErrorKind::TokenInvalid && delivery.may_have_executed() {
+                        assert!(state.scheduler.status_snapshot().iter().all(|a| !a.disabled),
+                            "提交后的续收鉴权失败不能证明 refresh token 永久失效");
+                    }
                   }
                 }
             }
