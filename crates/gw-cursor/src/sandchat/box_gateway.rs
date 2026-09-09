@@ -2,6 +2,7 @@
 //! 不向 box 传不受支持的 session_id，也不借用用户桌面端已有的 agent。
 
 use super::*;
+use gw_core::error::RequestDelivery;
 use serde_json::json;
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
@@ -133,15 +134,30 @@ impl Gateway {
             .headers(self.headers.clone())
             .json(&body)
             .send();
+        // 只有 sendPrompt 会提交本轮推理；提交后的响应丢失不能经 readiness 触发换号。
+        let submission = method == "sendPrompt";
+        let uncertain = |e: UpstreamError| {
+            if submission { e.with_delivery(RequestDelivery::Unknown) } else { e }
+        };
         let response = tokio::time::timeout(UNARY_TIMEOUT, response)
             .await
-            .map_err(|_| protocol_error("网关命令超时"))?
-            .map_err(|_| protocol_error("网关命令连接失败"))?;
-        check_status(response.status().as_u16())?;
+            .map_err(|_| uncertain(protocol_error("网关命令超时")))?
+            .map_err(|e| {
+                let error = protocol_error("网关命令连接失败");
+                if submission && e.is_connect() {
+                    error.with_delivery(RequestDelivery::NotSubmitted)
+                } else { uncertain(error) }
+            })?;
+        check_status(response.status().as_u16()).map_err(|e| {
+            if submission && matches!(response.status().as_u16(), 400 | 401 | 403 | 429) {
+                e.with_delivery(RequestDelivery::NotSubmitted)
+            } else { uncertain(e) }
+        })?;
         let data = tokio::time::timeout(UNARY_TIMEOUT, read_bounded(response))
             .await
-            .map_err(|_| protocol_error("网关响应读取超时"))??;
-        serde_json::from_slice(&data).map_err(|_| protocol_error("网关响应不是 JSON"))
+            .map_err(|_| uncertain(protocol_error("网关响应读取超时")))?
+            .map_err(uncertain)?;
+        serde_json::from_slice(&data).map_err(|_| uncertain(protocol_error("网关响应不是 JSON")))
     }
 
     async fn events(&self, client: &reqwest::Client) -> Result<reqwest::Response, UpstreamError> {
@@ -485,12 +501,12 @@ pub(super) async fn chat_stream(
             }
         }
     });
-    // 建流/上传/提交失败仍是 Provider::chat 的 Err，交回 worker 既有换号预算。
+    // 建流/上传失败仍是 Provider::chat 的 Err；提交确认丢失另带 Unknown，禁止重放。
     // 不能过早返回 Ok(stream)，否则这些错误绕过换号循环，直接变成客户端 502。
     ready_rx
         .await
-        .map_err(|_| protocol_error("准备任务提前结束"))??;
-    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .map_err(|_| protocol_error("准备任务提前结束").with_delivery(RequestDelivery::Unknown))??;
+    Ok(submitted_stream(rx))
 }
 
 async fn run(
@@ -619,7 +635,10 @@ async fn run(
             )
             .await?;
         if sent["accepted"] != true {
-            return Err(protocol_error("网关未确认接受消息"));
+            let delivery = if sent["accepted"] == false {
+                RequestDelivery::NotSubmitted
+            } else { RequestDelivery::Unknown };
+            return Err(protocol_error("网关未确认接受消息").with_delivery(delivery));
         }
         Ok(response)
     }
@@ -919,6 +938,51 @@ mod tests {
         assert_eq!(r.emitted["t1s0"], "Hello world");
         r.entry(&output("Goodbye"));
         assert!(r.folder.is_failed());
+    }
+
+    #[tokio::test]
+    async fn 提交响应丢失标记未知而上传错误不阻止安全换号() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for response in [
+            &b""[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"[..],
+            &b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+        ] {
+            for method in ["sendPrompt", "uploadAttachment"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut input = Vec::new();
+                    loop {
+                        let mut chunk = [0; 4096];
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        input.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = input.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&input[..end]).to_lowercase();
+                            let size: usize = headers.lines().find_map(|l| l.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                            if input.len() >= end + 4 + size { break; }
+                        }
+                    }
+                    // 已完整接收本次提交，随后丢失确认或返回不可判定的错误。
+                    socket.write_all(response).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                });
+                let gateway = Gateway { url: format!("http://{address}/").parse().unwrap(), headers: Default::default() };
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let error = gateway.command(&client, method, json!({"clientNonce":"one-turn"})).await.unwrap_err();
+                assert_eq!(error.delivery.may_have_executed(), method == "sendPrompt");
+                assert_eq!(error.kind, UpstreamErrorKind::ServerError);
+                tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = Gateway { url: format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap(), headers: Default::default() };
+        drop(listener);
+        let error = gateway.command(&reqwest::Client::builder().no_proxy().build().unwrap(), "sendPrompt", json!({})).await.unwrap_err();
+        assert_eq!(error.delivery, RequestDelivery::NotSubmitted);
     }
 
     #[tokio::test]

@@ -1076,6 +1076,10 @@ async fn unary(
     method: &str,
     body: Vec<u8>,
 ) -> Result<Vec<u8>, UpstreamError> {
+    let submission = method == "SendGrokBotUserMessage";
+    let request_error = |e: UpstreamError| {
+        if submission { e.with_delivery(gw_core::error::RequestDelivery::Unknown) } else { e }
+    };
     let url = format!("{BASE}/{method}");
     let rb = client
         .post(&url)
@@ -1084,23 +1088,26 @@ async fn unary(
     let resp = tokio::time::timeout(UNARY_TIMEOUT, with_sand_headers(rb, account, token).send())
         .await
         .map_err(|_| {
-            UpstreamError::network(format!(
+            request_error(UpstreamError::network(format!(
                 "sandchat {method} 等响应超时({}s)",
                 UNARY_TIMEOUT.as_secs()
-            ))
+            )))
         })?
-        .map_err(|e| UpstreamError::network(format!("sandchat {method} 请求发送失败: {e}")))?;
+        .map_err(|e| request_error(UpstreamError::network(format!("sandchat {method} 请求发送失败: {e}"))))?;
     let status = resp.status().as_u16();
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| UpstreamError::network(format!("sandchat {method} 读响应体失败: {e}")))?;
+        .map_err(|e| request_error(UpstreamError::network(format!("sandchat {method} 读响应体失败: {e}"))))?;
     if status != 200 {
-        return Err(crate::inference::classify_http_error_for(
+        let e = crate::inference::classify_http_error_for(
             "sandchat",
             status,
             &String::from_utf8_lossy(&bytes),
-        ));
+        );
+        return Err(if submission && matches!(status, 400 | 401 | 403 | 404 | 429) {
+            e.with_delivery(gw_core::error::RequestDelivery::NotSubmitted)
+        } else { request_error(e) });
     }
     Ok(bytes.to_vec())
 }
@@ -1479,7 +1486,14 @@ pub(crate) async fn chat_stream(
     };
     tokio::spawn(watch_loop(resp, collector, tx.clone(), task_state, run_guard));
 
-    Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    Ok(submitted_stream(rx))
+}
+
+/// 发消息已经得到接纳确认，后续 watch/补读错误不得触发整轮重发。
+fn submitted_stream(rx: tokio::sync::mpsc::Receiver<Result<StreamItem, UpstreamError>>) -> ChatStream {
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(|item| {
+        item.map_err(|e| e.with_delivery(gw_core::error::RequestDelivery::Submitted))
+    }))
 }
 
 /// `render` 里可能含 PDF 文本抽取(同步 CPU 活),与 inference 同一套
@@ -1796,6 +1810,19 @@ fn trailer_error(payload: &[u8]) -> Option<UpstreamError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn 提交后续收鉴权失败保留类别并禁止重放() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Err(UpstreamError::new(UpstreamErrorKind::TokenInvalid,
+            "watch 重连被拒"))).await.unwrap();
+        drop(tx);
+        let mut stream = submitted_stream(rx);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::TokenInvalid);
+        assert_eq!(error.delivery, gw_core::error::RequestDelivery::Submitted);
+        assert!(stream.next().await.is_none());
+    }
     use serde_json::json;
 
     // ── 测试用解码小工具(与 inference.rs 测试同款)──

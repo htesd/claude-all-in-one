@@ -458,7 +458,8 @@ pub(crate) async fn chat_via_sidecar(
         .json(&body)
         .send()
         .await
-        .map_err(|e| UpstreamError::network(format!("dario sidecar connect failed: {e}")))?;
+        .map_err(|e| UpstreamError::network(format!("dario sidecar connect failed: {e}"))
+            .with_delivery(gw_core::error::RequestDelivery::Unknown))?;
 
     let status = resp.status();
 

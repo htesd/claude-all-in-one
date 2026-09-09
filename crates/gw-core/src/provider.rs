@@ -296,8 +296,8 @@ pub trait Provider: Send + Sync {
 
     /// 核心:吃 Anthropic-native 请求,吐 [`StreamItem`] 事件流。
     ///
-    /// 失败时返回 `Err(UpstreamError)`;首包前的错误可被 gw-app 透明重试
-    /// (committed 状态由 gw-app 跟踪)。
+    /// 失败返回 `Err(UpstreamError)`；提交后确认丢失必须标注 delivery=Unknown，
+    /// 已知被接纳则标注 Submitted。gw-app 结合送达事实、输出阶段和预算决定恢复。
     async fn chat(&self, req: ChatRequest, ctx: &CallCtx) -> Result<ChatStream, UpstreamError>;
 
     /// 从请求派生**会话亲和键**(worker 据此把同会话钉到组内同一账号)。

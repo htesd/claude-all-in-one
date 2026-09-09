@@ -1,12 +1,10 @@
 //! 上游错误分类
 //!
-//! 调度层(gw-app)看 [`UpstreamErrorKind`] + 自己跟踪的 committed 状态
-//! (首字节是否已写出客户端)决定动作:换号 / 冷却 / 直接返回。
+//! 调度层(gw-app)结合错误类别、上游送达事实与客户端输出状态决定是否恢复。
 //! 借鉴 ALLinOne `errors.py` 与 static_flow kiro_dispatch 的状态码映射。
 //!
-//! **审查 H1**:能否透明重试 = "错误类型可换号" AND "尚未向客户端写出字节"。
-//! 后半句是 gw-app 转发层的运行时事实,**不**编码进错误对象(旧设计的
-//! `retryable_pre_stream` bool 在流开始后就是个谎言)。错误只描述"上游怎么了"。
+//! 上游已提交或送达未知时，即使尚未向客户端输出，也不能透明重放。
+//! 错误携带 provider 观察到的事实，客户端输出状态及最终重试决策仍归 gw-app。
 
 use std::fmt;
 
@@ -169,10 +167,29 @@ impl fmt::Display for UpstreamErrorKind {
     }
 }
 
+/// provider 观察到的推理提交状态，不包含客户端是否已经收到内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestDelivery {
+    /// 旧驱动尚未标注；保留原恢复规则，不代表已证明未送达。
+    #[default]
+    Untracked,
+    /// 确定推理尚未提交，或服务端明确拒绝接纳。
+    NotSubmitted,
+    /// 推理已经被接纳或产生内容。
+    Submitted,
+    /// 提交确认丢失，无法证明是否已执行。
+    Unknown,
+}
+
+impl RequestDelivery {
+    pub fn may_have_executed(self) -> bool {
+        matches!(self, Self::Submitted | Self::Unknown)
+    }
+}
+
 /// 上游错误。
 ///
-/// 只描述"上游发生了什么"。能否透明重试由 gw-app 结合 committed 状态判断
-/// (见模块文档 H1),故此处**不**含 retryable 标志。
+/// 只描述上游事实；是否重试由 gw-app 结合输出状态与预算判断。
 #[derive(Debug, Clone)]
 pub struct UpstreamError {
     pub kind: UpstreamErrorKind,
@@ -181,6 +198,7 @@ pub struct UpstreamError {
     pub message: String,
     /// 上游 HTTP 状态码(若有)。
     pub status_code: Option<u16>,
+    pub delivery: RequestDelivery,
     /// 允许对外展示的详情。`None` = 用 [`UpstreamErrorKind::client_message`] 的中性兜底。
     ///
     /// **私有,且只有 [`Self::bad_request_visible`] 一个入口。** 对抗评审三个镜头一致指出:
@@ -196,12 +214,18 @@ impl UpstreamError {
             kind,
             message: message.into(),
             status_code: None,
+            delivery: RequestDelivery::Untracked,
             client_detail: None,
         }
     }
 
     pub fn with_status(mut self, status: u16) -> Self {
         self.status_code = Some(status);
+        self
+    }
+
+    pub fn with_delivery(mut self, delivery: RequestDelivery) -> Self {
+        self.delivery = delivery;
         self
     }
 

@@ -293,7 +293,8 @@ pub async fn chat_stream(
         .body(body)
         .send()
         .await
-        .map_err(|e| UpstreamError::network(format!("generateAssistantResponse 请求失败: {e}")))?;
+        .map_err(|e| UpstreamError::network(format!("generateAssistantResponse 请求失败: {e}"))
+            .with_delivery(gw_core::error::RequestDelivery::Unknown))?;
 
     let status = resp.status();
     let mut resp = resp;
@@ -325,6 +326,7 @@ pub async fn chat_stream(
             );
             let resp2 = rb2.body(stripped_body).send().await.map_err(|e| {
                 UpstreamError::network(format!("generateAssistantResponse 重试请求失败: {e}"))
+                    .with_delivery(gw_core::error::RequestDelivery::Unknown)
             })?;
             let status2 = resp2.status();
             if status2.is_success() {

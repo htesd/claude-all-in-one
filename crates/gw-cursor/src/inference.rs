@@ -2852,9 +2852,10 @@ async fn chat_once(
         UpstreamError::network(format!(
             "inference 等响应头超时({}s)",
             HEADER_TIMEOUT.as_secs()
-        ))
+        )).with_delivery(gw_core::error::RequestDelivery::Unknown)
     })?
-    .map_err(|e| UpstreamError::network(format!("inference 请求发送失败: {e}")))?;
+    .map_err(|e| UpstreamError::network(format!("inference 请求发送失败: {e}"))
+        .with_delivery(gw_core::error::RequestDelivery::Unknown))?;
 
     let status = resp.status().as_u16();
     if status != 200 {

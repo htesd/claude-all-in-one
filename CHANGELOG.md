@@ -1,5 +1,23 @@
 # Changelog
 
+## [architecture-r1-provider-delivery] - 2026-09-10
+
+### 功能
+- 上游错误携带推理送达事实，worker 对 Unknown/Submitted 停止换号、过载退避及认证恢复重放。
+- box 区分提交确认丢失与明确未接纳；box/Temporal 接纳后的续收错误统一标为 Submitted。
+- Temporal 提交网络错误标为 Unknown；Kiro、Dario 与 Cursor inference 的 POST 发送错误同样
+  保守标注，Cursor 内部驱动回退也检查送达状态。
+
+### 设计理由
+- 错误健康类别、推理送达事实和客户端输出阶段分别处理，不伪装成请求错误来阻止重试。
+- 既有非流式已产出判断、请求恢复状态及 RPM 视图问题继续按 R3 修复，不扩大普通流内恢复范围。
+
+### 注意事项
+- Untracked 是旧路径兼容状态，不能解释为已证明未提交；本次未全面改写 CLI/wire 内部恢复
+  或所有 HTTP 错误响应分类。非 box 的 POST 发送错误保守停止重放，包括连接失败，可能降低自动恢复率。
+- 已验证 TCP 提交后断开/坏 JSON/截断/503、明确连接拒绝，以及 worker 的同步/流内错误、
+  流式/非流式响应、认证/过载/换号调用次数。端到端真实客户端将在后续重构完成后重新验收。
+
 ## [architecture-r1-router-delivery] - 2026-09-10
 
 ### 功能

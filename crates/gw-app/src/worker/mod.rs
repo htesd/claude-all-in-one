@@ -2422,18 +2422,15 @@ async fn sync_now(State(st): State<Arc<WorkerState>>) -> axum::response::Respons
 /// 真死号由刷新环节(shouldLogout / invalid_grant)权威判定,轮不到这里。
 fn demote_cursor_retry_401(
     family: &str,
-    e: gw_core::error::UpstreamError,
+    mut e: gw_core::error::UpstreamError,
 ) -> gw_core::error::UpstreamError {
     if family == "cursor" && e.kind == UpstreamErrorKind::TokenInvalid {
-        gw_core::error::UpstreamError::new(
-            UpstreamErrorKind::Other,
-            format!(
+        e.message = format!(
                 "刷新成功但重试仍 401:推理面/请求形态问题而非凭据死亡(原 TokenInvalid 已降级): {e}"
-            ),
-        )
-    } else {
-        e
+            );
+        e.kind = UpstreamErrorKind::Other;
     }
+    e
 }
 
 /// 纯 bot 池判定:cursor worker 且持有的账号**全部**钉 `extra.pool="bot"`。
@@ -3021,6 +3018,10 @@ async fn handle_chat(
             // API Key 403:ksk_ 无可刷新,同号刷新是空操作、retry 同 key 必再 403 且放大上游
             // (审查 Skeptic#3/Architect#2)。故 apikey 的 403 **不走**同号刷新重试,直接落到下方
             // 通用失败分支:report_failure(TokenInvalid) 禁用该号 + 换号(误伤可 admin reset 复活)。
+            Err(e) if e.delivery.may_have_executed() => {
+                return fail_pre_first_byte(&st, lease, &req, &client_key, &ctx.account,
+                    started_at, wire, &e, None, true);
+            }
             Err(e)
                 if e.kind == UpstreamErrorKind::TokenInvalid
                     && !gw_kiro::machine_id::is_api_key_credential(&ctx.account) =>
@@ -3094,7 +3095,8 @@ async fn handle_chat(
                                 // 拿不到自己的 profile。镜像配额路径:强制发现真实 ARN 持久化后用真
                                 // ARN 再重试一次,成功即救回(治「导入即入活跃池、客户 chat 抢在验活
                                 // force_discover 前命中、用错 ARN 403」的竞态)。
-                                let e2 = if e2.kind == UpstreamErrorKind::TokenInvalid {
+                                let e2 = if e2.kind == UpstreamErrorKind::TokenInvalid
+                                    && !e2.delivery.may_have_executed() {
                                     match st
                                         .discover_paid_profile_arn(
                                             &retry_ctx.account,
@@ -3194,7 +3196,8 @@ async fn handle_chat(
                                     &e2.to_string().chars().take(300).collect::<String>(),
                                 );
                                 drop(lease);
-                                if !e2.kind.worth_switching_account()
+                                if e2.delivery.may_have_executed()
+                                    || !e2.kind.worth_switching_account()
                                     || retry_started.elapsed() >= RETRY_DEADLINE
                                     || attempts >= switch_cap(e2.kind, total, general_cap)
                                 {
@@ -3419,7 +3422,7 @@ async fn chat_with_overload_backoff(
 ) -> Result<gw_core::provider::ChatStream, gw_core::error::UpstreamError> {
     let mut last = match chat_once_corrected(st, req, ctx).await {
         Ok(s) => return Ok(s),
-        Err(e) if e.kind.worth_same_account_backoff() => e,
+        Err(e) if !e.delivery.may_have_executed() && e.kind.worth_same_account_backoff() => e,
         Err(e) => return Err(e),
     };
     for (i, base_ms) in OVERLOAD_BACKOFF_MS.iter().enumerate() {
@@ -3447,7 +3450,7 @@ async fn chat_with_overload_backoff(
                 return Ok(s);
             }
             // 退避期间错误类型可能变(如容量恢复但换成 403):非过载即刻透出,别用过载预算硬打。
-            Err(e) if e.kind.worth_same_account_backoff() => last = e,
+            Err(e) if !e.delivery.may_have_executed() && e.kind.worth_same_account_backoff() => last = e,
             Err(e) => return Err(e),
         }
     }
@@ -4207,6 +4210,7 @@ async fn collect_response(
     // 事故:RT 活着却被一次流内 401 永久误杀)。
     if let Some(e) = &hard_err {
         if e.kind == UpstreamErrorKind::TokenInvalid
+            && !e.delivery.may_have_executed()
             && !token_retried
             && !gw_kiro::machine_id::is_api_key_credential(&account)
         {
@@ -4652,6 +4656,7 @@ async fn stream_response(
             // 与同步分支同口径:先同号刷新重试一次,刷新也失败才按 refresh 的 kind
             // 定生死(TokenInvalid=真死;transient=对应轻罚,不误杀)。
             if e.kind == UpstreamErrorKind::TokenInvalid
+                && !e.delivery.may_have_executed()
                 && !token_retried
                 && !gw_kiro::machine_id::is_api_key_credential(&account)
             {
@@ -6651,6 +6656,77 @@ mod tests {
     struct Instream401Provider {
         chat_calls: Arc<std::sync::atomic::AtomicUsize>,
         refresh_ok: bool,
+    }
+
+    struct DeliveryProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        refreshes: Arc<std::sync::atomic::AtomicUsize>,
+        delivery: gw_core::error::RequestDelivery,
+        kind: UpstreamErrorKind,
+        in_stream: bool,
+    }
+
+    #[tokio::test]
+    async fn missing_openai_marker_is_only_set_by_rejection_endpoint() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/v1/chat/completions", post(unsupported_openai_endpoint))
+            .route("/v1/responses", post(unsupported_openai_endpoint));
+        for path in ["/v1/chat/completions", "/v1/responses", "/unknown"] {
+            let response = app.clone().oneshot(axum::http::Request::builder().method("POST")
+                .uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers().get(crate::ENDPOINT_UNAVAILABLE_HEADER).is_some(), path != "/unknown");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for DeliveryProvider {
+        fn family(&self) -> &'static str { "cursor" }
+        fn account_schema(&self) -> &'static [gw_core::account::FieldSpec] { &[] }
+        async fn list_models(&self) -> Result<Vec<gw_core::model::ModelInfo>, UpstreamError> { Ok(vec![]) }
+        async fn chat(&self, _: ChatRequest, _: &CallCtx) -> Result<gw_core::provider::ChatStream, UpstreamError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let e = UpstreamError::new(self.kind, "提交确认丢失").with_delivery(self.delivery);
+                if self.in_stream { Ok(chat_stream(vec![Err(e)])) } else { Err(e) }
+            } else { Ok(text_reply_stream()) }
+        }
+        async fn refresh_auth(&self, account: &Account) -> Result<Account, UpstreamError> {
+            self.refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut account = account.clone();
+            account.extra.insert("access_token".into(), serde_json::json!("at-new"));
+            Ok(account)
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_unknown_stops_switch_and_overload_backoff() {
+        use gw_core::error::RequestDelivery as D;
+        for delivery in [D::Unknown, D::Submitted, D::NotSubmitted] {
+            for kind in [UpstreamErrorKind::ServerError, UpstreamErrorKind::Overloaded, UpstreamErrorKind::TokenInvalid] {
+                for stream in [true, false] {
+                  for in_stream in [true, false] {
+                    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let provider = Arc::new(DeliveryProvider { calls: calls.clone(), refreshes: refreshes.clone(), delivery, kind, in_stream });
+                    let (state, account) = instream_401_state(provider);
+                    let mut b = (*account).clone(); b.account_id = "b".into();
+                    state.scheduler.sync_accounts(vec![account, Arc::new(b)]);
+                    let response = tokio::time::timeout(std::time::Duration::from_secs(5), handle_chat(
+                        state, HeaderMap::new(), serde_json::json!({"model":"m","stream":stream,
+                            "max_tokens":10,"messages":[{"role":"user","content":"probe"}]}), Wire::Anthropic,
+                    )).await.unwrap();
+                    let status = response.status();
+                    let _ = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
+                    let may_retry = delivery == D::NotSubmitted && (!in_stream || kind == UpstreamErrorKind::TokenInvalid);
+                    let expected = if may_retry { 2 } else { 1 };
+                    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), expected, "{delivery:?} {kind:?}");
+                    assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), usize::from(may_retry && kind == UpstreamErrorKind::TokenInvalid));
+                    assert_eq!(status == StatusCode::OK, may_retry);
+                  }
+                }
+            }
+        }
     }
 
     #[async_trait::async_trait]

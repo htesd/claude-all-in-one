@@ -2055,7 +2055,7 @@ impl Provider for CursorProvider {
                     // 必然不是 wire_opt_out —— 那条路在前面就不进 inference 分支。)
                     // pool=bot 已在前面路由进 sandchat(2026-09-09 旧面已死),到不了
                     // 这里;`pool_bot` 判断保留作防御(真走到 = 绝不许跨池烧月池)。
-                    if !driver_level || pool_bot {
+                    if e.delivery.may_have_executed() || !driver_level || pool_bot {
                         return Err(e);
                     }
                     tracing::warn!(
