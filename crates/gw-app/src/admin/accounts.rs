@@ -16,7 +16,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use gw_core::config::SystemSettings;
 use gw_core::store::{AccountPatch, AccountRow};
-use gw_store::UpdateAccountOutcome;
+use gw_store::{AccountExtraEdit, UpdateAccountOutcome};
 use serde::Deserialize;
 
 use super::{internal_error, redact_proxy_url, validate_proxy_url, AdminState};
@@ -46,11 +46,6 @@ pub(crate) fn account_proxy(extra_json: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
 }
-
-/// PATCH extra 替换模式的凭据丢失守卫键:这些键在 DB 里已有非空值,而新 extra
-/// 把它们弄丢了(未传/空串)且调用方未显式确认 → 拒绝(2026-09-08 bot2 事故)。
-/// 三个 provider(kiro/cursor/dario)的凭据都落在这两个键上。
-const CREDENTIAL_GUARD_KEYS: &[&str] = &["access_token", "refresh_token"];
 
 /// 出口池「最少使用」分配器:把新号粘到当前分配最少的池 URL,使账号均衡铺满 N 个出口 IP
 /// (每号固定一个,粘性)。计数初值 = 现有**正常(未禁用)**账号分配到各池 URL 的数量
@@ -1612,72 +1607,17 @@ async fn update_account(
             return resp;
         }
     }
-    let extra = match &body.extra {
-        // `***` 开头的字符串值是脱敏哨兵 = "保留 DB 原值":GET 返回的就是脱敏形态,
-        // 前端整块回传时不需要(也不可能)还原真实凭据;没有这一层,带多个敏感字段
-        // 的账号在轮换单个 token 时会丢掉其余凭据(审查 Minimalist#6)。
-        Some(map) => {
-            let current = match st.store.get_account(&id) {
-                Ok(Some(row)) => row.extra,
-                Ok(None) => return api_error(StatusCode::NOT_FOUND, "账号不存在"),
-                Err(e) => return internal_error(e),
-            };
-            let current: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&current).unwrap_or_default();
-            let mut resolved = serde_json::Map::new();
-            for (k, v) in map {
-                match v.as_str() {
-                    Some(s) if s.starts_with("***") => {
-                        if let Some(orig) = current.get(k) {
-                            resolved.insert(k.clone(), orig.clone());
-                        }
-                        // DB 已无该字段:脱敏占位无可保留,丢弃。
-                    }
-                    _ => {
-                        resolved.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            if body.extra_merge == Some(true) {
-                // 合并模式:传入键逐条盖到现有 extra 上,未传字段原样保留。
-                // 部分更新(补 pool/driver 之类单字段)的唯一安全通道 —— 替换语义
-                // 在这种用法下会静默抹掉凭据(2026-09-08 bot2 事故)。
-                let mut merged = current.clone();
-                for (k, v) in &resolved {
-                    merged.insert(k.clone(), v.clone());
-                }
-                resolved = merged;
-            } else {
-                // 替换模式(凭据轮换)+ 凭据丢失守卫:新 extra 把 DB 里已有的
-                // 凭据键弄丢了(没传或传空),而调用方又没显式确认 → 拒绝。
-                // 哨兵解析已在上游完成,带 `***` 的常规整表回传天然过守卫。
-                for ck in CREDENTIAL_GUARD_KEYS {
-                    let had = current
-                        .get(*ck)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| !s.is_empty());
-                    let kept = resolved
-                        .get(*ck)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| !s.is_empty());
-                    if had && !kept && body.allow_credential_drop != Some(true) {
-                        return api_error(
-                            StatusCode::BAD_REQUEST,
-                            &format!(
-                                "PATCH extra 是整体替换,新 extra 会丢掉已有的凭据字段 \
-                                 `{ck}`。若只想改个别字段,请用 `extra_merge: true` 或对应 \
-                                 定点字段;确要清空该凭据,请加 `allow_credential_drop: true`。"
-                            ),
-                        );
-                    }
-                }
-            }
-            match serde_json::to_string(&resolved) {
-                Ok(s) => Some(s),
-                Err(e) => return internal_error(e),
-            }
+    // 原始编辑意图交给 Store；哨兵必须保留写事务当时的值，不能提前还原旧 token。
+    let extra = match body.extra.as_ref().map(serde_json::to_string).transpose() {
+        Ok(extra) => extra,
+        Err(e) => return internal_error(e),
+    };
+    let extra_edit = if body.extra_merge == Some(true) {
+        AccountExtraEdit::Merge
+    } else {
+        AccountExtraEdit::Replace {
+            allow_credential_drop: body.allow_credential_drop == Some(true),
         }
-        None => None,
     };
     // 主体更新:仅当存在可改字段时才打 update_account(避免 all-None 空 patch 语义歧义)。
     // ⚠️ `disabled=false`(启用)必须**剔除出通用 patch**:启用与「清 suspend 生命周期 +
@@ -1696,7 +1636,12 @@ async fn update_account(
             disabled: patch_disabled,
             extra,
         };
-        match st.store.update_account(&id, &patch) {
+        match st.store.update_account_from_admin(&id, &patch, extra_edit) {
+            Ok(UpdateAccountOutcome::CredentialDrop { field }) => {
+                return api_error(StatusCode::BAD_REQUEST, &format!(
+                    "PATCH extra 是整体替换,新 extra 会丢掉已有的凭据字段 \u{60}{field}\u{60}。若只想改个别字段,请用 extra_merge: true 或对应定点字段;确要清空该凭据,请加 allow_credential_drop: true。"
+                ));
+            }
             Ok(UpdateAccountOutcome::Ok) => {}
             Ok(UpdateAccountOutcome::NotFound) => {
                 return api_error(StatusCode::NOT_FOUND, "账号不存在")

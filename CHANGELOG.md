@@ -1,5 +1,19 @@
 # Changelog
 
+## [architecture-r2-admin-extra] - 2026-09-10
+
+### 功能
+- 管理端 extra 合并、脱敏哨兵恢复、凭据删除守卫和账号修改统一在 SQLite Immediate 写事务内执行。
+- 显式允许删除凭据且没有哨兵的整体替换仍可修复损坏的旧 extra。
+
+### 设计理由
+- 哨兵表示保留写入当时的值，避免 handler 提前读取后用旧 token 覆盖 worker 的新轮换。
+- 校验失败拒绝整份 patch；普通 merge 保留无关字段，整体替换保留既有语义。
+
+### 注意事项
+- 无数据库迁移。并发验证使用两个独立 SQLite 连接；部署时必须一并替换旧管理写入方。
+- worker 待写增量及快照准入在 R2b 继续修复，本提交不代表所有写者已统一。
+
 ## [architecture-r1-provider-delivery] - 2026-09-10
 
 ### 功能

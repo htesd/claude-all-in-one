@@ -55,12 +55,27 @@ pub enum MembershipOutcome {
 pub enum UpdateAccountOutcome {
     Ok,
     NotFound,
+    /// 整体替换将删除凭据，但调用方未明确允许。
+    CredentialDrop {
+        field: String,
+    },
     /// 改**归属**会让 `group` 这个组同时出现两个 owner。
     ///
     /// `upsert_membership` 守着"一组一 owner",但改归属是从**另一头**破坏同一个不变量:
     /// 边一条没动,却把边另一端的 owner 换了。不在这里拦,后端精心维护的约束就有一条
     /// 绕行通道 —— 而且是运维在 UI 上点一下就能走通的那种。
-    CrossOwner { group: String, existing: String, incoming: String },
+    CrossOwner {
+        group: String,
+        existing: String,
+        incoming: String,
+    },
+}
+
+/// 管理端 extra 编辑意图；哨兵保留、合并及删除守卫均在写事务内解释。
+#[derive(Debug, Clone, Copy)]
+pub enum AccountExtraEdit {
+    Merge,
+    Replace { allow_credential_drop: bool },
 }
 
 const SCHEMA: &str = r#"
@@ -783,6 +798,25 @@ impl SqliteStore {
         account_id: &str,
         patch: &AccountPatch,
     ) -> anyhow::Result<UpdateAccountOutcome> {
+        self.update_account_inner(account_id, patch, None)
+    }
+
+    /// 管理编辑使用原始字段，不接受 handler 提前合成的旧账号快照。
+    pub fn update_account_from_admin(
+        &self,
+        account_id: &str,
+        patch: &AccountPatch,
+        edit: AccountExtraEdit,
+    ) -> anyhow::Result<UpdateAccountOutcome> {
+        self.update_account_inner(account_id, patch, Some(edit))
+    }
+
+    fn update_account_inner(
+        &self,
+        account_id: &str,
+        patch: &AccountPatch,
+        edit: Option<AccountExtraEdit>,
+    ) -> anyhow::Result<UpdateAccountOutcome> {
         let mut sets: Vec<&str> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
         if let Some(g) = &patch.group_name {
@@ -812,7 +846,58 @@ impl SqliteStore {
                 UpdateAccountOutcome::NotFound
             });
         }
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let (Some(input), Some(edit)) = (&patch.extra, edit) {
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT extra FROM accounts WHERE account_id = ?1",
+                    [account_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Ok(UpdateAccountOutcome::NotFound);
+            };
+            let input: serde_json::Map<String, serde_json::Value> = serde_json::from_str(input)?;
+            let current: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&current) {
+                Ok(current) => current,
+                Err(_) if matches!(edit, AccountExtraEdit::Replace { allow_credential_drop: true })
+                    && !input.values().any(|v| v.as_str().is_some_and(|s| s.starts_with("***"))) => {
+                    // 显式授权替换损坏数据；没有哨兵需要恢复旧值。
+                    serde_json::Map::new()
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut resolved = match edit {
+                AccountExtraEdit::Merge => current.clone(),
+                AccountExtraEdit::Replace { .. } => serde_json::Map::new(),
+            };
+            for (key, value) in input {
+                if value.as_str().is_some_and(|s| s.starts_with("***")) {
+                    if let Some(value) = current.get(&key) {
+                        resolved.insert(key, value.clone());
+                    }
+                } else {
+                    resolved.insert(key, value);
+                }
+            }
+            if let AccountExtraEdit::Replace {
+                allow_credential_drop: false,
+            } = edit
+            {
+                for key in ["access_token", "refresh_token"] {
+                    let nonempty = |v: Option<&serde_json::Value>| {
+                        v.and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                    };
+                    if nonempty(current.get(key)) && !nonempty(resolved.get(key)) {
+                        return Ok(UpdateAccountOutcome::CredentialDrop { field: key.into() });
+                    }
+                }
+            }
+            // extra 是以上最后追加的字段，替换其参数；其他账号字段与它同事务更新。
+            *params.last_mut().expect("extra 已追加参数") =
+                Value::Text(serde_json::to_string(&resolved)?);
+        }
         // 换归属前先看:这个号参与的每个组里,**别的**成员归属谁?有一个对不上就整单拒绝。
         // 校验与写入必须同一事务 —— 否则并发的建边请求会插在检查与 UPDATE 之间。
         if let Some(incoming) = &patch.group_name {
@@ -837,10 +922,17 @@ impl SqliteStore {
             }
         }
         params.push(Value::Text(account_id.to_string()));
-        let sql = format!("UPDATE accounts SET {} WHERE account_id = ?", sets.join(", "));
+        let sql = format!(
+            "UPDATE accounts SET {} WHERE account_id = ?",
+            sets.join(", ")
+        );
         let changed = tx.execute(&sql, rusqlite::params_from_iter(params))?;
         tx.commit()?;
-        Ok(if changed == 1 { UpdateAccountOutcome::Ok } else { UpdateAccountOutcome::NotFound })
+        Ok(if changed == 1 {
+            UpdateAccountOutcome::Ok
+        } else {
+            UpdateAccountOutcome::NotFound
+        })
     }
 
     /// 删除账号;`false` = 不存在。usage_records 历史归属不动;
@@ -981,7 +1073,7 @@ impl SqliteStore {
         let patch: std::collections::BTreeMap<String, serde_json::Value> =
             serde_json::from_str(patch_json)?;
         let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current: Option<String> = {
             let mut stmt = tx.prepare("SELECT extra FROM accounts WHERE account_id = ?1")?;
             match stmt.query_row([account_id], |r| r.get(0)) {
@@ -2737,6 +2829,147 @@ mod restock_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_extra_edit_serializes_with_rotation_on_independent_connections() {
+        let root = std::env::temp_dir().join(format!(
+            "caio-extra-edit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("control.db");
+        {
+            let admin = SqliteStore::open(&db).unwrap();
+            let worker = SqliteStore::open(&db).unwrap();
+            admin
+                .create_account(
+                    "a",
+                    "G0",
+                    "cursor",
+                    1,
+                    r#"{"access_token":"at-0","refresh_token":"rt-0","region":"us"}"#,
+                )
+                .unwrap();
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    for n in 1..=100 {
+                        worker.merge_account_extra("a", &serde_json::json!({
+                            "access_token":format!("at-{n}"),"refresh_token":format!("rt-{n}")
+                        }).to_string()).unwrap();
+                    }
+                });
+                start.wait();
+                for n in 1..=100 {
+                    // 页面只知道脱敏值；合并与整体替换都应保留写入时的新 token。
+                    let patch = AccountPatch { extra: Some(serde_json::json!({
+                        "access_token":"***", "refresh_token":"***", "driver":"cli", "round":n
+                    }).to_string()), ..Default::default() };
+                    let edit = if n % 2 == 0 {
+                        AccountExtraEdit::Merge
+                    } else {
+                        AccountExtraEdit::Replace {
+                            allow_credential_drop: false,
+                        }
+                    };
+                    assert_eq!(
+                        admin.update_account_from_admin("a", &patch, edit).unwrap(),
+                        UpdateAccountOutcome::Ok
+                    );
+                }
+            });
+            let extra: serde_json::Value =
+                serde_json::from_str(&admin.get_account("a").unwrap().unwrap().extra).unwrap();
+            assert_eq!(extra["access_token"], "at-100");
+            assert_eq!(extra["refresh_token"], "rt-100");
+            assert_eq!(extra["round"], 100);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admin_extra_guard_rejects_entire_patch_and_explicit_rotation_still_works() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_account(
+                "a",
+                "G0",
+                "cursor",
+                1,
+                r#"{"access_token":"at-live","refresh_token":"rt-live"}"#,
+            )
+            .unwrap();
+        let mut patch = AccountPatch {
+            max_concurrency: Some(9),
+            extra: Some(r#"{"driver":"cli"}"#.into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store
+                .update_account_from_admin(
+                    "a",
+                    &patch,
+                    AccountExtraEdit::Replace {
+                        allow_credential_drop: false
+                    }
+                )
+                .unwrap(),
+            UpdateAccountOutcome::CredentialDrop { .. }
+        ));
+        assert_eq!(store.get_account("a").unwrap().unwrap().max_concurrency, 1);
+        patch.extra = Some(r#"{"access_token":"at-new","refresh_token":"rt-new"}"#.into());
+        assert_eq!(
+            store
+                .update_account_from_admin(
+                    "a",
+                    &patch,
+                    AccountExtraEdit::Replace {
+                        allow_credential_drop: false
+                    }
+                )
+                .unwrap(),
+            UpdateAccountOutcome::Ok
+        );
+        assert!(store
+            .get_account("a")
+            .unwrap()
+            .unwrap()
+            .extra
+            .contains("rt-new"));
+        patch.extra = Some("{}".into());
+        assert_eq!(
+            store
+                .update_account_from_admin(
+                    "a",
+                    &patch,
+                    AccountExtraEdit::Replace {
+                        allow_credential_drop: true
+                    }
+                )
+                .unwrap(),
+            UpdateAccountOutcome::Ok
+        );
+        assert_eq!(store.get_account("a").unwrap().unwrap().extra, "{}");
+    }
+
+
+
+    #[test]
+    fn admin_extra_explicit_replace_repairs_malformed_json() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.create_account("broken", "G", "kiro", 1, "null").unwrap();
+        let mut patch = AccountPatch { extra: Some(r#"{"access_token":"***"}"#.into()), ..Default::default() };
+        let edit = AccountExtraEdit::Replace { allow_credential_drop: true };
+        assert!(store.update_account_from_admin("broken", &patch, edit).is_err());
+        patch.extra = Some("{}".into());
+        assert_eq!(store.update_account_from_admin("broken", &patch, edit).unwrap(), UpdateAccountOutcome::Ok);
+        assert_eq!(store.get_account("broken").unwrap().unwrap().extra, "{}");
+    }
 
     #[test]
     fn settings_absent_then_roundtrip_then_overwrite() {
