@@ -67,8 +67,10 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// 与其它 Cursor 驱动一致的媒体预算。Inference 路径直接把 base64 放进 protobuf，
 /// 如果不在构建请求前卡住，单个大附件会同时占用 JSON、protobuf 与 HTTP body 多份内存。
-const MAX_ONE_IMAGE: usize = 12 * 1024 * 1024;
-const MAX_ALL_IMAGES: usize = 24 * 1024 * 1024;
+/// `pub(crate)`:sandchat 的文档渲染用同一份预算(grokbot 面没有附件上传通道,
+/// 超预算的块渲成占位文本而不是上线)。
+pub(crate) const MAX_ONE_IMAGE: usize = 12 * 1024 * 1024;
+pub(crate) const MAX_ALL_IMAGES: usize = 24 * 1024 * 1024;
 
 // ── field9 门面(grok 专用实验,默认关)──────────────────────────────────
 //
@@ -188,7 +190,8 @@ fn tools_prompt_block(tools: &[Json]) -> String {
 
 /// 文本模拟门面的 system 契约(实弹验证过的措辞,别随手改:grok/claude 都按
 /// 它输出可解析的 `<tool_call>` 块)。
-fn tools_text_block(tools: &[Json]) -> String {
+/// `pub(crate)`:sandchat(grokbot 0.39 面)的工具只有这一条文本契约,原样复用。
+pub(crate) fn tools_text_block(tools: &[Json]) -> String {
     let mut s = String::from(
         "You have access to the following tools. To call a tool, output a block in exactly \
          this format:\n\n<tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{...}}</tool_call>\n\n\
@@ -197,6 +200,9 @@ fn tools_text_block(tools: &[Json]) -> String {
          never a bare {\"flag\"}.\n\
          - Do not wrap the block in markdown fences. Do not add commentary inside the block.\n\
          - After emitting a tool call, stop and wait for the tool result.\n\
+         - The tools listed below are the COMPLETE set. There is NO discovery or meta tool: \
+         never call GetMcpTools, GetDynamicTools, CallDynamicTool or any other unlisted name — \
+         such calls are silently dropped and you will never receive a result.\n\
          - Tool results arrive as <tool_result name=\"TOOL_NAME\">...</tool_result> in a user message. \
          Never emit a <tool_result> block yourself — only the user side provides them.\n\n\
          Tools:\n",
@@ -225,7 +231,8 @@ fn tools_text_block(tools: &[Json]) -> String {
 /// <tool_call>;甚至自己编 `_result` 谎称执行成功。同报文消融:换极简 system →
 /// 正常结构化调用;CC system + 工具砍到 2 个 → 依旧散文。把精简提醒钉在会话
 /// 尾巴(模型最后读到的位置)后,同报文立即恢复结构化回调。
-fn textemu_tail_reminder(tools: &[Json]) -> String {
+/// `pub(crate)`:sandchat 同契约复用(全量/增量包都钉在尾巴上)。
+pub(crate) fn textemu_tail_reminder(tools: &[Json]) -> String {
     let mut s = String::from(
         "<system-reminder>IMPORTANT: Tool calling in this environment is TEXT-BASED. \
          To call a tool, your reply MUST contain exactly one \
@@ -233,7 +240,9 @@ fn textemu_tail_reminder(tools: &[Json]) -> String {
          and NOTHING after it. arguments must be strict JSON — boolean flags need explicit \
          values (\"-n\":true), never bare keys. NEVER write tool calls as markdown (like \"**Bash** ```json ...```\"), \
          NEVER narrate them in prose, and NEVER fabricate a <tool_result> or _result yourself — \
-         tool results are provided by the user in the next turn. Available tools: ",
+         tool results are provided by the user in the next turn. \
+         There is NO tool-list or discovery tool (no GetMcpTools / GetDynamicTools / CallDynamicTool) — \
+         the names below are the complete set, call them directly. Available tools: ",
     );
     let names: Vec<&str> = tools
         .iter()
@@ -245,14 +254,14 @@ fn textemu_tail_reminder(tools: &[Json]) -> String {
 }
 
 // InferenceMessageRole
-const ROLE_USER: u64 = 1;
-const ROLE_ASSISTANT: u64 = 2;
+const ROLE_USER: u64 = 1;const ROLE_ASSISTANT: u64 = 2;
 const ROLE_TOOL: u64 = 3;
 const ROLE_SYSTEM: u64 = 4;
 
 // ── 按账号 client(代理时 H1 专用,fail-closed)──────────────────────────────
-
-fn inference_client(
+//
+// `pub(crate)`:sandchat(grokbot 0.39 面)走同一纪律 —— 刷新与发包同出口。
+pub(crate) fn inference_client(
     account: &Account,
     egress: &reqwest::Client,
 ) -> Result<reqwest::Client, UpstreamError> {
@@ -401,7 +410,8 @@ fn eligible_media_block(block: &Json, media_bytes: &mut usize) -> bool {
     }
 }
 
-fn push_text(out: &mut String, text: &str) {
+/// `pub(crate)`:sandchat 的渲染器复用(同一个拼接口径,别各写各的)。
+pub(crate) fn push_text(out: &mut String, text: &str) {
     if text.is_empty() {
         return;
     }
@@ -410,7 +420,6 @@ fn push_text(out: &mut String, text: &str) {
     }
     out.push_str(text);
 }
-
 // ── google.protobuf.Struct / Value 编码 ─────────────────────────────────────
 //
 // 工具入参(parameters / args)与 tool_result 的 result 都是任意 JSON,官方线格式
@@ -512,7 +521,8 @@ fn model_params(model: &str, thinking_enabled: bool) -> (bool, Vec<(&'static str
 /// document 块 → 注入文本。与 cli/wire 同形态(chat.rs:1877):抽到文本层就内联,
 /// 抽不到(扫描件/图片型)明确告知模型无法读取 —— 否则它会反复尝试调工具读文件,
 /// 而反代答不了内建终端工具。返回 None = base64 解不出(门控已挡,这里是兜底)。
-fn document_inject_text(b: &Json, doc_n: &mut usize) -> Option<String> {
+/// `pub(crate)`:sandchat 的文档注入同形复用。
+pub(crate) fn document_inject_text(b: &Json, doc_n: &mut usize) -> Option<String> {
     let data = b
         .get("source")
         .and_then(|s| s.get("data"))
@@ -589,7 +599,9 @@ fn user_parts(blocks: &[Json], doc_n: &mut usize, w: &mut Writer) {
 /// TOOL 角色消息(role=3,InferenceMessageRole.TOOL 的官方枚举值),与官方同形。
 /// TextEmu 门面的 tool_result 文本渲染(契约措辞见 `tools_text_block`,
 /// 两者必须逐字一致,模型是靠契约文本认这个形态的)。
-fn tool_results_as_text(
+/// TextEmu 门面的 tool_result → `<tool_result name=…>` 文本(契约形态)。
+/// `pub(crate)`:sandchat 历史渲染同形复用。
+pub(crate) fn tool_results_as_text(
     blocks: &[Json],
     names: &std::collections::HashMap<String, String>,
     doc_n: &mut usize,
@@ -1589,6 +1601,51 @@ fn repair_json_bare_flags(raw: &str) -> String {
     out
 }
 
+/// TextEmu 契约 JSON 的窄修复(第三级):模型写深层嵌套参数时偶尔丢掉**最外层
+/// 收尾括号** —— 2026-09-09 生产实弹两条(fable-5-1 的 todowrite、opus-5 的
+/// skill_manage):`{"name":"X","arguments":{…[…]}` 数组和 arguments 都合上了,
+/// 根对象的 `}` 没写就输出 </tool_call>,严格解析必然失败。
+/// 规则:全程跟踪字符串/转义;扫完仍停在字符串**里面**的(疑似截断,补括号等于
+/// 虚构参数)一律原样返回不修;否则把未闭合容器按栈序补 `}`/`]`。只补括号,
+/// 不虚构任何内容;补完仍不合法就交给后续的宽容解析/诚实降级。
+fn repair_json_unclosed(raw: &str) -> String {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if in_str || stack.is_empty() {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len() + stack.len());
+    out.push_str(raw);
+    for c in stack.iter().rev() {
+        out.push(*c);
+    }
+    out
+}
+
 /// TextEmu 门面的流式文本过滤器:在文本 delta 流里识别 `<tool_call>…</tool_call>`
 /// 块。标签可能横跨两个 delta,所以滞回 `OPEN.len()-1` 个字符确认不是标签前缀
 /// 才往下流放(流式体验只损失这 10 个字符的延迟)。
@@ -1729,7 +1786,11 @@ impl TextToolFilter {
 ///(content_block_start → 一帧全量 input_json_delta → content_block_stop),与
 /// Run 路径(chat.rs:3175「input 一次性给全」)同形态,两条路径产出可比。
 /// Anthropic 侧同一时刻只有一个打开块;并行调用靠缓冲天然串行化。
-struct Folder {
+///
+/// `pub(crate)`:sandchat(grokbot 0.39 面)的 transcript 折叠直接复用这台
+/// 状态机 —— 它只经 [`Folder::on_text`] 喂文本增量,TextEmu 过滤器
+/// (`text_tools=true`)在内部把 `<tool_call>` 块切成 tool_use,与本面同形态。
+pub(crate) struct Folder {
     msg_id: String,
     model: String,
     started: bool,
@@ -1772,7 +1833,7 @@ struct Folder {
 }
 
 impl Folder {
-    fn new(
+    pub(crate) fn new(
         model: &str,
         declared_tools: std::collections::HashSet<String>,
         show_thinking: bool,
@@ -1811,9 +1872,35 @@ impl Folder {
     }
 
     /// 失败终态:发一次 Err,此后任何收尾都不再产正常事件。
-    fn fail(&mut self, e: UpstreamError) {
+    pub(crate) fn fail(&mut self, e: UpstreamError) {
         self.failed = true;
         self.pending.push(Err(e));
+    }
+
+    /// 是否已进失败终态(sandchat 的流循环按它提前收线)。
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// 是否产出过内容(sandchat 的停滞兜底据此决定「部分内容收尾」还是「报错」)。
+    pub(crate) fn saw_content(&self) -> bool {
+        self.saw_content
+    }
+
+    /// sandchat 专用:grokbot 0.39 的 transcript **没有 token 用量字段**,
+    /// 按文本量估算 —— input = 本轮发送文本字节/4(全量渲染或增量),
+    /// output = 产出字符/4。**这是估算口径**(request_logs 里的数会偏离真实
+    /// 消耗),真实 Bot 周池消耗由后台 `GetSandUsageStatus` 周期核对。
+    /// 在 [`Folder::finish`] 前调用;调了之后 finish 不再走自估兜底。
+    /// 注意:TextEmu 过滤器滞回缓冲里的尾巴(≤一个标签前缀长,finish 才放出)
+    /// 不在 out_chars 里,output 估算会少算那几字节 —— 估算口径本就粗糙,忽略。
+    pub(crate) fn set_estimated_usage(&mut self, input_bytes: u64) {
+        self.usage = ChatUsage {
+            input_tokens: input_bytes / 4,
+            output_tokens: (self.out_chars / 4).max(1),
+            ..Default::default()
+        };
+        self.saw_usage = true;
     }
 
     fn sse(&mut self, event: &'static str, data: Json) {
@@ -1878,7 +1965,9 @@ impl Folder {
         }
     }
 
-    fn on_text(&mut self, text: &str, is_final: bool) {
+    /// 喂一段正文文本增量(text_tools 开着时过 TextToolFilter 切 `<tool_call>`)。
+    /// `pub(crate)`:sandchat 的 transcript diff 直接喂这里。
+    pub(crate) fn on_text(&mut self, text: &str, is_final: bool) {
         if !self.text_tools {
             self.on_text_direct(text, is_final);
             return;
@@ -1902,8 +1991,11 @@ impl Folder {
     }
 
     /// TextEmu:模型写出的 `<tool_call>` 块内容(两个标签之间的 JSON)→ tool_use。
-    /// 解析失败先经 [`repair_json_bare_flags`] 做一次窄修复(裸布尔旗标),
-    /// 仍失败 / 未声明 / args 非 object:原文按文本吐回(诚实降级,不伪造调用)。
+    /// 解析失败走三级窄修复:字符串消毒 + 裸布尔旗标 → 未闭合括号补齐 →
+    /// 宽容前向解析;仍失败 / 未声明 / args 非 object:原文按文本吐回(诚实
+    /// 降级,不伪造调用),负反馈按**真实失败原因**分三类措辞 —— 2026-09-09
+    /// 生产实态:模型丢最外层 `}` 导致解析失败,反馈却咬死"工具没声明",
+    /// 模型被误导后对着声明清单里明明存在的名字反复重发同一个畸形块。
     fn publish_text_tool_call(&mut self, raw: String) {
         let parsed = serde_json::from_str::<Json>(&raw)
             .ok()
@@ -1917,20 +2009,54 @@ impl Folder {
                     })
             })
             .or_else(|| {
+                // 第三级:未闭合容器补齐(模型丢最外层收尾括号,生产实弹)。
+                // 字符串里没走完(疑似截断)时 repair_json_unclosed 原样返回,不补。
+                let repaired = repair_json_bare_flags(&repair_json_string_escapes(&raw));
+                let balanced = repair_json_unclosed(&repaired);
+                (balanced != repaired)
+                    .then(|| serde_json::from_str::<Json>(&balanced).ok())
+                    .flatten()
+                    .inspect(|_| {
+                        tracing::warn!("inference: TextEmu 契约 JSON 补齐未闭合括号生效")
+                    })
+            })
+            .or_else(|| {
                 // 最后兜底:宽容前向解析(字符串值里的裸引号,生产实弹形态)。
                 parse_tool_call_lenient(&raw).inspect(|_| {
                     tracing::warn!("inference: TextEmu 契约 JSON 经宽容解析救回(裸引号)")
                 })
             });
+        /// 降级原因:决定负反馈措辞,模型要据此修自己的下一个块。
+        enum Why {
+            /// 三级修复后仍不是合法 JSON(截断/畸形)。
+            Malformed,
+            /// 解析成功但缺 name,或 arguments/args 不是对象。
+            BadShape,
+            /// 解析成功但工具名不在声明清单。
+            Undeclared(String),
+        }
+        let mut why = Why::Malformed;
         let good = parsed.as_ref().and_then(|v| {
-            let name = v.get("name").and_then(Json::as_str)?;
+            let Some(name) = v.get("name").and_then(Json::as_str) else {
+                why = Why::BadShape;
+                return None;
+            };
             // Hermes 标准是 `arguments`;旧契约(今天早些时候灰度)用 `args`,兼容收。
-            let args = v
+            let Some(args) = v
                 .get("arguments")
                 .or_else(|| v.get("args"))
-                .filter(|a| a.is_object())?;
-            self.resolve_declared_name(name)
-                .map(|n| (n, args.to_string()))
+                .filter(|a| a.is_object())
+            else {
+                why = Why::BadShape;
+                return None;
+            };
+            match self.resolve_declared_name(name) {
+                Some(n) => Some((n, args.to_string())),
+                None => {
+                    why = Why::Undeclared(name.to_string());
+                    None
+                }
+            }
         });
         match good {
             Some((name, args)) => {
@@ -1946,6 +2072,25 @@ impl Folder {
                     &format!("{}{}{}", TextToolFilter::OPEN, raw, TextToolFilter::CLOSE),
                     false,
                 );
+                // 给模型一条**下一轮能在历史里读到**的负反馈:静默降级会让它以为
+                // "调用发出去了但没回",然后开始空转"先取工具清单"(2026-09-08 生产
+                // 诊断实态——模型对未声明名发调用后自我脑补了整套发现协议)。
+                let feedback = match &why {
+                    Why::Malformed => "\n[gateway: tool call NOT executed — the JSON inside \
+                        <tool_call> was malformed or unbalanced. Re-issue the SAME tool call \
+                        with strict, fully-closed JSON (every opened brace must be closed, \
+                        including the outermost one).]\n"
+                        .to_string(),
+                    Why::BadShape => "\n[gateway: tool call NOT executed — the block must \
+                        contain a \"name\" and an \"arguments\" JSON object. Re-issue with \
+                        that exact shape.]\n"
+                        .to_string(),
+                    Why::Undeclared(n) => format!(
+                        "\n[gateway: tool call NOT executed — \"{n}\" is not a declared tool. \
+                         No result will arrive; re-issue with one of the declared tool names.]\n"
+                    ),
+                };
+                self.on_text_direct(&feedback, false);
             }
         }
     }
@@ -2292,7 +2437,7 @@ impl Folder {
     }
 
     /// 收尾(message_delta + message_stop + Usage)。exactly-once;失败终态后不调。
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         if self.finale_sent || self.failed {
             return;
         }
@@ -2432,7 +2577,7 @@ impl Folder {
         Ok(())
     }
 
-    fn take_pending(&mut self) -> Vec<Result<StreamItem, UpstreamError>> {
+    pub(crate) fn take_pending(&mut self) -> Vec<Result<StreamItem, UpstreamError>> {
         std::mem::take(&mut self.pending)
     }
 }
@@ -2464,6 +2609,11 @@ fn map_stream_error(error_type: u64, code: &str, message: &str) -> UpstreamError
 
 /// connect 层错误(END trailer JSON / 非 200 结构化 body)的 code → kind。
 fn map_connect_error(code: &str, message: &str) -> UpstreamError {
+    map_connect_error_for("inference", code, message)
+}
+
+/// [`map_connect_error`] 的可冠名版:`face` 只是日志/消息前缀(sandchat 复用)。
+pub(crate) fn map_connect_error_for(face: &str, code: &str, message: &str) -> UpstreamError {
     let kind = match code {
         "unauthenticated" => UpstreamErrorKind::TokenInvalid,
         "resource_exhausted" => UpstreamErrorKind::RateLimited,
@@ -2476,7 +2626,7 @@ fn map_connect_error(code: &str, message: &str) -> UpstreamError {
         "unavailable" => UpstreamErrorKind::Overloaded,
         _ => UpstreamErrorKind::ServerError,
     };
-    UpstreamError::new(kind, format!("inference 上游错误[{code}]: {message}"))
+    UpstreamError::new(kind, format!("{face} 上游错误[{code}]: {message}"))
 }
 
 /// 非 200 的 HTTP 错误分类(inference 专用,不套用 Run 路径的分类器 ——
@@ -2485,13 +2635,19 @@ fn map_connect_error(code: &str, message: &str) -> UpstreamError {
 /// 保留的核心教训(chat.rs:2162):**401 才是号的问题**;403 无结构化错误体时
 /// 是出口 IP 被拦(坏的是 IP 不是号),判 Other 不动账号健康。
 fn classify_http_error(status: u16, body: &str) -> UpstreamError {
+    classify_http_error_for("inference", status, body)
+}
+
+/// [`classify_http_error`] 的可冠名版:`face` 只是日志/消息前缀(sandchat 复用,
+/// 同一套分类语义,含 401=TokenInvalid → worker 同号刷新重试的约定)。
+pub(crate) fn classify_http_error_for(face: &str, status: u16, body: &str) -> UpstreamError {
     if let Ok(j) = serde_json::from_str::<Json>(body) {
         if let Some(code) = j.get("code").and_then(Json::as_str) {
             let message = j
                 .get("message")
                 .and_then(Json::as_str)
                 .unwrap_or("上游错误");
-            return map_connect_error(code, message).with_status(status);
+            return map_connect_error_for(face, code, message).with_status(status);
         }
     }
     let kind = match status {
@@ -2499,7 +2655,7 @@ fn classify_http_error(status: u16, body: &str) -> UpstreamError {
         403 => {
             tracing::warn!(
                 body_head = %body.chars().take(120).collect::<String>(),
-                "inference 403 且无结构化错误体 —— 疑似出口 IP 被拦(不是号的问题),不动账号健康"
+                "{face} 403 且无结构化错误体 —— 疑似出口 IP 被拦(不是号的问题),不动账号健康"
             );
             UpstreamErrorKind::Other
         }
@@ -2512,7 +2668,7 @@ fn classify_http_error(status: u16, body: &str) -> UpstreamError {
     UpstreamError::new(
         kind,
         format!(
-            "inference HTTP {status}: {}",
+            "{face} HTTP {status}: {}",
             body.chars().take(300).collect::<String>()
         ),
     )
@@ -2612,10 +2768,13 @@ async fn build_request_blocking(
 }
 
 /// PDF 文本抽取的进程级并发槽(codex 二轮 M5)。
-static PDF_EXTRACT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// `pub(crate)`:sandchat 的渲染走同一道闸(同一进程共享同一份内存预算)。
+pub(crate) static PDF_EXTRACT_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(4);
 
 /// 请求里有没有 document 块(顶层或 tool_result 内嵌)。只在拿抽取并发槽前用。
-fn has_document_block(body: &Json) -> bool {
+/// `pub(crate)`:sandchat 同用。
+pub(crate) fn has_document_block(body: &Json) -> bool {
     let Some(ms) = body.get("messages").and_then(Json::as_array) else {
         return false;
     };
@@ -3678,6 +3837,12 @@ mod tests {
         assert!(text.contains("You are helpful."), "{text}");
         assert!(text.contains("<tool_call>"), "契约进 system: {text}");
         assert!(text.contains("get_weather"), "{text}");
+        // 契约必须明令否决发现/元工具:模型对未声明名发调用会被静默降级,
+        // 然后陷入"先取清单"空转(2026-09-08 生产诊断)。
+        assert!(
+            text.contains("NO discovery or meta tool") && text.contains("GetDynamicTools"),
+            "system 契约否决发现工具: {text}"
+        );
         // 消息序列:system / user / assistant(文本化 tool_use)/ user(文本化 result)
         // / user(尾部契约提醒,2026-09-07 消融实验后新增)
         let msgs: Vec<&[u8]> = fs
@@ -3717,6 +3882,8 @@ mod tests {
         assert!(tail.contains("get_weather"), "尾部提醒带工具名清单: {tail}");
         // 提醒里绝不能出现真实工具名之外的幻觉诱饵(措辞别随手改)
         assert!(tail.contains("NEVER"), "{tail}");
+        // 尾部同样否决发现工具(模型最后读到的位置)
+        assert!(tail.contains("no GetMcpTools"), "尾部否决发现工具: {tail}");
     }
 
     /// 尾部提醒只钉在 user 结尾的会话;assistant 结尾(prefill)不追加,
@@ -3819,6 +3986,91 @@ mod tests {
             joined.contains(r#"<tool_call>{\"name\":\"get_weather\""#),
             "半截标签原文: {joined}"
         );
+        // 降级必须附网关负反馈(模型下一轮能在历史里读到),否则它会以为
+        // "调用发出去了没回"而陷入"先取清单"空转(2026-09-08 生产诊断)。
+        // 反馈措辞按真实原因分类:未声明 ≠ 畸形,别让模型被误诊带偏(2026-09-09
+        // 生产实态:模型丢最外层 } 被判成"未声明",对着清单里存在的名字空转)。
+        assert!(
+            joined.contains(r#"tool call NOT executed — \"undeclared\" is not a declared tool"#),
+            "未声明调用应带名字反馈: {joined}"
+        );
+        assert!(
+            joined.contains("malformed or unbalanced"),
+            "坏块应带畸形反馈: {joined}"
+        );
+    }
+
+    /// 2026-09-09 生产实弹:模型写深层嵌套参数丢掉**最外层**收尾 `}`
+    /// (`{"name":"todowrite","arguments":{"todos":[…]}` 就闭标签)。窄补齐后
+    /// 应正常产出 tool_use 而不是降级。
+    #[test]
+    fn textemu_丢最外层收尾括号被补齐() {
+        let mut f = Folder::new("claude-fable-5-1", declared(&["todowrite"]), true, 4000, true);
+        f.feed_frame(
+            &text_part(
+                "<tool_call>{\"name\":\"todowrite\",\"arguments\":{\"todos\":[\
+                 {\"content\":\"甲\",\"status\":\"pending\"},\
+                 {\"content\":\"乙\",\"status\":\"done\"}\
+                 ]}</tool_call>",
+                false,
+            ),
+        )
+        .unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(
+            joined.contains(r#""type":"tool_use""#),
+            "补齐后应产出 tool_use 而非降级文本: {joined}"
+        );
+        assert!(joined.contains("todowrite"), "{joined}");
+        assert!(joined.contains("乙"), "参数内容不丢: {joined}");
+        assert!(
+            !joined.contains("NOT executed"),
+            "不该出现降级负反馈: {joined}"
+        );
+    }
+
+    /// 截断疑云不修:扫完仍停在字符串**里面**的块(像被掐断),补括号等于虚构
+    /// 参数 —— 原样降级,绝不能伪造调用。
+    #[test]
+    fn textemu_字符串内截断不虚构() {
+        let mut f = Folder::new("claude-opus-5", declared(&["bash"]), true, 4000, true);
+        f.feed_frame(
+            &text_part(
+                "<tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"rm -rf /tmp/x</tool_call>",
+                false,
+            ),
+        )
+        .unwrap();
+        f.finish();
+        let joined = sse_jsons(&mut f).join("\n");
+        assert!(
+            !joined.contains(r#""type":"tool_use""#),
+            "截断块绝不能产出 tool_use: {joined}"
+        );
+        assert!(
+            joined.contains("malformed or unbalanced"),
+            "截断块应带畸形反馈: {joined}"
+        );
+    }
+
+    #[test]
+    fn repair_json_unclosed_只补括号且不碰字符串() {
+        // 生产原形:数组/对象都合了,根 } 丢了。
+        let raw = r#"{"name":"todowrite","arguments":{"todos":[{"content":"a"}]}"#;
+        let fixed = repair_json_unclosed(raw);
+        assert_eq!(fixed, format!("{raw}}}"));
+        let v: Json = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["name"], "todowrite");
+        // 合法 JSON 原样不动。
+        let ok = r#"{"name":"bash","arguments":{"command":"ls"}}"#;
+        assert_eq!(repair_json_unclosed(ok), ok);
+        // 字符串内截断:原样返回(不虚构)。
+        let trunc = r#"{"name":"bash","arguments":{"command":"rm -rf"#;
+        assert_eq!(repair_json_unclosed(trunc), trunc);
+        // 字符串里的括号不计数:{"text":"}]} 合不上是假的"} —— 已合法,不动。
+        let tricky = r#"{"text":"}]}"}"#;
+        assert_eq!(repair_json_unclosed(tricky), tricky);
     }
 
     /// 模型幻觉的 `<tool_result>` 块(契约禁止,opus-5 实弹会抢答)→ 整段丢弃,

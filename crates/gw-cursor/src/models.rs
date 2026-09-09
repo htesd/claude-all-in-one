@@ -223,6 +223,12 @@ pub fn resolve_cursor_model(name: &str) -> Option<String> {
         // 空名是「没说要哪个」而不是「要了一个不存在的」——维持交给服务端路由。
         return Some(DEFAULT_MODEL.to_string());
     }
+    // 纯 bot 池的对外单模型名:显式归一到现役 grok 旗舰 —— 不等族规则把它
+    // 降到 grok-4.5,否则带白名单的 bot 号(白名单里通常写的是 4.6)会把
+    // 自己唯一的对外模型名挡在门外。
+    if n == BOT_POOL_MODEL {
+        return Some("grok-4.6".to_string());
+    }
     // 已经是 Run 目录里的名字 → 原样。
     if catalog().iter().any(|m| m.name == n) {
         return Some(n.to_string());
@@ -427,6 +433,26 @@ pub fn list() -> Vec<ModelInfo> {
         .collect()
 }
 
+/// pool=bot(grokbot 0.39 sandchat 面)纯池的对外唯一模型名。
+///
+/// 该面 proto **没有模型字段**,服务端永远是同一个 Grok(2026-09-09 实测:
+/// 带 session 发 model 字段会被拒,agent 自述就是 Grok)。把全量目录暴露给
+/// 客户端只会诱导它点到 bot 号接不了的 claude/gpt,换来「已钉 pool=bot」
+/// 拒绝 —— 所以纯 bot 池的 `/v1/models` 只留这一项(语义 = UI 的 Auto,
+/// 即不指定模型)。名字本身含 "grok",`resolve_cursor_model` 会把它归一到
+/// grok 真身,请求路径无需特判。
+pub const BOT_POOL_MODEL: &str = "grok_bot_auto";
+
+/// 纯 bot 池的 `/v1/models` 目录:仅 [`BOT_POOL_MODEL`] 一项。
+pub fn bot_pool_list() -> Vec<ModelInfo> {
+    let mut info = ModelInfo::new(BOT_POOL_MODEL);
+    info.display_name = Some(format!("{} (grokbot)", BOT_POOL_MODEL));
+    info.context_length = Some(200_000);
+    info.supports_tools = true;
+    info.supports_vision = true;
+    vec![info]
+}
+
 /// `"300k"` → `300_000`。
 fn parse_context(v: &str) -> Option<u32> {
     let t = v.trim();
@@ -496,6 +522,17 @@ mod tests {
         // UI 的 "Auto" 线上名是 `default`;发 `auto` 会被判 ERROR_BAD_MODEL_NAME。
         assert!(!catalog().iter().any(|m| m.name == "auto"));
         assert_eq!(to_cursor_model("auto"), "default");
+    }
+
+    #[test]
+    fn bot池单项目录_且名字能归一到grok真身() {
+        let list = bot_pool_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, BOT_POOL_MODEL);
+        // 纯 bot 池的客户端只会照这个 id 发请求:resolve 必须认它,
+        // 且显式归一到现役 grok 旗舰(白名单通常按 4.6 配),不能 None → 400。
+        let up = resolve_cursor_model(BOT_POOL_MODEL).expect("bot 池模型名必须可解析");
+        assert_eq!(up, "grok-4.6");
     }
 
     #[test]

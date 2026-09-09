@@ -336,6 +336,9 @@ pub trait Provider: Send + Sync {
     /// gw-app 下次用旧 rt 刷新直接 invalid_grant,号被判死。provider 观测到轮换
     /// 就记录在此;worker 周期任务取走后做 CAS 落库(增量键与 `refresh_auth`
     /// 回写口径一致:access_token / refresh_token / expires_at)。默认空实现。
+    ///
+    /// 增量**也可以不带 access_token**:那是非凭据的 extra 更新(如 gw-cursor
+    /// sandchat 驱动的 `sand_agent_id` 缓存),worker 跳过 token CAS 直接 merge 落库。
     fn poll_token_updates(
         &self,
     ) -> Vec<(String, std::collections::BTreeMap<String, serde_json::Value>)> {

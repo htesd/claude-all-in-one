@@ -42,6 +42,8 @@ mod models;
 mod pdf;
 pub mod protobuf;
 pub mod run;
+/// grokbot 0.39 驱动(pool=bot 账号的推理面,见模块文档)。
+mod sandchat;
 pub mod usage;
 pub mod wire;
 /// wire v2 反应式帧序驱动(生产与探针共用,见模块文档)。
@@ -53,6 +55,8 @@ pub mod wirev2;
 /// 否则测出来的形态不等于生产发出去的形态。
 pub use models::catalog;
 pub use models::set_extra_models;
+// 纯 bot 池的对外目录裁剪(worker `/v1/models` 用;见 models::BOT_POOL_MODEL)。
+pub use models::bot_pool_list;
 
 /// 内建工具护栏的**策略句**默认值(见 [`chat`] 里 `builtin_tool_guard` 的模块文档)。
 ///
@@ -534,6 +538,11 @@ pub struct CursorProvider {
     /// CLI 子进程自刷新的 token 捕获表(CLI 回写 auth.json → 这里 →
     /// worker 周期任务经 `poll_token_updates` 取走 CAS 落库)。
     cli_token_updates: clidrv::TokenUpdates,
+    /// sandchat 驱动(grokbot 0.39 面,pool=bot)的会话绑定表与串行闸门。
+    sand_sessions: Arc<sandchat::SandSessions>,
+    /// sandchat 的账号 extra 增量(目前只有 `sand_agent_id`):与 cli_token_updates
+    /// 同一条 `poll_token_updates` 通道取走,worker CAS 落库。
+    sand_extra_updates: sandchat::ExtraUpdates,
     /// 每会话(conversation_id)一把分流锁:把「① 挂起接续/弃槽判定 → ② lookup
     /// → start_conv 完成注册(insert 在其内部)」的**整个事务**按会话串行化。
     ///
@@ -1451,6 +1460,8 @@ impl CursorProvider {
             cli_cfg: clidrv::CliDriverConfig::from_env(),
             cli_convs: Arc::new(clidrv::CliConversations::default()),
             cli_token_updates: clidrv::TokenUpdates::default(),
+            sand_sessions: Arc::new(sandchat::SandSessions::default()),
+            sand_extra_updates: sandchat::ExtraUpdates::default(),
             cli_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1820,6 +1831,22 @@ impl Provider for CursorProvider {
                 ),
             },
         }
+
+        // sandchat 门面(pool=bot 的 grokbot 0.39 面,默认开;详见 sandchat.rs)。
+        // 关掉 = pool=bot 账号无面可走(旧 inference 端点已被上游锁死,不会回落)。
+        match settings.get("cursor_sandchat") {
+            None => {}
+            Some(v) => match v.as_bool() {
+                Some(b) => {
+                    crate::sandchat::set_sandchat_enabled(b);
+                    tracing::debug!(enabled = b, "cursor sandchat 门面已热应用");
+                }
+                None => tracing::warn!(
+                    value = %v,
+                    "settings 里的 cursor_sandchat 不是布尔，已忽略"
+                ),
+            },
+        }
     }
 
     /// 与 [`Self::apply_hot_settings`] 同进退(trait 文档:只覆盖其中一个就是在撒谎)。
@@ -1914,11 +1941,12 @@ impl Provider for CursorProvider {
         let wire_opt_out = effective_driver == Some("wire");
         let explicit_cli = effective_driver == Some("cli");
         // 池钉(2026-09-07):一个 cursor 号有两个池能服务第三方模型 ——
-        // sand 身份(整条 InferenceService 面,含 field9/TextEmu 门面)烧 **Bot 周池**;
+        // sand 身份烧 **Bot 周池**(0.39 起是 sandchat/GrokBotService 面;
+        // 之前的 InferenceService 面含 field9/TextEmu 门面,2026-09-09 已死);
         // cli 身份(clidrv 子进程 / wire 线协议)烧 **月池**(auto/api)。缺省不钉 =
         // 现状混合(推理面为主、驱动级故障落 clidrv)。钉死后**绝不跨池**:
-        // - `extra.pool="bot"`:只走 sand 面。门面未覆盖的 tools 形态、形态门控
-        //   回落、驱动级故障兜底一律禁用 —— 那些路径会静默烧到月池。
+        // - `extra.pool="bot"`:只走 sand 面(sandchat)。门面关闭直接报错,
+        //   形态/故障兜底一律禁用 —— 那些路径会静默烧到月池。
         // - `extra.pool="api"`:只走 cli 身份,推理面整体跳过(语义等同
         //   driver="cli",但表达的是池不是实现;将来月池侧有了纯协议面可无缝换)。
         // 冲突口径:显式 driver 闸(cli/wire/CURSOR_DRIVER)是回滚命门,压过池钉;
@@ -1945,30 +1973,31 @@ impl Provider for CursorProvider {
             && chat::cli_eligible(&req.body)
             && (explicit_cli || pool_api || !req_has_tools);
 
-        // pool=bot 的「绝不跨池」闸:凡进不了 sand 推理面的请求,**不许**顺着
-        // cli/wire 兜底烧到月池。两种进不去的情形分别处置:
-        // - 形态本身推理面接不了(URL 媒体/超预算附件):请求级问题,BadRequest
-        //   明说,不惩罚账号;
-        // - 带 tools 但门面未覆盖(门面开关被关、或 grok/claude/composer 之外的
-        //   模型带工具):记 (号,模型) 不可用交调度层换号 —— 这号此刻确实服务
-        //   不了这个模型,语义与上游 INVALID_MODEL_ID 一致。
+        // pool=bot 的「绝不跨池」闸 + 新面路由(2026-09-09):旧
+        // `aiserver.v1.InferenceService/Stream` 面**当日被服务端锁死**(任何 cursor
+        // JWT 一律 401 ERROR_NOT_LOGGED_IN,见 docs/grokbot-0.39-protocol-re.md),
+        // BOT 池改走 grokbot 0.39 的 GrokBotService 面(sandchat 驱动)。
+        // 「绝不跨池」口径不变:pool=bot 的请求不许顺 cli/wire 兜底烧月池;
+        // 门面开关关掉 = 该号无面可走,直接报错(不落 inference —— 端点已死)。
         if pool_bot && inference_driver {
-            if !inference::inference_eligible(&req.body) {
+            if !sandchat::sandchat_enabled() {
                 return Err(UpstreamError::bad_request_visible(
-                    "cursor: 该账号已钉 pool=bot(只走 Bot 周池),而本请求形态推理面接不了;\
-                     请改走未钉池的账号或调整请求形态",
+                    "cursor: 账号已钉 pool=bot,但旧 inference 推理端点已被上游废弃\
+                     (2026-09-09 起 401),而 sandchat 门面被 CURSOR_SANDCHAT/cursor_sandchat \
+                     关闭 —— 该号当前无可用推理面;请开启门面或把账号改钉 pool=api",
                 ));
             }
-            if inference::tools_skip_inference(&req.model, &req.body) {
-                return Err(UpstreamError::new(
-                    UpstreamErrorKind::ModelNotAvailable,
-                    format!(
-                        "cursor: 账号已钉 pool=bot,而模型 {:?} 带工具的请求没有对应门面,\
-                         只能烧月池 —— 已拒绝跨池,请换号或开门面",
-                        req.model
-                    ),
-                ));
-            }
+            let client = self.client_for(&ctx.account)?;
+            return sandchat::chat_stream(
+                &client,
+                &ctx.account,
+                &token,
+                req,
+                ctx,
+                &self.sand_sessions,
+                &self.sand_extra_updates,
+            )
+            .await;
         }
 
         let machine_id = Self::machine_id_of(&ctx.account, &token);
@@ -2010,8 +2039,8 @@ impl Provider for CursorProvider {
                     // CLI 接不了的形态)继续走 wire —— 不能在这里直接 return Err,
                     // 否则 prefill 请求的兜底链被掐断(codex 二轮 M1)。(执行到这里
                     // 必然不是 wire_opt_out —— 那条路在前面就不进 inference 分支。)
-                    // pool=bot 例外:兜底链是 cli 身份、烧月池,钉了 bot 池的号
-                    // 宁可把错误交回调度层换号,也绝不跨池。
+                    // pool=bot 已在前面路由进 sandchat(2026-09-09 旧面已死),到不了
+                    // 这里;`pool_bot` 判断保留作防御(真走到 = 绝不许跨池烧月池)。
                     if !driver_level || pool_bot {
                         return Err(e);
                     }
@@ -2481,7 +2510,7 @@ impl Provider for CursorProvider {
         String,
         std::collections::BTreeMap<String, serde_json::Value>,
     )> {
-        std::mem::take(
+        let mut out: Vec<_> = std::mem::take(
             &mut *self
                 .cli_token_updates
                 .lock()
@@ -2489,7 +2518,23 @@ impl Provider for CursorProvider {
         )
         .into_iter()
         .map(|(id, u)| (id, u.to_delta()))
-        .collect()
+        .collect();
+        // sandchat 的 extra 增量(如 sand_agent_id)走同一通道:合进同号条目,
+        // 没有同号条目就自成一条(worker 侧对不带 access_token 的增量做纯 merge)。
+        let sand = std::mem::take(
+            &mut *self
+                .sand_extra_updates
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        for (id, delta) in sand {
+            if let Some(existing) = out.iter_mut().find(|(aid, _)| *aid == id) {
+                existing.1.extend(delta);
+            } else {
+                out.push((id, delta));
+            }
+        }
+        out
     }
 
     /// 用 `refresh_token` 换一份新凭据(标准 OAuth2,见 [`auth`])。

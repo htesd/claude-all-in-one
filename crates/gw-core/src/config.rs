@@ -427,6 +427,16 @@ pub struct SystemConfig {
     /// yaml 缺省读 env `CURSOR_TEXT_TOOLS`,面板热配置再覆盖。
     #[serde(default = "default_cursor_text_tools")]
     pub cursor_text_tools: bool,
+    /// **sandchat 门面**(pool=bot 账号的 grokbot 0.39 推理面,默认 **开**)。
+    /// 旧 `aiserver.v1.InferenceService/Stream` 面 2026-09-09 被服务端锁死
+    /// (401 ERROR_NOT_LOGGED_IN),BOT 池的唯一活路就是 sandchat
+    /// (GrokBotService:SendGrokBotUserMessage + WatchGrokBotTranscripts,
+    /// 见 `docs/grokbot-0.39-protocol-re.md` 与 gw-cursor `sandchat` 模块)。
+    /// 关掉后 pool=bot 账号无面可走(路由处直接报错,不落已死的端点)。
+    /// yaml 缺省读 env `CURSOR_SANDCHAT`(`0`/`false` 关),面板热配置再覆盖。
+    /// 命名空间同 [`Self::cursor_tool_guard`],只影响 cursor 家族 pool=bot 账号。
+    #[serde(default = "default_cursor_sandchat")]
+    pub cursor_sandchat: bool,
 }
 
 /// `cursor_text_tools` 的 yaml 缺省:env `CURSOR_TEXT_TOOLS`(`1`/`true` 开)。
@@ -442,6 +452,14 @@ fn default_cursor_field9_tools() -> bool {
     std::env::var("CURSOR_FIELD9_TOOLS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// `cursor_sandchat` 的 yaml 缺省:默认 **开**(pool=bot 的唯一活路);
+/// env `CURSOR_SANDCHAT` 显式 `0`/`false` 才关(`1`/`true` 显式开,与现状一致)。
+fn default_cursor_sandchat() -> bool {
+    std::env::var("CURSOR_SANDCHAT")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// `cursor_cli_phase_timeout_secs` 的 yaml 缺省:env `CURSOR_CLI_PHASE_TIMEOUT_SECS`,
@@ -1147,6 +1165,10 @@ pub struct SystemSettings {
     /// 详见 [`SystemConfig::cursor_text_tools`]。**只影响 cursor 家族 claude 系。**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_text_tools: Option<bool>,
+    /// sandchat 门面(None = 用 yaml 基线,基线默认开)。
+    /// 详见 [`SystemConfig::cursor_sandchat`]。**只影响 cursor 家族 pool=bot 账号。**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_sandchat: Option<bool>,
     /// 兜住本版本**不认识**的 overlay key(新镜像写、旧镜像读的滚动升级窗口)。
     ///
     /// 存在的唯一理由是让「一个陌生 key」不再作废整份 overlay。它有两个消费者:
@@ -1234,6 +1256,9 @@ impl SystemSettings {
         if let Some(v) = self.cursor_text_tools {
             base.cursor_text_tools = v;
         }
+        if let Some(v) = self.cursor_sandchat {
+            base.cursor_sandchat = v;
+        }
     }
 
     /// 由**有效** SystemConfig + 独立的 default_proxy 反构出全量(每字段都 Some)。
@@ -1292,6 +1317,7 @@ impl SystemSettings {
             cursor_cli_phase_timeout_secs: Some(cfg.cursor_cli_phase_timeout_secs as i64),
             cursor_field9_tools: Some(cfg.cursor_field9_tools),
             cursor_text_tools: Some(cfg.cursor_text_tools),
+            cursor_sandchat: Some(cfg.cursor_sandchat),
             // 全量视图由本进程的有效配置构造,按定义不含未知 key。
             unknown: Default::default(),
         }
