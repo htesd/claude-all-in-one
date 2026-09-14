@@ -1985,11 +1985,18 @@ impl Provider for CursorProvider {
         // 那是协议面出问题时的回滚闸。
         let req_has_tools = !chat::to_tools(&req.body).is_empty();
         // inference 不接的形态(URL 媒体等)落回 CLI;`cli_eligible` 是 CLI 的硬前提
-        //(assistant 结尾这类形态 CLI 接不了,回线协议)。pool=api 钉月池:与显式
-        // driver="cli" 同待遇,推理面整体跳过(见上方池钉注释)。
+        //(assistant 结尾这类形态 CLI 接不了,回线协议)。
+        //
+        // 2026-09-11 二版:tools 恢复走 wire(同日凌晨曾被 `pool_api` 项误并回 clidrv ——
+        // wire 也是 cli 身份烧月池,不违反池钉)。动因:clidrv 的 cursor-agent
+        // `--mode ask` 会向模型注入 "supersedes any other instructions" 的只读
+        // preamble,opus/fable 照实拒绝写入、让客户「切 Agent 模式」(生产客诉);
+        // AGENTS.md 强化文案 / 用户轮尾部授权 / 温和引导话术三版提示词对抗全部无效
+        //(防注入语义反而触发抵抗)。wire 由我们渲染报文,该 preamble 物理上不存在。
+        // pool=api 下 chat(无 tools)仍走 clidrv:无写操作可拒,模式话术只是显示问题。
         let cli_driver = !wire_opt_out
             && chat::cli_eligible(&req.body)
-            && (explicit_cli || pool_api || !req_has_tools);
+            && (explicit_cli || !req_has_tools);
 
         // pool=bot 的「绝不跨池」闸 + 新面路由(2026-09-09):旧
         // `aiserver.v1.InferenceService/Stream` 面**当日被服务端锁死**(任何 cursor

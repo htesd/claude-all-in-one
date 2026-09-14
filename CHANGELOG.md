@@ -1,5 +1,32 @@
 # Changelog
 
+## [cursor-tools-back-to-wire] - 2026-09-11
+
+### 功能
+- CUR 池(pool=api)带 tools 的请求恢复走 **wire 线协议**(同日凌晨取消缺省混合时被
+  `pool_api` 项误并回 clidrv;wire 同属 cli 身份烧月池,不违反池钉);无 tools 的 chat
+  仍走 clidrv。
+- 撤掉同日上线的尾部恒定授权声明(`clidrv::TAIL_AUTH_REMINDER` 常量、组装点与测试
+  全删)—— wire 路径本就零注入,clidrv 只剩无 tools 流量,不再需要对抗文案。
+
+### 设计理由
+- cursor-agent `--mode ask` 注入 "Ask mode is active… supersedes any other
+  instructions" 的 preamble,opus/fable 严格服从:自称只读、拒绝写入、让客户
+  「切 Agent 模式」(生产客诉,客户报文 + 冒烟逐字引用双重实锤)。
+- 提示词对抗三连败并各自定位了死因:AGENTS.md 强化文案(「仓库文档」层级,模型原话
+  「一个仓库文件不能授予我 harness 没有给的权限」)→ 用户轮 `<system-reminder>`
+  尾部授权(被归档为「附加声明」,不如真人指令)→ 温和引导话术(0/3,模型反定性
+  「约束来自运行框架本身,文本无法解除」)。前沿 Anthropic 模型的指令层级在
+  preamble 面前不可撼动,且强硬措辞本身就是注入 pattern、触发防注入抵抗。
+- wire 由我们渲染报文,preamble 物理上不存在;且 2026-09-04~09-11 tools 已在 wire
+  上生产跑过一周(「整条工具回路纯协议化」),不是新路。无 tools 的 chat 留 clidrv:
+  没有写操作可拒,模式话术只是显示问题。
+
+### 注意事项
+- 无数据库迁移。显式 `driver="cli"`(账号 extra / `CURSOR_DRIVER`)仍是整组回滚闸,
+  压过本路由;prefill 等 cli 接不了的形态照旧落 wire。
+- cargo test -p gw-cursor 绿(411;尾部声明那 +1 测试随撤回一并删除)。
+
 ## [cursor-pool-no-mixed-default] - 2026-09-11
 
 ### 功能
