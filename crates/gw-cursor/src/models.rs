@@ -229,6 +229,14 @@ pub fn resolve_cursor_model(name: &str) -> Option<String> {
     if n == BOT_POOL_MODEL {
         return Some("grok-4.6".to_string());
     }
+    // grok-4.6 是**命名第三方模型**,烧美元月池(2026-09-12 实测上游计费类目
+    // `cursor-grok-4.6-high`,cur25 半小时 $45 的主犯之一);grok-4.5 全系在
+    // autoBucketModels(auto 池,几乎不烧 $)。2026-09-13 用户拍板:对外 4.6
+    // 缺省归一到 auto 池的 4.5,宁降一代保成本。必须插在目录精确命中**之前** ——
+    // 目录里有 4.6 探测项真身,不拦就直连烧 $ 池了。
+    if n.eq_ignore_ascii_case("grok-4.6") {
+        return Some(grok46_upstream().to_string());
+    }
     // 已经是 Run 目录里的名字 → 原样。
     if catalog().iter().any(|m| m.name == n) {
         return Some(n.to_string());
@@ -272,6 +280,22 @@ pub fn resolve_cursor_model(name: &str) -> Option<String> {
         return None;
     };
     Some(mapped.to_string())
+}
+
+/// grok-4.6 的上游落点:缺省归一到 auto 池的 `grok-4.5`;
+/// `CURSOR_GROK46_DOLLAR=1/true` 恢复直连 4.6(烧美元月池)。进程内读一次
+///(docker 改 env 本来就要重建容器)。
+fn grok46_upstream() -> &'static str {
+    static V: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    V.get_or_init(|| grok46_upstream_for(std::env::var("CURSOR_GROK46_DOLLAR").ok().as_deref()))
+}
+
+/// 纯函数版(测试用):flag 为 "1"/"true"(大小写不敏感)时直连 4.6,其余归一 4.5。
+fn grok46_upstream_for(flag: Option<&str>) -> &'static str {
+    match flag {
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => "grok-4.6",
+        _ => "grok-4.5",
+    }
 }
 
 /// [`resolve_cursor_model`] 的兼容包装:认不出回退 `default`。
@@ -781,8 +805,9 @@ mod tests {
     fn grok46_selectable_but_not_in_menu() {
         // 与 extras 测试共用锁:它会临时往目录里加探测项。
         let _g = CATALOG_TEST_LOCK.lock().unwrap();
-        // 探测项(2026-08-13):精确名透传,不被族归一吞回 grok-4.5;参数照抄 grok-4.5。
-        assert_eq!(to_cursor_model("grok-4.6"), "grok-4.6");
+        // 探测项(2026-08-13)参数照抄 grok-4.5;2026-09-13 起对外名缺省归一到
+        // auto 池的 grok-4.5(省美元月池,见 grok46_upstream),不再精确透传。
+        assert_eq!(to_cursor_model("grok-4.6"), "grok-4.5");
         let m = model_by_name("grok-4.6");
         assert_eq!(
             m.params,
@@ -958,10 +983,28 @@ mod tests {
 
     #[test]
     fn 全名精确匹配不吃前缀() {
-        // 没写 `*` 就是全等:`grok-4.5` 不该顺带放行 `grok-4.6`(新模型要显式上架)。
-        let a = acct_models(serde_json::json!("grok-4.5"));
-        assert!(account_supports(&a, "grok-4.5"));
-        assert!(!account_supports(&a, "grok-4.6"));
+        // 没写 `*` 就是全等:`claude-sonnet-4-5` 不该顺带放行 `claude-sonnet-5`
+        // (新模型要显式上架)。(原 grok-4.5/4.6 用例 2026-09-13 起失效:
+        // 4.6 对外名已归一到 4.5,白名单视角它们是同一个上游模型。)
+        let a = acct_models(serde_json::json!("claude-sonnet-4-5"));
+        assert!(account_supports(&a, "claude-sonnet-4-5"));
+        assert!(!account_supports(&a, "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn grok46_缺省归一auto池_环境变量可恢复直连() {
+        // 纯函数口径:缺省/空/乱值 → auto 池 grok-4.5;"1"/"true"(大小写不敏感)
+        // → 直连 grok-4.6(烧 $ 池)。
+        assert_eq!(grok46_upstream_for(None), "grok-4.5");
+        assert_eq!(grok46_upstream_for(Some("")), "grok-4.5");
+        assert_eq!(grok46_upstream_for(Some("0")), "grok-4.5");
+        assert_eq!(grok46_upstream_for(Some("1")), "grok-4.6");
+        assert_eq!(grok46_upstream_for(Some("TRUE")), "grok-4.6");
+        // 请求路径缺省归一(测试进程不会设 CURSOR_GROK46_DOLLAR);大小写都拦。
+        assert_eq!(resolve_cursor_model("grok-4.6").as_deref(), Some("grok-4.5"));
+        assert_eq!(resolve_cursor_model("GROK-4.6").as_deref(), Some("grok-4.5"));
+        // bot 池单模型名不受影响:仍归一到 4.6(它烧的是 Bot 周池,不碰 $ 池)。
+        assert_eq!(resolve_cursor_model(BOT_POOL_MODEL).as_deref(), Some("grok-4.6"));
     }
 
     #[test]
