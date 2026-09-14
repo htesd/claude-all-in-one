@@ -292,7 +292,7 @@ pub(super) fn convert_tools(
                 tool_repair_fields.insert(short_name.clone(), repair);
             }
 
-            Tool {
+            let tool = Tool {
                 tool_specification: ToolSpecification {
                     name: short_name,
                     description,
@@ -300,9 +300,45 @@ pub(super) fn convert_tools(
                         &serde_json::json!(t.input_schema),
                     ))),
                 },
-            }
+            };
+            stub_oversize_tool(tool)
         })
         .collect()
+}
+
+/// 单工具序列化体积上限(字节)。Kiro 上游对单个 toolSpecification 有 ~32KB 硬限制:
+/// 线上实测 26932B(CC 2.1.270 的 Artifact 工具)成功、38291B(lark docx MCP 工具)
+/// 被确定性 400("Improperly formed request")。取 31KB 留余量。
+/// 背景:Claude Code ≥2.1.270 自带工具暴涨且 schema 变长,用户再挂 MCP 大 schema 工具
+/// (lark docx 单工具 37KB / 245KB)后,整个请求被上游拒死,会话完全不可用。
+const TOOL_SPEC_MAX_BYTES: usize = 31 * 1024;
+
+/// 超体积工具替换为**同名 stub**:保留名字(历史 toolUse 引用不炸)、丢弃 schema。
+/// 不做整工具剔除——历史消息里的 toolUse 若引用一个 tools 列表里不存在的名字,
+/// 上游同样可能 400;stub 只需几十字节,行为最接近"工具仍在"。
+fn stub_oversize_tool(tool: Tool) -> Tool {
+    let bytes = serde_json::to_string(&tool).map(|s| s.len()).unwrap_or(0);
+    if bytes <= TOOL_SPEC_MAX_BYTES {
+        return tool;
+    }
+    let name = tool.tool_specification.name;
+    tracing::warn!(
+        tool = %name,
+        bytes,
+        "单工具 schema 体积超上游限制({TOOL_SPEC_MAX_BYTES}B),已替换为同名 stub"
+    );
+    Tool {
+        tool_specification: ToolSpecification {
+            name: name.clone(),
+            description: format!(
+                "[参数 schema 体积({bytes}B)超上游限制已省略;请按工具名 '{name}' 的语义给出最简参数]"
+            ),
+            input_schema: InputSchema::from_json(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +377,54 @@ mod desc_tests {
         let mut repair = HashMap::new();
         let out = convert_tools(&tools, &mut map, &mut repair);
         assert_eq!(out[0].tool_specification.description, "real desc");
+    }
+
+    #[test]
+    fn oversize_tool_is_replaced_with_same_name_stub() {
+        // 线上原型(2026-09-14):CC 2.1.270 + lark docx MCP,单工具 schema 37KB/245KB
+        // 被 Kiro 确定性 400。stub 必须保留工具名(历史 toolUse 引用不炸)且体积达标。
+        let mut t = atool("mcp__lark__docx_big", "big tool");
+        t.input_schema.insert(
+            "huge".to_string(),
+            serde_json::Value::String("x".repeat(64 * 1024)),
+        );
+        let tools = Some(vec![t]);
+        let mut map = HashMap::new();
+        let mut repair = HashMap::new();
+        let out = convert_tools(&tools, &mut map, &mut repair);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].tool_specification.name, "mcp__lark__docx_big",
+            "stub 必须保留原名"
+        );
+        let bytes = serde_json::to_string(&out[0]).unwrap().len();
+        assert!(
+            bytes <= TOOL_SPEC_MAX_BYTES,
+            "stub 后体积应回落到限制内,实际 {bytes}"
+        );
+        assert_eq!(
+            out[0].tool_specification.input_schema.json["type"], "object",
+            "stub schema 应为空 object"
+        );
+    }
+
+    #[test]
+    fn normal_size_tool_is_not_stubbed() {
+        // CC 自带工具级别(几 KB)必须原样放行,不被误 stub。
+        let mut t = atool("Artifact", "normal desc");
+        t.input_schema.insert(
+            "properties".to_string(),
+            serde_json::json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+        );
+        let tools = Some(vec![t]);
+        let mut map = HashMap::new();
+        let mut repair = HashMap::new();
+        let out = convert_tools(&tools, &mut map, &mut repair);
+        assert_eq!(out[0].tool_specification.description, "normal desc");
+        assert!(
+            out[0].tool_specification.input_schema.json["properties"]["path"]["type"] == "string",
+            "正常 schema 应保留"
+        );
     }
 
     fn contains_banned(v: &serde_json::Value) -> bool {

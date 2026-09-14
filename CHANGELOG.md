@@ -1,5 +1,25 @@
 # Changelog
 
+## [kiro-tool-spec-stub] - 2026-09-14
+
+### 修复
+- **新版 Claude Code(≥2.1.270)整会话被 Kiro 确定性 400 的根因与修复**:新版 CC 自带
+  工具暴涨到 35 个且 schema 显著变长(Artifact 单工具 kiro 格式 26.9KB),用户再叠加
+  MCP 大 schema 工具(lark `docx_v1_documentBlock_batchUpdate` 37KB、
+  `docx_v1_documentBlockChildren_create` 245KB)后,**单个 toolSpecification 超上游
+  ~32KB 硬限制**,整个请求被 "Improperly formed request" 拒死,重试/换号均无效。
+- 线上探测实锤阈值:单工具 kiro 格式 26932B 成功、38291B 确定性 400;与工具总数、
+  tools 段总量(188KB 可过)、报文总体积(489KB 失败 vs 664KB 成功)均无关。
+- 修法:`convert_tools` 输出侧按序列化字节判定,单工具 > 31KB(留余量)替换为
+  **同名 stub**(保留名字 + 短描述 + 空 object schema),WARN 记录原名与原体积。
+  不做整工具剔除 —— 历史 toolUse 引用了 tools 列表里不存在的名字,上游同样可能 400;
+  stub 几十字节,行为最接近"工具仍在"。
+
+### 验证
+- 生产链路探测(同一 pig key、同一号池):原 78 工具 400 → 仅 stub 两个 lark 大工具后
+  200;新增单测 `oversize_tool_is_replaced_with_same_name_stub` /
+  `normal_size_tool_is_not_stubbed`;cargo test --workspace 全绿(gw-kiro 541)。
+
 ## [cursor-fork-heal] - 2026-09-13
 
 ### 修复
