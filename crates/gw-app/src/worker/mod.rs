@@ -2352,7 +2352,7 @@ async fn models(State(st): State<Arc<WorkerState>>) -> axum::response::Response 
             // 纯 bot 池裁剪:grokbot 0.39(sandchat 面)没有模型字段,服务端
             // 永远是同一个 Grok;把全量目录给客户端只会诱导它点到 bot 号接不了
             // 的模型、然后撞「已钉 pool=bot」拒绝。worker 持有的账号**全部**钉
-            // pool=bot 时只留 grok_bot_auto 一项;混合池/无账号维持全量目录
+            // pool=bot 时只留 grok_bot_auto 一项;非纯 bot 池/无账号维持全量目录
             // (判据与调度器账号集同源,见 accounts_snapshot)。
             let list = if bot_pool_only(&st) {
                 gw_cursor::bot_pool_list()

@@ -1,5 +1,24 @@
 # Changelog
 
+## [cursor-pool-no-mixed-default] - 2026-09-11
+
+### 功能
+- 取消缺省混合:cursor 账号未钉 `pool` 一律按 api 对待(只走 cli 身份烧月池),推理面整体跳过;
+  只有显式 `pool="bot"` 才走 sandchat 面烧 Bot 周池,语义不变。
+- 管理端 `pool` 字段的注释/报错文案同步改为「清除 = 回缺省(月池)」。
+
+### 设计理由
+- 旧 InferenceService 面 2026-09-09 起对任何 cursor JWT 一律 401,缺省混合的
+  「推理面为主、故障落 clidrv」只剩先撞死面再把 401 回显给客户的纯损耗(生产 502 的
+  直接来源之一)。
+- grokbot 0.39 起没有模型字段、服务端永远是同一个 Grok,Bot 周池必须是显式选择,
+  不能让一个未钉号静默烧到它。
+
+### 注意事项
+- 无数据库迁移。存量未钉号(cur15、lan 等)行为变化:inference 面不再尝试,tools/composer
+  形态直接落 cli/wire —— 这些形态本就在死面上 401,现在是把必然的失败换成直连活路。
+- 全量 cargo test --workspace 绿(gw-app 514 / gw-cursor 411)。
+
 ## [architecture-r2-worker-extra] - 2026-09-10
 
 ### 功能

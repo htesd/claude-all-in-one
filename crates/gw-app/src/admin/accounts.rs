@@ -257,13 +257,14 @@ pub struct UpdateAccountBody {
     driver: Option<String>,
     /// 定点切换池钉(写 `extra.pool`,走 merge_account_extra 绝不碰凭据,仿 `driver`)。
     ///
-    /// 一个 cursor 号有两个池能服务第三方模型:sand 身份(InferenceService 面,
-    /// 含 field9/TextEmu 门面)烧 Bot 周池;cli 身份(clidrv/wire)烧月池(auto/api)。
-    /// 缺省不钉 = 混合(推理面为主,驱动级故障兜底 clidrv)。
-    /// `""` = 清除(回缺省);`"bot"` = 只走 sand 面,绝不跨池月池;
-    /// `"api"` = 只走 cli 身份,推理面整体跳过。其余值 400 —— fail-closed,
-    /// 与 `driver` 同一纪律(收下一个认不出的池名,读侧会当缺省混合处理,
-    /// 与 UI 显示不符)。
+    /// 一个 cursor 号有两个池能服务第三方模型:sand 身份(sandchat/GrokBotService
+    /// 面;旧 InferenceService 面 2026-09-09 已死)烧 Bot 周池;cli 身份
+    /// (clidrv/wire)烧月池(auto/api)。**缺省不钉 = 只走月池**(缺省混合
+    /// 2026-09-11 取消:死面兜底只剩把 401 回显给客户的纯损耗)。
+    /// `""` = 清除(回缺省 = 月池);`"bot"` = 只走 sand 面,绝不跨池月池;
+    /// `"api"` = 只走 cli 身份(与缺省同义,显式标记)。其余值 400 ——
+    /// fail-closed,与 `driver` 同一纪律(收下一个认不出的池名,读侧会当
+    /// 缺省(月池)处理,与 UI 显示不符)。
     #[serde(default)]
     pool: Option<String>,
 }
@@ -285,9 +286,9 @@ fn normalize_driver(raw: &str) -> Result<serde_json::Value, String> {
     }
 }
 
-/// `pool` 的写侧校验:`""` → `null`(清除 = 回缺省混合);`"bot"` → 只烧 Bot 周池;
-/// `"api"` → 只烧月池(auto/api)。其余一律拒绝(fail-closed,理由见
-/// [`UpdateAccountBody::pool`])。
+/// `pool` 的写侧校验:`""` → `null`(清除 = 回缺省,即只走月池);`"bot"` → 只烧
+/// Bot 周池;`"api"` → 只烧月池(auto/api,与缺省同义)。其余一律拒绝(fail-closed,
+/// 理由见 [`UpdateAccountBody::pool`])。
 fn normalize_pool(raw: &str) -> Result<serde_json::Value, String> {
     match raw.trim() {
         "" => Ok(serde_json::Value::Null),
@@ -295,7 +296,7 @@ fn normalize_pool(raw: &str) -> Result<serde_json::Value, String> {
         "api" => Ok(serde_json::json!("api")),
         other => Err(format!(
             "未知池钉 {other:?};只接受 \"bot\"(只走 Bot 周池)、\"api\"(只走月池 auto/api)\
-             或 \"\"(清除,回缺省混合)"
+             或 \"\"(清除,回缺省 = 月池)"
         )),
     }
 }
@@ -463,7 +464,7 @@ fn redacted_view(row: AccountRow, memberships: Option<&[(String, i64)]>) -> serd
         // 与 `gw-cursor` 读侧 `opt_str("driver")` 同口径。
         "driver": extra.get("driver").filter(|v| !v.is_null()).cloned().unwrap_or(serde_json::Value::Null),
         // 池钉顶层回显(前端要能显示某号钉了哪个池、并高亮对应额度窗口)。
-        // 缺失/null = 缺省混合,统一吐 null;与 `gw-cursor` 读侧 `opt_str("pool")` 同口径。
+        // 缺失/null = 缺省(只走月池),统一吐 null;与 `gw-cursor` 读侧 `opt_str("pool")` 同口径。
         "pool": extra.get("pool").filter(|v| !v.is_null()).cloned().unwrap_or(serde_json::Value::Null),
         "disabled": row.disabled,
         "extra": extra,
@@ -1740,7 +1741,7 @@ async fn update_account(
             Err(e) => return internal_error(e),
         }
     }
-    // 定点切换池钉(同上:增量 merge,绝不碰凭据)。`""` 写 null = 回缺省混合。
+    // 定点切换池钉(同上:增量 merge,绝不碰凭据)。`""` 写 null = 回缺省(月池)。
     if let Some(raw) = &body.pool {
         let pool_val = match normalize_pool(raw) {
             Ok(v) => v,
@@ -2853,7 +2854,7 @@ mod tests {
         assert!(row.extra.contains("tok-secret"), "清除驱动不得动凭据");
     }
 
-    /// 池钉定点切换:设 `bot`/`api` → 落库 + 顶层回显;`""` → 写 null 回缺省混合;
+    /// 池钉定点切换:设 `bot`/`api` → 落库 + 顶层回显;`""` → 写 null 回缺省(月池);
     /// 认不出的值整单 400 且库内不动(fail-closed,与 driver 同一纪律)。
     /// 全程不得碰凭据。
     #[tokio::test]
@@ -2902,7 +2903,7 @@ mod tests {
         let row = store.get_account("acc1").unwrap().unwrap();
         assert!(row.extra.contains(r#""pool":"api""#), "api 应落库: {}", row.extra);
 
-        // 清除:空串 → null(读侧与缺失同义 = 缺省混合)。
+        // 清除:空串 → null(读侧与缺失同义 = 缺省只走月池)。
         let body = serde_json::json!({"pool": ""}).to_string();
         let resp = app
             .clone()

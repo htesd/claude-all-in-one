@@ -1957,17 +1957,21 @@ impl Provider for CursorProvider {
         // 池钉(2026-09-07):一个 cursor 号有两个池能服务第三方模型 ——
         // sand 身份烧 **Bot 周池**(0.39 起是 sandchat/GrokBotService 面;
         // 之前的 InferenceService 面含 field9/TextEmu 门面,2026-09-09 已死);
-        // cli 身份(clidrv 子进程 / wire 线协议)烧 **月池**(auto/api)。缺省不钉 =
-        // 现状混合(推理面为主、驱动级故障落 clidrv)。钉死后**绝不跨池**:
+        // cli 身份(clidrv 子进程 / wire 线协议)烧 **月池**(auto/api)。钉死后**绝不跨池**:
         // - `extra.pool="bot"`:只走 sand 面(sandchat)。门面关闭直接报错,
         //   形态/故障兜底一律禁用 —— 那些路径会静默烧到月池。
-        // - `extra.pool="api"`:只走 cli 身份,推理面整体跳过(语义等同
-        //   driver="cli",但表达的是池不是实现;将来月池侧有了纯协议面可无缝换)。
+        // - 其余一切(钉 `"api"` 或未钉):只走 cli 身份(clidrv 跑 chat、wire 跑 tools,
+        //   两者都烧月池),推理面整体跳过(语义是池不是实现;将来月池侧有了纯协议面
+        //   可无缝换)。
+        // **缺省混合 2026-09-11 取消**:旧 inference 面对任何 cursor JWT 一律 401 后,
+        // 「未钉 = 推理面为主、故障落 clidrv」只剩先撞死面再把 401 回显给客户的纯
+        // 损耗;而 Bot 周池(grokbot 无模型字段,服务端永远是同一个 Grok)必须是
+        // 显式选择 —— 未钉一律按 api 对待,不存在第三条路。
         // 冲突口径:显式 driver 闸(cli/wire/CURSOR_DRIVER)是回滚命门,压过池钉;
         // 同号同时钉 bot 又退 cli/wire 属操作失误,打 warn 提醒。
         let pool_pin = Self::opt_str(&ctx.account, "pool");
         let pool_bot = pool_pin.as_deref() == Some("bot");
-        let pool_api = pool_pin.as_deref() == Some("api");
+        let pool_api = !pool_bot;
         if pool_bot && (explicit_cli || wire_opt_out) {
             tracing::warn!(
                 account = %ctx.account.account_id,
