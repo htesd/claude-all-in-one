@@ -169,6 +169,59 @@ pub async fn set_on_demand(
     Ok(())
 }
 
+/// 需要逐号同意数据保留政策的门控模型(NoZDR consent):`(model_id, consent_version)`。
+///
+/// 逆向口径来自上游 `ERROR_MODEL_BLOCKED` 错误体里的 `buttons[].dashboardAction`
+///(`enableNoZdrModelConsent`,args 带 `modelId` / `consentVersion`)。Cursor 以后
+/// 新增门控模型时往这里追加。
+pub const KNOWN_NOZDR_CONSENTS: &[(&str, &str)] =
+    &[("claude-fable-5", "fable-data-retention-v1")];
+
+/// 替账号点「Accept」:`DashboardService/SetUserNoZdrModelConsent`。
+///
+/// 与真实客户端在「Review Data Policy」弹窗点 Accept 完全等价 —— 只是 per-user
+/// 设置位,幂等,重复调无副作用。返回响应里的 `consented`。
+///
+/// 字段口径(`aiserver.v1.SetUserNoZdrModelConsentRequest`,桌面端 3.18.25 bundle):
+/// `model_id` / `enabled` / `acknowledged` / `consent_version`。
+pub async fn set_user_no_zdr_model_consent(
+    client: &reqwest::Client,
+    account: &Account,
+    api_host: &str,
+    model_id: &str,
+    consent_version: &str,
+) -> Result<bool, UpstreamError> {
+    let text = dashboard_call(
+        client,
+        account,
+        api_host,
+        "SetUserNoZdrModelConsent",
+        &serde_json::json!({
+            "modelId": model_id,
+            "enabled": true,
+            "acknowledged": true,
+            "consentVersion": consent_version,
+        }),
+    )
+    .await?;
+    parse_consented(&text)
+}
+
+/// 解析 `SetUserNoZdrModelConsent` 响应 → `consented`。缺字段按 false(没确认上),
+/// 让调用方下个周期重试,而不是假装同意过。
+pub fn parse_consented(body: &str) -> Result<bool, UpstreamError> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        UpstreamError::new(
+            UpstreamErrorKind::Other,
+            format!("Cursor SetUserNoZdrModelConsent 响应不是 JSON: {e}"),
+        )
+    })?;
+    Ok(v
+        .get("consented")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false))
+}
+
 /// 解析 `GetHardLimit` JSON → [`OnDemandQuota`](不含已用金额,那在用量接口里)。
 pub fn parse_hard_limit(body: &str) -> Result<OnDemandQuota, UpstreamError> {
     let v: HardLimitResponse = serde_json::from_str(body).map_err(|e| {
@@ -517,6 +570,25 @@ struct PlanUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `{"consented":true}`(2026-09-12 cur24/cur25 实测响应)。
+    #[test]
+    fn 同意响应_已同意() {
+        assert!(parse_consented(r#"{"consented":true}"#).expect("应解析"));
+    }
+
+    /// `consented` 缺省或 false → 未同意(调用方下周期重试,不假装成功)。
+    #[test]
+    fn 同意响应_未确认视为未同意() {
+        assert!(!parse_consented(r#"{"consented":false}"#).expect("应解析"));
+        assert!(!parse_consented(r"{}").expect("应解析"));
+    }
+
+    /// 非 JSON 必须报错,绝不能当已同意。
+    #[test]
+    fn 同意响应_非_json报错() {
+        assert!(parse_consented("not json").is_err());
+    }
 
     #[test]
     fn 解析官方样例_美分换美元() {

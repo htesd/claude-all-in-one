@@ -533,6 +533,9 @@ pub struct CursorProvider {
     assets: Arc<AssetStore>,
     /// 「上一轮被内建工具截断」的待发纠偏标记(见 [`TruncationNotices`])。
     notices: Arc<TruncationNotices>,
+    /// NoZDR 数据政策同意的进程内去重表(`{account_id}\0{model_id}`)。
+    /// 见 [`usage::KNOWN_NOZDR_CONSENTS`];幂等,重启后每号至多重放一次。
+    nozdr_consented: Mutex<std::collections::HashSet<String>>,
     /// 续轮描述符影子表(见 [`DescriptorShadow`])。
     shadow: Arc<DescriptorShadow>,
     /// 内容分节库(应答服务端 `4.2` 点名,见 [`ContentSections`])。
@@ -1474,6 +1477,7 @@ impl CursorProvider {
             conversations: Arc::new(ConvRegistry::from_env()),
             assets: Arc::new(AssetStore::default()),
             notices: Arc::new(TruncationNotices::default()),
+            nozdr_consented: Mutex::new(std::collections::HashSet::new()),
             shadow: Arc::new(DescriptorShadow::default()),
             sections: Arc::new(ContentSections::default()),
             cli_cfg: clidrv::CliDriverConfig::from_env(),
@@ -2634,6 +2638,49 @@ impl Provider for CursorProvider {
     ) -> Result<Option<AccountQuota>, UpstreamError> {
         let client = self.client_for(account)?;
         let mut q = usage::get_account_quota(&client, account, &self.cfg.api_host).await?;
+        // 门控模型的数据保留政策同意(NoZDR consent):未同意的号请求 fable 等模型
+        // 会被上游 ERROR_MODEL_BLOCKED 全灭(2026-09-12 生产事故:fable-5-1 自上架
+        // 0 成功,真因被 CLI 吞成「未成功收尾」)。配额查询是每个号周期性必走之路
+        //(新进预热 / TTL 刷新 / sweep),顺路把已知同意点掉,等价导入即自动 Accept。
+        // 进程内去重;失败不拖垮主查询,下个配额周期重试。
+        for (model_id, consent_version) in usage::KNOWN_NOZDR_CONSENTS {
+            let key = format!("{}\u{0}{}", account.account_id, model_id);
+            if self
+                .nozdr_consented
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&key)
+            {
+                continue;
+            }
+            match usage::set_user_no_zdr_model_consent(
+                &client,
+                account,
+                &self.cfg.api_host,
+                model_id,
+                consent_version,
+            )
+            .await
+            {
+                // 上游 200 就当落定(含 consented=false 的未确认:也记去重,免得每个
+                // 配额周期都重放一次写操作;进程重启后自然再试)。
+                Ok(consented) => {
+                    self.nozdr_consented
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(key);
+                    if consented {
+                        tracing::info!(account = %account.account_id, model = model_id,
+                            "cursor 数据保留政策已同意(NoZDR consent)");
+                    } else {
+                        tracing::warn!(account = %account.account_id, model = model_id,
+                            "cursor NoZDR consent 上游未确认(consented=false),本进程内不再重试");
+                    }
+                }
+                Err(e) => tracing::debug!(account = %account.account_id, model = model_id,
+                    "cursor NoZDR consent 失败(下周期重试,不影响配额): {e}"),
+            }
+        }
         // 超额开关/上限来自 GetHardLimit(用量接口只在**已开启**时给数字,推不出开关态)。
         //
         // 这一跳失败**不能**让整个配额查询失败:套餐额度是账号页的主信息,不该被一个
