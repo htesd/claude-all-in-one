@@ -1,5 +1,24 @@
 # Changelog
 
+## [kiro-tool-union-strip] - 2026-09-11
+
+### 修复
+- **MCP 工具联合类型 schema 被 Bedrock 确定性 400 并毒化账号失败计数**:客户侧
+  Claude Code 挂的 codex_app MCP 工具(如 `mcp__codex_app__automation_update`)
+  input_schema 顶层就是 `anyOf` + `$defs`,上游直接 400 `TOOL_SCHEMA_INVALID`
+  ("input_schema does not support oneOf, allOf, or anyOf at the top level");
+  该错误按 ServerError 计入账号失败,坏报文随重试迁徙,7 个账号连续失败被拉起。
+- 修法:转换器恒走 `strip_union_keywords`(原「含图才降级」口径作废 —— 纯文本
+  请求带联合类型同样 400):`anyOf`/`oneOf` 取第一个对象变体(`$ref` 就地内联,
+  外层 description/title/default 补上),`allOf` 浅合并(properties 深合并、
+  required 去重),`$defs`/`definitions` 内联后删除,残留 `$ref` 宽松 object
+  兜底,递归自引用深度上限防死循环。尽量保留参数信息,不做整体置空。
+
+### 验证
+- 新增单测:顶层 anyOf+$defs 内联、嵌套属性 anyOf、allOf 合并、普通 schema 原样、
+  递归 $ref 终止;`multimodal_request_downgrades_complex_tool_schema` 口径同步
+  更新(纯文本也不再保留 anyOf);cargo test --workspace 全绿。
+
 ## [cursor-tools-back-to-wire] - 2026-09-11
 
 ### 功能

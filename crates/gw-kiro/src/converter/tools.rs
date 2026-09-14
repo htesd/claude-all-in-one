@@ -56,6 +56,126 @@ pub(super) fn apply_multimodal_tool_schema_compatibility(tools: &mut [Tool], has
     }
 }
 
+/// 解析本地 `$ref` 指针(仅支持 `#/$defs/x`、`#/definitions/x` 这类同文档路径)。
+fn resolve_local_ref<'a>(ref_str: &str, root: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    let path = ref_str.strip_prefix("#/")?;
+    let mut cur = root;
+    for seg in path.split('/') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// 递归清除 Kiro/Bedrock 不支持的 JSON Schema 联合类型。
+///
+/// 背景:2026-09-11 客户侧 Claude Code 2.1.162 挂的 codex_app MCP 工具
+/// (如 `mcp__codex_app__automation_update`)顶层就是 `anyOf` + `$defs`,`Bedrock` 直接
+/// 400 `TOOL_SCHEMA_INVALID`("input_schema does not support oneOf, allOf, or anyOf at the top level"),
+/// 且该错误按 ServerError 计入账号失败,坏报文随重试迁徙把一批号的连续失败全拉起来。
+///
+/// 策略(尽量保留参数信息,不做整体置空):
+/// - `anyOf`/`oneOf` → 取第一个对象变体(`$ref` 就地内联展开),外层 description/title/default 补上;
+/// - `allOf` → 浅合并所有变体(properties 深合并、required 去重合并,其余键后者覆盖前者);
+/// - `$defs`/`definitions` 在 `$ref` 全部内联后删除;
+/// - 残留无法解析的 `$ref` → 宽松 object 兜底;
+/// - 递归自引用用深度上限防死循环。
+pub(super) fn strip_union_keywords(schema: &serde_json::Value) -> serde_json::Value {
+    fn inner(node: &serde_json::Value, root: &serde_json::Value, depth: usize) -> serde_json::Value {
+        let serde_json::Value::Object(obj) = node else {
+            return node.clone();
+        };
+        // 深度兜底:递归 schema 时防栈爆
+        if depth > 16 {
+            return serde_json::json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true});
+        }
+        // 1) $ref 节点:就地解析为所指定义
+        if let Some(r) = obj.get("$ref").and_then(|v| v.as_str()) {
+            let target = resolve_local_ref(r, root).cloned().unwrap_or_else(|| {
+                serde_json::json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true})
+            });
+            return inner(&target, root, depth + 1);
+        }
+        // 2) anyOf/oneOf:取第一个对象变体
+        for key in ["anyOf", "oneOf"] {
+            if let Some(serde_json::Value::Array(variants)) = obj.get(key) {
+                let mut cleaned = match variants.iter().find(|v| v.is_object()) {
+                    Some(first) => inner(first, root, depth + 1),
+                    None => serde_json::json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true}),
+                };
+                if let serde_json::Value::Object(cm) = &mut cleaned {
+                    for ak in ["description", "title", "default"] {
+                        if !cm.contains_key(ak) {
+                            if let Some(v) = obj.get(ak) {
+                                cm.insert(ak.to_string(), v.clone());
+                            }
+                        }
+                    }
+                }
+                return cleaned;
+            }
+        }
+        // 3) allOf:浅合并全部变体
+        if let Some(serde_json::Value::Array(variants)) = obj.get("allOf") {
+            let mut merged = serde_json::Map::new();
+            for v in variants {
+                if let serde_json::Value::Object(m) = inner(v, root, depth + 1) {
+                    for (k, val) in m {
+                        match k.as_str() {
+                            "properties" => {
+                                let entry = merged
+                                    .entry("properties")
+                                    .or_insert_with(|| serde_json::json!({}));
+                                if let (serde_json::Value::Object(dst), serde_json::Value::Object(src)) =
+                                    (&mut *entry, &val)
+                                {
+                                    for (pk, pv) in src {
+                                        dst.insert(pk.clone(), pv.clone());
+                                    }
+                                }
+                            }
+                            "required" => {
+                                let entry = merged
+                                    .entry("required")
+                                    .or_insert_with(|| serde_json::json!([]));
+                                if let (serde_json::Value::Array(dst), serde_json::Value::Array(src)) =
+                                    (&mut *entry, &val)
+                                {
+                                    for iv in src {
+                                        if !dst.contains(iv) {
+                                            dst.push(iv.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                merged.insert(k, val);
+                            }
+                        }
+                    }
+                }
+            }
+            for ak in ["description", "title", "default"] {
+                if !merged.contains_key(ak) {
+                    if let Some(v) = obj.get(ak) {
+                        merged.insert(ak.to_string(), v.clone());
+                    }
+                }
+            }
+            return serde_json::Value::Object(merged);
+        }
+        // 4) 普通节点:丢弃 $defs/definitions(此时 $ref 已内联),递归清理子节点
+        let mut out = serde_json::Map::new();
+        for (k, v) in obj {
+            if matches!(k.as_str(), "$defs" | "definitions") {
+                continue;
+            }
+            out.insert(k.clone(), inner(v, root, depth + 1));
+        }
+        serde_json::Value::Object(out)
+    }
+    inner(schema, schema, 0)
+}
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
@@ -176,7 +296,9 @@ pub(super) fn convert_tools(
                 tool_specification: ToolSpecification {
                     name: short_name,
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(strip_union_keywords(
+                        &serde_json::json!(t.input_schema),
+                    ))),
                 },
             }
         })
@@ -219,6 +341,88 @@ mod desc_tests {
         let mut repair = HashMap::new();
         let out = convert_tools(&tools, &mut map, &mut repair);
         assert_eq!(out[0].tool_specification.description, "real desc");
+    }
+
+    fn contains_banned(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(m) => m.iter().any(|(k, c)| {
+                matches!(k.as_str(), "anyOf" | "oneOf" | "allOf" | "$defs" | "definitions" | "$ref")
+                    || contains_banned(c)
+            }),
+            serde_json::Value::Array(a) => a.iter().any(contains_banned),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn strip_union_top_level_anyof_with_defs() {
+        // 2026-09-11 事故原型:mcp__codex_app__automation_update 顶层 anyOf + $defs
+        let schema = serde_json::json!({
+            "$defs": {
+                "ById": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+                "ByName": {"type": "object", "properties": {"name": {"type": "string"}}}
+            },
+            "anyOf": [{"$ref": "#/$defs/ById"}, {"$ref": "#/$defs/ByName"}],
+            "description": "更新自动化任务"
+        });
+        let out = strip_union_keywords(&schema);
+        assert!(!contains_banned(&out), "清洗后不应残留联合/引用关键字: {out}");
+        assert_eq!(out["description"], "更新自动化任务");
+        assert_eq!(out["properties"]["id"]["type"], "string", "应取第一个变体并内联 $ref");
+    }
+
+    #[test]
+    fn strip_union_nested_property_anyof() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "目标"},
+                "n": {"type": "integer"}
+            }
+        });
+        let out = strip_union_keywords(&schema);
+        assert!(!contains_banned(&out));
+        assert_eq!(out["properties"]["target"]["type"], "string");
+        assert_eq!(out["properties"]["target"]["description"], "目标");
+        assert_eq!(out["properties"]["n"]["type"], "integer");
+    }
+
+    #[test]
+    fn strip_union_allof_merges() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"properties": {"b": {"type": "integer"}}, "required": ["b"]}
+            ]
+        });
+        let out = strip_union_keywords(&schema);
+        assert!(!contains_banned(&out));
+        assert_eq!(out["properties"]["a"]["type"], "string");
+        assert_eq!(out["properties"]["b"]["type"], "integer");
+        assert_eq!(out["required"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn strip_union_plain_schema_untouched() {
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"q": {"type": "string", "minLength": 1}},
+            "required": ["q"],
+            "additionalProperties": false
+        });
+        assert_eq!(strip_union_keywords(&schema), schema);
+    }
+
+    #[test]
+    fn strip_union_recursive_ref_terminates() {
+        // 自引用 $ref 必须在深度上限处兜底,不能死循环
+        let schema = serde_json::json!({
+            "$defs": {"node": {"type": "object", "properties": {"child": {"$ref": "#/$defs/node"}}}},
+            "$ref": "#/$defs/node"
+        });
+        let out = strip_union_keywords(&schema);
+        assert!(!contains_banned(&out), "残留 $ref: {out}");
     }
 }
 

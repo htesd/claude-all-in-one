@@ -430,10 +430,14 @@ fn multimodal_request_downgrades_complex_tool_schema() {
         )
         .unwrap()
     };
-    // 含图:anyOf 应被剥除(降级为宽松 schema)。
+    // 含图:anyOf 应被剥除(降级/清洗后上游不再 400)。
     assert!(!tools_json(&mk(true)).contains("anyOf"), "含图请求的复杂 schema 应降级");
-    // 不含图:anyOf 保留(不误伤纯文本请求的工具定义)。
-    assert!(tools_json(&mk(false)).contains("anyOf"), "纯文本请求不应改工具 schema");
+    // 不含图:2026-09-11 起确认纯文本请求带联合类型同样被 Bedrock 400(TOOL_SCHEMA_INVALID,
+    // codex_app MCP 顶层 anyOf+$defs 毒化 7 个账号失败计数),转换器恒走 strip_union_keywords。
+    // anyOf 不再保留,但参数结构保留(取第一变体)。
+    let plain = tools_json(&mk(false));
+    assert!(!plain.contains("anyOf"), "纯文本请求的联合类型 schema 也应清洗");
+    assert!(plain.contains("\"x\""), "清洗后参数 x 应保留");
 }
 
 #[test]
