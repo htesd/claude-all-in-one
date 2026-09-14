@@ -1,6 +1,7 @@
 //! gw-cursor —— 把 Cursor 订阅(IDE 后端 ConnectRPC 协议)接成一个 Provider。
 //!
-//! 逆向自本机 Cursor **3.14.27**:对 `agentn.api5.cursor.sh` 的
+//! 逆向自本机 Cursor **3.14.27**(2026-09-12 对本机 **3.18.25** 重抓复核,见 wire.rs):
+//! 对 `agentn.global.api5.cursor.sh` 的
 //! `agent.v1.AgentService/Run` 发 HTTP/2 + ConnectRPC(protobuf,逐帧 gzip),
 //! 鉴权 = `Bearer <session JWT>` + `x-cursor-checksum`(zyg cipher + machineId)。
 //! 完整规格见 `PROTOCOL-agent-run.md`。
@@ -10,7 +11,8 @@
 //!
 //! ## 两个域名,别搞混
 //!
-//! - `agentn.api5.cursor.sh` —— 推理(`AgentService/Run`),BiDi 流。
+//! - `agentn.global.api5.cursor.sh` —— 推理(`AgentService/Run`),BiDi 流。
+//!   (2026-09 起官方默认带 global 区域路由;旧的 `agentn.api5.cursor.sh` 仍兼容。)
 //! - `api2.cursor.sh` —— unary 服务:`ServerConfigService/GetServerConfig`(取
 //!   `config_version`)、OAuth `/oauth/token`(刷新)、以及
 //!   `DashboardService/GetCurrentPeriodUsage`(官方账期用量,admin 配额列)。
@@ -418,7 +420,10 @@ pub struct CursorConfig {
 impl Default for CursorConfig {
     fn default() -> Self {
         Self {
-            agent_host: "agentn.api5.cursor.sh".to_string(),
+            // 2026-09-12 起默认跟服务端下发的 global 区域路由域名(3.18.25 实测,
+            // 响应头 x-cursor-server-region 按出口地域分配);旧默认 agentn.api5.cursor.sh
+            // 仍可用,但已非真客户端默认。
+            agent_host: "agentn.global.api5.cursor.sh".to_string(),
             api_host: "api2.cursor.sh".to_string(),
         }
     }
@@ -2721,7 +2726,8 @@ mod tests {
     #[test]
     fn default_hosts_are_the_run_endpoint_and_api2() {
         let d = CursorConfig::default();
-        assert_eq!(d.agent_host, "agentn.api5.cursor.sh");
+        // 2026-09-12 起默认 = 服务端下发的 global 区域路由域名(3.18.25 重抓)。
+        assert_eq!(d.agent_host, "agentn.global.api5.cursor.sh");
         assert_eq!(d.api_host, "api2.cursor.sh");
         // 退役端点的域名不该再作为推理主机
         assert_ne!(d.agent_host, "api2.cursor.sh");
@@ -2729,16 +2735,16 @@ mod tests {
 
     #[test]
     fn from_config_reads_both_hosts_and_defaults_each() {
-        let cfg = serde_json::json!({"cursor":{"agent_host":"agentn.global.api5.cursor.sh"}});
+        let cfg = serde_json::json!({"cursor":{"agent_host":"agentn.api5.cursor.sh"}});
         let c = CursorConfig::from_cfg(&cfg);
-        assert_eq!(c.agent_host, "agentn.global.api5.cursor.sh");
+        assert_eq!(c.agent_host, "agentn.api5.cursor.sh", "显式配置旧域名也要尊重(覆盖默认)");
         assert_eq!(c.api_host, "api2.cursor.sh", "未配的那个走默认");
 
         let empty = CursorConfig::from_cfg(&serde_json::Value::Null);
-        assert_eq!(empty.agent_host, "agentn.api5.cursor.sh");
+        assert_eq!(empty.agent_host, "agentn.global.api5.cursor.sh");
         // 空串不算配置
         let blank = CursorConfig::from_cfg(&serde_json::json!({"cursor":{"agent_host":"  "}}));
-        assert_eq!(blank.agent_host, "agentn.api5.cursor.sh");
+        assert_eq!(blank.agent_host, "agentn.global.api5.cursor.sh");
     }
 
     #[test]

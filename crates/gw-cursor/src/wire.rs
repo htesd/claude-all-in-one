@@ -1,6 +1,8 @@
 //! Cursor 线缆细节:`x-cursor-checksum` 生成、请求头 profile、ConnectRPC 分帧。
 //!
-//! 全部逐字对齐解包 workbench.desktop.main.js(3.14.27)得到的实现:
+//! 全部逐字对齐解包 workbench.desktop.main.js(3.14.27)得到的实现;
+//! 2026-09-12 对本机 3.18.25 重抓验证:checksum 公式、头表、分帧全部未变,
+//! 仅版本号/默认 agent host 有漂移(见 CLIENT_VERSION 与 lib.rs 的 agent_host)。
 //! - checksum:`base64url(zyg(6字节时间戳)) + machineId [ + "/" + macMachineId ]`
 //!   其中 `zyg`(社区称 "Jyh cipher")= `t=165; e[i]=(e[i]^t)+i%256; t=e[i]`。
 //! - ConnectRPC(server-streaming)信封:`[flag:1][len:4 大端][payload]`,
@@ -10,14 +12,15 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Cursor 客户端版本(解包本机 3.14.27)。作为 `x-cursor-client-version` 发送。
-pub const CLIENT_VERSION: &str = "3.14.27";
-/// 客户端 build commit(product.json)。
+/// Cursor 客户端版本。作为 `x-cursor-client-version` 发送。
+/// 2026-09-12 由本机 3.18.25 重抓更新(原先 3.14.27);心跳/头表/端点均无漂移。
+pub const CLIENT_VERSION: &str = "3.18.25";
+/// 客户端 build commit(product.json)。3.18.25 的 commit 同步更新。
 ///
 /// ⚠️ 真 IDE 的 `AgentService/Run` **不发** `x-cursor-client-commit`(抓包实证,
 /// 见 PROTOCOL-agent-run.md §2.2)。早期代码发它,是基于「版本过旧被软封」这个
 /// 已被推翻的猜想 —— 那个 500 其实是打了退役端点。保留常量仅供 unary 端点与排查用。
-pub const CLIENT_COMMIT: &str = "047548b00c1a079373d74d00183f32510a4a41e0";
+pub const CLIENT_COMMIT: &str = "280eca2911f1774689696e5f1efa5a4f97a87af0";
 /// 平台标识(逐字对齐真客户端)。
 pub const CLIENT_OS: &str = "linux";
 pub const CLIENT_ARCH: &str = "x64";

@@ -4339,7 +4339,7 @@ mod tests {
 
     fn ctx() -> RunCtx {
         RunCtx {
-            host: "agentn.api5.cursor.sh".into(),
+            host: "agentn.global.api5.cursor.sh".into(),
             token: "tok".into(),
             machine_id: "m".repeat(64),
             mac_machine_id: Some("a".repeat(64)),
