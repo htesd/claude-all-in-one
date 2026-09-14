@@ -259,14 +259,25 @@ fn report_token_update(
     refresh: Option<&str>,
     exp: Option<i64>,
 ) {
-    updates.lock().unwrap_or_else(|p| p.into_inner()).insert(
-        account_id.to_string(),
-        TokenUpdate {
-            access_token: access.to_string(),
-            refresh_token: refresh.map(str::to_string),
-            expires_at: exp.map(crate::auth::format_unix_utc),
-        },
-    );
+    let incoming = TokenUpdate {
+        access_token: access.to_string(),
+        refresh_token: refresh.map(str::to_string),
+        expires_at: exp.map(crate::auth::format_unix_utc),
+    };
+    let mut pending = updates.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(current) = pending.get_mut(account_id) {
+        if current.access_token == incoming.access_token {
+            // 同枚 token 的不完整观测不得抹掉已捕获的 refresh_token。
+            if current.refresh_token.is_none() { current.refresh_token = incoming.refresh_token; }
+            if incoming.expires_at > current.expires_at { current.expires_at = incoming.expires_at; }
+            return;
+        }
+        // 没有可比较的新代际时保留已排队观测；不能按抵达顺序猜 token 新旧。
+        if incoming.expires_at.is_none() || incoming.expires_at <= current.expires_at {
+            return;
+        }
+    }
+    pending.insert(account_id.to_string(), incoming);
     tracing::info!(account = %account_id, "cursor-cli:捕获到 CLI 自刷新轮换的 token,待落库");
 }
 
@@ -2724,6 +2735,20 @@ pub fn resume_conv(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn token_update_queue_keeps_newer_observation_and_complete_credentials() {
+        let updates = TokenUpdates::default();
+        report_token_update(&updates, "a", "at-new", Some("rt-new"), Some(200));
+        report_token_update(&updates, "a", "at-old", Some("rt-old"), Some(100));
+        report_token_update(&updates, "a", "at-new", None, Some(200));
+        report_token_update(&updates, "a", "at-unknown", None, None);
+        let map = updates.lock().unwrap();
+        let got = &map["a"];
+        assert_eq!(got.access_token, "at-new");
+        assert_eq!(got.refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(got.expires_at, Some(crate::auth::format_unix_utc(200)));
+    }
+
     use super::*;
 
     /// 测试用:造一个只关心 `cache_read` / `sim_total` 的槽。
