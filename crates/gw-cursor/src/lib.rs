@@ -596,6 +596,14 @@ struct ConvEntry {
     /// 不同的历史。逐轮指纹做前缀校验,分叉即换新 conversation_id 重铺。
     /// IDE 形态不用它(历史每轮折叠重发,无所谓分叉)。
     fps: Vec<u64>,
+    /// 服务端实际持有的会话 id。**大多数情况等于本条目的 key**;分叉重铺后
+    /// 不同:分叉轮换了新 id 发 Opening(旧 id 服务端还有旧历史,直接重铺
+    /// 会粘),而登记落回**基础 id**(调用方亲和键派生、跨轮稳定)之下,
+    /// 靠这个字段回指到真正的上游会话。没有它,分叉一次之后就永远查不到
+    /// 重铺成果 —— 每轮 lookup 基础 id 看到的都是旧指纹,永久 Diverged,
+    /// 每轮全量重铺、模拟缓存按每轮新 key 永不命中(2026-09-13 生产实病:
+    /// pi 长会话 6 小时 527 次分叉、30 个会话全残)。
+    wire_id: String,
 }
 
 /// CLI 形态的会话判定结果(见 [`ConvRegistry::cli_lookup`])。
@@ -603,7 +611,9 @@ pub(crate) enum CliLookup {
     /// 服务端没有这个会话(或换了号):Opening。
     Fresh,
     /// 本地记录是调用方历史的严格前缀:Continuation,只发最后一条新消息。
-    Continue,
+    /// 携服务端实际持有的会话 id(通常等于查询用的基础 id;分叉重铺过的
+    /// 会话是基础 id 条目里回指的新 id,见 [`ConvEntry::wire_id`])。
+    Continue(String),
     /// 调用方改写了历史:必须换 conversation_id + Opening 重铺。
     Diverged,
 }
@@ -1375,7 +1385,18 @@ impl ConvRegistry {
 
     /// 本轮**成功**收尾后登记:服务端现在持有这个会话了。
     /// `fps` 是 CLI 形态的逐轮指纹(见 [`ConvEntry::fps`]);IDE 形态传空表。
-    fn confirm_with_fps(&self, conversation_id: &str, account_id: &str, fps: Vec<u64>) {
+    ///
+    /// 落库 key 一律用**基础 id**(调用方亲和键派生、跨轮稳定),
+    /// `wire_id` 记本轮实际发给上游的会话 id —— 两者只在分叉重铺轮不同
+    /// (分叉轮换了新 id;登记仍落基础 id,下轮 lookup 才能命中并经
+    /// `wire_id` 回指到上游真正持有的会话,见 [`CliLookup::Continue`])。
+    fn confirm_with_fps(
+        &self,
+        conversation_id: &str,
+        account_id: &str,
+        fps: Vec<u64>,
+        wire_id: &str,
+    ) {
         // 关闭时没人读这张表,写它纯属浪费(且把所有流的收尾串在同一把锁上)。
         if !self.stateful {
             return;
@@ -1387,6 +1408,7 @@ impl ConvRegistry {
                 account_id: account_id.to_string(),
                 at: Instant::now(),
                 fps,
+                wire_id: wire_id.to_string(),
             },
         );
         // 顺手清过期项:这张表按会话增长,没人清就是内存泄漏。
@@ -1413,7 +1435,9 @@ impl ConvRegistry {
                 if e.fps.len() <= history_fps.len()
                     && e.fps.iter().zip(history_fps).all(|(a, b)| a == b)
                 {
-                    CliLookup::Continue
+                    // 回指上游真正持有的会话 id:分叉重铺过的会话,key 是基础 id,
+                    // 但服务端的会话是 `wire_id`(见 `ConvEntry::wire_id`)。
+                    CliLookup::Continue(e.wire_id.clone())
                 } else {
                     tracing::info!(
                         conversation_id,
@@ -2467,13 +2491,29 @@ impl Provider for CursorProvider {
         } else {
             Vec::new()
         };
+        // 基础 id:分叉轮换掉 conversation_id 之前的那个(调用方亲和键派生、
+        // 跨轮稳定)。会话成功登记一律落它之下,靠条目里的 `wire_id` 回指上游
+        // 真正持有的会话 —— 否则分叉一次之后就永久 Diverged:每轮 lookup
+        // 基础 id 看到的都是旧指纹、confirm 又写进每轮一新的 digest id,
+        // 结果是每轮全量重铺 + 模拟缓存按每轮新 key 永不命中
+        // (2026-09-13 pi 长会话生产实病)。
+        let base_conversation_id = conversation_id.clone();
+        // 本轮是「分叉换新 id 重铺」时为真:失败清理只忘新 id、保留基础条目
+        // (下轮会再次分叉换新 id 重试),与其余轮的「忘掉基础条目、下轮首轮
+        // 重铺」语义分开。
+        let mut diverged_retry = false;
         let phase = if self.tuning.profile.is_cli() {
             let history = &cli_fps[..cli_fps.len().saturating_sub(1)];
             match self
                 .conversations
                 .cli_lookup(&conversation_id, &ctx.account.account_id, history)
             {
-                CliLookup::Continue => run::Phase::Continuation,
+                CliLookup::Continue(wire_id) => {
+                    // 服务端持有的会话是条目回指的 wire_id(分叉重铺过的会话
+                    // 与基础 id 不同;未分叉时两者相等),续轮必须发到它。
+                    conversation_id = wire_id;
+                    run::Phase::Continuation
+                }
                 CliLookup::Fresh => run::Phase::Opening,
                 CliLookup::Diverged => {
                     // 分叉必须换 conversation_id:旧的还在服务端手里,直接重铺会把
@@ -2483,6 +2523,7 @@ impl Provider for CursorProvider {
                     });
                     conversation_id =
                         chat::conversation_uuid(&format!("{material}\x1f{digest:016x}"));
+                    diverged_retry = true;
                     run::Phase::Opening
                 }
             }
@@ -2521,14 +2562,24 @@ impl Provider for CursorProvider {
             req,
             // 只在**成功收尾**后才登记会话已建立。失败时清掉,下次从首轮重铺 ——
             // 服务端很可能没落下这一轮,而错用 Continuation 是无声的上下文丢失。
+            //
+            // 登记落**基础 id** 之下并带上本轮实际发给上游的 `wire_id`(见
+            // `ConvEntry::wire_id` / `confirm_with_fps`):分叉重铺轮换了新 id,
+            // 但只有基础 id 是下轮 lookup 会查的键。失败清理分两种:分叉重铺轮
+            // 只忘新 id(基础条目保留,下轮再次分叉换新 id 重试);其余轮忘基础
+            // 条目(下轮从首轮重铺)。
             {
                 let reg = self.conversations.clone();
                 let account_id = ctx.account.account_id.clone();
+                let base_id = base_conversation_id;
+                let wire_id = conversation_id.clone();
                 Some(Arc::new(move |ok: bool| {
                     if ok {
-                        reg.confirm_with_fps(&conversation_id, &account_id, cli_fps.clone());
+                        reg.confirm_with_fps(&base_id, &account_id, cli_fps.clone(), &wire_id);
+                    } else if diverged_retry {
+                        reg.forget(&wire_id);
                     } else {
-                        reg.forget(&conversation_id);
+                        reg.forget(&base_id);
                     }
                 }))
             },
@@ -2768,6 +2819,60 @@ mod tests {
             CursorProvider::new(CursorConfig::default()).family(),
             "cursor"
         );
+    }
+
+    fn test_registry() -> ConvRegistry {
+        ConvRegistry {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stateful: true,
+        }
+    }
+
+    /// 2026-09-13 生产实病的回归锁:分叉重铺后,登记落基础 id 且 `wire_id`
+    /// 回指上游新会话,下一轮必须自愈为 `Continue(wire_id)` —— 修复前
+    /// confirm 写到每轮一新的 digest id,基础 id 条目永远停在旧指纹,
+    /// 会话一旦分叉就永久每轮全量重铺、模拟缓存永不命中。
+    #[test]
+    fn 分叉重铺后基础条目回指上游会话() {
+        let reg = test_registry();
+        let base = "base-conv";
+        // 旧历史 2 轮,正常登记(wire == base)。
+        reg.confirm_with_fps(base, "acc", vec![11, 22], base);
+        // 调用方改写历史(/compact):前缀对不上 → 分叉。
+        assert!(matches!(
+            reg.cli_lookup(base, "acc", &[99, 22]),
+            CliLookup::Diverged
+        ));
+        // 分叉轮换新 id 重铺成功:登记落基础 id、回指新 wire id。
+        reg.confirm_with_fps(base, "acc", vec![99, 22, 33], "wire-new");
+        // 下一轮历史再涨一条(减末轮口径由调用方做,这里直接给前缀):
+        // 自愈为 Continue,且回指分叉轮的新会话 id。
+        match reg.cli_lookup(base, "acc", &[99, 22, 33]) {
+            CliLookup::Continue(w) => assert_eq!(w, "wire-new"),
+            _ => panic!("分叉重铺后应自愈为 Continue"),
+        }
+        // 继续涨历史仍 Continue(指纹更新模拟下一轮 confirm)。
+        reg.confirm_with_fps(base, "acc", vec![99, 22, 33, 44], "wire-new");
+        match reg.cli_lookup(base, "acc", &[99, 22, 33, 44]) {
+            CliLookup::Continue(w) => assert_eq!(w, "wire-new"),
+            _ => panic!("续轮 confirm 后应继续 Continue"),
+        }
+        // 调用方再次改写历史 → 再次分叉(安全语义不变)。
+        assert!(matches!(
+            reg.cli_lookup(base, "acc", &[77]),
+            CliLookup::Diverged
+        ));
+        // 换号 → Fresh(会话是 per-account 的)。
+        assert!(matches!(
+            reg.cli_lookup(base, "other", &[99, 22, 33]),
+            CliLookup::Fresh
+        ));
+        // 未分叉的普通会话:wire_id == key,Continue 回指自身。
+        reg.confirm_with_fps("plain", "acc", vec![1, 2], "plain");
+        match reg.cli_lookup("plain", "acc", &[1, 2]) {
+            CliLookup::Continue(w) => assert_eq!(w, "plain"),
+            _ => panic!("普通会话应 Continue"),
+        }
     }
 
     #[test]
