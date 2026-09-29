@@ -105,17 +105,16 @@ pub fn render_kiro_payload(req: &ChatRequest, account: &Account) -> String {
         Ok(c) => c,
         Err(e) => return format!("<转换失败: {e}>"),
     };
-    // legacy 线缆形态:思考强度走旧文本标签(结构化字段不发,发了就是时代错位的混搭),
+    // legacy 线缆形态:思考强度走旧文本标签(结构化字段不发;例外 opus-5.5 只认结构化字段照发),
     // body 顶层 agentMode 省略(0.12.155 时代没有该字段)。见 wire_profile。
     let legacy = crate::wire_profile::legacy_wire();
     let kiro_req = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: crate::headers::resolve_profile_arn(account),
-        additional_model_request_fields: if legacy {
-            None
-        } else {
-            crate::thinking_policy::additional_model_request_fields(&messages_req)
-        },
+        additional_model_request_fields: crate::thinking_policy::wire_additional_model_request_fields(
+            &messages_req,
+            legacy,
+        ),
         agent_mode: if legacy {
             None
         } else {
@@ -203,17 +202,13 @@ pub async fn chat_stream(
     // 3. 组装顶层 KiroRequest(注入 profileArn:显式值 > 按 idp 固定兜底,对齐 static_flow)
     let profile_arn = crate::headers::resolve_profile_arn(&account);
     // 思考强度走 1.0.212 的结构化字段(旧的正文文本标签见 converter::history 的开关)。
-    // legacy 线缆形态:结构化字段与 body 顶层 agentMode 都不发(见 wire_profile)。
+    // legacy 线缆形态:结构化字段与 body 顶层 agentMode 都不发(见 wire_profile);
+    // 例外:上游只认结构化思考强度的模型(opus-5.5)照发 additionalModelRequestFields。
     let legacy = crate::wire_profile::legacy_wire();
-    let amrf = if legacy {
-        None
-    } else {
-        let amrf = crate::thinking_policy::additional_model_request_fields(&messages_req);
-        if let Some(v) = &amrf {
-            tracing::debug!(model = %messages_req.model, fields = %v, "additionalModelRequestFields");
-        }
-        amrf
-    };
+    let amrf = crate::thinking_policy::wire_additional_model_request_fields(&messages_req, legacy);
+    if let Some(v) = &amrf {
+        tracing::debug!(model = %messages_req.model, fields = %v, "additionalModelRequestFields");
+    }
     let mut kiro_req = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: profile_arn.clone(),

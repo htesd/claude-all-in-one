@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | UA 自报版本 | 1.0.212 | 0.12.155(headers.rs) |
 //! | body 顶层 `agentMode` | 必发 `"vibe"` | 不发(chat.rs 构造时置 None) |
-//! | `additionalModelRequestFields` | 按策略发 | 不发(chat.rs 构造时置 None) |
+//! | `additionalModelRequestFields` | 按策略发 | 不发;**例外** opus-5.5 照发(见下) |
 //! | 当前消息空 `userInputMessageContext` | 省略 | 照发 `{}`(conversation.rs 谓词) |
 //! | 思考强度载体 | 结构化字段 | 旧文本标签(converter/history.rs) |
 //! | 配额/profiles 控制面域名 | management.*.kiro.dev | q.*.amazonaws.com(usage_limits.rs) |
@@ -30,6 +30,10 @@
 //!   形态无关,不回退。
 //! - 思考预算下限 8192(`fac24c0`)与默认档位 high 是**策略**(保智力/延迟),
 //!   只改字段里的值、不改字段形态,保留。
+//! - **opus-5.5 在 legacy 下照发 `additionalModelRequestFields`**(2026-09-29 用户拍板):
+//!   它上游只认结构化 `output_config.effort`、完全忽略旧文本标签(真号 A/B 实测),不发则
+//!   客户端的思考强度设置一律失效。按模型表 `structured_effort_only` 门控,其余模型不变;
+//!   旧标签仍照常写进 history[0](5.5 忽略但无害),保持缓存前缀字节不变。
 //!
 //! ⚠️ 缓存前缀:若 worker 同时开着 `KIRO_THINKING_IN_HISTORY0=1`(生产即如此),
 //! 旧标签重新注入 history[0] = 前缀第一块字节变化,所有在途会话下一轮缓存 miss

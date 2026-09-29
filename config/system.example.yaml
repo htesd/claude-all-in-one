@@ -18,8 +18,8 @@ admin:
 # 入站请求体上限(字节)。0 = 用内置默认 16MB。
 # ⚠️ **启动期参数** —— axum 的 DefaultBodyLimit 在建 app 时固定,改完必须重启,热调无效。
 # 超限由 axum 在 handler 之前直接返回 413,请求**不进 request_logs**,排障时查不到。
-# 注意这与出站上限是两道闸:出站 DEFAULT_MAX_BODY_BYTES = 6,300,000 是实测定标的硬编码值,
-# 不可配,调大只会把我方 400 换成上游 400(更糟,会进 poison_memo)。
+# 注意这与出站上限是两道闸:出站 DEFAULT_MAX_BODY_BYTES = 24,000,000 是实测定标的硬编码值
+# (上游真实上限约 32MB,2026-09-29),不可配,调大只会把我方 400 换成上游 400(更糟,会进 poison_memo)。
 max_request_body_bytes: 0
 # 生产实际值(139 机):33554432   # 32MB,Claude Desktop 带附件长会话会撞 16MB
 

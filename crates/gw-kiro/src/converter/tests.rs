@@ -1583,6 +1583,51 @@ fn test_signed_thinking_dropped_when_model_mismatch_or_unsupported() {
 }
 
 #[test]
+fn test_opus_5_5_v4_anonymous_signature_is_uploaded() {
+    // 2026-09-26 实测:opus-5.5 的签名是 v4 信封,**没有 f6 代号**。旧门控「读 f6 比代号」
+    // 会把它全部丢掉 → 5.5 多轮对话历史推理全丢(降智)。v4 且无代号必须照常上传。
+    let mut m = HashMap::new();
+    let v4 = crate::signature::test_envelope(Some(4), None);
+    let msg = signed_asst("5.5 的推理", &v4, "答");
+    let kept = convert_assistant_message(&msg, &mut m, true, "claude-opus-5.5").unwrap();
+    match &kept.assistant_response_message.reasoning_content {
+        Some(ReasoningContent::ReasoningText { reasoning_text }) => {
+            assert_eq!(reasoning_text.text, "5.5 的推理");
+            assert_eq!(reasoning_text.signature, v4, "签名逐字节透传");
+        }
+        other => panic!("v4 签名应挂 reasoningText,实际 {other:?}"),
+    }
+    // 窗口外照旧不挂。
+    let dropped = convert_assistant_message(&msg, &mut m, false, "claude-opus-5.5").unwrap();
+    assert!(dropped.assistant_response_message.reasoning_content.is_none());
+}
+
+#[test]
+fn test_opus_5_5_rejects_foreign_envelopes_and_vice_versa() {
+    let mut m = HashMap::new();
+    let up = |sig: &str, model: &str, m: &mut HashMap<String, String>| {
+        convert_assistant_message(&signed_asst("推理", sig, "答"), m, true, model)
+            .unwrap()
+            .assistant_response_message
+            .reasoning_content
+            .is_some()
+    };
+    let honey_v2 = crate::signature::test_envelope(Some(2), Some("claude-honey"));
+    let v4 = crate::signature::test_envelope(Some(4), None);
+    // 会话中途从 opus-5 切到 5.5:opus-5 签发的(带代号)不得挂到 5.5 上,反之亦然。
+    assert!(!up(&honey_v2, "claude-opus-5.5", &mut m), "opus-5 的签名不能挂到 5.5");
+    assert!(!up(REAL_SIG_QUINCE, "claude-opus-5.5", &mut m), "opus-4.8 的签名不能挂到 5.5");
+    assert!(!up(&v4, "claude-opus-5", &mut m), "5.5 的 v4 签名不能挂到 opus-5");
+    assert!(up(&honey_v2, "claude-opus-5", &mut m), "opus-5 自己的 v2 签名照常上传(回归)");
+    // 其它版本的无代号信封(未来格式)不猜,丢。
+    assert!(!up(&crate::signature::test_envelope(Some(5), None), "claude-opus-5.5", &mut m));
+    assert!(!up(&crate::signature::test_envelope(None, None), "claude-opus-5.5", &mut m));
+    // 我方合成签名一定带代号 → 5.5 下必丢。
+    let synth = crate::signature::synthesize_signature("claude-opus-5-5", "推理");
+    assert!(!up(&synth, "claude-opus-5.5", &mut m), "合成签名不能冒充 v4");
+}
+
+#[test]
 fn test_synthesized_signature_dropped_before_upstream() {
     // 我方合成的假签名(无原生推理模型的下行兜底)→ 重推导识别后丢弃,
     // 不带上行白吃 THINKING_SIGNATURE_INVALID。
@@ -2870,4 +2915,100 @@ fn 不加盐时与改动前逐字节一致() {
         // 而加盐后必须不同
         assert_ne!(scoped_conv_id(&req, "acct-A"), want);
     }
+}
+
+fn media_req(messages: serde_json::Value) -> MessagesRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "messages": messages
+    }))
+    .unwrap()
+}
+
+fn pdf_block(data: &str) -> serde_json::Value {
+    serde_json::json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}})
+}
+
+#[test]
+fn tool_result_pdfs_reach_kiro_documents_with_unique_names() {
+    // Claude Code 的 Read 读 PDF:tool_result.content = [text, document](无 name/title)。
+    // 修复前 document 被静默丢弃;两个 PDF 还会都叫 "document" → 上游重名 400。
+    let req = media_req(serde_json::json!([
+        {"role": "user", "content": "read both specs"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.pdf"}},
+            {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/b.pdf"}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "PDF file read: /a.pdf"}, pdf_block("QUFB")]},
+            {"type": "tool_result", "tool_use_id": "t2", "content": [
+                {"type": "text", "text": "PDF file read: /b.pdf"}, pdf_block("QkJC")]}
+        ]}
+    ]));
+    let cs = convert_request(&req, "").unwrap().conversation_state;
+    let cur = &cs.current_message.user_input_message;
+    let names: Vec<_> = cur.documents.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["document", "document-2"]);
+    assert_eq!(cur.documents[0].source.bytes, "QUFB");
+    assert_eq!(cur.documents[1].format, "pdf");
+    assert_eq!(cur.user_input_message_context.tool_results.len(), 2, "tool_result 文本照常保留");
+}
+
+#[test]
+fn tool_result_pdf_names_unique_across_history_and_current() {
+    let req = media_req(serde_json::json!([
+        {"role": "user", "content": "read a"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [pdf_block("QUFB")]}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "Read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": [pdf_block("QkJC")]}]}
+    ]));
+    let cs = convert_request(&req, "").unwrap().conversation_state;
+    let hist_names: Vec<String> = cs
+        .history
+        .iter()
+        .filter_map(|m| match m {
+            Message::User(u) => Some(u.user_input_message.documents.iter().map(|d| d.name.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(hist_names, vec!["document"]);
+    assert_eq!(cs.current_message.user_input_message.documents[0].name, "document-2");
+}
+
+#[test]
+fn document_title_used_as_name_and_sanitized() {
+    let req = media_req(serde_json::json!([
+        {"role": "user", "content": [
+            {"type": "document", "title": "Q3 spec.pdf", "source": {"type": "base64", "media_type": "application/pdf", "data": "QUFB"}},
+            {"type": "text", "text": "summarize"}
+        ]}
+    ]));
+    let cs = convert_request(&req, "").unwrap().conversation_state;
+    assert_eq!(cs.current_message.user_input_message.documents[0].name, "Q3 spec-pdf");
+}
+
+#[test]
+fn image_url_data_urls_become_images_remote_urls_skipped() {
+    let req = media_req(serde_json::json!([
+        {"role": "user", "content": "shoot"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "s1", "name": "screenshot", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "s1", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0K"}}
+            ]},
+            {"type": "image_url", "image_url": "data:image/jpeg;base64,/9j/4AAQ"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            {"type": "image_url", "image_url": {"url": "data:image/bmp;base64,Qk0="}},
+            {"type": "text", "text": "compare"}
+        ]}
+    ]));
+    let cs = convert_request(&req, "").unwrap().conversation_state;
+    let imgs = &cs.current_message.user_input_message.images;
+    let got: Vec<_> = imgs.iter().map(|i| (i.format.as_str(), i.source.bytes.as_str())).collect();
+    assert_eq!(got, vec![("png", "iVBORw0K"), ("jpeg", "/9j/4AAQ")], "按块顺序;远程 URL 与 bmp 跳过");
 }

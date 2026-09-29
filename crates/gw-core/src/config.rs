@@ -150,8 +150,8 @@ fn default_upstream_timeout_secs() -> u64 {
 /// 入站请求体体积上限(字节)的默认值。客户端 base64 图片/PDF 常使整请求体达数 MB;
 /// axum 0.8 的 `Bytes`/`Json` 提取器默认上限仅 **2MB**,超了在 handler 执行前就被框架
 /// 直接 413(且请求根本到不了业务逻辑,不入库、不可见——2026-06 线上实测)。取 **16MB**:
-/// = 出站 6.3MB 护栏(gw-kiro 侧,对齐 Kiro 上游 ~7.3MB 硬限)的 ~2.5×,给当前轮 + 可被
-/// shed 裁掉的历史媒体留足余量;同时是**有界**值(非 disable),防超大 body 在 router/worker
+/// 出站护栏(gw-kiro `DEFAULT_MAX_BODY_BYTES`,2026-09-29 起 24MB,上游实测 ~32MB)之下的
+/// 内置默认;生产在 system.yaml 显式设 32MB,给当前轮 + 可被 shed 裁掉的历史媒体留余量;同时是**有界**值(非 disable),防超大 body 在 router/worker
 /// 入口无界缓冲撑爆内存(DoS——本网关 :38991 对外,入口提取在鉴权前完成)。8× 于旧 2MB 已
 /// 决定性解除闷死;需更大可在 system.yaml 显式上调。0 视为未设,回落本默认。
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;

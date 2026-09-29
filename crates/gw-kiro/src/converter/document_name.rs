@@ -44,19 +44,54 @@ fn item_is_document(item: &serde_json::Value) -> bool {
     item.get("type").and_then(|v| v.as_str()) == Some("document")
 }
 
-/// 文档块的「有效名」：显式非空 name 经净化后使用；缺省或净化后为空 → `"document"`。
-///
-/// ⚠️ 只读 `name`(与 [`super::content`] 发往 Bedrock 的取名口径严格一致)。Anthropic document
-/// 块历史上也可能用 `title` 字段——但若这里读 title 而 content.rs 仍读 name,两边对"名字"的判断
-/// 会不一致(dedup 以为两份不同 title 不撞名、content.rs 却都发缺省 "document" → 仍 400)。故要
-/// 支持 title 必须【content.rs 与本模块一起改】+ 先抓真实客户端报文确认字段名,不能只在本模块加。
+fn item_is_tool_result(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+}
+
+/// 逐个访问一条消息里的 document 块:顶层的,以及嵌在 `tool_result.content` 里的
+/// (Claude Code 的 Read 读 PDF 时,结果就是 `[text, document]`,无 name/title)。
+/// 两处都会被 [`super::content`] 转成 Kiro documents,所以去重必须一起算。
+fn visit_documents(content: &serde_json::Value, f: &mut impl FnMut(&serde_json::Value)) {
+    let Some(items) = content.as_array() else {
+        return;
+    };
+    for item in items {
+        if item_is_document(item) {
+            f(item);
+        } else if item_is_tool_result(item) {
+            if let Some(inner) = item.get("content").and_then(|c| c.as_array()) {
+                inner.iter().filter(|d| item_is_document(d)).for_each(&mut *f);
+            }
+        }
+    }
+}
+
+fn visit_documents_mut(content: &mut serde_json::Value, f: &mut impl FnMut(&mut serde_json::Value)) {
+    let Some(items) = content.as_array_mut() else {
+        return;
+    };
+    for item in items.iter_mut() {
+        if item_is_document(item) {
+            f(item);
+        } else if item_is_tool_result(item) {
+            if let Some(inner) = item.get_mut("content").and_then(|c| c.as_array_mut()) {
+                inner.iter_mut().filter(|d| item_is_document(d)).for_each(&mut *f);
+            }
+        }
+    }
+}
+
+/// 客户端给的原始名:`name` 优先,其次 Anthropic 标准字段 `title`(与 [`super::content`]
+/// 取名口径严格一致 —— 两边口径不一会出现"这里以为不撞名、发出去却都叫 document"的 400)。
+fn raw_name(item: &serde_json::Value) -> Option<&str> {
+    ["name", "title"]
+        .iter()
+        .find_map(|k| item.get(*k).and_then(|v| v.as_str()).filter(|n| !n.trim().is_empty()))
+}
+
+/// 文档块的「有效名」：原始名经净化后使用；缺省或净化后为空 → `"document"`。
 fn effective_name(item: &serde_json::Value) -> String {
-    let raw = item
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|n| !n.is_empty());
-    match raw {
+    match raw_name(item).map(str::trim) {
         Some(n) => {
             let s = sanitize(n);
             if s.is_empty() {
@@ -72,44 +107,38 @@ fn effective_name(item: &serde_json::Value) -> String {
 /// 是否需要改写：任一 document 名含非法字符（净化后与原始不同），或有效名在请求内撞名。
 fn needs_rewrite(messages: &[Message]) -> bool {
     let mut seen: HashSet<String> = HashSet::new();
+    let mut dirty = false;
     for m in messages {
-        let Some(items) = m.content.as_array() else {
-            continue;
-        };
-        for item in items {
-            if !item_is_document(item) {
-                continue;
+        visit_documents(&m.content, &mut |item| {
+            if dirty {
+                return;
             }
-            // 原始 name 含非法字符 → 需净化改写
-            if let Some(raw) = item.get("name").and_then(|v| v.as_str()) {
-                if sanitize(raw) != raw {
-                    return true;
-                }
+            // 原始名含非法字符 → 需净化改写
+            if raw_name(item).is_some_and(|raw| sanitize(raw) != raw) {
+                dirty = true;
             }
             // 有效名撞名 → 需去重改写
             if !seen.insert(effective_name(item)) {
-                return true;
+                dirty = true;
             }
+        });
+        if dirty {
+            return true;
         }
     }
     false
 }
 
 /// 就地把每个 document 块的 name 改写成「全局唯一 + 合法字符集」。
+/// 写 `name`(取名口径里它优先于 `title`),原 `title` 保留不动。
 fn apply(messages: &mut [Message]) {
     let mut used: HashSet<String> = HashSet::new();
     for m in messages.iter_mut() {
-        let Some(items) = m.content.as_array_mut() else {
-            continue;
-        };
-        for item in items.iter_mut() {
-            if !item_is_document(item) {
-                continue;
-            }
+        visit_documents_mut(&mut m.content, &mut |item| {
             let base = effective_name(item);
             let unique = uniquify(&base, &mut used);
             item["name"] = serde_json::Value::String(unique);
-        }
+        });
     }
 }
 
@@ -246,6 +275,28 @@ mod tests {
         let got = &names(&out)[0];
         assert!(got.len() <= 200, "改写后仍超 Bedrock 200 上限: len={}", got.len());
         assert!(got.len() <= MAX_DOC_NAME_LEN, "基名应钳到 {MAX_DOC_NAME_LEN}");
+    }
+
+    #[test]
+    fn nested_tool_result_documents_deduped_with_top_level() {
+        let m = msgs(serde_json::json!([
+            {"role": "user", "content": [doc("AAA", None)]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                "content": [{"type": "text", "text": "read"}, doc("BBB", None)]}]}
+        ]));
+        let out = dedup_document_names(&m).expect("嵌套无名文档与顶层撞名应改写");
+        let nested = out[1].content[0]["content"][1]["name"].as_str().unwrap().to_string();
+        assert_eq!(names(&out), vec!["document"]);
+        assert_eq!(nested, "document-2");
+    }
+
+    #[test]
+    fn title_counts_as_name_and_gets_sanitized() {
+        let mut d = doc("AAA", None);
+        d["title"] = serde_json::json!("spec v2.pdf");
+        let m = msgs(serde_json::json!([{"role": "user", "content": [d]}]));
+        let out = dedup_document_names(&m).expect("title 含非法字符应改写");
+        assert_eq!(names(&out), vec!["spec v2-pdf"]);
     }
 
     #[test]

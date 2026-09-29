@@ -701,9 +701,11 @@ enum LastReasoning {
 ///    类型优先级判断 —— 原"redacted 无条件优先"会让 `[redacted, thinking]` 上传较早的
 ///    那个(对抗评审 r2 #6);
 /// 3. 签名**原样透传**(2026-08-19 用户决策:下发链路不改写 f6 代号,检测平台角度不关心)。
-///    f6 读出的代号必须等于当前模型的代号,否则丢弃 —— 覆盖三种情况:
-///    别的模型签发的(官方:reasoningModelId 不匹配即丢)、历史遗留的改写签名
-///    (f6=官方名,无法还原即放弃,上游 400 兜底也用不着)、读不出 f6 的畸形签名;
+///    归属按当前模型的 [`super::SignatureId`] 判定,对不上即丢:
+///    - `Codename`:f6 读出的代号必须等于本模型代号 —— 覆盖别的模型签发的(官方:
+///      reasoningModelId 不匹配即丢)、历史遗留的改写签名(f6=官方名)、读不出 f6 的;
+///    - `Anonymous`(opus-5.5 的 v4 信封,**本就没有 f6**):信封版本必须相等且确无 f6。
+///      带 f6 的(旧信封 / 我方合成)必然不是本模型签发,直接丢;
 /// 4. 我方合成的假签名(无原生推理模型的下行兜底产物)重推导识别后丢弃 ——
 ///    上行必过不了验签,发了只会白吃一次 `THINKING_SIGNATURE_INVALID`。
 ///
@@ -714,7 +716,10 @@ fn build_reasoning_content(
     last: Option<&LastReasoning>,
     model_id: &str,
 ) -> Option<ReasoningContent> {
-    let codename = super::signature_codename_for(model_id)?;
+    let id = super::signature_id_for(model_id);
+    if id == super::SignatureId::Unsigned {
+        return None;
+    }
     let (text, sig) = match last? {
         LastReasoning::Redacted(data) => {
             return Some(ReasoningContent::Redacted {
@@ -723,14 +728,21 @@ fn build_reasoning_content(
         }
         LastReasoning::Signed(t, s) => (t, s),
     };
-    let issued = crate::signature::read_model_from_signature(sig)?;
-    // 合成签名识别用 f6 里的签发名逐字重算(合成时的 model 入参就是当时的客户端请求名)。
-    // 必须先于代号比对:opus-4-7 的代号恰好等于官方名,合成签名会误过代号检查。
-    if crate::signature::is_synthesized_signature(&issued, text, sig) {
-        return None;
-    }
-    if issued != codename {
-        return None;
+    let envelope = crate::signature::read_envelope(sig)?;
+    match (id, envelope.codename.as_deref()) {
+        (super::SignatureId::Codename(want), Some(issued)) => {
+            // 合成签名识别用 f6 里的签发名逐字重算(合成时的 model 入参就是当时的客户端请求名)。
+            // 必须先于代号比对:opus-4-7 的代号恰好等于官方名,合成签名会误过代号检查。
+            if crate::signature::is_synthesized_signature(issued, text, sig) || issued != want {
+                return None;
+            }
+        }
+        (super::SignatureId::Anonymous { envelope_version }, None) => {
+            if envelope.version != Some(envelope_version) {
+                return None;
+            }
+        }
+        _ => return None,
     }
     Some(ReasoningContent::ReasoningText {
         reasoning_text: ReasoningText {

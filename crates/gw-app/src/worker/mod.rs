@@ -3731,8 +3731,8 @@ async fn finalize_usage(
 const REQUEST_LOG_CAP: u64 = 2_000;
 /// 单条报文(client/kiro)入库前的**文本**体积上限(截断兜底)。报文经 gzip 压缩入库
 /// (`gw-store`,文本压 5-10 倍),且图片/文档已抽到去重 blob 表,故**全文存储不再截断**;
-/// 此上限抬到 16MiB 仅作防御性护栏——Kiro 报文体积硬上限 ~6.3MB(`DEFAULT_MAX_BODY_BYTES`),
-/// 真实报文绝不触顶,只挡住非常规超大输入(防单行无界内存/库占用)。
+/// 此上限抬到 16MiB 仅作防御性护栏——媒体 base64 已抽走,剩下的文本报文远小于出站上限
+/// (`DEFAULT_MAX_BODY_BYTES`),真实报文不触顶,只挡住非常规超大输入(防单行无界内存/库占用)。
 const MAX_LOG_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// 流式模型回复采集的**累计字节**上限(真正的内存护栏:按 SSE data 序列化字节计,而非按条数——

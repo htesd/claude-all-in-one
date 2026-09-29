@@ -198,6 +198,22 @@ pub fn additional_model_request_fields(req: &MessagesRequest) -> Option<serde_js
     Some(serde_json::json!({ "output_config": { "effort": effort } }))
 }
 
+/// 线缆上实际要发的 `additionalModelRequestFields`(chat 发包与报文预览共用,两处口径必须一致)。
+///
+/// - 1.0.212 形态(`legacy=false`):照 [`additional_model_request_fields`] 发。
+/// - legacy 形态:默认不发(思考强度走旧文本标签,见 wire_profile);**例外**是上游只认结构化
+///   字段的模型(`requires_structured_effort`,目前仅 opus-5.5)—— 不发则强度设置完全失效。
+///   这是用户 2026-09-29 拍板的最小影响面修法:其余模型与其余字段(UA/agentMode 等)不变。
+pub fn wire_additional_model_request_fields(
+    req: &MessagesRequest,
+    legacy: bool,
+) -> Option<serde_json::Value> {
+    if legacy && !crate::converter::requires_structured_effort(&req.model) {
+        return None;
+    }
+    additional_model_request_fields(req)
+}
+
 /// 按模型名覆写 thinking 配置。在 converter 之前调用,直接 mutate 请求。
 pub fn override_thinking_from_model_name(req: &mut MessagesRequest) {
     let model_lower = req.model.to_lowercase();
@@ -486,6 +502,36 @@ mod tests {
         override_thinking_from_model_name(&mut r);
         let v = additional_model_request_fields(&r).unwrap();
         assert_eq!(v, serde_json::json!({"output_config":{"effort":"high"}}));
+    }
+
+    #[test]
+    fn legacy_wire_still_sends_structured_effort_for_opus_5_5_only() {
+        // 2026-09-29 真号 A/B:opus-5.5 忽略旧文本标签,只认 output_config.effort。
+        let mk = |model: &str, effort: &str| {
+            let mut r = req_mt(model, None, 32000);
+            r.output_config = Some(OutputConfig { effort: Some(effort.into()), format: None });
+            override_thinking_from_model_name(&mut r);
+            r
+        };
+        for alias in ["claude-opus-5-5", "claude-opus-5-5-thinking", "claude-opus-5.5"] {
+            let r = mk(alias, "max");
+            assert_eq!(
+                wire_additional_model_request_fields(&r, true),
+                Some(serde_json::json!({"output_config":{"effort":"max"}})),
+                "{alias}: legacy 下也必须发,且 max 原样(不走旧标签词表 max→xhigh)"
+            );
+        }
+        // 认旧标签的模型:legacy 下保持不发(线缆形态不变)。
+        for model in ["claude-opus-5", "claude-opus-4-8"] {
+            let r = mk(model, "xhigh");
+            assert!(wire_additional_model_request_fields(&r, true).is_none(), "{model}");
+            assert!(wire_additional_model_request_fields(&r, false).is_some(), "{model}: 1.0.212 形态照发");
+        }
+        // 5.5 客户端显式 disabled:照旧不发(上游 5.5 关不掉思考,按其默认档)。
+        let dis = Thinking { thinking_type: "disabled".into(), display: None, budget_tokens: 0 };
+        let mut r = req_mt("claude-opus-5-5", Some(dis), 32000);
+        override_thinking_from_model_name(&mut r);
+        assert!(wire_additional_model_request_fields(&r, true).is_none());
     }
 
     #[test]

@@ -1,5 +1,139 @@
 # Changelog
 
+## [kiro-media-limits] - 2026-09-29
+
+### 修复:opus-5.5 思考强度设置不生效
+- 用户反馈 5.5「思考强度设置有问题」。真号 A/B(同一账号、同一道题)实测:**opus-5.5 完全忽略
+  legacy 线缆的旧文本标签 `<thinking_effort>`,只认结构化 `output_config.effort`**。
+  | 发法 | low | xhigh | max |
+  |---|---|---|---|
+  | 结构化字段 | 签名 1.9~4k / 输出 41~268 tok | 7~17k / 535~1110 | **35~41k / 2800~3200 / ~145s** |
+  | 旧文本标签(线上) | 5~11k / 178~647 | 6~12k / 364~649 | 5~15k / 398~501 |
+  opus-5 / 4.8 旧标签照常生效(max 档 5~14k 字符思考、93~243s)。
+- 修法(用户拍板「只给 5.5 发结构化字段」,影响面最小):模型表新增 `structured_effort_only`,
+  仅 opus-5.5 为 true;`thinking_policy::wire_additional_model_request_fields` 在 legacy 线缆下
+  对这类模型照发 `additionalModelRequestFields.output_config.effort`,其余模型与其余字段
+  (UA 0.12.155、无 agentMode)不变。history[0] 的旧标签照写(5.5 忽略、无害),缓存前缀字节不变。
+  客户端 max 原样发 max(不走旧标签词表 max→xhigh)。
+- 旁证:sonnet-5 在旧标签下**确实在思考**(57~250s、难题答对)但上游**从不下发推理事件**;
+  只发结构化 effort 反而不思考(1 token、答错)。属上游行为,caio 未丢任何内容,本次不改。
+
+### 背景
+- 用户反馈「opus-5.5 上下文似乎只有 600k」,实为 Claude Code + 大量附件撞 caio 出站体积闸:
+  `API Error: 400 请求体剔除历史媒体后仍 6504598 字节,超出体积上限 6300000 字节`。
+  图片/PDF 的 token 很少、字节很大,token 才 60 万时请求体就过 6.3MB。
+- 排查中发现更严重的静默丢附件:Claude Code 的 Read 读 PDF 时,tool_result 是
+  `[text, document]`,caio 只从 tool_result 里抽 image,**PDF 被整个丢掉**,模型只看到一句
+  "PDF 已读取";OpenAI 形态 `image_url`(data URL)也被丢(最近 2000 条请求里 3 个 PDF、
+  12 个 image_url)。
+
+### 上游媒体限制重新定标(claude-opus-5.5,绕开 caio 闸门直打上游)
+| 限制 | 实测 | 上游 reason |
+|---|---|---|
+| 请求体总量 | 31,454,526B 过;32.6MB 起确定性拒 | CONTENT_LENGTH_EXCEEDS_THRESHOLD |
+| 单图 | base64 长度 ≤ 5,242,880 | IMAGE_SIZE_EXCEEDED |
+| 图片边长 | 8000px 过、8200px 拒 | IMAGE_DIMENSION_EXCEEDED |
+| 单文档 | 3.9MB 过、7.9MB 拒(文案 "4.5MB") | DOCUMENT_SIZE_EXCEEDED |
+| 每条消息文档数 | 5 过、6 拒 | DOCUMENT_COUNT_EXCEEDED |
+| 跨轮文档数 | history 里 6 个(每轮 1 个)照常可读 | 只按单条消息计 |
+- 16 张 1.9MB 图(30.7MB)通过、17 张(32.6MB)被拒:**~32MB 是整请求总量,不是单图**。
+- 旧 6.3MB 定标(2026-06)已过时;当年 7.3MB 那批 400 的会话带 PDF,更可能是撞了单文档 4.5MB。
+
+### 修复
+- **tool_result 里的 PDF/文档不再静默丢弃**:`extract_media_from_tool_result_content` 同时抽
+  image / image_url / document,挂到同一条 userInputMessage(与官方客户端 tool 消息同位)。
+- **`image_url` data URL 转图**(顶层与 tool_result 内);远程 URL 仍跳过(Kiro 要内联字节)。
+- **文档名**:认 Anthropic 标准字段 `title`(此前只读 `name`,而 document 块根本没有 name);
+  去重/净化扩到 tool_result 内嵌文档 —— 否则同会话 Read 两个 PDF 都叫 `document`,上游重名 400。
+  content.rs 与 document_name.rs 取名口径一致:`name` 优先,其次 `title`。
+- **图片压缩覆盖 tool_result 与 image_url**:生产 5607 张图里 5039 张在 tool_result
+  (Claude Code 读截图 / browser 截图),旧实现以"体量小"为由不压 —— 它们才是请求体膨胀主因,
+  也会撞单图 5MB / 边长 8000px。加进程内压缩结果记忆(sha256 寻址,128MB + 2 万条双上限,
+  淘汰后归还容量):长会话每轮重发全部截图,同一张图只压一次。
+  单/多图档改按**所在消息自己的图片数**判定(原为全请求):否则单/多图参数不同时,后来追加的图
+  会让历史旧图被按另一档重压、字节改变、缓存前缀断裂(生产两档参数相同,不触发)。
+- **逐项上限预检**(新 `converter::media_limits`):单文档 >4.5MB、单条 >5 个文档、单图 base64
+  >5,242,880B、图片边长 >8000px 的附件就地剔除,原位留一句模型可读的说明(如"改用分页读取")。
+  此前一个超限附件会让整轮 400,而客户端每轮重发历史、超限附件一直在,会话此后每轮 400。
+  边长必须在出站前读图片头再校:压缩是可关、可失败回退的优化(超 1 亿像素的解压炸弹护栏原样透传),
+  「尝试过压缩」不等于「已合规」。
+- **出站总体积闸 6.3MB → 24MB**(实测上限 ~32MB 的 ~75%,刻意不贴上限)。
+
+### 评审
+- adversarial-review(codex,Skeptic/Architect/Minimalist 三视角)一致提出 4 条,全部接受并已修:
+  [high] 边长预检缺失;[medium] 多图档按全请求计致历史图字节漂移;[medium] 记忆缓存记账低估;
+  [low] 剔图说明混用原始字节与 base64 口径。另纠正:poison_memo 需 ≥2 个号 600s 内同一 400 才判毒,
+  并非一次 400 永久封会话。
+
+- 复审一(codex):#3/#4 关闭;#1 新发现 `image::ImageReader::into_dimensions` 会解压 PNG iCCP 等
+  元数据(32KB 图可展开 32MiB,且同步跑在 async 线程)+ base64 含空白/URL-safe 时解码失败绕过检查
+  → 改为手写只读尺寸字段的头解析(PNG IHDR / GIF / WebP / JPEG 按段长跳到 SOFn,不解压任何数据)
+  + 宽松 base64 前缀解码;#2 按消息计档在「同一轮拆成多条 user 消息」时被绕过 → 改按连续 user
+  消息组计数,与 converter 合并口径一致。
+
+### 注意
+- 本次上线后,带图的在途会话历史图片字节会变(新压缩),Kiro 前缀缓存一次性 miss。
+- 入站闸(`max_request_body_bytes`,生产 32MB)不变;超 24MB 的部分仍先走历史媒体剔除。
+
+## [kiro-opus-5-5] - 2026-09-26
+
+### 新增
+- **上线 `claude-opus-5-5`**(上游 modelId `claude-opus-5.5`,目录标注 Experimental preview,
+  积分倍率 2.0,比 opus-5 的 2.2 便宜)。权威表加行后 chat 路由 / 身份行 / 上下文窗口(1M)/
+  `/v1/models`(含 `-thinking` 变体)全部自动跟随。
+- 与 opus-5 的上游 schema 差异只有两处:effort 默认 `medium`(opus-5 是 `high`);
+  `thinking.type` 只允许 `adaptive`(没有 `disabled`)。caio 对客户端的 disabled 本就是
+  「不发该字段」,从不把 `disabled` 写上线缆,故无需特判。
+
+### 修复
+- **子串兜底把 opus-5.5 静默降级成 opus-5**:`opus-5-5` / `opus-5.5` 含 `opus-5` 邻接串,
+  被 opus-5 分支吞掉 —— 客户以为在用 5.5,实际拿到 5,且不报错。5.5 分支现排在 opus-5 之前。
+- **opus-5.5 多轮对话历史推理全部丢失(降智)**:5.5 的 thinking 签名换成 **v4 信封**
+  (顶层 f1=4,header 里没有 f5,也**没有 f6 模型代号**)。旧回传门控靠读 f6 代号比对归属,
+  读不出即丢 → 5.5 的历史 thinking 100% 不上传。
+  - 权威表的 `signature_codename: Option<&str>` 换成三态 `SignatureId`:
+    `Unsigned`(无原生签名推理,不上传)/ `Codename(..)`(f6 必须逐字相等,旧行为)/
+    `Anonymous { envelope_version }`(无代号信封:版本相等且确无 f6 才上传)。
+  - 新增 `signature::read_envelope`,只读明文轮廓(信封版本 + 可选代号),必须能下钻到
+    f2.f1 header 才算签名,防止任意 base64 被当成无代号信封放行。
+  - 跨模型隔离不变:opus-5 签发的(带代号)不会挂到 5.5 上,5.5 的 v4 签名也不会挂到
+    opus-5 上;我方合成签名恒带代号,不可能冒充 v4。
+
+### 设计理由
+- 官方客户端是把签发模型 id 与推理**一起存**、回传时比对;我们无状态,只能读签名明文。
+  v4 信封里没有任何模型标识,「同版本信封的另一个模型签发」在本地无法识别 —— 这一残余
+  由上游验签兜底(`THINKING_SIGNATURE_INVALID` → 剥全历史 reasoning 重试一次,既有逻辑)。
+- 不按「无代号就放行」一刀切:未来格式(v5 或无版本号)不猜,宁可少回传一段。
+
+### 验证
+- 生产日志审计(改动前,最近 150 条 opus-5 请求):客户端回传带签名 thinking 1821 段 →
+  上传 reasoningContent 1821 段(100%,v2 信封 `claude-honey`);opus-4.8 198/198。
+  opus-5 / 4.8 的回传链路本身无问题,本次改动对其行为逐字节不变(回归测试覆盖)。
+- 真号探针(生产同款 `KIRO_LEGACY_WIRE=1` + `KIRO_THINKING_IN_HISTORY0=1` 线缆):
+  5.5 单轮 / 显式关思考 / 难题(3249 字符思考、签名 14344B)均正常;新代码下 5.5 的历史
+  reasoningContent 进入上游报文且被接受。上游对 v4 签名确有校验:有效签名组行为系统性改变,
+  篡改签名(改加密体 1 字节)被**静默丢弃**(无 400,表现与不回传相同)。
+- 对照官方客户端 Kiro 1.0.212(`convertToGenerateAssistantMessages` / `er5` / `oe12`):
+  **全部历史 AI 消息都回传**,每条带该回合封存的最后一段推理,门控 = 签发模型 == 当前模型
+  且推理文本非空 + 有签名。caio 生产配置 `history_thinking_turns=-1` 与之一致;生产报文中
+  4287 段上传推理无一空文本。
+- 部署(只换 `caio-worker0`,镜像 `opus55-20260926`)后:opus-5 118 请求 2508/2508 段
+  回传(无回归);admin 探针经生产 worker 发 `claude-opus-5-5` 正常出词;`/v1/models` 含
+  `claude-opus-5-5` / `-thinking`。
+- 新增测试:`opus_5_5_resolves_and_is_not_downgraded_to_opus_5`、
+  `signature_id_table_matches_probe_evidence`、`read_envelope_*` ×2、
+  `test_opus_5_5_v4_anonymous_signature_is_uploaded`、
+  `test_opus_5_5_rejects_foreign_envelopes_and_vice_versa`;cargo test --workspace 全绿
+  (gw-kiro 546)。
+- 对抗评审(codex ×3,无 high):Skeptic#1「f6 存在但损坏被当成无代号」已修(header 严格解析,
+  解析失败 ≠ 无代号);Architect「5.5 实际走 high 而非上游默认 medium」不改 —— 缺省 high 是
+  既有保智力策略(4.7 同理有测试锁定)。
+
+### 已知未处理
+- 上游拒答(`metadataEvent.stopDetails.refusal`,如 `REASONING_EXTRACTION`)目前被归为
+  EmptyResponse(记账号失败 + 客户端收错误),而非透传 `stop_reason: refusal`。生产频率低
+  (约 2 小时 2000 请求中 3 条),未在本版处理。
+
 ## [kiro-tool-spec-stub] - 2026-09-14
 
 ### 修复

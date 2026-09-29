@@ -418,6 +418,9 @@ pub struct ContentBlock {
     pub content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// document 块的标题(Anthropic 标准字段;文档没有 `name`,名字在这里)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -126,8 +126,8 @@ pub struct KiroProvider {
     /// 图像压缩参数(system.yaml `image` 段 + 热调;chat 前对 body 内 base64 图瘦身 + OOM 护栏)。
     image_cfg: parking_lot::RwLock<gw_core::config::ImageConfig>,
     /// 出站请求体体积上限(字节)。序列化后的 KiroRequest 超此值时,先从 history
-    /// 剔最老媒体瘦身;仍超限则本地 BadRequest(不发上游)。🔵 搬运自 kiro.rs v63
-    /// (实测 Kiro 报文体积硬上限在 (6.34, 7.34]MB,默认取 6,300,000)。
+    /// 剔最老媒体瘦身;仍超限则本地 BadRequest(不发上游)。🔵 搬运自 kiro.rs v63;
+    /// 上限值 2026-09-29 重新定标,见 [`DEFAULT_MAX_BODY_BYTES`]。
     ///
     /// 目前固定为 [`DEFAULT_MAX_BODY_BYTES`]:不经 admin 热调(caio 的 SystemConfig 分节
     /// 结构暂无此项干净归属;接入 admin 面板时再一并加 SystemSettings 字段与归属节)。
@@ -135,8 +135,16 @@ pub struct KiroProvider {
     max_body_bytes: usize,
 }
 
-/// 出站请求体体积上限默认值(字节)。已知成功最大值 6,341,854 之下,方向安全。
-pub const DEFAULT_MAX_BODY_BYTES: usize = 6_300_000;
+/// 出站请求体体积上限默认值(字节)。
+///
+/// 【重新定标 2026-09-29,claude-opus-5.5,绕开本闸直打上游】全图片请求体 31,454,526 字节
+/// 成功、32,630,000 字节起确定性 400 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` —— 上游真实总上限
+/// 约 32MB。旧值 6,300,000(2026-06 kiro.rs 定标)已过时:当年 7.3MB 那批 400 的会话带着
+/// PDF,更可能是撞了**单文档 4.5MB** 上限而非总量(见 converter::media_limits)。
+///
+/// 取 24,000,000 = 实测上限的 ~75%,**刻意不贴着上限**:上游阈值可能按内容长度另算
+/// (非纯 body 字节),且随上游版本漂移;留 ~8MB 余量换稳定。
+pub const DEFAULT_MAX_BODY_BYTES: usize = 24_000_000;
 
 impl KiroProvider {
     /// 用 worker 基础 egress client 构造(无默认代理)。测试与简单注入用。

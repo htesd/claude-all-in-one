@@ -31,18 +31,52 @@ pub struct KiroModel {
     pub effort_levels: &'static [&'static str],
     /// schema 里标注的 `default`。请求档位不可用时回落到它(对齐真客户端 `A7`)。
     pub default_effort: Option<&'static str>,
-    /// thinking 签名(f2.f1.f6)里的**上游内部模型代号**。
+    /// thinking 签名的归属标识方式:f2.f1.f6 里的**上游内部模型代号**,或(v4 信封起)
+    /// 无代号、只能按信封版本匹配。
     ///
     /// 2026-08-19 探针实测(`kiro_think_probe4/5/6.py`):opus-4.8=`claude-quince`、
     /// opus-5=`claude-honey`、sonnet-5=`claude-saffron`、opus-4.7 的代号就是官方名
     /// `claude-opus-4-7` 本身;opus-4.6 / sonnet-4.6 / 4.5 系 / haiku **没有原生签名推理**
     /// (无 reasoningContentEvent 签名帧,或 inline `<thinking>` 文本形态),它们的客户端
-    /// 签名是我方合成的假签名,上行必过不了验签 → `None`,历史 thinking 不上传
-    /// (对齐官方 `reasoning.unsigned.dropped`)。
+    /// 签名是我方合成的假签名,上行必过不了验签 → `Unsigned`,历史 thinking 不上传
+    /// (对齐官方 `reasoning.unsigned.dropped`)。2026-09-26:opus-5.5 为 v4 匿名信封。
     ///
     /// 透传原则下代号不做改写/反写,本字段的用途是:「该模型可否做结构化
-    /// reasoningContent 历史上传」的门控 + 签名归属匹配(f6 代号 ≠ 本代号即丢)。
-    pub signature_codename: Option<&'static str>,
+    /// reasoningContent 历史上传」的门控 + 签名归属匹配(见 [`SignatureId`])。
+    pub signature_id: SignatureId,
+    /// 上游**只认**结构化 `additionalModelRequestFields.output_config.effort`,忽略旧文本标签
+    /// `<thinking_effort>`。为 true 时即便开着 legacy 线缆(`KIRO_LEGACY_WIRE`),也必须随请求
+    /// 发结构化字段,否则客户端设的思考强度一律不生效、按上游默认档跑。
+    ///
+    /// 2026-09-29 真号 A/B(同一账号、同一道题,max 档):opus-5.5 结构化字段 → 签名 35~41k、
+    /// 输出 ~3000 token、~145s,low→xhigh→max 严格单调;旧标签 → 5~15k、~450 token,与 low 无差。
+    /// opus-5 / 4.8 旧标签照常生效(max 档 5~14k 字符思考、93~243s),保持 false 不动线缆。
+    pub structured_effort_only: bool,
+}
+
+/// 一个模型的 thinking 签名**怎样标识归属** —— 决定历史 thinking 能否以结构化
+/// `reasoningContent` 回传上游(回传失败 = 多轮对话丢推理 = 用户感知「降智」)。
+///
+/// 官方客户端是把「签发模型 id」和推理**一起存**、回传时比对(reasoningModelId 不匹配即丢);
+/// 我们无状态,只能从签名明文里读归属,而信封格式随模型代际在变:
+///
+/// | 信封 | 顶层 f1 | f2.f1.f6 代号 | 实测模型 |
+/// |---|---|---|---|
+/// | 旧 | 无 | 有 | opus-4.8 |
+/// | v2 | 2 | 有 | opus-5 |
+/// | v4 | 4 | **无**(f5 也无) | opus-5.5 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureId {
+    /// 无原生签名推理(无 reasoningContentEvent 签名帧,或 inline `<thinking>` 文本形态)。
+    /// 客户端手里的签名只可能是我方合成的,上行必过不了验签 → 历史 thinking 不上传
+    /// (对齐官方 `reasoning.unsigned.dropped`)。
+    Unsigned,
+    /// 签名 f2.f1.f6 携带上游内部代号,必须逐字相等才上传。
+    Codename(&'static str),
+    /// 信封**不带**模型代号,只能按信封版本匹配:顶层 f1 == `envelope_version` 且确无 f6
+    /// 才上传。跨模型误挂(另一个同版本信封的模型签发)无法在本地识别,由上游验签兜底
+    /// (`THINKING_SIGNATURE_INVALID` → 剥全历史 reasoning 重试一次,见 chat.rs)。
+    Anonymous { envelope_version: u64 },
 }
 
 /// 5 档全集。opus-5 / sonnet-5 / opus-4.8 / opus-4.7 实测为此形态。
@@ -66,6 +100,31 @@ const EFFORTS_NONE: &[&str] = &[];
 /// 发一个该模型 enum 里没有的档位既可能 400,也是可被规则化的形态差异。
 pub const KIRO_MODELS: &[KiroModel] = &[
     KiroModel {
+        // 2026-09-26 上游新增(目录标注 "Experimental preview",rateMultiplier 2.0,比 opus-5 的
+        // 2.2 便宜)。与 4.x 同规律:上游 modelId 带点号 `claude-opus-5.5`,对外名用连字符
+        // `claude-opus-5-5`(对齐 Anthropic 官方 id)。原始目录存档 `kiro-models-20260926.json`(与 1.0.212 那份同目录)。
+        //
+        // 与 opus-5 的 schema 差异只有两处:
+        // - `output_config.effort.default` = `medium`(opus-5 是 `high`);
+        // - `thinking.type` 的 enum **只有 `adaptive`,没有 `disabled`** —— 思考关不掉。
+        //   caio 对 disabled 本就是「不发 additionalModelRequestFields」(见 thinking_policy),
+        //   从不把 `disabled` 写上线缆,故无需特判。
+        //
+        // 线缆上的差异:thinking 签名换成 **v4 信封,不再携带模型代号**(见 [`SignatureId`])。
+        // 若沿用「读 f6 比代号」,5.5 的历史推理会被**全部**丢弃、多轮对话降智。
+        advertised_id: "claude-opus-5-5",
+        display_name: "Claude Opus 5.5",
+        kiro_model: "claude-opus-5.5",
+        identity_short: "Opus 5.5",
+        context_window: 1_000_000,
+        supports_thinking: true,
+        dated_alias: None,
+        effort_levels: EFFORTS_WITH_XHIGH,
+        default_effort: Some("medium"),
+        signature_id: SignatureId::Anonymous { envelope_version: 4 },
+        structured_effort_only: true,
+    },
+    KiroModel {
         // 2026-07-25 上游新增。与 sonnet-5 同规律:modelId 是主版本裸名
         // `claude-opus-5`(无 x.y 点号,与 4.x 各行不同)。
         advertised_id: "claude-opus-5",
@@ -77,7 +136,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_WITH_XHIGH,
         default_effort: Some("high"),
-        signature_codename: Some("claude-honey"),
+        signature_id: SignatureId::Codename("claude-honey"),
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-8",
@@ -89,7 +149,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_WITH_XHIGH,
         default_effort: Some("high"),
-        signature_codename: Some("claude-quince"),
+        signature_id: SignatureId::Codename("claude-quince"),
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-7",
@@ -102,7 +163,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         effort_levels: EFFORTS_WITH_XHIGH,
         // 全表唯一 default 不是 high 的模型(上游 schema 逐字如此)。
         default_effort: Some("xhigh"),
-        signature_codename: Some("claude-opus-4-7"),
+        signature_id: SignatureId::Codename("claude-opus-4-7"),
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-6",
@@ -114,7 +176,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_NO_XHIGH,
         default_effort: Some("high"),
-        signature_codename: None,
+        signature_id: SignatureId::Unsigned,
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-5",
@@ -126,7 +189,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: Some("claude-opus-4-5-20251101"),
         effort_levels: EFFORTS_NONE,
         default_effort: None,
-        signature_codename: None,
+        signature_id: SignatureId::Unsigned,
+        structured_effort_only: false,
     },
     KiroModel {
         // 2026-07-02 上游 ListAvailableModels 实测新增(标注 experimental preview),
@@ -140,7 +204,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_WITH_XHIGH,
         default_effort: Some("high"),
-        signature_codename: Some("claude-saffron"),
+        signature_id: SignatureId::Codename("claude-saffron"),
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-6",
@@ -152,7 +217,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: None,
         effort_levels: EFFORTS_NO_XHIGH,
         default_effort: Some("high"),
-        signature_codename: None,
+        signature_id: SignatureId::Unsigned,
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-5",
@@ -164,7 +230,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: Some("claude-sonnet-4-5-20250929"),
         effort_levels: EFFORTS_NONE,
         default_effort: None,
-        signature_codename: None,
+        signature_id: SignatureId::Unsigned,
+        structured_effort_only: false,
     },
     KiroModel {
         advertised_id: "claude-haiku-4-5",
@@ -176,7 +243,8 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         dated_alias: Some("claude-haiku-4-5-20251001"),
         effort_levels: EFFORTS_NONE,
         default_effort: None,
-        signature_codename: None,
+        signature_id: SignatureId::Unsigned,
+        structured_effort_only: false,
     },
 ];
 
@@ -210,6 +278,12 @@ pub fn clamp_effort_for_model(model: &str, requested: Option<&str>) -> Option<&'
     m.default_effort
         .and_then(|d| m.effort_levels.iter().find(|lv| **lv == d).copied())
         .or_else(|| m.effort_levels.first().copied())
+}
+
+/// 该模型是否只认结构化思考强度字段(见 [`KiroModel::structured_effort_only`])。
+/// 未知模型返回 false(不改线缆形态)。
+pub fn requires_structured_effort(model: &str) -> bool {
+    lookup_model(model).is_some_and(|m| m.structured_effort_only)
 }
 
 /// 静态表与上游实际目录的一处不一致。
@@ -256,17 +330,13 @@ pub fn effort_drift(upstream: &[(String, Vec<String>, Option<String>)]) -> Vec<E
     out
 }
 
-/// 按上游 kiro_model 查 thinking 签名内部代号(`signature_codename` 字段的门控读口)。
-/// `Some` = 该模型有原生签名推理,历史 thinking 可做结构化 `reasoningContent` 上传;
-/// `None` = 无原生签名推理,历史 thinking 不上传(对齐官方 `reasoning.unsigned.dropped`)。
-///
-/// 透传原则下代号不做改写/反写,用途只剩两个:门控 + 模型匹配(签名 f6 代号必须
-/// 等于当前模型的代号才挂,对齐官方 reasoningModelId 不匹配即丢)。
-pub fn signature_codename_for(kiro_model: &str) -> Option<&'static str> {
+/// 按上游 kiro_model 查 thinking 签名的归属标识方式(`signature_id` 字段的门控读口)。
+/// 不在权威表里的模型按 [`SignatureId::Unsigned`] 处理(宁可不回传,也不猜)。
+pub fn signature_id_for(kiro_model: &str) -> SignatureId {
     KIRO_MODELS
         .iter()
         .find(|m| m.kiro_model == kiro_model)
-        .and_then(|m| m.signature_codename)
+        .map_or(SignatureId::Unsigned, |m| m.signature_id)
 }
 
 /// 按对外名找权威表行:先精确归一([`resolve_base`]),再走子串兜底反查 `kiro_model`。
@@ -334,7 +404,16 @@ fn map_model_substring(model_lower: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("opus-5") || model_lower.contains("opus5") {
+        if model_lower.contains("opus-5-5")
+            || model_lower.contains("opus-5.5")
+            || model_lower.contains("opus5.5")
+            || model_lower.contains("opus5-5")
+        {
+            // 2026-09-26: 上游新增 claude-opus-5.5。**必须排在 opus-5 分支之前** —— 此前
+            // `opus-5-5` 含 `opus-5` 邻接串,会被下一分支**静默降级**成 claude-opus-5
+            // (客户以为在用 5.5,实际拿到 5,且不报错)。
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower.contains("opus-5") || model_lower.contains("opus5") {
             // 2026-07-25: 上游新增 claude-opus-5(无 x.y 点号,权威表已列;此兜底覆盖
             // 异名写法,如 `openrouter/claude-opus-5-preview`)。
             // ⚠️必须锚定 `opus-5` 邻接串,不能用裸 contains("5")——否则未来的
@@ -360,14 +439,15 @@ fn map_model_substring(model_lower: &str) -> Option<String> {
     }
 }
 
-/// 根据模型名返回上下文窗口大小。权威表优先,兜底子串(1M 仅 sonnet-5/sonnet-4.6/opus-4.6/4.7/4.8)。
+/// 根据模型名返回上下文窗口大小。权威表优先,兜底子串(1M 仅 opus-5.5/opus-5/sonnet-5/sonnet-4.6/opus-4.6/4.7/4.8)。
 pub fn get_context_window_size(model: &str) -> i32 {
     if let Some(m) = resolve_base(model) {
         return m.context_window;
     }
     match map_model_substring(&model.to_lowercase()) {
         Some(mapped)
-            if mapped == "claude-opus-5"
+            if mapped == "claude-opus-5.5"
+                || mapped == "claude-opus-5"
                 || mapped == "claude-sonnet-5"
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
@@ -441,27 +521,31 @@ fn dated_label(dated: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 签名代号表回归(codex 审查补):四个实测有原生签名推理的模型必须各有正确代号,
-    /// 其余模型必须 None(门控静默丢弃,不上传 reasoningContent)。
+    /// 签名标识表回归(codex 审查补):实测有原生签名推理的模型必须各有正确标识方式,
+    /// 其余模型必须 Unsigned(门控静默丢弃,不上传 reasoningContent)。
     /// 代号来自 2026-08-19 线上探针(kiro_think_probe4/5/6),**不要凭印象改**。
     #[test]
-    fn signature_codename_table_matches_probe_evidence() {
-        let expect: &[(&str, Option<&str>)] = &[
-            ("claude-opus-5", Some("claude-honey")),
-            ("claude-opus-4.8", Some("claude-quince")),
-            ("claude-opus-4.7", Some("claude-opus-4-7")), // 代号=官方名,实测如此
-            ("claude-sonnet-5", Some("claude-saffron")),
-            ("claude-opus-4.6", None),
-            ("claude-opus-4.5", None),
-            ("claude-sonnet-4.6", None),
-            ("claude-sonnet-4.5", None),
-            ("claude-haiku-4.5", None),
+    fn signature_id_table_matches_probe_evidence() {
+        use SignatureId::*;
+        let expect: &[(&str, SignatureId)] = &[
+            // 2026-09-26 实测:v4 信封,无 f5/f6。
+            ("claude-opus-5.5", Anonymous { envelope_version: 4 }),
+            ("claude-opus-5", Codename("claude-honey")),
+            ("claude-opus-4.8", Codename("claude-quince")),
+            ("claude-opus-4.7", Codename("claude-opus-4-7")), // 代号=官方名,实测如此
+            ("claude-sonnet-5", Codename("claude-saffron")),
+            ("claude-opus-4.6", Unsigned),
+            ("claude-opus-4.5", Unsigned),
+            ("claude-sonnet-4.6", Unsigned),
+            ("claude-sonnet-4.5", Unsigned),
+            ("claude-haiku-4.5", Unsigned),
+            ("some-future-model", Unsigned),
         ];
         for (kiro_model, want) in expect {
             assert_eq!(
-                signature_codename_for(kiro_model),
+                signature_id_for(kiro_model),
                 *want,
-                "{kiro_model} 的签名代号与探针实测不符"
+                "{kiro_model} 的签名标识方式与探针实测不符"
             );
         }
     }
@@ -544,6 +628,37 @@ mod tests {
         assert_eq!(map_model("claude-opus-4.5").as_deref(), Some("claude-opus-4.5"));
         // 日期变体仍归到 4-5 基础行,不被 opus-5 误吞。
         assert_eq!(map_model("claude-opus-4-5-20251101").as_deref(), Some("claude-opus-4.5"));
+    }
+
+    #[test]
+    fn opus_5_5_resolves_and_is_not_downgraded_to_opus_5() {
+        // 权威表精确匹配(plain/-thinking)→ 上游点号 id。
+        assert_eq!(map_model("claude-opus-5-5").as_deref(), Some("claude-opus-5.5"));
+        assert_eq!(map_model("claude-opus-5-5-thinking").as_deref(), Some("claude-opus-5.5"));
+        assert_eq!(resolve_base("claude-opus-5-5").map(|m| m.identity_short), Some("Opus 5.5"));
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        // 回归(2026-09-23 实测坑):各种 5.5 写法都不能被 opus-5 分支吞成 claude-opus-5。
+        for alias in [
+            "claude-opus-5.5",
+            "Claude-Opus-5.5-thinking",
+            "openrouter/claude-opus-5-5-preview",
+            "anthropic/claude-opus5.5",
+            "claude-opus5-5",
+        ] {
+            assert_eq!(map_model(alias).as_deref(), Some("claude-opus-5.5"), "{alias}");
+            assert_eq!(get_context_window_size(alias), 1_000_000, "{alias}");
+        }
+        // opus-5 本身不受影响。
+        assert_eq!(map_model("claude-opus-5").as_deref(), Some("claude-opus-5"));
+        assert_eq!(map_model("openrouter/claude-opus-5-preview").as_deref(), Some("claude-opus-5"));
+        // 档位表与上游 schema 一致:5 档全集,default=medium(opus-5 是 high)。
+        assert_eq!(clamp_effort_for_model("claude-opus-5-5", None), Some("medium"));
+        assert_eq!(clamp_effort_for_model("claude-opus-5-5", Some("xhigh")), Some("xhigh"));
+        assert_eq!(clamp_effort_for_model("claude-opus-5-5", Some("max")), Some("max"));
+        // 公告目录里有它。
+        let ids: Vec<String> = advertised_models().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"claude-opus-5-5".to_string()));
+        assert!(ids.contains(&"claude-opus-5-5-thinking".to_string()));
     }
 
     #[test]

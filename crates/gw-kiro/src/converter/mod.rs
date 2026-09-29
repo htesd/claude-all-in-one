@@ -19,6 +19,7 @@ mod cache_point;
 mod content;
 mod document_name;
 mod history;
+mod media_limits;
 mod model_map;
 mod normalize;
 mod pairing;
@@ -30,8 +31,9 @@ mod tools;
 // 重导出子模块项,使本文件(及测试)无需逐一限定路径即可调用。
 pub use model_map::{
     advertised_models, clamp_effort_for_model, effort_drift, get_context_window_size, map_model,
-    signature_codename_for, AdvertisedModel, EffortDrift,
+    requires_structured_effort, signature_id_for, AdvertisedModel, EffortDrift, SignatureId,
 };
+pub use media_limits::{enforce_media_limits, MediaLimitReport};
 pub use shed::{shed_history_media, MediaShed};
 /// 实验开关热应用入口(供 [`crate::KiroProvider::apply_hot_settings`] 调用)。
 pub(crate) use cache_point::set_experimental_flags;
@@ -397,6 +399,11 @@ pub fn convert_request(
             cache_point_with_config()
         );
     }
+
+    // 12.5 上游逐项媒体硬限制预检(单文档 4.5MB / 每条 5 个文档 / 单图 5MB / 边长 8000px,
+    // 2026-09-29 实测):超限附件就地换成模型可读的说明,不让一个超限附件把整轮打成 400
+    // (客户端每轮重发历史,超限附件一直在,会话此后每轮 400)。无超限项时零改动,不扰动缓存前缀。
+    enforce_media_limits(&mut user_input, &mut history);
 
     let current_message = CurrentMessage::new(user_input);
 

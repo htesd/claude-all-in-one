@@ -208,6 +208,115 @@ pub fn read_model_from_signature(signature_b64: &str) -> Option<String> {
     read_string_field(&raw, &[2, 1], 6)
 }
 
+/// 签名信封的**明文轮廓**:归属判定只需要这两样,加密体不碰。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureEnvelope {
+    /// 顶层 f1(varint)= 信封版本。opus-4.8 的信封没有它(`None`),opus-5 = 2,
+    /// opus-5.5 = 4(2026-09-26 实测)。
+    pub version: Option<u64>,
+    /// f2.f1.f6 = 上游内部模型代号。**v4 信封不再携带**(f2.f1 里连 f5 也没了),
+    /// 此时为 `None`。
+    pub codename: Option<String>,
+}
+
+/// 读出签名信封轮廓。必须能下钻到 f2.f1(header 子消息),否则视为非签名 → `None`,
+/// 防止任意 base64 串被当成"无代号的新信封"放行。
+pub fn read_envelope(signature_b64: &str) -> Option<SignatureEnvelope> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .ok()?;
+    let mut version = None;
+    let mut header: Option<&[u8]> = None;
+    let mut i = 0usize;
+    while i < raw.len() {
+        let (key, ni) = read_varint(&raw, i)?;
+        i = ni;
+        let (field, wire) = ((key >> 3) as u32, (key & 7) as u8);
+        match wire {
+            0 => {
+                let (v, after) = read_varint(&raw, i)?;
+                if field == 1 {
+                    version = Some(v);
+                }
+                i = after;
+            }
+            2 => {
+                let (len, after_len) = read_varint(&raw, i)?;
+                let end = after_len.checked_add(len as usize)?;
+                let body = raw.get(after_len..end)?;
+                if field == 2 {
+                    header = Some(first_bytes_field(body, 1)?);
+                }
+                i = end;
+            }
+            5 => i = i.checked_add(4).filter(|e| *e <= raw.len())?,
+            1 => i = i.checked_add(8).filter(|e| *e <= raw.len())?,
+            _ => return None,
+        }
+    }
+    let header = header?;
+    Some(SignatureEnvelope {
+        version,
+        codename: header_codename(header)?,
+    })
+}
+
+/// 严格解析 f2.f1 header,取 f6 代号。
+/// 外层 `None` = header 结构损坏,或 f6 **存在**却不是合法 UTF-8 —— 都不是可信签名;
+/// `Some(None)` = header 完好且确实没有 f6(v4 信封)。两者必须分开:若把「解析失败」
+/// 也当成「无代号」,一个损坏的旧信封就能冒充 v4 被放行(对抗评审 Skeptic#1)。
+fn header_codename(header: &[u8]) -> Option<Option<String>> {
+    let mut codename = None;
+    let mut i = 0usize;
+    while i < header.len() {
+        let (key, ni) = read_varint(header, i)?;
+        i = ni;
+        let (field, wire) = ((key >> 3) as u32, (key & 7) as u8);
+        match wire {
+            0 => i = read_varint(header, i)?.1,
+            2 => {
+                let (len, after_len) = read_varint(header, i)?;
+                let end = after_len.checked_add(len as usize)?;
+                let body = header.get(after_len..end)?;
+                if field == 6 {
+                    codename = Some(String::from_utf8(body.to_vec()).ok()?);
+                }
+                i = end;
+            }
+            5 => i = i.checked_add(4).filter(|e| *e <= header.len())?,
+            1 => i = i.checked_add(8).filter(|e| *e <= header.len())?,
+            _ => return None,
+        }
+    }
+    Some(codename)
+}
+
+/// 在一层消息里取第一个 length-delimited 字段 `field` 的原始字节;结构异常/未命中 → `None`。
+fn first_bytes_field(buf: &[u8], field: u32) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i < buf.len() {
+        let (key, ni) = read_varint(buf, i)?;
+        i = ni;
+        let (f, wire) = ((key >> 3) as u32, (key & 7) as u8);
+        match wire {
+            0 => i = read_varint(buf, i)?.1,
+            2 => {
+                let (len, after_len) = read_varint(buf, i)?;
+                let end = after_len.checked_add(len as usize)?;
+                let body = buf.get(after_len..end)?;
+                if f == field {
+                    return Some(body);
+                }
+                i = end;
+            }
+            5 => i = i.checked_add(4).filter(|e| *e <= buf.len())?,
+            1 => i = i.checked_add(8).filter(|e| *e <= buf.len())?,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// 判断 `signature_b64` 是否为我方合成的假签名（上行必过不了验签）。
 /// 合成算法对同 (model, thinking) 确定性可复现，直接重算比对。
 pub fn is_synthesized_signature(model: &str, thinking: &str, signature_b64: &str) -> bool {
@@ -318,6 +427,35 @@ pub fn synthesize_signature(model: &str, thinking: &str) -> String {
     encode_varint_field(3, 1, &mut envelope);
 
     base64::engine::general_purpose::STANDARD.encode(envelope)
+}
+
+#[cfg(test)]
+/// 按实测布局拼一个签名信封(加密体用填充字节;**不入库真实签名**,仓库是公开的)。
+/// `version=None` → 无顶层 f1(opus-4.8 形态);`codename=None` → header 无 f5/f6(v4 形态)。
+pub(crate) fn test_envelope(version: Option<u64>, codename: Option<&str>) -> String {
+    let mut header = Vec::new();
+    encode_varint_field(1, 18, &mut header);
+    encode_varint_field(2, 1, &mut header);
+    encode_varint_field(3, 2, &mut header);
+    if let Some(c) = codename {
+        encode_bytes_field(5, &[7u8; 64], &mut header);
+        encode_bytes_field(6, c.as_bytes(), &mut header);
+    }
+    encode_varint_field(7, u64::from(codename.is_none()), &mut header);
+    encode_bytes_field(8, b"thinking", &mut header);
+    let mut inner = Vec::new();
+    encode_bytes_field(1, &header, &mut inner);
+    encode_bytes_field(2, &[1u8; 12], &mut inner);
+    encode_bytes_field(3, &[2u8; 12], &mut inner);
+    encode_bytes_field(4, &[3u8; 48], &mut inner);
+    encode_bytes_field(5, &[4u8; 300], &mut inner);
+    let mut out = Vec::new();
+    if let Some(v) = version {
+        encode_varint_field(1, v, &mut out);
+    }
+    encode_bytes_field(2, &inner, &mut out);
+    encode_varint_field(3, 1, &mut out);
+    base64::engine::general_purpose::STANDARD.encode(out)
 }
 
 #[cfg(test)]
@@ -541,6 +679,47 @@ mod tests {
     fn read_model_rejects_garbage() {
         assert_eq!(read_model_from_signature(""), None);
         assert_eq!(read_model_from_signature("not!!base64!!"), None);
+    }
+
+    #[test]
+    fn read_envelope_distinguishes_v4_anonymous_from_codename_envelopes() {
+        // opus-5.5(2026-09-26 实测):顶层 f1=4,header 无 f5/f6。
+        let v4 = read_envelope(&test_envelope(Some(4), None)).unwrap();
+        assert_eq!(v4, SignatureEnvelope { version: Some(4), codename: None });
+        assert_eq!(read_model_from_signature(&test_envelope(Some(4), None)), None, "v4 读不出代号");
+        // opus-5:顶层 f1=2 + 代号。
+        let v2 = read_envelope(&test_envelope(Some(2), Some("claude-honey"))).unwrap();
+        assert_eq!(v2.version, Some(2));
+        assert_eq!(v2.codename.as_deref(), Some("claude-honey"));
+        // opus-4.8 真签名:无顶层版本 + 代号。
+        let old = read_envelope(REAL_SIG).unwrap();
+        assert_eq!(old, SignatureEnvelope { version: None, codename: Some("claude-quince".into()) });
+        // 合成签名一定带代号(= 请求名),不可能冒充 v4 匿名信封。
+        let synth = read_envelope(&synthesize_signature("claude-opus-5-5", "t")).unwrap();
+        assert_eq!(synth.codename.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    #[test]
+    fn read_envelope_rejects_non_signatures() {
+        assert_eq!(read_envelope(""), None);
+        assert_eq!(read_envelope("not!!base64!!"), None);
+        // 合法 protobuf 但没有 f2.f1 header → 不是签名,不能被当成匿名信封放行。
+        let mut only_version = Vec::new();
+        encode_varint_field(1, 4, &mut only_version);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(only_version);
+        assert_eq!(read_envelope(&b64), None);
+        // header 里 f6 存在但不是合法 UTF-8 → 不是可信签名,不能被当成「无代号 v4」(Skeptic#1)。
+        let bad_f6 = base64::engine::general_purpose::STANDARD
+            .encode([0x08, 0x04, 0x12, 0x05, 0x0a, 0x03, 0x32, 0x01, 0xff]);
+        assert_eq!(read_envelope(&bad_f6), None);
+        // header 结构损坏(声明长度越界)→ None。
+        let bad_hdr = base64::engine::general_purpose::STANDARD
+            .encode([0x08, 0x04, 0x12, 0x04, 0x0a, 0x02, 0x32, 0x09]);
+        assert_eq!(read_envelope(&bad_hdr), None);
+        // 截断的信封 → None,不 panic。
+        let full = decode(&test_envelope(Some(4), None));
+        let cut = base64::engine::general_purpose::STANDARD.encode(&full[..full.len() / 2]);
+        assert_eq!(read_envelope(&cut), None);
     }
 
     #[test]

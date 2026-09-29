@@ -64,10 +64,21 @@ pub(super) fn process_message_content(
                                 }
                             }
                         }
+                        "image_url" => {
+                            // OpenAI 形态的图(部分客户端混发):只认 data URL。
+                            if let Some(img) = image_url_to_kiro(item) {
+                                images.push(img);
+                            }
+                        }
                         "document" => {
                             // Anthropic 文档块 → Kiro documents[*]（PDF/Office/文本附件）
                             if let Some(source) = block.source {
-                                if let Some(doc) = anthropic_document_to_kiro(block.name.as_deref(), &source) {
+                                // 取名口径与 document_name::raw_name 一致:name 优先,其次 title。
+                                let name = [block.name.as_deref(), block.title.as_deref()]
+                                    .into_iter()
+                                    .flatten()
+                                    .find(|n| !n.trim().is_empty());
+                                if let Some(doc) = anthropic_document_to_kiro(name, &source) {
                                     documents.push(doc);
                                 }
                             }
@@ -87,8 +98,13 @@ pub(super) fn process_message_content(
 
                                 tool_results.push(result);
 
-                                // 工具结果里也可能有图（如 browser 截图），单独抽出来
-                                images.extend(extract_images_from_tool_result_content(&block.content));
+                                // 工具结果里的媒体(browser 截图、Claude Code Read 读 PDF)单独抽出来:
+                                // Kiro 的 toolResults 只收文本,媒体要挂到同一条 userInputMessage 上
+                                // (与官方客户端 tool 消息的 images/documents 同位)。
+                                let (tr_images, tr_documents) =
+                                    extract_media_from_tool_result_content(&block.content);
+                                images.extend(tr_images);
+                                documents.extend(tr_documents);
                             }
                         }
                         "tool_use" => {
@@ -135,7 +151,7 @@ pub(super) fn anthropic_document_to_kiro(
     use base64::Engine;
     let media_type = source.media_type.as_deref()?;
     let format = get_document_format(media_type)?;
-    let doc_name = name.filter(|n| !n.is_empty()).unwrap_or("document").to_string();
+    let doc_name = name.filter(|n| !n.trim().is_empty()).unwrap_or("document").to_string();
     match source.source_type.as_str() {
         "base64" => {
             let data = source.data.as_ref()?;
@@ -243,26 +259,73 @@ pub(super) fn anthropic_image_to_kiro(source: &crate::anthropic_types::ImageSour
     }
 }
 
-/// 从 tool_result 的 content 数组里抽出 image 块（如 browser 工具的截图）。
-pub(super) fn extract_images_from_tool_result_content(
+/// OpenAI 形态图片块 `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
+/// (`image_url` 也可能直接是字符串)→ KiroImage。
+///
+/// 只认 `data:` URL:Kiro 要内联字节,远程 URL 需要异步抓取,和 Anthropic `url` 源同样跳过。
+pub(super) fn image_url_to_kiro(item: &serde_json::Value) -> Option<KiroImage> {
+    let field = item.get("image_url")?;
+    let url = field.as_str().or_else(|| field.get("url").and_then(|u| u.as_str()))?;
+    let Some(rest) = url.strip_prefix("data:") else {
+        tracing::warn!("暂不支持远程 image_url 图片，已跳过。客户端请改用 data URL 或 base64。");
+        return None;
+    };
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    let Some(format) = get_image_format(&media_type.to_ascii_lowercase()) else {
+        tracing::warn!(media_type, "image_url 图片格式 Kiro 不支持(仅 png/jpeg/gif/webp)，已跳过");
+        return None;
+    };
+    Some(KiroImage::from_base64(format, data.to_string()))
+}
+
+/// 从 tool_result 的 content 数组里抽出媒体:图(browser 截图、`image_url`)与文档
+/// (Claude Code 的 Read 读 PDF 时,结果就是 `[text, document]`)。
+///
+/// 此前只抽 image,tool_result 里的 document 会被**静默丢弃** —— 模型只看到一句
+/// "PDF 已读取",却拿不到文件本身。
+pub(super) fn extract_media_from_tool_result_content(
     content: &Option<serde_json::Value>,
-) -> Vec<crate::kiro_types::conversation::KiroImage> {
+) -> (Vec<KiroImage>, Vec<KiroDocument>) {
     let mut images = Vec::new();
-    if let Some(serde_json::Value::Array(arr)) = content {
-        for item in arr {
-            let block_type = item.get("type").and_then(|v| v.as_str());
-            if block_type == Some("image") {
-                if let Ok(src) = serde_json::from_value::<crate::anthropic_types::ImageSource>(
-                    item.get("source").cloned().unwrap_or(serde_json::Value::Null),
-                ) {
-                    if let Some(img) = anthropic_image_to_kiro(&src) {
-                        images.push(img);
-                    }
+    let mut documents = Vec::new();
+    let Some(serde_json::Value::Array(arr)) = content else {
+        return (images, documents);
+    };
+    for item in arr {
+        match item.get("type").and_then(|v| v.as_str()) {
+            Some("image") => {
+                if let Some(img) = item
+                    .get("source")
+                    .and_then(|s| serde_json::from_value::<crate::anthropic_types::ImageSource>(s.clone()).ok())
+                    .and_then(|src| anthropic_image_to_kiro(&src))
+                {
+                    images.push(img);
                 }
             }
+            Some("image_url") => {
+                if let Some(img) = image_url_to_kiro(item) {
+                    images.push(img);
+                }
+            }
+            Some("document") => {
+                let Some(src) = item
+                    .get("source")
+                    .and_then(|s| serde_json::from_value::<crate::anthropic_types::ImageSource>(s.clone()).ok())
+                else {
+                    continue;
+                };
+                let name = ["name", "title"]
+                    .iter()
+                    .find_map(|k| item.get(*k).and_then(|v| v.as_str()).filter(|n| !n.trim().is_empty()));
+                if let Some(doc) = anthropic_document_to_kiro(name, &src) {
+                    documents.push(doc);
+                }
+            }
+            _ => {}
         }
     }
-    images
+    (images, documents)
 }
 
 /// 提取工具结果内容

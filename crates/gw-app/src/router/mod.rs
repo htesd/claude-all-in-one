@@ -388,7 +388,7 @@ pub async fn run(instances_path: &Path, db_path: &Path, system_path: &Path) -> a
 
     // 入站体积上限:客户端 base64 图片/PDF 常 >2MB,axum 默认 2MB 会在 handler 前 413 且不入库
     // (2026-06 线上实测)。提到 system.max_request_body_bytes(默认 16MB),让大请求进得来交给
-    // 下游 worker 内容感知护栏(6.3MB 裁剪/压缩或清晰报错)。有界值(非 disable)防 DoS。
+    // 下游 worker 内容感知护栏(出站 24MB 裁剪/压缩或清晰报错)。有界值(非 disable)防 DoS。
     // **挂在 nest 之后**:axum 的 .layer() 只包住调用时已存在的路由,放这里才能同时覆盖
     // /v1/messages 与 /admin/api(大 JSON 导入),否则 admin 仍受默认 2MB(Skeptic 审查)。
     let app = app.layer(axum::extract::DefaultBodyLimit::max(max_body));
