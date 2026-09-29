@@ -46,6 +46,17 @@ pub enum UpstreamErrorKind {
     ModelNotAvailable,
     /// 上游 200 空流(Kiro 首包截断等)。动作:见 empty-fallback 策略。
     EmptyResponse,
+    /// 上游**内容安全分类器拒答**:Kiro `metadataEvent` 带 `stopReason=CONTENT_FILTERED`
+    /// 与 `stopDetails.refusal{category, explanation}`,且模型零产出。
+    ///
+    /// 2026-09-29 之前它被笼统归进 `EmptyResponse`,客户只看到一句「可能触发了审核」,
+    /// 且会累加账号的空响应计数、把健康号冷却掉。实测(真号直放同一报文):
+    /// Claude Code 自动模式第二段安全分类器(要求「先写 `<thinking>` 再给结论」)被
+    /// opus-5.5 以 `REASONING_EXTRACTION` 拒答,同一报文确定性复现。
+    ///
+    /// 动作:**不换号**(内容级确定性,换号一样拒)+ **不惩罚账号**(不是号的问题)+
+    /// 对外 400,文案带上游给的类别与说明(见 [`UpstreamError::content_filtered`])。
+    ContentFiltered,
     /// 其他未分类。动作:保守切号一次。
     Other,
 }
@@ -58,6 +69,7 @@ impl UpstreamErrorKind {
     /// - `BadRequest`:请求本身非法,换号一样错。
     /// - `EmptyResponse`:上游对该**内容**的确定性空流(疑 guardrail);换号救不回且放大
     ///   成多条 error 招封号(实战已证,见 caio-empty-response-not-fixable)。
+    /// - `ContentFiltered`:上游分类器对该**内容**确定性拒答,换号一样拒。
     /// - `TemporarilyBlocked`:账号被上游封禁/暂停;封禁号自身冷却自愈即可,把同一(被封
     ///   内容/高频)请求喂给健康号正是雪崩根因。
     /// - `Overloaded`:模型级容量不足,与账号无关。换号打的还是同一个模型端点,纯扩散;
@@ -70,6 +82,7 @@ impl UpstreamErrorKind {
             self,
             UpstreamErrorKind::BadRequest
                 | UpstreamErrorKind::EmptyResponse
+                | UpstreamErrorKind::ContentFiltered
                 | UpstreamErrorKind::TemporarilyBlocked
                 | UpstreamErrorKind::Overloaded
         )
@@ -93,12 +106,15 @@ impl UpstreamErrorKind {
     /// - `Overloaded`:上游模型没容量,与账号无关。**2026-07-25 opus-5 事故正是漏了这条**——
     ///   上游 5xx 记进 `failure_count`,35 秒内禁光 7 个健康号(禁用对**所有模型**生效,
     ///   连带 opus-4-6/sonnet-5 一起挂)。
+    /// - `ContentFiltered`:上游分类器拒的是**内容**,号本身健康;记进空响应计数会让
+    ///   同一会话反复触发时把健康号冷却掉。
     pub fn spares_account_health(&self) -> bool {
         matches!(
             self,
             UpstreamErrorKind::BadRequest
                 | UpstreamErrorKind::ModelNotAvailable
                 | UpstreamErrorKind::Overloaded
+                | UpstreamErrorKind::ContentFiltered
         )
     }
 
@@ -140,6 +156,10 @@ impl UpstreamErrorKind {
             UpstreamErrorKind::EmptyResponse => {
                 "模型未对该请求产出任何内容:可能是内容触发了上游安全审核,或包含当前通道不支持的输入(如图片附件)。请调整内容或更换模型后重试"
             }
+            // 兜底文案;正常路径走 UpstreamError::content_filtered 带上游类别与说明。
+            UpstreamErrorKind::ContentFiltered => {
+                "请求被模型的内容安全分类器拒绝。请调整内容、回退对话到更早的位置或更换模型后重试"
+            }
             // 要人介入。
             UpstreamErrorKind::QuotaExhausted => "服务额度已用尽,请联系管理员",
             UpstreamErrorKind::TokenInvalid => "服务鉴权异常,请联系管理员",
@@ -161,6 +181,7 @@ impl fmt::Display for UpstreamErrorKind {
             UpstreamErrorKind::BadRequest => "bad_request",
             UpstreamErrorKind::ModelNotAvailable => "model_not_available",
             UpstreamErrorKind::EmptyResponse => "empty_response",
+            UpstreamErrorKind::ContentFiltered => "content_filtered",
             UpstreamErrorKind::Other => "other",
         };
         f.write_str(s)
@@ -201,10 +222,11 @@ pub struct UpstreamError {
     pub delivery: RequestDelivery,
     /// 允许对外展示的详情。`None` = 用 [`UpstreamErrorKind::client_message`] 的中性兜底。
     ///
-    /// **私有,且只有 [`Self::bad_request_visible`] 一个入口。** 对抗评审三个镜头一致指出:
-    /// 只要留一个「把任意 String 登记为对外文案」的公开 API,迟早有人顺手把上游响应体
-    /// 传进去,fail-closed 就退化成靠自觉。收窄到单一构造器后,任何新的对外展示需求都得
-    /// 显式改这里 —— 改动可见,才评审得动。
+    /// **私有,只有两个入口:** [`Self::bad_request_visible`](我方本地文案)与
+    /// [`Self::content_filtered`](上游分类器拒答,只取结构化字段并清洗)。对抗评审三个镜头
+    /// 一致指出:只要留一个「把任意 String 登记为对外文案」的公开 API,迟早有人顺手把上游
+    /// 响应体传进去,fail-closed 就退化成靠自觉。任何新的对外展示需求都得显式改这里 ——
+    /// 改动可见,才评审得动。
     client_detail: Option<String>,
 }
 
@@ -252,6 +274,44 @@ impl UpstreamError {
         e
     }
 
+    /// 便捷构造:上游内容安全分类器拒答,**完整**告诉客户是哪个分类器、上游怎么说
+    /// (2026-09-29 用户要求:分类器导致的失败要把原因原样给到用户,不再用模糊文案)。
+    ///
+    /// 只接两个**结构化字段**,不接整段响应体:`category` 只留 `[A-Za-z0-9_]`(上游是
+    /// `REASONING_EXTRACTION` 这类常量),`explanation` 去控制字符、封顶
+    /// [`MAX_REFUSAL_EXPLANATION_CHARS`]。实测说明文本是通用英文句子,不含上游厂商名。
+    pub fn content_filtered(category: &str, explanation: &str) -> Self {
+        let raw_category = sanitize_refusal_category(category);
+        let raw_explanation = flatten_refusal_explanation(explanation);
+        // 对外版本:类别/说明带上游厂商/接口指纹就不发(类别退回 UNKNOWN、说明整段省略);
+        // 内部 message 永远留原文(排障要看)。
+        let category = if contains_vendor_fingerprint(&raw_category) {
+            "UNKNOWN".to_string()
+        } else {
+            raw_category.clone()
+        };
+        let explanation = if contains_vendor_fingerprint(&raw_explanation) {
+            String::new()
+        } else {
+            raw_explanation.clone()
+        };
+        let label = match refusal_category_gloss(&category) {
+            Some(gloss) => format!("类别:{category},{gloss}"),
+            None => format!("类别:{category}"),
+        };
+        let visible = if explanation.is_empty() {
+            format!("请求被模型的内容安全分类器拒绝({label})。请调整内容、回退对话到更早的位置或更换模型后重试")
+        } else {
+            format!("请求被模型的内容安全分类器拒绝({label})。上游说明:{explanation}")
+        };
+        let mut e = Self::new(
+            UpstreamErrorKind::ContentFiltered,
+            format!("上游分类器拒答 category={raw_category} explanation={raw_explanation}"),
+        );
+        e.client_detail = Some(visible);
+        e
+    }
+
     /// 发给客户端的消息 —— 唯一对外出口。
     ///
     /// 没登记 `client_detail` 就退回按类别的中性文案:宁可少说,不可说漏。
@@ -259,6 +319,59 @@ impl UpstreamError {
         self.client_detail
             .clone()
             .unwrap_or_else(|| self.kind.client_message().to_string())
+    }
+}
+
+/// 分类器说明文本的对外长度上限(字符)。实测说明约 200 字符,留余量防上游塞长文。
+pub const MAX_REFUSAL_EXPLANATION_CHARS: usize = 600;
+
+/// 类别只留 `[A-Za-z0-9_]`、最长 64;清空了就记 `UNKNOWN`。
+fn sanitize_refusal_category(raw: &str) -> String {
+    let s: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(64)
+        .collect();
+    if s.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        s
+    }
+}
+
+/// 对外文案里不许出现的上游厂商 / 接口指纹(小写),与 `no_kind_leaks_vendor_fingerprint` 同表。
+const VENDOR_FINGERPRINTS: &[&str] = &["kiro", "codewhisperer", "amazon", "aws", "generateassistantresponse"];
+
+/// 说明里是否带上游厂商 / 接口指纹。按**单词**比对(词以指纹开头即算,如 `KiroIDE`、
+/// `aws-sdk` 拆出的 `aws`),不做子串匹配 —— 否则 `laws` / `flaws` 这类普通英文会误伤,
+/// 把本该完整返回的拒答原因整段吞掉。实测说明是通用英文句子,这条只是防上游改文案的兜底。
+fn contains_vendor_fingerprint(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| VENDOR_FINGERPRINTS.iter().any(|f| w.starts_with(f)))
+}
+
+/// 控制字符(含换行)换成空格、压掉连续空白、按字符封顶。
+fn flatten_refusal_explanation(raw: &str) -> String {
+    let flat: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let words: Vec<&str> = flat.split_whitespace().collect();
+    let joined = words.join(" ");
+    if joined.chars().count() <= MAX_REFUSAL_EXPLANATION_CHARS {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(MAX_REFUSAL_EXPLANATION_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
+/// 已实测过的类别给一句中文释义;没见过的类别只报原名,不瞎猜。
+fn refusal_category_gloss(category: &str) -> Option<&'static str> {
+    match category {
+        "REASONING_EXTRACTION" => Some("上游判定该请求在索取模型的内部推理过程"),
+        _ => None,
     }
 }
 
@@ -340,7 +453,7 @@ mod tests {
     #[test]
     fn no_kind_leaks_vendor_fingerprint() {
         use UpstreamErrorKind as K;
-        const KINDS: [K; 11] = [
+        const KINDS: [K; 12] = [
             K::TokenInvalid,
             K::RateLimited,
             K::TemporarilyBlocked,
@@ -351,14 +464,74 @@ mod tests {
             K::BadRequest,
             K::ModelNotAvailable,
             K::EmptyResponse,
+            K::ContentFiltered,
             K::Other,
         ];
         for k in KINDS {
             let m = k.client_message().to_ascii_lowercase();
-            for bad in ["kiro", "codewhisperer", "amazon", "aws", "generateassistantresponse"] {
+            for bad in VENDOR_FINGERPRINTS {
                 assert!(!m.contains(bad), "{k} 的对外文案泄露了 `{bad}`: {m}");
             }
             assert!(!k.client_message().is_empty(), "{k} 缺对外文案");
         }
+    }
+
+    /// 分类器拒答:类别与上游说明完整给到客户(2026-09-29 用户要求),内部 message 同样留底。
+    #[test]
+    fn content_filtered_passes_category_and_explanation() {
+        let expl = "The selected model cannot continue this conversation. Please select a different model, or start a new conversation, or rewind the current conversation to an earlier point and try a different approach.";
+        let e = UpstreamError::content_filtered("REASONING_EXTRACTION", expl);
+        assert_eq!(e.kind, UpstreamErrorKind::ContentFiltered);
+        let out = e.client_message();
+        assert!(out.contains("REASONING_EXTRACTION"), "{out}");
+        assert!(out.contains("内部推理"), "已知类别带中文释义: {out}");
+        assert!(out.contains(expl), "上游说明必须完整透出: {out}");
+        assert!(e.message.contains("REASONING_EXTRACTION") && e.message.contains(expl));
+    }
+
+    #[test]
+    fn content_filtered_sanitizes_inputs() {
+        // 类别只留 [A-Za-z0-9_];说明去控制字符、压空白。
+        let e = UpstreamError::content_filtered("BAD<script>\n", "line1\n\tline2\u{0007}");
+        let out = e.client_message();
+        assert!(out.contains("类别:BADscript"), "{out}");
+        assert!(out.contains("上游说明:line1 line2"), "{out}");
+        // 空类别 → UNKNOWN;空说明 → 可操作的兜底提示。
+        let e = UpstreamError::content_filtered("", "");
+        let out = e.client_message();
+        assert!(out.contains("类别:UNKNOWN") && out.contains("更换模型"), "{out}");
+        // 超长说明按字符封顶(不会切坏 UTF-8)。
+        let long = "拒".repeat(MAX_REFUSAL_EXPLANATION_CHARS + 50);
+        let out = UpstreamError::content_filtered("X", &long).client_message();
+        assert!(out.ends_with('…'));
+        let shown = out.split_once("上游说明:").map(|(_, x)| x).unwrap_or_default();
+        assert_eq!(shown.matches('拒').count(), MAX_REFUSAL_EXPLANATION_CHARS);
+    }
+
+    #[test]
+    fn content_filtered_drops_explanation_with_vendor_fingerprint() {
+        let e = UpstreamError::content_filtered("X", "Blocked by Kiro guardrail on AWS");
+        let out = e.client_message();
+        assert!(!out.to_ascii_lowercase().contains("kiro"), "{out}");
+        assert!(out.contains("类别:X") && out.contains("更换模型"), "{out}");
+        // 内部诊断保留原文。
+        assert!(e.message.contains("Blocked by Kiro guardrail on AWS"), "{}", e.message);
+        // 类别同样过指纹(`_` 是分词符,AWS_GUARDRAIL 拆出 aws),内部照留原文。
+        let e = UpstreamError::content_filtered("AWS_GUARDRAIL", "Request blocked.");
+        assert!(e.client_message().contains("类别:UNKNOWN"), "{}", e.client_message());
+        assert!(!e.client_message().to_ascii_lowercase().contains("aws"));
+        assert!(e.message.contains("AWS_GUARDRAIL"));
+        // 按单词比对:普通英文里含 aws 子串的词不算指纹,说明照常完整返回。
+        let e = UpstreamError::content_filtered("X", "This request violates applicable laws and has flaws.");
+        assert!(e.client_message().contains("violates applicable laws and has flaws."));
+    }
+
+    #[test]
+    fn content_filtered_is_content_level() {
+        let k = UpstreamErrorKind::ContentFiltered;
+        assert!(!k.worth_switching_account(), "内容级确定性拒答,换号一样拒");
+        assert!(k.spares_account_health(), "拒的是内容,不扣号的健康");
+        assert!(!k.should_cooldown());
+        assert_eq!(k.to_string(), "content_filtered");
     }
 }

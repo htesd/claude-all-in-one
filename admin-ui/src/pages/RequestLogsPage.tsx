@@ -9,9 +9,10 @@ import { Modal } from '@/components/ui/modal'
 import { Segment } from '@/components/ui/segment'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TBody, TD, TH, THead, TR } from '@/components/ui/table'
+import { clientErrorMessage, isClassifierBlocked } from '@/features/logs/errorKind'
 import { useLogDetail, useLogs } from '@/features/logs/hooks'
 import { PayloadView, type PayloadMode } from '@/features/logs/PayloadView'
-import type { LogsSuccessFilter, LogsTimeRange } from '@/features/logs/types'
+import type { LogsSuccessFilter, LogsTimeRange, RequestLogRow } from '@/features/logs/types'
 import { useI18n } from '@/lib/i18n'
 import { cn, formatInt } from '@/lib/utils'
 
@@ -63,6 +64,26 @@ function formatCredit(c: number): string {
 function ratioPct(num: number, denom: number, digits = 0): string {
   if (denom <= 0) return '—'
   return `${((num / denom) * 100).toFixed(digits)}%`
+}
+
+/** 状态徽章:分类器拦截单独标出(不论 success),其余按成功/失败;失败附 error_kind 小字。 */
+function StatusBadge({ row }: { row: Pick<RequestLogRow, 'success' | 'error_kind'> }) {
+  const { t } = useI18n()
+  if (isClassifierBlocked(row)) {
+    return <Badge variant="destructive">{t('logs.classifierBlocked')}</Badge>
+  }
+  return (
+    <>
+      <Badge variant={row.success ? 'success' : 'destructive'}>
+        {row.success ? t('logs.filter.success.ok') : t('logs.filter.success.fail')}
+      </Badge>
+      {!row.success && row.error_kind && (
+        <span className="mt-0.5 block font-mono text-[10px] text-muted-foreground">
+          {row.error_kind}
+        </span>
+      )}
+    </>
+  )
 }
 
 interface LogDetailModalProps {
@@ -122,12 +143,22 @@ function LogDetailModal({ id, onClose }: LogDetailModalProps) {
                 {t('logs.detail.status')}
               </p>
               <div className="mt-1">
-                <Badge variant={data.success ? 'success' : 'destructive'}>
-                  {data.success ? t('logs.filter.success.ok') : t('logs.filter.success.fail')}
-                </Badge>
+                <StatusBadge row={data} />
               </div>
             </div>
           </div>
+
+          {/* 分类器拦截:红色横幅,给出客户实际收到的那句错误(答到一半被拦则无错误体) */}
+          {isClassifierBlocked(data) && (
+            <div className="rounded-2xl border border-rose-300 bg-rose-50 px-4 py-3 dark:border-rose-400/30 dark:bg-rose-500/10">
+              <p className="text-sm font-semibold text-rose-700 dark:text-rose-300">
+                {t('logs.detail.classifierBlocked')}
+              </p>
+              <p className="mt-1 whitespace-pre-wrap break-words text-xs text-rose-700/90 dark:text-rose-200/90">
+                {clientErrorMessage(data.response_payload) ?? t('logs.detail.classifierMidStream')}
+              </p>
+            </div>
+          )}
 
           {/* Token row */}
           <div className="grid grid-cols-3 gap-2">
@@ -228,12 +259,14 @@ function LogDetailModal({ id, onClose }: LogDetailModalProps) {
               </div>
               <PayloadView raw={data.kiro_payload} mode={payloadMode} blobs={data.blobs} />
             </div>
-            {/* 模型回复:仅成功且采集到时展示(旧日志/失败请求无此字段) */}
+            {/* 模型回复 / 失败时客户端实收的错误体(旧日志无此字段) */}
             {data.response_payload && (
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
                   <p className="text-xs font-semibold text-muted-foreground">
-                    {t('logs.detail.responsePayload')}
+                    {clientErrorMessage(data.response_payload) !== null
+                      ? t('logs.detail.clientError')
+                      : t('logs.detail.responsePayload')}
                   </p>
                   <button
                     type="button"
@@ -393,14 +426,17 @@ export default function RequestLogsPage() {
               rows.map((row) => (
                 <TR
                   key={row.id}
-                  className={cn('cursor-pointer')}
+                  className={cn(
+                    'cursor-pointer',
+                    // 上游分类器拦截的请求整行标红,一眼可见。
+                    isClassifierBlocked(row) &&
+                      'bg-rose-50 hover:bg-rose-100 dark:bg-rose-500/10 dark:hover:bg-rose-500/15',
+                  )}
                   onClick={() => setSelectedId(row.id)}
                 >
                   <TD className="text-xs text-muted-foreground">{formatTime(row.created_at)}</TD>
                   <TD>
-                    <Badge variant={row.success ? 'success' : 'destructive'}>
-                      {row.success ? t('logs.filter.success.ok') : t('logs.filter.success.fail')}
-                    </Badge>
+                    <StatusBadge row={row} />
                   </TD>
                   <TD className="max-w-[200px] truncate font-mono text-xs">{row.model}</TD>
                   <TD className="text-xs">

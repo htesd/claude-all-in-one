@@ -16,6 +16,7 @@ use crate::kiro_types::conversation::{
 };
 
 mod cache_point;
+mod classifier_prompt;
 mod content;
 mod document_name;
 mod history;
@@ -361,6 +362,11 @@ pub fn convert_request(
         // 仅有 tool_results（无媒体、无文本）：正常工具结果回合，保留空文本。
         text_content
     };
+
+    // 12.1 安全分类器第二段「正文写 <thinking>」指令的上游兼容改写(仅 opus-5.5,逐字匹配
+    // Claude Code 原句;不命中零改动)。上游把它判成 REASONING_EXTRACTION 拒答,见
+    // classifier_prompt 模块注释。在 thinking 前缀注入之前做,只动当前轮文本。
+    let content = classifier_prompt::rewrite_visible_thinking_directive(&req.model, content);
 
     // 块2b:thinking 前缀注入**当前轮** content(不进 system/history,避免毒化缓存前缀)。
     // 在兜底之后注入:即便当前轮是纯 tool_result/媒体占位,带 thinking 时也应让上游开思考。

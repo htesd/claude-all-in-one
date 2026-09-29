@@ -847,6 +847,40 @@ impl BlockTracker {
     }
 }
 
+/// 上游内容安全分类器拒答的结构化信息(`metadataEvent.stopDetails.refusal`)。
+#[derive(Debug, Clone, PartialEq)]
+struct Refusal {
+    category: String,
+    explanation: String,
+}
+
+/// 从 `metadataEvent` 载荷识别分类器拒答。2026-09-29 真号实测形态:
+///
+/// ```json
+/// {"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION",
+///   "explanation":"The selected model cannot continue this conversation. ..."}},
+///  "stopReason":"CONTENT_FILTERED"}
+/// ```
+///
+/// 有 `stopDetails.refusal` 即算拒答;只有 `stopReason=CONTENT_FILTERED` 没有详情时也算,
+/// 类别记 `CONTENT_FILTERED`。其余 metadataEvent(正常 `end_turn` 等)返回 None。
+fn parse_refusal(v: &serde_json::Value) -> Option<Refusal> {
+    let str_at = |x: Option<&serde_json::Value>| {
+        x.and_then(|s| s.as_str()).unwrap_or_default().to_string()
+    };
+    if let Some(r) = v.pointer("/stopDetails/refusal").filter(|r| r.is_object()) {
+        let category = str_at(r.get("category"));
+        return Some(Refusal {
+            category: if category.is_empty() { "CONTENT_FILTERED".to_string() } else { category },
+            explanation: str_at(r.get("explanation")),
+        });
+    }
+    (v.get("stopReason").and_then(|s| s.as_str()) == Some("CONTENT_FILTERED")).then(|| Refusal {
+        category: "CONTENT_FILTERED".to_string(),
+        explanation: String::new(),
+    })
+}
+
 /// 用 async-stream 风格手写状态机(不引入 async-stream crate:用 channel + task)。
 fn async_stream_like(
     byte_stream: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -914,6 +948,8 @@ fn async_stream_like(
         // EOF 时 saw_upstream_payload && !saw_terminal → 流是被上游**静默掐断**的。
         let mut saw_upstream_payload = false;
         let mut saw_terminal = false;
+        // 上游内容安全分类器拒答(metadataEvent.stopDetails.refusal),收尾时决定形态。
+        let mut refusal: Option<Refusal> = None;
         let window = crate::converter::get_context_window_size(&model);
         futures::pin_mut!(byte_stream);
 
@@ -1110,8 +1146,14 @@ fn async_stream_like(
                             Some("metadataEvent") => {
                                 // Kiro 正常收尾帧(带 stopReason):**正常终止信号**。
                                 // 它的缺席正是「静默掐流」的判据(见收尾处 UpstreamCut 发射)。
-                                // stopReason 的具体值不进 SSE(收尾仍按既有优先级推导 stop_reason)。
+                                // stopReason 的具体值不进 SSE(收尾仍按既有优先级推导 stop_reason),
+                                // 唯一例外是分类器拒答,见 [`parse_refusal`]。
                                 saw_terminal = true;
+                                if let Ok(v) = frame.payload_as_json::<serde_json::Value>() {
+                                    if let Some(r) = parse_refusal(&v) {
+                                        refusal = Some(r);
+                                    }
+                                }
                             }
                             // event-type 异常名兜底(:message-type=event 但 event-type 是异常名
                             // 的奇异帧;常规异常帧已在上方按 :message-type 路由)。
@@ -1161,8 +1203,29 @@ fn async_stream_like(
             let _ = tx.send(Ok(StreamItem::UpstreamCut)).await;
         }
 
+        // 拒答判定要的「是否已有答案」必须在 finish() 之前取:thinking-only 兜底会补一个空格
+        // 正文(text_opened 置真),output_tokens 又把推理也算进去 —— 两者都不代表客户拿到了答案。
+        let answered = tracker.text_opened || tracker.has_tool_use;
+
         // --- 收尾:关掉任何开着的块(thinking/text)+ thinking-only 兜底 ---
         let finish_events = tracker.finish();
+
+        // ④' 分类器拒答:没给出正文/工具调用 → 终态 Err(ContentFiltered),文案带上游类别与
+        // 说明(客户能看懂为什么、该怎么办;账号不受罚、不换号,见 UpstreamErrorKind 注释)。
+        // 已有正文/工具调用 → 按 Anthropic 原生语义 stop_reason=refusal 收尾(客户端认得)。
+        // 判据刻意不用 produced_any_content() / output_tokens:只有推理、没有答案时,客户真正
+        // 需要的是那句拒答原因,而不是一条空消息(判据 `answered` 见 finish() 之前)。
+        // 必须排在空响应检测之前:否则零产出拒答又会落回笼统的 EmptyResponse。
+        if let Some(r) = &refusal {
+            tracing::warn!(model = %model, category = %r.category, answered, "上游分类器拒答");
+            if !answered {
+                let _ = tx
+                    .send(Err(UpstreamError::content_filtered(&r.category, &r.explanation)))
+                    .await;
+                return;
+            }
+            stop_reason = Some("refusal".to_string());
+        }
 
         // ⑤ 空响应检测(v60 契约):到达此处 = 流无失败;零实质产出且无显式 stop_reason
         // (max_tokens/context 超限的零产出是合法退化,不算空)→ 终态 Err(EmptyResponse),
@@ -2055,6 +2118,89 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ---- 上游分类器拒答(metadataEvent.stopDetails.refusal,2026-09-29 真号实测形态)----
+
+    const REFUSAL_META: &str = r#"{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"The selected model cannot continue this conversation. Please select a different model, or start a new conversation, or rewind the current conversation to an earlier point and try a different approach."}},"stopReason":"CONTENT_FILTERED"}"#;
+
+    #[tokio::test]
+    async fn zero_output_refusal_yields_content_filtered_with_full_reason() {
+        // 真号实测序列:只有 metadataEvent(拒答)+ contextUsageEvent,零正文。
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "metadataEvent")],
+            REFUSAL_META.as_bytes(),
+        );
+        let f2 = es_frame(
+            &[(":message-type", "event"), (":event-type", "contextUsageEvent")],
+            br#"{"contextUsagePercentage":7.18}"#,
+        );
+        let items = run_stream(vec![f1, f2], false).await;
+        let err = items.iter().find_map(|i| i.as_ref().err()).expect("应有终态 Err");
+        assert_eq!(err.kind, UpstreamErrorKind::ContentFiltered, "不能再落回笼统的 EmptyResponse");
+        let msg = err.client_message();
+        assert!(msg.contains("REASONING_EXTRACTION"), "{msg}");
+        assert!(msg.contains("The selected model cannot continue this conversation."), "{msg}");
+        let evs = sse_events(&items);
+        assert!(!evs.iter().any(|e| e.event == "message_delta" || e.event == "message_stop"));
+        assert!(!items.iter().any(|i| matches!(i, Ok(StreamItem::Usage(_)))));
+        assert!(!items.iter().any(|i| matches!(i, Ok(StreamItem::UpstreamCut))), "拒答有终止帧,不算掐流");
+    }
+
+    #[tokio::test]
+    async fn refusal_after_answer_finishes_with_stop_reason_refusal() {
+        let f1 = es_frame(
+            &[(":message-type", "event"), (":event-type", "assistantResponseEvent")],
+            r#"{"content":"半截回答"}"#.as_bytes(),
+        );
+        let f2 = es_frame(
+            &[(":message-type", "event"), (":event-type", "metadataEvent")],
+            REFUSAL_META.as_bytes(),
+        );
+        let items = run_stream(vec![f1, f2], false).await;
+        assert!(items.iter().all(|i| i.is_ok()), "已有正文不应报错");
+        let evs = sse_events(&items);
+        let delta = evs.iter().find(|e| e.event == "message_delta").expect("正常收尾");
+        assert_eq!(delta.data["delta"]["stop_reason"], "refusal");
+        assert!(evs.iter().any(|e| e.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn refusal_after_reasoning_only_still_reports_reason() {
+        // 只有推理、没有正文就被拒:推理会计入 output_tokens,thinking-only 兜底还会补空格正文,
+        // 两者都不能被当成"已回答" —— 客户需要的是拒答原因(对抗评审 Minimalist#1)。
+        for thinking in [false, true] {
+            let f1 = es_frame(
+                &[(":message-type", "event"), (":event-type", "reasoningContentEvent")],
+                "{\"text\":\"先想一想\"}".as_bytes(),
+            );
+            let f2 = es_frame(
+                &[(":message-type", "event"), (":event-type", "metadataEvent")],
+                REFUSAL_META.as_bytes(),
+            );
+            let items = run_stream(vec![f1, f2], thinking).await;
+            let err = items
+                .iter()
+                .find_map(|i| i.as_ref().err())
+                .unwrap_or_else(|| panic!("thinking={thinking}: 应报 ContentFiltered 而非空的成功回复"));
+            assert_eq!(err.kind, UpstreamErrorKind::ContentFiltered, "thinking={thinking}");
+            assert!(!sse_events(&items).iter().any(|e| e.event == "message_stop"));
+        }
+    }
+
+    #[test]
+    fn parse_refusal_shapes() {
+        let v: serde_json::Value = serde_json::from_str(REFUSAL_META).unwrap();
+        let r = parse_refusal(&v).expect("完整形态");
+        assert_eq!(r.category, "REASONING_EXTRACTION");
+        assert!(r.explanation.starts_with("The selected model"));
+        // 只有 stopReason 没有详情 → 类别兜底 CONTENT_FILTERED。
+        let r = parse_refusal(&serde_json::json!({"stopReason":"CONTENT_FILTERED"})).unwrap();
+        assert_eq!(r, Refusal { category: "CONTENT_FILTERED".into(), explanation: String::new() });
+        // 正常收尾帧不是拒答。
+        assert!(parse_refusal(&serde_json::json!({"stopReason":"end_turn"})).is_none());
+        assert!(parse_refusal(&serde_json::json!({})).is_none());
+        assert!(parse_refusal(&serde_json::json!({"stopDetails":{"refusal":null}})).is_none());
     }
 
     #[tokio::test]

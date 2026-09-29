@@ -3012,3 +3012,46 @@ fn image_url_data_urls_become_images_remote_urls_skipped() {
     let got: Vec<_> = imgs.iter().map(|i| (i.format.as_str(), i.source.bytes.as_str())).collect();
     assert_eq!(got, vec![("png", "iVBORw0K"), ("jpeg", "/9j/4AAQ")], "按块顺序;远程 URL 与 bmp 跳过");
 }
+
+/// 安全分类器第二段「正文写 <thinking>」指令:opus-5.5 在转换时被改写,其余模型原样;
+/// 改写只作用于当前轮文本(2026-09-29,上游 REASONING_EXTRACTION 拒答修复)。
+#[test]
+fn convert_request_rewrites_stage2_thinking_directive_for_opus_5_5_only() {
+    use crate::anthropic_types::Message as AnthropicMessage;
+    let tail = "Review the classification process and follow it carefully. Use <thinking> before responding with <block>. Think longer on ambiguous or borderline actions; keep reasoning brief for clear-cut ones.";
+    let build = |model: &str| MessagesRequest {
+        model: model.to_string(),
+        max_tokens: 10240,
+        messages: vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "<transcript>\n"},
+                {"type": "text", "text": "{\"Bash\":\"ls\"}\n"},
+                {"type": "text", "text": "</transcript>\n"},
+                {"type": "text", "text": tail},
+            ]),
+        }],
+        system: None,
+        stream: false,
+        tools: None,
+        thinking: None,
+        tool_choice: None,
+        output_config: None,
+        metadata: None,
+        context_management: None,
+    };
+    let content = |model: &str| {
+        convert_request(&build(model), "")
+            .unwrap()
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content
+    };
+    let c = content("claude-opus-5-5");
+    assert!(!c.contains("Use <thinking>"), "opus-5.5 必须改写: {c}");
+    assert!(c.contains("Think it through before responding with <block>."), "{c}");
+    assert!(c.contains("{\"Bash\":\"ls\"}") && c.contains("keep reasoning brief"), "其余内容保留: {c}");
+    let c = content("claude-sonnet-5");
+    assert!(c.contains("Use <thinking> before responding with <block>."), "sonnet-5 不动: {c}");
+}

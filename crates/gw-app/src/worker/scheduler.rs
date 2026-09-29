@@ -3390,9 +3390,12 @@ impl AccountScheduler {
             // 这里刻意**穷举**而非用 `spares_account_health()` 做守卫:守卫会让新增 kind 悄悄
             // 落进某个分支,穷举则编译不过、强迫做决策。两者一致性由
             // `spares_account_health_matches_no_penalty_arms` 测试锁住。
+            // ContentFiltered(上游分类器拒答)拒的是内容,号本身健康;以前混在 EmptyResponse
+            // 里累加空响应计数,同一会话反复触发会把健康号冷却掉。
             UpstreamErrorKind::BadRequest
             | UpstreamErrorKind::ModelNotAvailable
-            | UpstreamErrorKind::Overloaded => {}
+            | UpstreamErrorKind::Overloaded
+            | UpstreamErrorKind::ContentFiltered => {}
         }
         drop(entries);
         // 即时落库(B4):把"崩溃丢转换"窗口从 30s sync 周期压到毫秒级;
@@ -5836,6 +5839,19 @@ mod tests {
         assert_eq!(s.acquire(Some("s")).await.err(), Some(AcquireError::AllDisabled));
     }
 
+    /// 上游分类器拒答拒的是内容:同一会话反复触发(实测一个会话 6 分钟内 3 次)也不许
+    /// 把健康号冷却掉 —— 以前它混在 EmptyResponse 里,3 次就撞空响应阈值。
+    #[tokio::test]
+    async fn content_filtered_never_cools_down_account() {
+        let s = sched(vec![acct("a", 4, None)]);
+        for _ in 0..10 {
+            s.report_failure("a", UpstreamErrorKind::ContentFiltered);
+        }
+        assert!(s.acquire(Some("s")).await.is_ok(), "分类器拒答不得禁用/冷却账号");
+        let snap = s.status_snapshot();
+        assert_eq!(snap.iter().find(|x| x.account_id == "a").unwrap().failure_count, 0);
+    }
+
     #[tokio::test]
     async fn too_many_failures_then_self_heal() {
         let s = sched(vec![acct("a", 4, None)]);
@@ -5898,7 +5914,7 @@ mod tests {
         const ALL: &[K] = &[
             K::TokenInvalid, K::RateLimited, K::TemporarilyBlocked, K::QuotaExhausted,
             K::Network, K::ServerError, K::Overloaded, K::BadRequest,
-            K::ModelNotAvailable, K::EmptyResponse, K::Other,
+            K::ModelNotAvailable, K::EmptyResponse, K::ContentFiltered, K::Other,
         ];
         for &kind in ALL {
             // 两个号:避免单号被禁时"全灭自愈"重置计数,掩盖真实惩罚行为。

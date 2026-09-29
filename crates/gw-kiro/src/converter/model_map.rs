@@ -52,6 +52,15 @@ pub struct KiroModel {
     /// 输出 ~3000 token、~145s,low→xhigh→max 严格单调;旧标签 → 5~15k、~450 token,与 low 无差。
     /// opus-5 / 4.8 旧标签照常生效(max 档 5~14k 字符思考、93~243s),保持 false 不动线缆。
     pub structured_effort_only: bool,
+    /// 上游会把「在正文里写 `<thinking>`」的指令判成 `REASONING_EXTRACTION` 拒答
+    /// (`metadataEvent.stopDetails.refusal`,零产出)。为 true 时,转换器把 Claude Code
+    /// 自动模式安全分类器第二段的这类指令改写成不索取可见推理的等价说法,见
+    /// `converter::classifier_prompt`。
+    ///
+    /// 2026-09-29 真号直放实测(opus-5.5,同一报文):原样 → 拒答;去掉结构化 effort 仍拒答
+    /// (与 effort 字段无关);改写后两条样本都正常出 `<block>`,模型走原生推理(约 800 字符)。
+    /// sonnet-5 同一类请求 11/11 正常,保持 false 不动。
+    pub rewrite_visible_thinking_directive: bool,
 }
 
 /// 一个模型的 thinking 签名**怎样标识归属** —— 决定历史 thinking 能否以结构化
@@ -123,6 +132,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("medium"),
         signature_id: SignatureId::Anonymous { envelope_version: 4 },
         structured_effort_only: true,
+        rewrite_visible_thinking_directive: true,
     },
     KiroModel {
         // 2026-07-25 上游新增。与 sonnet-5 同规律:modelId 是主版本裸名
@@ -138,6 +148,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("high"),
         signature_id: SignatureId::Codename("claude-honey"),
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-8",
@@ -151,6 +162,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("high"),
         signature_id: SignatureId::Codename("claude-quince"),
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-7",
@@ -165,6 +177,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("xhigh"),
         signature_id: SignatureId::Codename("claude-opus-4-7"),
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-6",
@@ -178,6 +191,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("high"),
         signature_id: SignatureId::Unsigned,
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-opus-4-5",
@@ -191,6 +205,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: None,
         signature_id: SignatureId::Unsigned,
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         // 2026-07-02 上游 ListAvailableModels 实测新增(标注 experimental preview),
@@ -206,6 +221,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("high"),
         signature_id: SignatureId::Codename("claude-saffron"),
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-6",
@@ -219,6 +235,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: Some("high"),
         signature_id: SignatureId::Unsigned,
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-sonnet-4-5",
@@ -232,6 +249,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: None,
         signature_id: SignatureId::Unsigned,
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
     KiroModel {
         advertised_id: "claude-haiku-4-5",
@@ -245,6 +263,7 @@ pub const KIRO_MODELS: &[KiroModel] = &[
         default_effort: None,
         signature_id: SignatureId::Unsigned,
         structured_effort_only: false,
+        rewrite_visible_thinking_directive: false,
     },
 ];
 
@@ -284,6 +303,12 @@ pub fn clamp_effort_for_model(model: &str, requested: Option<&str>) -> Option<&'
 /// 未知模型返回 false(不改线缆形态)。
 pub fn requires_structured_effort(model: &str) -> bool {
     lookup_model(model).is_some_and(|m| m.structured_effort_only)
+}
+
+/// 该模型是否需要改写「正文写 `<thinking>`」类指令(见
+/// [`KiroModel::rewrite_visible_thinking_directive`])。未知模型返回 false(不改报文)。
+pub fn rewrites_visible_thinking_directive(model: &str) -> bool {
+    lookup_model(model).is_some_and(|m| m.rewrite_visible_thinking_directive)
 }
 
 /// 静态表与上游实际目录的一处不一致。

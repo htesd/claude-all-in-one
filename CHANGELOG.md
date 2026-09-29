@@ -1,5 +1,55 @@
 # Changelog
 
+## [kiro-classifier-refusal] - 2026-09-29
+
+### 修复:Claude Code 自动模式第二段安全分类器在 opus-5.5 上被上游拒答
+- 用户报错 `400 模型未对该请求产出任何内容:可能是内容触发了上游安全审核...`。定位:Claude Code
+  「自动模式」两段式安全分类器,第一段判为需拦截后进入第二段,第二段末尾要求
+  `Use <thinking> before responding with <block>.`(把推理写进正文)。opus-5.5 在 Kiro 上把这句
+  判成 `REASONING_EXTRACTION`,`metadataEvent` 返回
+  `stopReason=CONTENT_FILTERED` + `stopDetails.refusal{category, explanation}`,零正文。
+  同一会话 6 分钟内 3 次确定性复现;第一段(只许输出 `<block>`)不受影响。
+- 真号直放 A/B(同一报文):原样 → 拒答;去掉结构化 effort → **仍拒答**(与 kiro-media-limits
+  的 effort 修复无关,是早已存在的问题);只把那一句改写成
+  `Think it through before responding with <block>.` → 两条被拒样本都正常返回,模型走原生推理
+  (隐藏,约 800 字符),正文 `<block>no</block>` / `<block>yes</block><category>…</category><reason>…</reason>`。
+- 修法:新模块 `converter/classifier_prompt.rs`,对模型表 `rewrite_visible_thinking_directive=true`
+  (仅 opus-5.5)的请求,只改当前轮**最后一个 `</transcript>` 之后**(分类器后缀)与 Claude Code
+  原句逐字相同的指令;没有 `</transcript>` 的请求、转录里引用到的同一句话一律不动;`<severity>` 版本
+  (`Use <thinking> first, then respond with <severity>N</severity>`)同机制一并改写。
+  sonnet-5 同类请求 11/11 正常,不动。
+
+### 分类器拒答单独归类、原因完整返回用户、面板标红
+- 新 `UpstreamErrorKind::ContentFiltered`:**不换号**(内容级确定性)、**不扣账号健康**(以前混在
+  EmptyResponse 里,同一会话 3 次就把健康号冷却掉)、对外 400 `invalid_request_error`。
+- 对外文案(用户要求「完整返回给用户」):`请求被模型的内容安全分类器拒绝(类别:REASONING_EXTRACTION,
+  上游判定该请求在索取模型的内部推理过程)。上游说明:The selected model cannot continue this
+  conversation. ...`。`UpstreamError::content_filtered` 是继 `bad_request_visible` 之后第二个允许对外
+  文案的受控构造器:只收结构化的类别与说明两个字段,类别只留 `[A-Za-z0-9_]`,说明去控制字符、封顶
+  600 字符,带上游厂商/接口指纹时整段不发。
+- 「已有答案」只认真实正文块/工具调用,且在 thinking-only 兜底补空格正文之前判定;只有推理
+  就被拒仍按 ContentFiltered 报错。拒答发生在已有正文/工具调用之后:按 Anthropic 原生语义
+  `stop_reason=refusal` 收尾,请求日志打 `error_kind=ContentFiltered`(success 口径不变)。
+- 类别与说明都过厂商/接口指纹检查(按单词,`laws`/`flaws` 不误伤),命中则对外省略、内部留原文。
+- 请求日志:失败请求的 `response_payload` 现在存**下发客户端的错误体**(以前为空;首包前、
+  非流式、首包后 SSE error 三条路径同口径,非流式折叠失败存中性化后的版本),详情页能看到
+  客户实际收到的那句话。
+- admin-ui:`ContentFiltered` 整行标红 + 「分类器拦截」徽章,详情页红色横幅显示客户实收错误;
+  其余失败行在徽章下显示 error_kind。
+
+### Notes & Caveats
+- 改写逐字依赖 Claude Code 2.1.284 的提示词原句;Claude Code 改措辞后改写自动失效(退回拒答,
+  但至少文案完整、账号不受罚)。拒答仍会出现在请求日志里标红,可据此发现。
+- `<severity>` 版本未单独真号实测。
+- UI 改动随镜像发布,但**只有 router 换到新镜像后面板才显示**(router 仍是 09-08 镜像)。
+- 对抗评审(codex,Skeptic/Architect/Minimalist 三镜头,无 high):一致指出「推理计入 output_tokens
+  导致只推理就被拒被当成已回答」、改写范围过宽会改动被审查的转录、`aws` 子串误伤 `laws`、非流式
+  折叠失败日志存的是净化前错误体、首包后错误体未落库、类别可绕过指纹检查 —— 均已修复并补测试。
+- 测试:workspace 1823 条通过(新增 gw-core 4、gw-kiro 11、gw-app 4 条),admin-ui 67 条通过。
+- 生产验证(只换 worker0):分类器第二段请求发往上游的报文已是改写后的句子,正常返回 `<block>`;
+  拒答探针返回 400 + 完整类别与说明,请求日志 `error_kind=ContentFiltered` 且存了客户实收错误体,
+  被拒账号 failure_count=0、未冷却。
+
 ## [kiro-media-limits] - 2026-09-29
 
 ### 修复:opus-5.5 思考强度设置不生效

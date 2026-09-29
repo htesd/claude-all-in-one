@@ -3213,7 +3213,7 @@ fn fail_pre_first_byte(
         Some(started_at.elapsed().as_millis() as i64),
         None,
         usage,
-        ResponseLog::None,
+        ResponseLog::Error(upstream_error_payload(e)),
         st.provider.family(),
     );
     drop(lease);
@@ -3368,7 +3368,7 @@ mod error_shape_tests {
         for kind in [
             K::TokenInvalid, K::RateLimited, K::TemporarilyBlocked, K::QuotaExhausted,
             K::Network, K::ServerError, K::Overloaded, K::BadRequest,
-            K::ModelNotAvailable, K::EmptyResponse, K::Other,
+            K::ModelNotAvailable, K::EmptyResponse, K::ContentFiltered, K::Other,
         ] {
             let e = UpstreamError::new(kind, "x");
             for (path, body) in [
@@ -3386,6 +3386,39 @@ mod error_shape_tests {
         }
     }
 
+    /// 面板按 error_kind 字面量标红:常量必须与 kind 的 Debug 串一致(首包前失败路径用的是后者)。
+    #[test]
+    fn content_filtered_kind_constant_matches_debug_name() {
+        assert_eq!(CONTENT_FILTERED_KIND, format!("{:?}", K::ContentFiltered));
+    }
+
+    #[test]
+    fn refusal_stop_reason_is_detected_in_stream_and_folded_message() {
+        let refusal = SseEvent::new(
+            "message_delta",
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal"}}),
+        );
+        let normal = SseEvent::new(
+            "message_delta",
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        );
+        assert!(is_refusal_delta(&refusal));
+        assert!(!is_refusal_delta(&normal));
+        assert!(is_refusal_message(&serde_json::json!({"stop_reason":"refusal"})));
+        assert!(!is_refusal_message(&serde_json::json!({"stop_reason":"end_turn"})));
+    }
+
+    /// 分类器拒答对外:400 + 客户端错误体里带上游类别与说明。
+    #[test]
+    fn content_filtered_error_body_carries_full_reason() {
+        let e = UpstreamError::content_filtered("REASONING_EXTRACTION", "The selected model cannot continue this conversation.");
+        assert_eq!(upstream_status(e.kind), StatusCode::BAD_REQUEST);
+        let body = upstream_error_payload(&e);
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("REASONING_EXTRACTION") && msg.contains("cannot continue"), "{msg}");
+    }
+
     /// type 必须与状态码自洽 —— 两者打架会让客户端 SDK 的重试判断和状态码判断冲突。
     #[test]
     fn error_type_agrees_with_status_code() {
@@ -3393,6 +3426,7 @@ mod error_shape_tests {
         assert_eq!(anthropic_error_type(K::ModelNotAvailable), "invalid_request_error");
         // 确定性空流 → 400 → invalid_request_error(止住重试,见 upstream_status 注释)。
         assert_eq!(anthropic_error_type(K::EmptyResponse), "invalid_request_error");
+        assert_eq!(anthropic_error_type(K::ContentFiltered), "invalid_request_error");
         assert_eq!(anthropic_error_type(K::Overloaded), "overloaded_error");
         // 选号失败那条路自己算状态码,走 error_type_for_status
         assert_eq!(error_type_for_status(StatusCode::SERVICE_UNAVAILABLE), "overloaded_error");
@@ -3470,6 +3504,8 @@ fn upstream_status(kind: UpstreamErrorKind) -> StatusCode {
         // ⚠️ 与之正交的瞬态停滞(cursor Run 90s 只有心跳)已在源头改挂 ServerError
         // (gw-cursor chat.rs STALL_TIMEOUT 分支),不会冒到这条 arm 被误标成 400。
         UpstreamErrorKind::EmptyResponse => StatusCode::BAD_REQUEST,
+        // 上游分类器对该内容确定性拒答:同上,400 止住重试,文案带类别与说明。
+        UpstreamErrorKind::ContentFiltered => StatusCode::BAD_REQUEST,
         UpstreamErrorKind::Overloaded => overloaded_status(),
         _ => StatusCode::BAD_GATEWAY,
     }
@@ -3749,6 +3785,24 @@ enum ResponseLog {
     Folded(serde_json::Value),
     /// 流式:转发期间按字节预算采集的 SSE 事件,落库任务里折叠成 Messages。
     Events(Vec<SseEvent>),
+    /// 失败请求:下发客户端的 Anthropic 形状错误体(`{"type":"error",...}`)。
+    /// 让详情页看得到客户实际收到的那句话(如分类器拒答的类别与说明)。
+    Error(serde_json::Value),
+}
+
+/// 请求日志里分类器拒答的 error_kind 取值 —— 与 `format!("{:?}", UpstreamErrorKind::ContentFiltered)`
+/// 同串(测试锁住),面板据此标红。
+const CONTENT_FILTERED_KIND: &str = "ContentFiltered";
+
+/// 该 SSE 事件是否为 `stop_reason=refusal` 的 message_delta(上游分类器中途拦截)。
+fn is_refusal_delta(ev: &SseEvent) -> bool {
+    ev.event == "message_delta"
+        && ev.data.pointer("/delta/stop_reason").and_then(|v| v.as_str()) == Some("refusal")
+}
+
+/// 折叠后的非流式消息是否以 refusal 收尾。
+fn is_refusal_message(msg: &serde_json::Value) -> bool {
+    msg.get("stop_reason").and_then(|v| v.as_str()) == Some("refusal")
 }
 
 /// 报文入库前处理:**按字段把图片/文档 base64 抽到 blob 列表**(`data`/`bytes` 键的长值,
@@ -3851,6 +3905,7 @@ fn write_request_log(
         ResponseLog::None => String::new(),
         // 非流式:复用下发客户端的同一份折叠结果,不二次折叠(避免与客户端响应分歧)。
         ResponseLog::Folded(msg) => serialize_response_capped(&msg),
+        ResponseLog::Error(body) => serialize_response_capped(&body),
         ResponseLog::Events(events) if events.is_empty() => String::new(),
         ResponseLog::Events(events) => match gw_core::fold::fold_sse_to_message(&events) {
             Ok(msg) => serialize_response_capped(&msg),
@@ -4193,6 +4248,10 @@ async fn collect_response(
     // ModelNotAvailable→400、Overloaded→529、其余 502),折叠失败 502。
     // 详情据此回显,不留空(审查 low#7)。
     let (status_code, error_kind): (Option<i64>, Option<String>) = match &outcome {
+        // 答到一半被分类器拦下:成功口径不变,只打标记(见流式同名判定)。
+        Outcome::Ok(msg) if is_refusal_message(msg) => {
+            (Some(200), Some(CONTENT_FILTERED_KIND.to_string()))
+        }
         Outcome::Ok(_) => (Some(200), None),
         Outcome::Upstream(e) => (
             Some(upstream_status(e.kind).as_u16() as i64),
@@ -4240,10 +4299,12 @@ async fn collect_response(
         let guard = pw.enter();
         let duration_ms = Some(started_at.elapsed().as_millis() as i64);
         // 非流式:复用上面已折叠、即将下发客户端的同一份响应体(成功才有),不二次折叠——
-        // 保证入库的 response_payload 与客户端实际收到的响应严格一致。失败 → 无回复。
+        // 保证入库的 response_payload 与客户端实际收到的响应严格一致。失败 → 下发客户端的错误体。
         let response = match &outcome {
             Outcome::Ok(msg) => ResponseLog::Folded(msg.clone()),
-            _ => ResponseLog::None,
+            Outcome::Upstream(e) => ResponseLog::Error(upstream_error_payload(e)),
+            // 与下方下发同一闸门:客户收到的是中性化后的错误体(原文已在 warn 日志里)。
+            Outcome::Bad(body) => ResponseLog::Error(sanitize_upstream_error_payload(body)),
         };
         handle.spawn_blocking(move || {
             let _guard = guard;
@@ -4681,6 +4742,9 @@ async fn stream_response(
         // 防超长/超大回复无界占内存(触顶后停止累积,折叠仍尽力而为;正常回复远低于此)。
         resp_events: Vec<SseEvent>,
         resp_bytes: usize,
+        /// 首包后上游 Err 时下发客户端的 SSE error 载荷。有值则请求日志存它(与首包前 /
+        /// 非流式失败同口径:response_payload = 客户实收的错误体),而不是折叠不成的半截回复。
+        client_error: Option<serde_json::Value>,
         /// 流是否走到了 `message_stop`(= 客户端拿到了完整响应)。
         saw_message_stop: bool,
         /// 是否因上游静默超过 [`STREAM_IDLE_ABORT`] 被我方主动中止。
@@ -4833,7 +4897,10 @@ async fn stream_response(
                 duration_ms,
                 ttfb_ms,
                 usage,
-                ResponseLog::Events(std::mem::take(&mut self.resp_events)),
+                match self.client_error.take() {
+                    Some(body) => ResponseLog::Error(body),
+                    None => ResponseLog::Events(std::mem::take(&mut self.resp_events)),
+                },
                 self.st.provider.family(),
             );
         }
@@ -4862,6 +4929,7 @@ async fn stream_response(
         error_kind: None,
         resp_events: Vec::new(),
         resp_bytes: 0,
+        client_error: None,
         saw_message_stop: false,
         idle_aborted: false,
         upstream_cut: false,
@@ -4995,6 +5063,11 @@ async fn stream_response(
                     if ev.event == "message_stop" {
                         ctx.saw_message_stop = true;
                     }
+                    // 答到一半被上游分类器拦下(stop_reason=refusal):客户端拿到的是完整消息,
+                    // success 口径不变,只在请求日志里打 ContentFiltered 标记(面板标红)。
+                    if ctx.error_kind.is_none() && is_refusal_delta(&ev) {
+                        ctx.error_kind = Some(CONTENT_FILTERED_KIND.to_string());
+                    }
                     // 跟踪当前开着的块,供保活帧选形态(必须在转发前更新:下一轮静默时要用)。
                     ctx.open_block = track_open_block(ctx.open_block, &ev);
                     // OpenAI 线缆:转换后排队下发。请求日志的采集口径**不变** ——
@@ -5061,6 +5134,7 @@ async fn stream_response(
                     if ctx.error_kind.is_none() {
                         ctx.error_kind = Some(format!("{:?}", e.kind));
                     }
+                    ctx.client_error.get_or_insert_with(|| sse_error_payload(&e));
                     if !ctx.reported {
                         ctx.reported = true;
                         if should_report_inference_failure(&ctx.account, &e) {
@@ -6151,7 +6225,7 @@ mod tests {
         correct_overload_kind(&s, "m", K::Overloaded); // 开窗
         // 窗口内也只升级 ServerError;别的 kind 各有自己的处置(禁号/冷却/400),不能被吞掉。
         for k in [K::TokenInvalid, K::RateLimited, K::TemporarilyBlocked, K::QuotaExhausted,
-                  K::Network, K::BadRequest, K::ModelNotAvailable, K::EmptyResponse, K::Other] {
+                  K::Network, K::BadRequest, K::ModelNotAvailable, K::EmptyResponse, K::ContentFiltered, K::Other] {
             assert_eq!(correct_overload_kind(&s, "m", k), k, "{k:?} 不应被窗口改写");
         }
     }
@@ -6165,6 +6239,8 @@ mod tests {
         assert_eq!(upstream_status(K::ModelNotAvailable), StatusCode::BAD_REQUEST);
         // 确定性内容级空流 → 400(止住重试风暴,文案亮给用户;见 upstream_status 注释)。
         assert_eq!(upstream_status(K::EmptyResponse), StatusCode::BAD_REQUEST);
+        // 上游分类器拒答同理 → 400。
+        assert_eq!(upstream_status(K::ContentFiltered), StatusCode::BAD_REQUEST);
         for k in [K::ServerError, K::Network, K::RateLimited, K::QuotaExhausted,
                   K::TokenInvalid, K::TemporarilyBlocked, K::Other] {
             assert_eq!(upstream_status(k), StatusCode::BAD_GATEWAY, "{k:?} 应保持 502");
